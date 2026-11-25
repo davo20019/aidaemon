@@ -226,53 +226,6 @@ pub fn with_hint(label: impl IntoReactive<SharedString>, control: impl IntoEleme
     view().tooltip(hint(label)).child(control)
 }
 
-/// A glyph button with a count over it (waiting approvals). `label` names
-/// it for screen readers, with the count.
-pub fn icon_btn_count(
-    glyph: Glyph,
-    label: &'static str,
-    count: impl Fn() -> usize + Copy + 'static,
-    on_press: impl Fn() + 'static,
-) -> View {
-    with_hint(
-        label,
-        frame(Variant::Ghost, Size::Md, motion::PRESS_SCALE_ICON)
-            .w(px(Size::Md.height()))
-            .accessibility_label(move || {
-                Some(SharedString::from(match count() {
-                    0 => label.to_owned(),
-                    n => format!("{label}, {n} waiting"),
-                }))
-            })
-            .on_press(on_press)
-            .child(
-                icon(glyph)
-                    .text_color(colors::MUTED)
-                    .accessibility_elements_hidden(true),
-            )
-            .child(when(
-                move || count() > 0,
-                move || {
-                    text(move || count().to_string())
-                        .absolute()
-                        .top(px(4.0))
-                        .right(px(2.0))
-                        .min_w(px(18.0))
-                        .h(px(18.0))
-                        .px(px(4.0))
-                        .rounded_full()
-                        .text_center()
-                        .bg(colors::WARNING)
-                        .text_color(colors::ON_STATUS)
-                        .text_size(px(type_scale::XS))
-                        .line_height(px(18.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .accessibility_elements_hidden(true)
-                },
-            )),
-    )
-}
-
 /// The tooltip every control uses.
 pub fn hint(label: impl IntoReactive<SharedString>) -> nsh_base::TooltipElement {
     tooltip()
@@ -875,11 +828,6 @@ pub fn kbd(keys: impl IntoReactive<SharedString>) -> View {
 /// A hairline between regions.
 pub fn separator() -> View {
     view().h(px(1.0)).bg(colors::LINE)
-}
-
-/// A vertical hairline.
-pub fn separator_v() -> View {
-    view().w(px(1.0)).bg(colors::LINE)
 }
 
 /// Small caps over a group.

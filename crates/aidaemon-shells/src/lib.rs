@@ -648,14 +648,6 @@ impl ShellRegistry {
     fn forget(&self, id: &ShellId) {
         let _ = self.close(id);
     }
-
-    /// End every shell (the daemon stops).
-    pub fn close_all(&self) {
-        let ids: Vec<ShellId> = lock(&self.inner.shells).keys().cloned().collect();
-        for id in ids {
-            let _ = self.close(&id);
-        }
-    }
 }
 
 impl Drop for Inner {

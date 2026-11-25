@@ -163,7 +163,6 @@ pub mod text {
     pub const TITLE: f32 = 20.0;
     /// Line heights for each.
     pub const LH_SM: f32 = 17.0;
-    pub const LH_BASE: f32 = 19.0;
     pub const LH_READ: f32 = 24.0;
 }
 

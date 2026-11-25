@@ -289,63 +289,6 @@ impl HealthProbeManager {
         Ok(())
     }
 
-    /// Run a single probe immediately (on-demand execution).
-    pub async fn run_probe_now(&self, probe_id: &str) -> anyhow::Result<ProbeResult> {
-        let probe = self
-            .store
-            .get_probe(probe_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Probe not found: {}", probe_id))?;
-
-        let result = ProbeExecutor::execute(&probe).await;
-
-        // Store the result
-        self.store.insert_result(&result).await?;
-
-        // Process alerts
-        self.alerts.process_result(&probe, &result).await;
-
-        // Update last run time (but don't change next_run_at for on-demand runs)
-        let now = Utc::now();
-        if let Err(e) = self
-            .store
-            .update_probe_run(&probe.id, now, probe.next_run_at)
-            .await
-        {
-            warn!(probe = %probe.name, "Failed to update last run time: {}", e);
-        }
-
-        Ok(result)
-    }
-
-    /// Get current status for all probes.
-    pub async fn get_all_status(&self) -> anyhow::Result<Vec<ProbeStatusSummary>> {
-        let probes = self.store.list_probes().await?;
-        let mut summaries = Vec::with_capacity(probes.len());
-
-        for probe in probes {
-            let latest = self.store.get_latest_result(&probe.id).await?;
-            let consecutive_failures = self.store.count_consecutive_failures(&probe.id).await?;
-            let alert_state = self.alerts.get_probe_state(&probe.id).await;
-
-            summaries.push(ProbeStatusSummary {
-                id: probe.id,
-                name: probe.name,
-                probe_type: probe.probe_type.as_str().to_string(),
-                target: probe.target,
-                is_paused: probe.is_paused,
-                last_status: latest.as_ref().map(|r| r.status.as_str().to_string()),
-                last_latency_ms: latest.as_ref().and_then(|r| r.latency_ms),
-                last_checked: latest.as_ref().map(|r| r.checked_at),
-                next_run: probe.next_run_at,
-                consecutive_failures,
-                has_active_alert: alert_state.map(|(_, sent)| sent).unwrap_or(false),
-            });
-        }
-
-        Ok(summaries)
-    }
-
     /// Cleanup old probe results beyond retention period.
     pub async fn cleanup_old_results(&self, retention_days: u32) -> anyhow::Result<u64> {
         let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);

@@ -31,16 +31,6 @@ pub enum ConnectedContentMode {
     DraftThenDeliver,
 }
 
-impl ConnectedContentMode {
-    pub fn is_authoring_only(self) -> bool {
-        matches!(self, Self::DraftOnly)
-    }
-
-    pub fn expects_live_delivery(self) -> bool {
-        matches!(self, Self::DeliverOnly | Self::DraftThenDeliver)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompletionTaskKind {
     #[default]
@@ -77,8 +67,6 @@ pub enum ForbiddenMutationAction {
     Post,
     Send,
 }
-
-impl ForbiddenMutationAction {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompletionContract {
@@ -760,16 +748,6 @@ impl CompletionProgress {
         format!("{}/{}", self.task_scope, local_id)
     }
 
-    #[cfg(test)]
-    fn next_evidence_id(&self, prefix: &str) -> String {
-        format!(
-            "{prefix}:{}",
-            self.mutation_count
-                .saturating_add(self.observation_count)
-                .saturating_add(1)
-        )
-    }
-
     fn record_receipt_node(&mut self, tool_call_id: &str) -> Option<String> {
         if !self.proof_graph_initialized {
             return None;
@@ -837,12 +815,6 @@ impl CompletionProgress {
         ) {
             self.indeterminate_mutation_count = self.indeterminate_mutation_count.saturating_add(1);
         }
-    }
-
-    #[cfg(test)]
-    pub fn mark_mutation(&mut self, contract: &CompletionContract, semantics: &ToolCallSemantics) {
-        let evidence_id = self.next_evidence_id("synthetic-mutation");
-        self.mark_mutation_receipt(contract, semantics, &evidence_id);
     }
 
     pub fn mark_mutation_receipt(
@@ -925,22 +897,6 @@ impl CompletionProgress {
                 }
             }
         }
-    }
-
-    #[cfg(test)]
-    pub fn mark_observation(&mut self, contract: &CompletionContract, matched_target: bool) {
-        let evidence_id = self.next_evidence_id("synthetic-verification");
-        let matched_requirements = if matched_target {
-            (0..contract.evidence_requirements.len()).collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        self.mark_observation_receipt(
-            contract,
-            &matched_requirements,
-            matched_target,
-            &evidence_id,
-        );
     }
 
     pub fn mark_observation_receipt(

@@ -1127,15 +1127,6 @@ impl ToolCallSemantics {
         }
     }
 
-    /// Apply a dispatcher-owned hard observation boundary while retaining
-    /// target and evidence metadata from the original call. Use only when the
-    /// adapter itself enforces that boundary before I/O.
-    pub fn constrained_to_observation(mut self) -> Self {
-        self.effect = ToolCallEffect::Observation;
-        self.mutation_effects = ToolMutationEffects::NONE;
-        self
-    }
-
     pub fn mutation() -> Self {
         Self {
             effect: ToolCallEffect::Mutation,

@@ -316,31 +316,6 @@ pub struct PatternStats {
     pub top_patterns: Vec<(String, i32)>,
 }
 
-/// Get statistics about learned patterns for display/prompt.
-#[allow(dead_code)]
-pub async fn get_pattern_stats(pool: &SqlitePool) -> anyhow::Result<PatternStats> {
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_patterns")
-        .fetch_one(pool)
-        .await?;
-
-    let trusted: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM command_patterns WHERE approval_count >= 3")
-            .fetch_one(pool)
-            .await?;
-
-    let top_patterns: Vec<(String, i32)> = sqlx::query_as(
-        "SELECT pattern, approval_count FROM command_patterns WHERE approval_count >= 3 ORDER BY approval_count DESC LIMIT 10"
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(PatternStats {
-        total_patterns: total.0 as usize,
-        trusted_patterns: trusted.0 as usize,
-        top_patterns,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

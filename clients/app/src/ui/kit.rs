@@ -89,18 +89,6 @@ pub fn choice(
     choice_sized(label, placeholder, items, value, change, false)
 }
 
-/// [`choice`] as a small, borderless trigger, for a toolbar row (the
-/// composer's model and effort).
-pub fn choice_compact(
-    label: impl Into<SharedString>,
-    placeholder: impl Into<SharedString>,
-    items: Vec<(String, String)>,
-    value: impl Fn() -> Option<String> + Copy + 'static,
-    change: impl Fn(Option<String>) + 'static,
-) -> nsh_base::SelectElement {
-    choice_sized(label, placeholder, items, value, change, true)
-}
-
 fn choice_sized(
     label: impl Into<SharedString>,
     placeholder: impl Into<SharedString>,

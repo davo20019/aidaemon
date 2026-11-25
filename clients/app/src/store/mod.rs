@@ -288,7 +288,6 @@ struct Reads {
     projects: Memo<Vec<ProjectSummary>>,
     project_error: Memo<Option<String>>,
     project_missing_folder: Memo<Option<String>>,
-    saving_project: Memo<bool>,
     sources: Memo<Vec<Source>>,
     bots: Memo<Vec<Bot>>,
     approvals: Memo<Vec<Approval>>,
@@ -404,7 +403,6 @@ impl Reads {
             project_missing_folder: computed(move || {
                 client.with(|c| c.project_missing_folder.clone())
             }),
-            saving_project: computed(move || client.with(Client::saving_project)),
             sources: computed(move || client.with(Client::sources)),
             bots: computed(move || client.with(Client::bots)),
             approvals: computed(move || client.with(Client::approvals)),
@@ -2079,20 +2077,6 @@ impl Store {
         }
     }
 
-    pub fn project_open(&self, id: &str) -> bool {
-        self.open_projects.with(|open| open.contains(id))
-    }
-
-    pub fn toggle_project(&self, id: &str) {
-        crate::ui::motion::next_unfold();
-        let id = id.to_owned();
-        self.open_projects.update(|open| {
-            if !open.remove(&id) {
-                open.insert(id);
-            }
-        });
-    }
-
     /// What the sidebar shows: every conversation, the projects, or one
     /// project's conversations.
     pub fn sidebar_view(&self) -> SidebarView {
@@ -2150,10 +2134,6 @@ impl Store {
     /// refused the save only because that folder is missing.
     pub fn project_missing_folder(&self) -> Option<String> {
         self.reads.project_missing_folder.get()
-    }
-
-    pub fn creating_project(&self) -> bool {
-        self.reads.saving_project.get()
     }
 
     pub fn create_project(&self, name: &str, path: &str) {
@@ -2523,10 +2503,6 @@ impl Store {
 
     pub fn is_unread(&self, id: &str) -> bool {
         self.reads.unread.with(|u| u.contains(id))
-    }
-
-    pub fn unread_count(&self) -> usize {
-        self.reads.unread.with(BTreeSet::len)
     }
 
     pub fn is_stopping(&self, id: &str) -> bool {
@@ -3521,30 +3497,9 @@ impl Store {
         })
     }
 
-    /// Every run running now, in any conversation, oldest first.
-    pub fn running_runs(&self) -> Vec<RunSummary> {
-        self.reads
-            .runs
-            .get()
-            .into_iter()
-            .filter(|run| run.phase.is_running())
-            .collect()
-    }
-
     /// Conversation `session`'s agents at work, for its drawer row.
     pub fn agent_work(&self, session: &str) -> Option<AgentWork> {
         agent_work(&self.runs_for(session))
-    }
-
-    /// How many coding agents are running for conversation `session`.
-    pub fn agents_running(&self, session: &str) -> usize {
-        self.reads.runs.with(|runs| {
-            runs.iter()
-                .filter(|run| {
-                    run.session_id == session && run.phase.is_running() && run.agent.is_some()
-                })
-                .count()
-        })
     }
 
     // ----- Naming, archiving, undoing, waiting messages ------------------

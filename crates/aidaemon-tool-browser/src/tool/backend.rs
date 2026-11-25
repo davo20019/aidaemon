@@ -88,11 +88,6 @@ pub trait PageHandle: Send + Sync {
     /// Click the element matching `selector`.
     async fn click(&self, selector: &str) -> Result<(), String>;
 
-    /// Focus the element matching `selector` and type `value` into it
-    /// (append semantics — kept as a seam primitive for future tasks).
-    #[allow(dead_code)]
-    async fn type_text(&self, selector: &str, value: &str) -> Result<(), String>;
-
     /// Evaluate a JavaScript `script` and return its result as a JSON value.
     ///
     /// Returns `Ok(None)` when the script produced no deserializable value
@@ -1336,22 +1331,6 @@ impl PageHandle for ChromiumoxidePage {
         Ok(())
     }
 
-    async fn type_text(&self, selector: &str, value: &str) -> Result<(), String> {
-        let element = self.page.find_element(selector).await.map_err(|e| {
-            self.faults
-                .noted(&e, format!("Element not found '{}': {}", selector, e))
-        })?;
-        element.click().await.map_err(|e| {
-            self.faults
-                .noted(&e, format!("Failed to focus '{}': {}", selector, e))
-        })?;
-        element.type_str(value).await.map_err(|e| {
-            self.faults
-                .noted(&e, format!("Failed to type into '{}': {}", selector, e))
-        })?;
-        Ok(())
-    }
-
     async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String> {
         let element = self.page.find_element(selector).await.map_err(|e| {
             self.faults
@@ -1900,7 +1879,6 @@ pub enum MockCall {
     Goto(String),
     FindElement(String),
     Click(String),
-    TypeText(String, String),
     /// Recorded by `MockPage::replace_text`. Fields: (selector, value).
     ReplaceText(String, String),
     Evaluate(String),
@@ -2486,12 +2464,6 @@ impl PageHandle for MockPage {
         if let Some(popup) = self.pending_popup.lock().await.take() {
             self.targets.lock().await.push(popup);
         }
-        Ok(())
-    }
-
-    async fn type_text(&self, selector: &str, value: &str) -> Result<(), String> {
-        self.record(MockCall::TypeText(selector.to_string(), value.to_string()))
-            .await;
         Ok(())
     }
 

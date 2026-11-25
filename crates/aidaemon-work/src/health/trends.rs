@@ -100,54 +100,6 @@ impl ProbeStats {
 pub struct TrendAnalyzer;
 
 impl TrendAnalyzer {
-    /// Compare stats across two time periods to detect trend direction.
-    ///
-    /// Returns a tuple of (is_improving, change_description)
-    pub fn compare_periods(current: &ProbeStats, previous: &ProbeStats) -> (bool, String) {
-        if current.check_count == 0 || previous.check_count == 0 {
-            return (true, "Insufficient data for comparison".to_string());
-        }
-
-        let uptime_diff = current.uptime_percent - previous.uptime_percent;
-        let latency_diff = match (current.avg_latency_ms, previous.avg_latency_ms) {
-            (Some(curr), Some(prev)) => Some(curr as i64 - prev as i64),
-            _ => None,
-        };
-
-        // Determine if improving
-        let uptime_improving = uptime_diff >= 0.0;
-        let latency_improving = latency_diff.map(|d| d <= 0).unwrap_or(true);
-        let is_improving = uptime_improving && latency_improving;
-
-        // Build description
-        let mut parts = Vec::new();
-
-        if uptime_diff.abs() >= 0.1 {
-            let direction = if uptime_diff > 0.0 { "up" } else { "down" };
-            parts.push(format!("uptime {} {:.2}%", direction, uptime_diff.abs()));
-        }
-
-        if let Some(diff) = latency_diff
-            && diff.abs() >= 10
-        {
-            let direction = if diff < 0 { "improved" } else { "increased" };
-            parts.push(format!("latency {} by {}ms", direction, diff.abs()));
-        }
-
-        let description = if parts.is_empty() {
-            "No significant change".to_string()
-        } else {
-            parts.join(", ")
-        };
-
-        (is_improving, description)
-    }
-
-    /// Detect if a probe is in a failure streak.
-    pub fn is_failure_streak(consecutive_failures: u32, threshold: u32) -> bool {
-        consecutive_failures >= threshold
-    }
-
     /// Calculate a health score (0-100) based on stats.
     pub fn health_score(stats: &ProbeStats) -> u32 {
         if stats.check_count == 0 {

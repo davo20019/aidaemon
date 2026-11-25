@@ -406,10 +406,6 @@ impl<S, X> Scenario<S, X> {
         Ok(())
     }
 
-    pub fn is_scripted(&self) -> bool {
-        self.script.is_some()
-    }
-
     /// The same scenario for a live model: the script is dropped (so the
     /// factory's live provider runs it) and `live_expect`, when present,
     /// replaces `expect`. Without `live_expect` the scripted assertions are

@@ -250,11 +250,6 @@ impl HarnessEvalAccumulator {
             self.contract.forbidden_mutation_attempts.saturating_add(1);
     }
 
-    #[allow(dead_code)] // wired when unrecovered error paths gain eval hooks
-    pub fn record_unrecovered_error(&mut self) {
-        self.unrecovered_errors = self.unrecovered_errors.saturating_add(1);
-    }
-
     pub fn record_llm_efficiency(&mut self, efficiency: &TaskEfficiencyData) {
         self.raw_input_tokens = efficiency.input_tokens;
         self.raw_output_tokens = efficiency.output_tokens;

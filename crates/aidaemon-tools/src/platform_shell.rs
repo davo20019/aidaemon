@@ -6,11 +6,6 @@
 
 use tokio::process::Command;
 
-/// The shell's name, as the owner and the model see it.
-pub fn shell_name() -> &'static str {
-    if cfg!(windows) { "powershell" } else { "sh" }
-}
-
 /// Appended to every PowerShell script so the shell exits as `sh` does:
 /// with the last program's own exit code. `-Command` alone turns any
 /// failing last step into 1, so `python x.py` exiting 7 read as 1.

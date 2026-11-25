@@ -350,12 +350,6 @@ pub struct PolicyAutotuneSnapshot {
     pub uncertainty_threshold: f32,
 }
 
-pub fn policy_autotune_snapshot(default_threshold: f32) -> PolicyAutotuneSnapshot {
-    PolicyAutotuneSnapshot {
-        uncertainty_threshold: current_uncertainty_threshold(default_threshold),
-    }
-}
-
 /// Bounded auto-tuning: adjust uncertainty threshold within safe bounds.
 /// Returns (old, new) when a change is applied.
 pub fn apply_bounded_autotune_from_failure_ratio(

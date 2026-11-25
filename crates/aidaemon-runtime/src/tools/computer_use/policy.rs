@@ -45,21 +45,6 @@ impl ComputerActionKind {
         }
     }
 
-    pub fn action_name(self) -> &'static str {
-        match self {
-            Self::ListApps => "list_apps",
-            Self::LaunchApp => "launch_app",
-            Self::GetAppState => "get_app_state",
-            Self::Screenshot => "screenshot",
-            Self::ActivateApp => "activate_app",
-            Self::Click => "click",
-            Self::TypeText => "type_text",
-            Self::PressKey => "press_key",
-            Self::Scroll => "scroll",
-            Self::SetValue => "set_value",
-        }
-    }
-
     pub fn base_class(self) -> ActionClass {
         match self {
             Self::ListApps | Self::GetAppState | Self::Screenshot => ActionClass::Observation,
@@ -71,15 +56,6 @@ impl ComputerActionKind {
             | Self::Scroll => ActionClass::LocalMutation,
             Self::SetValue => ActionClass::LocalMutation,
         }
-    }
-
-    pub fn requires_snapshot_generation(self) -> bool {
-        // launch_app starts an app that has no prior snapshot, so (like the
-        // observation actions and activate_app) it carries no generation.
-        !matches!(
-            self,
-            Self::ListApps | Self::LaunchApp | Self::GetAppState | Self::Screenshot
-        )
     }
 }
 

@@ -184,12 +184,6 @@ impl DiscordChannel {
         self
     }
 
-    /// Gateway intents bitmask. Default [`intents::DEFAULT`].
-    pub fn with_intents(mut self, intents: u64) -> Self {
-        self.intents = intents;
-        self
-    }
-
     /// Reconnect backoff: first wait and cap (doubling in between). The
     /// first wait also scales the 1-5 s pause after an Invalid Session.
     /// Default 1 s and 60 s.

@@ -1732,31 +1732,6 @@ impl BrowserConfig {
             agent_profile_dir: default_browser_user_data_dir(),
         }
     }
-
-    /// Resolved navigation/DOM-ready timeout (see [`aidaemon_tool_browser::BrowserSettings::nav_timeout`]).
-    #[allow(dead_code)] // the browser tool reads its own settings
-    pub fn nav_timeout(&self) -> std::time::Duration {
-        self.settings().nav_timeout()
-    }
-
-    /// Resolved default `wait`-action element-poll timeout.
-    #[allow(dead_code)] // the browser tool reads its own settings
-    pub fn element_timeout(&self) -> std::time::Duration {
-        self.settings().element_timeout()
-    }
-
-    /// Resolved overall per-action ceiling.
-    #[allow(dead_code)] // the browser tool reads its own settings
-    pub fn action_timeout(&self) -> std::time::Duration {
-        self.settings().action_timeout()
-    }
-
-    /// The effective session-isolation mode, refusing configurations that
-    /// would falsely claim per-session cookie isolation.
-    #[allow(dead_code)] // the browser tool reads its own settings
-    pub fn resolve_session_isolation(&self) -> Result<SessionIsolation, String> {
-        self.settings().resolve_session_isolation()
-    }
 }
 
 pub(crate) fn default_browser_user_data_dir() -> Option<String> {
@@ -3878,9 +3853,18 @@ session_isolation = "incognito"
     #[test]
     fn browser_timeout_defaults_are_sane() {
         let cfg = BrowserConfig::default();
-        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(30));
-        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(10));
-        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(30));
+        assert_eq!(
+            cfg.settings().nav_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            cfg.settings().element_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            cfg.settings().action_timeout(),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -3893,18 +3877,36 @@ session_isolation = "incognito"
             action_timeout_secs: 0,
             ..Default::default()
         };
-        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(1));
-        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(1));
-        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(
+            cfg.settings().nav_timeout(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            cfg.settings().element_timeout(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            cfg.settings().action_timeout(),
+            std::time::Duration::from_secs(1)
+        );
 
         // Absurdly large values are clamped down to the per-field maximum so a
         // typo can never hang the tool indefinitely.
         cfg.nav_timeout_secs = 1_000_000;
         cfg.element_timeout_secs = 1_000_000;
         cfg.action_timeout_secs = 1_000_000;
-        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(120));
-        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(120));
-        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(300));
+        assert_eq!(
+            cfg.settings().nav_timeout(),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            cfg.settings().element_timeout(),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            cfg.settings().action_timeout(),
+            std::time::Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -3915,16 +3917,25 @@ session_isolation = "incognito"
             action_timeout_secs: 90,
             ..Default::default()
         };
-        assert_eq!(cfg.nav_timeout(), std::time::Duration::from_secs(45));
-        assert_eq!(cfg.element_timeout(), std::time::Duration::from_secs(5));
-        assert_eq!(cfg.action_timeout(), std::time::Duration::from_secs(90));
+        assert_eq!(
+            cfg.settings().nav_timeout(),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(
+            cfg.settings().element_timeout(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            cfg.settings().action_timeout(),
+            std::time::Duration::from_secs(90)
+        );
     }
 
     #[test]
     fn resolve_auto_ephemeral_is_browser_context() {
         let cfg = ephemeral_browser_config(None);
         assert_eq!(
-            cfg.resolve_session_isolation(),
+            cfg.settings().resolve_session_isolation(),
             Ok(SessionIsolation::BrowserContext)
         );
     }
@@ -3933,28 +3944,37 @@ session_isolation = "incognito"
     fn resolve_auto_with_profile_is_page() {
         let mut cfg = ephemeral_browser_config(None);
         cfg.user_data_dir = Some("/tmp/profile".to_string());
-        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+        assert_eq!(
+            cfg.settings().resolve_session_isolation(),
+            Ok(SessionIsolation::Page)
+        );
     }
 
     #[test]
     fn resolve_auto_with_remote_port_is_page() {
         let mut cfg = ephemeral_browser_config(None);
         cfg.remote_debugging_port = Some(9222);
-        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+        assert_eq!(
+            cfg.settings().resolve_session_isolation(),
+            Ok(SessionIsolation::Page)
+        );
     }
 
     #[test]
     fn resolve_page_with_profile_is_ok_page() {
         let mut cfg = ephemeral_browser_config(Some(SessionIsolation::Page));
         cfg.user_data_dir = Some("/tmp/profile".to_string());
-        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+        assert_eq!(
+            cfg.settings().resolve_session_isolation(),
+            Ok(SessionIsolation::Page)
+        );
     }
 
     #[test]
     fn resolve_browser_context_ephemeral_is_ok() {
         let cfg = ephemeral_browser_config(Some(SessionIsolation::BrowserContext));
         assert_eq!(
-            cfg.resolve_session_isolation(),
+            cfg.settings().resolve_session_isolation(),
             Ok(SessionIsolation::BrowserContext)
         );
     }
@@ -3964,6 +3984,7 @@ session_isolation = "incognito"
         let mut cfg = ephemeral_browser_config(Some(SessionIsolation::BrowserContext));
         cfg.user_data_dir = Some("/tmp/profile".to_string());
         let err = cfg
+            .settings()
             .resolve_session_isolation()
             .expect_err("browser_context + persistent profile must be rejected");
         assert!(
@@ -3977,6 +3998,7 @@ session_isolation = "incognito"
         let mut cfg = ephemeral_browser_config(Some(SessionIsolation::BrowserContext));
         cfg.remote_debugging_port = Some(9222);
         let err = cfg
+            .settings()
             .resolve_session_isolation()
             .expect_err("browser_context + remote-debugging Chrome must be rejected");
         assert!(
@@ -3991,7 +4013,10 @@ session_isolation = "incognito"
         // session_isolation = None. It must resolve to Page, not error.
         let cfg = BrowserConfig::default();
         assert_eq!(cfg.session_isolation, None);
-        assert_eq!(cfg.resolve_session_isolation(), Ok(SessionIsolation::Page));
+        assert_eq!(
+            cfg.settings().resolve_session_isolation(),
+            Ok(SessionIsolation::Page)
+        );
     }
 
     #[test]

@@ -8,10 +8,7 @@
 //! - Supports resume capability for long-running tasks
 
 pub mod checklist_args;
-pub mod detection;
 mod store;
-#[allow(dead_code)]
-mod tracking;
 
 pub use store::{PlanStore, migrate_task_plans};
 

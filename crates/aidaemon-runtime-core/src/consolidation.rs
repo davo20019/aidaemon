@@ -57,14 +57,6 @@ impl ConsolidationResult {
     }
 }
 
-/// Statistics from daily consolidation
-#[derive(Debug, Default)]
-pub struct DailyConsolidationStats {
-    pub sessions_processed: usize,
-    pub total_result: ConsolidationResult,
-    pub failures: usize,
-}
-
 /// Extracts learnings from events and stores in long-term memory
 pub struct Consolidator {
     event_store: Arc<EventStore>,

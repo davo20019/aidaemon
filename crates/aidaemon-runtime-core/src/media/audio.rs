@@ -25,19 +25,6 @@ pub fn mime_to_openai_format(mime: &str) -> Option<&'static str> {
     }
 }
 
-/// Gemini `inlineData.mimeType` for an OpenAI audio format token.
-#[allow(dead_code)]
-pub fn openai_format_to_gemini_mime(format: &str) -> Option<&'static str> {
-    match format {
-        "opus" => Some("audio/ogg"),
-        "mp3" => Some("audio/mp3"),
-        "wav" => Some("audio/wav"),
-        "flac" => Some("audio/flac"),
-        "aac" => Some("audio/aac"),
-        _ => None,
-    }
-}
-
 /// Read and base64-encode an audio file when within size limits.
 pub fn encode_audio_attachment(
     path: &Path,

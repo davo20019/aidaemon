@@ -2067,10 +2067,6 @@ impl Client {
         self.project_missing_folder = None;
     }
 
-    pub fn saving_project(&self) -> bool {
-        self.project_request.is_some()
-    }
-
     /// Delete a project: its conversations go to no project and its folder
     /// stays. The daemon's answer says it, or why not.
     pub fn delete_project(&mut self, project_id: &str) {

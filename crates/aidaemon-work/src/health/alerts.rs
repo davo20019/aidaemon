@@ -293,55 +293,12 @@ impl AlertManager {
         }
     }
 
-    /// Send a degradation alert.
-    #[allow(dead_code)]
-    pub async fn send_degradation_alert(&self, probe: &HealthProbe, details: &str) {
-        let message = format!(
-            "⚠️ **Health Warning: {} is DEGRADED**\n\
-             Target: `{}`\n\
-             Details: {}",
-            probe.name, probe.target, details
-        );
-
-        info!(
-            probe = %probe.name,
-            target = %probe.target,
-            "Sending degradation alert"
-        );
-
-        let sessions = &probe.alert_session_ids;
-        if !sessions.is_empty() {
-            self.hub.broadcast_text(sessions, &message).await;
-        }
-
-        // Record alert in database
-        if let Err(e) = self
-            .store
-            .insert_alert(
-                &probe.id,
-                AlertType::Degraded.as_str(),
-                &message,
-                Utc::now(),
-            )
-            .await
-        {
-            warn!(probe = %probe.name, "Failed to record degradation alert: {}", e);
-        }
-    }
-
     /// Get the current alert state for a probe (for debugging/status).
     pub async fn get_probe_state(&self, probe_id: &str) -> Option<(u32, bool)> {
         let states = self.states.read().await;
         states
             .get(probe_id)
             .map(|s| (s.consecutive_failures, s.down_alert_sent))
-    }
-
-    /// Clear all tracked states (useful for testing or reset).
-    #[allow(dead_code)]
-    pub async fn clear_states(&self) {
-        let mut states = self.states.write().await;
-        states.clear();
     }
 }
 

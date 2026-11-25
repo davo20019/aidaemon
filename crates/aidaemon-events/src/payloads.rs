@@ -16,27 +16,6 @@ use crate::traits::{
 // Session Events
 // =============================================================================
 
-/// Data for SessionStart event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionStartData {
-    /// Channel name (e.g., "telegram", "discord")
-    pub channel: String,
-    /// Platform-specific user identifier
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
-}
-
-/// Data for SessionEnd event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionEndData {
-    /// Reason for session end
-    pub reason: SessionEndReason,
-    /// Total duration in seconds
-    pub duration_secs: u64,
-    /// Number of events in this session
-    pub event_count: u32,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEndReason {
@@ -1340,21 +1319,6 @@ pub struct TaskRef {
     pub task_id: String,
 }
 
-/// Typed audit record for a tool attempt that conflicts with a grounded
-/// current-request capability constraint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserConstraintViolationData {
-    pub task_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
-    pub constraint_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prohibited_scope: Option<crate::traits::ToolSemanticScope>,
-    pub attempted_tool: String,
-    pub prevented: bool,
-    pub side_effect_outcome: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackgroundContinuationLinkedData {
     pub parent_task_id: String,
@@ -1957,12 +1921,6 @@ impl ErrorData {
             task_id,
             tool_name: None,
         }
-    }
-
-    /// Mark as recovered
-    pub fn with_recovered(mut self) -> Self {
-        self.recovered = true;
-        self
     }
 
     /// Add context

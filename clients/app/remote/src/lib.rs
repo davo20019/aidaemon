@@ -223,11 +223,6 @@ impl Socket {
         let _ = self.out.unbounded_send(Message::text(text));
     }
 
-    #[wasm_bindgen(js_name = sendBytes)]
-    pub fn send_bytes(&self, bytes: Vec<u8>) {
-        let _ = self.out.unbounded_send(Message::binary(bytes));
-    }
-
     pub fn close(&self) {
         self.out.close_channel();
     }

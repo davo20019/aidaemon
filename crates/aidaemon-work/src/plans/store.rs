@@ -836,22 +836,6 @@ impl PlanStore {
     // Cleanup Operations
     // =========================================================================
 
-    /// Delete old completed/failed/abandoned plans.
-    pub async fn delete_old_completed(&self, older_than: DateTime<Utc>) -> anyhow::Result<u64> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM task_plans
-            WHERE status IN ('completed', 'failed', 'abandoned')
-              AND updated_at < ?
-            "#,
-        )
-        .bind(older_than.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected())
-    }
-
     // =========================================================================
     // Helpers
     // =========================================================================

@@ -869,17 +869,13 @@ async fn fill_replaces_existing_value_not_appends() {
     let calls = calls.lock().await;
 
     // Must have recorded a ReplaceText with exactly the new value (replace
-    // semantics). The old append sequence (Click + TypeText) must NOT appear.
+    // semantics). The old append preamble (Click) must NOT appear.
     assert!(
         calls.contains(&MockCall::ReplaceText(
             "#email".to_string(),
             "new@example.com".to_string()
         )),
         "fill must dispatch replace_text with new@example.com: {calls:?}"
-    );
-    assert!(
-        !calls.iter().any(|c| matches!(c, MockCall::TypeText(..))),
-        "fill must NOT use type_text (append path): {calls:?}"
     );
     assert!(
         !calls.iter().any(|c| matches!(c, MockCall::Click(..))),

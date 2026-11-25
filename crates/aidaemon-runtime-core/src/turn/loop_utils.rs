@@ -21,16 +21,6 @@ pub enum ToolFailureClass {
     Transient,
 }
 
-pub fn semantic_failure_limit(tool_name: &str) -> usize {
-    match tool_name {
-        "cli_agent" => 2,
-        // API calls often need multiple attempts to discover correct parameter
-        // formats, especially for unfamiliar APIs. Give more room to iterate.
-        "http_request" => 5,
-        _ => 3,
-    }
-}
-
 fn classify_http_status(status: u16) -> Option<ToolFailureClass> {
     if status >= 500 || matches!(status, 408 | 409 | 425 | 429) {
         return Some(ToolFailureClass::Transient);

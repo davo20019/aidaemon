@@ -2,17 +2,6 @@
 
 use serde_json::Value;
 
-/// Why a task terminated before natural completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants document persisted terminal causes before every caller is migrated.
-pub enum TaskTerminalCause {
-    Cancelled,
-    Timeout,
-    Watchdog,
-    HardFailure,
-    UnrecoveredModelFailure,
-}
-
 /// Detect model outputs that tried to write a tool call as plain text instead
 /// of returning a structured provider tool call.
 pub fn response_looks_like_plain_text_tool_call(reply: &str) -> bool {

@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
-use std::collections::HashMap;
 
 use super::probes::{HealthProbe, ProbeResult, ProbeStatus, ProbeType};
 use super::trends::ProbeStats;
@@ -416,33 +415,6 @@ impl HealthProbeStore {
         Ok(row.last_insert_rowid())
     }
 
-    /// Get the last alert of a specific type for a probe.
-    pub async fn get_last_alert(
-        &self,
-        probe_id: &str,
-        alert_type: &str,
-    ) -> anyhow::Result<Option<DateTime<Utc>>> {
-        let row = sqlx::query(
-            "SELECT sent_at FROM probe_alerts
-             WHERE probe_id = ? AND alert_type = ?
-             ORDER BY sent_at DESC LIMIT 1",
-        )
-        .bind(probe_id)
-        .bind(alert_type)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(row) => {
-                let sent_str: String = row.get("sent_at");
-                Ok(DateTime::parse_from_rfc3339(&sent_str)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc)))
-            }
-            None => Ok(None),
-        }
-    }
-
     // ==================== Trend Queries ====================
 
     /// Calculate stats for a probe over a time period.
@@ -498,25 +470,6 @@ impl HealthProbeStore {
             period_start: start,
             period_end: end,
         })
-    }
-
-    /// Get summary stats for all probes.
-    pub async fn get_all_probe_stats(
-        &self,
-        hours: u32,
-    ) -> anyhow::Result<HashMap<String, ProbeStats>> {
-        let end = Utc::now();
-        let start = end - chrono::Duration::hours(hours as i64);
-
-        let probes = self.list_probes().await?;
-        let mut stats_map = HashMap::new();
-
-        for probe in probes {
-            let stats = self.calculate_stats(&probe.id, start, end).await?;
-            stats_map.insert(probe.id, stats);
-        }
-
-        Ok(stats_map)
     }
 }
 

@@ -396,11 +396,6 @@ pub fn values_to_sdk(values: &[Value]) -> Vec<sdk::Message> {
         .collect()
 }
 
-/// A wire message's text, image parts left out.
-pub fn message_text(message: &Value) -> String {
-    split_content(message.get("content")).0
-}
-
 fn split_content(content: Option<&Value>) -> (String, Vec<sdk::Image>) {
     match content {
         Some(Value::String(text)) => (text.clone(), Vec::new()),

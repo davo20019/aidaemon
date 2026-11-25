@@ -1617,33 +1617,6 @@ impl EventStore {
         Ok(pending.into_iter().map(|(_, data)| data).collect())
     }
 
-    /// Reconstruct unresolved approval interactions belonging to one task.
-    /// Completion uses this as a final fail-closed check so a model response
-    /// cannot race ahead of an approval resolution.
-    pub async fn get_pending_task_interactions(
-        &self,
-        task_id: &str,
-    ) -> anyhow::Result<Vec<InteractionRequestedData>> {
-        let events = self.query_task_events(task_id).await?;
-        let mut pending = std::collections::HashMap::<String, InteractionRequestedData>::new();
-        for event in events {
-            match event.event_type {
-                EventType::InteractionRequested => {
-                    if let Ok(data) = event.parse_data::<InteractionRequestedData>() {
-                        pending.insert(data.interaction_id.clone(), data);
-                    }
-                }
-                EventType::InteractionResolved => {
-                    if let Ok(data) = event.parse_data::<InteractionResolvedData>() {
-                        pending.remove(&data.interaction_id);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(pending.into_values().collect())
-    }
-
     /// Query events for a specific task
     pub async fn query_task_events(&self, task_id: &str) -> anyhow::Result<Vec<Event>> {
         let rows = sqlx::query(
@@ -2041,31 +2014,6 @@ impl EventStore {
         }))
     }
 
-    /// Load every typed tool result for one task in event order. Recovery and
-    /// audit must evaluate the complete receipt set; selecting only the newest
-    /// row loses an earlier successful prerequisite when a later operation is
-    /// negative or blocked.
-    pub async fn task_tool_results(
-        &self,
-        session_id: &str,
-        task_id: &str,
-    ) -> anyhow::Result<Vec<ToolResultData>> {
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT data
-             FROM events
-             WHERE session_id = ? AND task_id = ? AND event_type = 'tool_result'
-             ORDER BY id ASC",
-        )
-        .bind(session_id)
-        .bind(task_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|data| serde_json::from_str::<ToolResultData>(&data).ok())
-            .collect())
-    }
-
     /// Reconcile receipt-bound invocation obligations from the persisted task
     /// assessment and result events. This is deliberately independent of the
     /// response model and of in-memory completion progress, so provider
@@ -2431,21 +2379,6 @@ impl EventStore {
         self.rows_to_events(rows)
     }
 
-    /// Get sessions with unconsolidated events older than a cutoff
-    pub async fn get_sessions_needing_consolidation(&self) -> anyhow::Result<Vec<String>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT DISTINCT session_id
-            FROM events
-            WHERE consolidated_at IS NULL
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.iter().map(|r| r.get("session_id")).collect())
-    }
-
     /// Get sessions with old unconsolidated events (before cutoff)
     pub async fn get_sessions_with_old_unconsolidated_events(
         &self,
@@ -2735,25 +2668,6 @@ impl EventStore {
             .as_deref()
             .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
             .map(|at| at.with_timezone(&Utc)))
-    }
-
-    /// Get the most recent error for a session
-    pub async fn get_last_error(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
-            FROM events
-            WHERE session_id = ? AND event_type = 'error'
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let events = self.rows_to_events(rows)?;
-        Ok(events.into_iter().next())
     }
 
     /// Get the current active task (TaskStart without matching TaskEnd).
@@ -3111,20 +3025,6 @@ impl EventStore {
         }
 
         Ok(reconciled)
-    }
-
-    /// Get recent tool calls for a session
-    pub async fn get_recent_tool_calls(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Event>> {
-        self.query_events_by_types(
-            session_id,
-            &[EventType::ToolCall, EventType::ToolResult],
-            limit,
-        )
-        .await
     }
 
     /// Resolve the latest state of an opaque resource handle inside one
@@ -3502,51 +3402,6 @@ impl EventStore {
         Ok(summary)
     }
 
-    /// Return a bounded historical latency estimate for one auxiliary model
-    /// producer.  Assessment failover must budget for the provider that is
-    /// actually being called; dividing one envelope by candidate count
-    /// treats a fast and a slow model as interchangeable and starves ordinary
-    /// responses.  Only successful, purpose-labelled calls are eligible so a
-    /// timeout cannot teach the allocator to make the next deadline shorter.
-    pub async fn recent_model_latency_ms(
-        &self,
-        model: &str,
-        call_purpose: &str,
-    ) -> anyhow::Result<Option<u64>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT data
-            FROM events
-            WHERE event_type = 'llm_call'
-            ORDER BY id DESC
-            LIMIT 512
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut latencies = rows
-            .into_iter()
-            .filter_map(|row| {
-                let data: String = row.get("data");
-                let call = serde_json::from_str::<LlmCallData>(&data).ok()?;
-                (call.model == model
-                    && call.call_purpose.as_deref() == Some(call_purpose)
-                    && !call.failed
-                    && call.latency_ms > 0)
-                    .then_some(call.latency_ms)
-            })
-            .collect::<Vec<_>>();
-        if latencies.is_empty() {
-            return Ok(None);
-        }
-        latencies.sort_unstable();
-        let rank = ((latencies.len() as f64) * 0.95).ceil() as usize;
-        Ok(latencies
-            .get(rank.saturating_sub(1).min(latencies.len() - 1))
-            .copied())
-    }
-
     /// Build the same durable efficiency shape used by the in-process agent
     /// when a supervisor has already dropped that agent future.  Keeping this
     /// projection in the event store makes cancellation/crash terminalization
@@ -3706,25 +3561,6 @@ impl EventStore {
                 overall: 0.0,
             },
         }
-    }
-
-    /// Get the last completed task for a session
-    pub async fn get_last_completed_task(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, session_id, event_type, data, created_at, consolidated_at, task_id, tool_name, turn_id
-            FROM events
-            WHERE session_id = ? AND event_type = 'task_end'
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let events = self.rows_to_events(rows)?;
-        Ok(events.into_iter().next())
     }
 
     /// Query all events of a single type in [start, end).

@@ -1478,10 +1478,6 @@ fn parse_key_token(part: &str) -> Result<Key, String> {
     }
 }
 
-fn is_modifier_key(key: &Key) -> bool {
-    matches!(key, Key::Meta | Key::Shift | Key::Control | Key::Alt)
-}
-
 fn press_key_combo(raw: &str) -> Result<(), String> {
     let keys = raw
         .split('+')
@@ -1528,6 +1524,10 @@ fn scroll_direction(direction: &str, pages: f64) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    fn is_modifier_key(key: &Key) -> bool {
+        matches!(key, Key::Meta | Key::Shift | Key::Control | Key::Alt)
+    }
 
     fn parse_combo(raw: &str) -> Vec<Key> {
         raw.split('+')

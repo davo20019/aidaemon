@@ -329,22 +329,6 @@ impl EventType {
     pub fn from_str(s: &str) -> Option<Self> {
         s.parse().ok()
     }
-
-    /// Event types that represent conversation messages (for history retrieval)
-    pub fn is_conversation_event(&self) -> bool {
-        matches!(
-            self,
-            EventType::UserMessage | EventType::AssistantResponse | EventType::ToolResult
-        )
-    }
-
-    /// Event types that should trigger consolidation learning
-    pub fn is_learnable(&self) -> bool {
-        matches!(
-            self,
-            EventType::TaskEnd | EventType::Error | EventType::ToolResult
-        )
-    }
 }
 
 /// Task completion status

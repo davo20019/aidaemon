@@ -220,9 +220,6 @@ pub struct AgentTool {
     suspend_on_interrupt: bool,
 }
 
-/// Alias matching the name used in the design notes.
-pub type SubAgentTool = AgentTool;
-
 impl fmt::Debug for AgentTool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentTool")

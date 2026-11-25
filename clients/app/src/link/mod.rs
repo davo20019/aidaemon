@@ -146,9 +146,6 @@ pub mod owner_pairing {
     }
 }
 
-/// Whether this platform pairs from the app (the browser does).
-pub const PAIRS_IN_APP: bool = cfg!(target_arch = "wasm32");
-
 /// Run the daemon on this computer, then connect (desktops only).
 pub fn install_here(store: Store) {
     #[cfg(not(target_arch = "wasm32"))]
