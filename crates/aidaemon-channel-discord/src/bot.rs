@@ -5,6 +5,7 @@
 //! [`Prompts`]; the shared slash commands are the application's
 //! ([`SharedCommandDispatch`]).
 
+use aidaemon_channels::prompts::PromptSurface as _;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
@@ -761,6 +762,27 @@ fn base_session_id(session_id: &str) -> &str {
 }
 
 #[async_trait]
+impl aidaemon_channels::prompts::PromptSurface for DiscordBot {
+    fn prompts(&self) -> &aidaemon_channels::prompts::Prompts {
+        &self.prompts
+    }
+
+    fn platform(&self) -> &'static str {
+        "Discord"
+    }
+
+    async fn prompt_target(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(
+        Arc<dyn aidaemon_channels::Channel>,
+        aidaemon_channels::Conversation,
+    )> {
+        Ok((self.transport(), self.conversation_for(session_id).await?))
+    }
+}
+
+#[async_trait]
 impl HubChannel for DiscordBot {
     fn name(&self) -> String {
         self.channel_name()
@@ -855,19 +877,15 @@ impl HubChannel for DiscordBot {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
-        let conversation = self.conversation_for(session_id).await?;
-        self.prompts
-            .approval(
-                self.transport(),
-                &conversation,
-                command,
-                risk_level,
-                warnings,
-                permission_mode,
-                one_time_only,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Discord approval request failed: {e}"))
+        let ask = aidaemon_channels::approval_render::ApprovalAsk {
+            command,
+            card: None,
+            risk_level,
+            warnings,
+            permission_mode,
+            one_time_only,
+        };
+        self.ask_approval(session_id, &ask).await
     }
 
     async fn request_approval_ask(
@@ -875,11 +893,7 @@ impl HubChannel for DiscordBot {
         session_id: &str,
         ask: &aidaemon_channels::approval_render::ApprovalAsk<'_>,
     ) -> anyhow::Result<ApprovalResponse> {
-        let conversation = self.conversation_for(session_id).await?;
-        self.prompts
-            .approval_ask(self.transport(), &conversation, ask)
-            .await
-            .map_err(|e| anyhow::anyhow!("Discord approval request failed: {e}"))
+        self.ask_approval(session_id, ask).await
     }
 
     async fn request_goal_confirmation(
@@ -889,17 +903,8 @@ impl HubChannel for DiscordBot {
         details: &[String],
         style: GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
-        let conversation = self.conversation_for(session_id).await?;
-        self.prompts
-            .goal(
-                self.transport(),
-                &conversation,
-                goal_description,
-                details,
-                style,
-            )
+        self.confirm_goal(session_id, goal_description, details, style)
             .await
-            .map_err(|e| anyhow::anyhow!("Discord goal confirmation failed: {e}"))
     }
 }
 

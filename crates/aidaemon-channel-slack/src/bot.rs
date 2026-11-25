@@ -6,6 +6,7 @@
 //! grants are kept, and which directories may be delegated, is the
 //! application's ([`SlackHost`]).
 
+use aidaemon_channels::prompts::PromptSurface as _;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -2274,6 +2275,27 @@ fn restore_mentions_from_cache(text: &str, cache: &HashMap<String, String>) -> S
 }
 
 #[async_trait]
+impl aidaemon_channels::prompts::PromptSurface for SlackBot {
+    fn prompts(&self) -> &aidaemon_channels::prompts::Prompts {
+        &self.prompts
+    }
+
+    fn platform(&self) -> &'static str {
+        "Slack"
+    }
+
+    async fn prompt_target(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(
+        Arc<dyn aidaemon_channels::Channel>,
+        aidaemon_channels::Conversation,
+    )> {
+        Ok((self.transport.clone(), self.conversation_for(session_id)))
+    }
+}
+
+#[async_trait]
 impl HubChannel for SlackBot {
     fn name(&self) -> String {
         self.channel_name()
@@ -2331,36 +2353,23 @@ impl HubChannel for SlackBot {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
-        self.prompts
-            .approval(
-                self.transport.clone(),
-                &self.conversation_for(session_id),
-                command,
-                risk_level,
-                warnings,
-                permission_mode,
-                one_time_only,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Slack approval request failed: {e}"))
+        let ask = aidaemon_channels::approval_render::ApprovalAsk {
+            command,
+            card: None,
+            risk_level,
+            warnings,
+            permission_mode,
+            one_time_only,
+        };
+        self.ask_approval(session_id, &ask).await
     }
 
-    /// The typed card: a plain headline, why the owner is asked, and the
-    /// exact command in a secondary block under them.
     async fn request_approval_ask(
         &self,
         session_id: &str,
         ask: &aidaemon_channels::approval_render::ApprovalAsk<'_>,
     ) -> anyhow::Result<ApprovalResponse> {
-        info!(session_id, card = ask.card.is_some(), risk = %ask.risk_level, "Approval requested");
-        self.prompts
-            .approval_ask(
-                self.transport.clone(),
-                &self.conversation_for(session_id),
-                ask,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Slack approval request failed: {e}"))
+        self.ask_approval(session_id, ask).await
     }
 
     async fn request_goal_confirmation(
@@ -2370,16 +2379,8 @@ impl HubChannel for SlackBot {
         details: &[String],
         style: GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
-        self.prompts
-            .goal(
-                self.transport.clone(),
-                &self.conversation_for(session_id),
-                goal_description,
-                details,
-                style,
-            )
+        self.confirm_goal(session_id, goal_description, details, style)
             .await
-            .map_err(|e| anyhow::anyhow!("Slack goal confirmation failed: {e}"))
     }
 }
 

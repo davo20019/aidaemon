@@ -5,6 +5,7 @@
 //! (its config file, extra commands, terminal sessions) goes through a
 //! [`TelegramHost`].
 
+use aidaemon_channels::prompts::PromptSurface as _;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
@@ -340,18 +341,22 @@ impl TelegramBot {
             .clone()
     }
 
+    /// The chat a session names, else the first allowed user's private chat.
+    fn chat_id_for(&self, session_id: &str) -> i64 {
+        aidaemon_events::session::telegram_chat_id_from_session(session_id).unwrap_or_else(|| {
+            self.allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .first()
+                .copied()
+                .unwrap_or(0) as i64
+        })
+    }
+
     /// The chat a session's prompts go to (the first allowed user's private
     /// chat when the session names none).
     fn conversation_for(&self, session_id: &str) -> aidaemon_channels::Conversation {
-        let chat_id: i64 = aidaemon_events::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
+        let chat_id = self.chat_id_for(session_id);
         aidaemon_channels::Conversation {
             id: chat_id.to_string(),
             kind: if chat_id > 0 {
@@ -1680,6 +1685,27 @@ fn fallback_session_namespace_from_token(bot_token: &str) -> String {
 }
 
 #[async_trait]
+impl aidaemon_channels::prompts::PromptSurface for TelegramBot {
+    fn prompts(&self) -> &aidaemon_channels::prompts::Prompts {
+        &self.prompts
+    }
+
+    fn platform(&self) -> &'static str {
+        "Telegram"
+    }
+
+    async fn prompt_target(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(
+        Arc<dyn aidaemon_channels::Channel>,
+        aidaemon_channels::Conversation,
+    )> {
+        Ok((self.sdk_transport(), self.conversation_for(session_id)))
+    }
+}
+
+#[async_trait]
 impl HubChannel for TelegramBot {
     fn name(&self) -> String {
         self.cached_channel_name
@@ -1698,15 +1724,7 @@ impl HubChannel for TelegramBot {
     }
 
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
-        let chat_id: i64 = aidaemon_events::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
+        let chat_id = self.chat_id_for(session_id);
         self.send_compact_or_full_reply(&self.bot, ChatId(chat_id), text)
             .await
     }
@@ -1716,15 +1734,7 @@ impl HubChannel for TelegramBot {
         session_id: &str,
         text: &str,
     ) -> anyhow::Result<Option<String>> {
-        let chat_id: i64 = aidaemon_events::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
+        let chat_id = self.chat_id_for(session_id);
         // Render markdown → Telegram HTML so the live surface displays formatted
         // content (the final reply is edited into this message at turn end, and it
         // carries markdown). Fall back to a plain send if Telegram rejects the
@@ -1754,15 +1764,7 @@ impl HubChannel for TelegramBot {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<bool> {
-        let chat_id: i64 = aidaemon_events::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
+        let chat_id = self.chat_id_for(session_id);
         let mid: i32 = match message_id.parse() {
             Ok(v) => v,
             Err(_) => return Ok(false),
@@ -1797,15 +1799,7 @@ impl HubChannel for TelegramBot {
     }
 
     async fn delete_message(&self, session_id: &str, message_id: &str) -> anyhow::Result<bool> {
-        let chat_id: i64 = aidaemon_events::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
+        let chat_id = self.chat_id_for(session_id);
         let mid: i32 = match message_id.parse() {
             Ok(v) => v,
             Err(_) => return Ok(false),
@@ -1818,15 +1812,6 @@ impl HubChannel for TelegramBot {
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
-        let chat_id: i64 = aidaemon_events::session::telegram_chat_id_from_session(session_id)
-            .unwrap_or_else(|| {
-                self.allowed_user_ids
-                    .read()
-                    .unwrap()
-                    .first()
-                    .copied()
-                    .unwrap_or(0) as i64
-            });
         let (name, bytes, mime_type) = match &media.kind {
             MediaKind::Photo { data } => (
                 "screenshot.png".to_string(),
@@ -1842,14 +1827,7 @@ impl HubChannel for TelegramBot {
                 (filename.clone(), bytes, mime_type)
             }
         };
-        let conversation = aidaemon_channels::Conversation {
-            id: chat_id.to_string(),
-            kind: if chat_id > 0 {
-                aidaemon_channels::ConversationKind::Direct
-            } else {
-                aidaemon_channels::ConversationKind::Group
-            },
-        };
+        let conversation = self.conversation_for(session_id);
         self.sdk_transport()
             .send_file(
                 &conversation,
@@ -1874,20 +1852,15 @@ impl HubChannel for TelegramBot {
         permission_mode: PermissionMode,
         one_time_only: bool,
     ) -> anyhow::Result<ApprovalResponse> {
-        info!(session_id, command, risk = %risk_level, mode = %permission_mode, "Approval requested");
-        let transport = self.sdk_transport();
-        self.prompts
-            .approval(
-                transport,
-                &self.conversation_for(session_id),
-                command,
-                risk_level,
-                warnings,
-                permission_mode,
-                one_time_only,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Telegram approval request failed: {e}"))
+        let ask = aidaemon_channels::approval_render::ApprovalAsk {
+            command,
+            card: None,
+            risk_level,
+            warnings,
+            permission_mode,
+            one_time_only,
+        };
+        self.ask_approval(session_id, &ask).await
     }
 
     async fn request_approval_ask(
@@ -1895,15 +1868,7 @@ impl HubChannel for TelegramBot {
         session_id: &str,
         ask: &aidaemon_channels::approval_render::ApprovalAsk<'_>,
     ) -> anyhow::Result<ApprovalResponse> {
-        info!(session_id, card = ask.card.is_some(), risk = %ask.risk_level, "Approval requested");
-        self.prompts
-            .approval_ask(
-                self.sdk_transport(),
-                &self.conversation_for(session_id),
-                ask,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Telegram approval request failed: {e}"))
+        self.ask_approval(session_id, ask).await
     }
 
     async fn request_goal_confirmation(
@@ -1913,17 +1878,8 @@ impl HubChannel for TelegramBot {
         details: &[String],
         style: GoalConfirmationStyle,
     ) -> anyhow::Result<bool> {
-        let transport = self.sdk_transport();
-        self.prompts
-            .goal(
-                transport,
-                &self.conversation_for(session_id),
-                goal_description,
-                details,
-                style,
-            )
+        self.confirm_goal(session_id, goal_description, details, style)
             .await
-            .map_err(|e| anyhow::anyhow!("Telegram goal confirmation failed: {e}"))
     }
 }
 

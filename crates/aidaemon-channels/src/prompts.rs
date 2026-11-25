@@ -437,6 +437,58 @@ fn goal_outcome(
     format!("{}\n\n{status}", text.trim_end())
 }
 
+/// A bot that asks its prompts over its SDK transport. The three prompt
+/// methods of [`crate::hub::HubChannel`] are [`PromptSurface::ask_approval`]
+/// and [`PromptSurface::confirm_goal`] for it, so every bot logs, asks and
+/// names its failures the same way.
+#[async_trait::async_trait]
+pub trait PromptSurface: Send + Sync {
+    /// The bot's open prompts.
+    fn prompts(&self) -> &Prompts;
+    /// The platform's name in errors ("Slack").
+    fn platform(&self) -> &'static str;
+    /// The transport and conversation a session's prompts go to.
+    async fn prompt_target(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(Arc<dyn Channel>, Conversation)>;
+
+    /// Ask the owner to approve `ask` in the session's chat.
+    async fn ask_approval(
+        &self,
+        session_id: &str,
+        ask: &approval_render::ApprovalAsk<'_>,
+    ) -> anyhow::Result<ApprovalResponse> {
+        info!(
+            session_id,
+            platform = self.platform(),
+            card = ask.card.is_some(),
+            risk = %ask.risk_level,
+            "Approval requested"
+        );
+        let (channel, conversation) = self.prompt_target(session_id).await?;
+        self.prompts()
+            .approval_ask(channel, &conversation, ask)
+            .await
+            .map_err(|e| anyhow::anyhow!("{} approval request failed: {e}", self.platform()))
+    }
+
+    /// Ask the owner to confirm a goal in the session's chat.
+    async fn confirm_goal(
+        &self,
+        session_id: &str,
+        description: &str,
+        details: &[String],
+        style: GoalConfirmationStyle,
+    ) -> anyhow::Result<bool> {
+        let (channel, conversation) = self.prompt_target(session_id).await?;
+        self.prompts()
+            .goal(channel, &conversation, description, details, style)
+            .await
+            .map_err(|e| anyhow::anyhow!("{} goal confirmation failed: {e}", self.platform()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
