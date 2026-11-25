@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::sse::SseEvent;
 use crate::transport::{
     ConfigError, SseDecoder, body_excerpt, build_client, drive_response, map_reqwest_error,
-    map_status, parse_arguments, raw_arguments,
+    map_status, parse_arguments,
 };
 
 /// The Codex backend root.
@@ -640,8 +640,13 @@ fn session_id(body: &Value) -> Option<&str> {
 fn build_input(messages: &[Message]) -> (String, Vec<Value>) {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
-    let mut pending = HashSet::new();
+    let mut results = crate::responses::ToolResults::default();
     for message in messages {
+        if message.role != Role::Tool
+            && let Some(images) = results.take_images()
+        {
+            input.push(user_message(images));
+        }
         match message.role {
             Role::System => {
                 if message.content.is_empty() {
@@ -655,17 +660,7 @@ fn build_input(messages: &[Message]) -> (String, Vec<Value>) {
                     }));
                 }
             }
-            Role::Tool => {
-                let call_id = message.tool_call_id.as_deref().unwrap_or_default();
-                if !pending.remove(call_id) {
-                    continue;
-                }
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message.content,
-                }));
-            }
+            Role::Tool => input.extend(results.output(message)),
             Role::Assistant => {
                 input.extend(
                     message
@@ -685,33 +680,27 @@ fn build_input(messages: &[Message]) -> (String, Vec<Value>) {
                     }));
                 }
                 for call in &message.tool_calls {
-                    let arguments = raw_arguments(&call.arguments)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| call.arguments.to_string());
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.name,
-                        "arguments": arguments,
-                    }));
-                    if !call.id.is_empty() {
-                        pending.insert(call.id.clone());
-                    }
+                    results.sent(call);
+                    input.push(crate::responses::function_call(call));
                 }
             }
             Role::User => {
                 let mut content = vec![json!({"type": "input_text", "text": message.content})];
-                content.extend(
-                    message
-                        .images
-                        .iter()
-                        .map(|image| json!({"type": "input_image", "image_url": image.to_url()})),
-                );
-                input.push(json!({"type": "message", "role": "user", "content": content}));
+                content.extend(message.images.iter().map(crate::responses::input_image));
+                input.push(user_message(content));
             }
         }
     }
+    // Images a tool returned reach the model in a user message after the
+    // results (an output item cannot carry them).
+    if let Some(images) = results.take_images() {
+        input.push(user_message(images));
+    }
     (instructions.join("\n\n"), input)
+}
+
+fn user_message(content: Vec<Value>) -> Value {
+    json!({"type": "message", "role": "user", "content": content})
 }
 
 fn build_tools(tools: &[ToolSpec]) -> Vec<Value> {

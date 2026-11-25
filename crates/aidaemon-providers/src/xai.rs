@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use aidaemon_core::{
-    Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat, Role,
+    Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat, Role,
     StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage,
 };
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use crate::OpenAiCompatible;
 use crate::transport::{
     ConfigError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, Secret, build_client, header_map,
-    map_reqwest_error, map_status, parse_arguments, raw_arguments,
+    map_reqwest_error, map_status, parse_arguments,
 };
 
 /// xAI's API root.
@@ -272,10 +272,12 @@ impl Provider for Xai {
 /// the call each image came from.
 fn build_input(messages: &[Message]) -> Vec<Value> {
     let mut input = Vec::with_capacity(messages.len());
-    let mut tool_images: Vec<Value> = Vec::new();
+    let mut results = crate::responses::ToolResults::default();
     for message in messages {
-        if message.role != Role::Tool && !tool_images.is_empty() {
-            input.push(user_item(std::mem::take(&mut tool_images)));
+        if message.role != Role::Tool
+            && let Some(images) = results.take_images()
+        {
+            input.push(user_item(images));
         }
         let has_text = !message.content.trim().is_empty();
         match message.role {
@@ -294,7 +296,7 @@ fn build_input(messages: &[Message]) -> Vec<Value> {
                 if has_text {
                     content.push(json!({"type": "input_text", "text": message.content}));
                 }
-                content.extend(message.images.iter().map(image_part));
+                content.extend(message.images.iter().map(crate::responses::input_image));
                 input.push(user_item(content));
             }
             Role::Assistant => {
@@ -302,46 +304,21 @@ fn build_input(messages: &[Message]) -> Vec<Value> {
                     input.push(json!({"role": "assistant", "content": message.content}));
                 }
                 for call in &message.tool_calls {
-                    let arguments = raw_arguments(&call.arguments)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| call.arguments.to_string());
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.name,
-                        "arguments": arguments,
-                    }));
+                    results.sent(call);
+                    input.push(crate::responses::function_call(call));
                 }
             }
-            Role::Tool => {
-                let call_id = message.tool_call_id.as_deref().unwrap_or_default();
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message.content,
-                }));
-                if !message.images.is_empty() {
-                    tool_images.push(json!({
-                        "type": "input_text",
-                        "text": format!("[Images returned by tool call {call_id}]"),
-                    }));
-                    tool_images.extend(message.images.iter().map(image_part));
-                }
-            }
+            Role::Tool => input.extend(results.output(message)),
         }
     }
-    if !tool_images.is_empty() {
-        input.push(user_item(tool_images));
+    if let Some(images) = results.take_images() {
+        input.push(user_item(images));
     }
     input
 }
 
 fn user_item(content: Vec<Value>) -> Value {
     json!({"role": "user", "content": content})
-}
-
-fn image_part(image: &Image) -> Value {
-    json!({"type": "input_image", "image_url": image.to_url()})
 }
 
 fn build_tools(tools: &[ToolSpec]) -> Vec<Value> {
@@ -548,7 +525,7 @@ fn parse_usage(data: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_core::RequestOptions;
+    use aidaemon_core::{Image, RequestOptions};
 
     fn request(messages: Vec<Message>) -> ModelRequest {
         ModelRequest {

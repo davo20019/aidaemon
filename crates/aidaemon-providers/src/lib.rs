@@ -67,6 +67,7 @@ mod google;
 pub mod key_check;
 pub mod model_upgrade;
 mod openai;
+mod responses;
 pub mod routing;
 mod sse;
 mod transport;
