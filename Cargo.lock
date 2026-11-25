@@ -756,7 +756,6 @@ dependencies = [
 name = "aidaemon-runtime"
 version = "0.24.0"
 dependencies = [
- "aidaemon-agents",
  "aidaemon-channels",
  "aidaemon-client-gateway",
  "aidaemon-coding-agents",
@@ -766,7 +765,6 @@ dependencies = [
  "aidaemon-exposure",
  "aidaemon-mcp",
  "aidaemon-memory",
- "aidaemon-nodes",
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-runtime",
@@ -796,7 +794,6 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "serde",
- "serde-saphyr",
  "serde_json",
  "sha2 0.11.1",
  "shell-words",
@@ -847,8 +844,6 @@ dependencies = [
  "dunce",
  "futures",
  "hex",
- "hmac",
- "libc",
  "proptest",
  "regex",
  "reqwest 0.13.5",
@@ -856,7 +851,6 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2 0.11.1",
- "shell-words",
  "shellexpand",
  "sqlx",
  "tempfile",

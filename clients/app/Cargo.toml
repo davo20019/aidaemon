@@ -20,8 +20,6 @@ nsh-base = "0.7.1"
 env_logger = "0.11"
 log = "0.4"
 serde_json = "1"
-# Files go to the gateway as base64.
-base64 = "0.23"
 aidaemon-client-core = { path = "../../crates/aidaemon-client-core", default-features = false }
 aidaemon-client-protocol = { path = "../../crates/client-protocol" }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
