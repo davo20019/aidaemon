@@ -28,6 +28,9 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades curl
 tmp=$(mktemp -d)
 curl -fsSL -o "$tmp/dns.tgz" \
   "https://github.com/n0-computer/iroh/releases/download/${VERSION}/iroh-dns-server-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+# The archive's sha256 for VERSION (change both together).
+DNS_SHA256=e49b72cfa4dbb30d25b40211db4d4b2ffc081797687fe4fcd51be11fba578a97
+echo "${DNS_SHA256}  $tmp/dns.tgz" | sha256sum -c -
 tar -xzf "$tmp/dns.tgz" -C "$tmp"
 install -m 0755 "$(find "$tmp" -name iroh-dns-server -type f | head -1)" /usr/local/bin/iroh-dns-server
 rm -rf "$tmp"

@@ -38,6 +38,14 @@ ARCH=$(uname -m)   # x86_64 or aarch64
 tmp=$(mktemp -d)
 curl -fsSL -o "$tmp/relay.tgz" \
   "https://github.com/n0-computer/iroh/releases/download/${IROH_RELAY_VERSION}/iroh-relay-${IROH_RELAY_VERSION}-${ARCH}-unknown-linux-musl.tar.gz"
+# The archive's sha256 for IROH_RELAY_VERSION (change both together): a
+# swapped release asset must not become a root-installed binary.
+case "$ARCH" in
+  x86_64) RELAY_SHA256=935892e4ad570d694f7ad2780f800077b99fd72d9a56ac982792fdd04ef631b4 ;;
+  aarch64) RELAY_SHA256=99a14d2ff541711f1b175a15e0c1571a45f46c171d655cda29849d91d90a5c9c ;;
+  *) echo "no pinned checksum for $ARCH" >&2; exit 1 ;;
+esac
+echo "${RELAY_SHA256}  $tmp/relay.tgz" | sha256sum -c -
 tar -xzf "$tmp/relay.tgz" -C "$tmp"
 install -m 0755 "$(find "$tmp" -name iroh-relay -type f | head -1)" /usr/local/bin/iroh-relay
 rm -rf "$tmp"
