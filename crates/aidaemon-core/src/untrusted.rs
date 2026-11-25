@@ -64,16 +64,29 @@ impl UntrustedHook {
 /// own turns are where composed data would be. Harness and stop-hook notes
 /// are kernel text, not the user's.
 ///
+/// Where messages carry a [`Message::sender`], only those from the sender of
+/// the run's latest request count: in a group chat, a URL another
+/// participant typed is not the requester's. A message with no sender then
+/// does not count either (it could be anyone's). Without senders on the
+/// latest request every user message counts, as in a one-person chat.
+///
 /// The match is of the whole outbound string as one token (a URL as the user
 /// wrote it, allowing wrapping brackets/quotes and trailing punctuation),
 /// never a substring of a longer token: `https://a.example` inside
 /// `https://a.example.evil.example` is not the user's URL. This is a
 /// machine-format comparison (exact field equality), not wording.
 fn typed_by_user(messages: &[Message], text: &str) -> bool {
+    let typed = |message: &&Message| {
+        message.role == Role::User && matches!(message.origin, None | Some(MessageOrigin::User))
+    };
+    let requester = messages
+        .iter()
+        .rev()
+        .find(typed)
+        .and_then(|message| message.sender.as_deref());
     !text.trim().is_empty()
-        && messages.iter().any(|message| {
-            message.role == Role::User
-                && matches!(message.origin, None | Some(MessageOrigin::User))
+        && messages.iter().filter(typed).any(|message| {
+            requester.is_none_or(|sender| message.sender.as_deref() == Some(sender))
                 && contains_as_token(&message.content, text)
         })
 }
@@ -396,6 +409,25 @@ mod tests {
         tool.role = Role::Tool;
         assert!(!typed_by_user(&[tool], url));
         assert!(!typed_by_user(&from(MessageOrigin::User), " "));
+    }
+
+    /// In a group chat, only the requester's own messages name strings for
+    /// them; another participant's, or an unattributed one, do not.
+    #[test]
+    fn only_the_requesters_messages_count_when_senders_are_known() {
+        let url = "https://docs.example/page";
+        let guest = Message::user(format!("open {url}")).with_sender("telegram:synthetic-user-2");
+        let unattributed = Message::user(format!("open {url}"));
+        let request = Message::user("do what was asked").with_sender("telegram:synthetic-user-1");
+        assert!(!typed_by_user(&[guest.clone(), request.clone()], url));
+        assert!(!typed_by_user(&[unattributed, request.clone()], url));
+        let own = Message::user(format!("open {url}")).with_sender("telegram:synthetic-user-1");
+        assert!(typed_by_user(&[guest, own, request], url));
+        // Without a sender on the request, every user message counts.
+        assert!(typed_by_user(
+            &[Message::user(format!("open {url}")), Message::user("go")],
+            url
+        ));
     }
 
     #[tokio::test]

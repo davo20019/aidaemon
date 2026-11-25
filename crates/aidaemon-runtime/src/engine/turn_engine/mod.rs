@@ -1204,6 +1204,11 @@ impl TurnEngine<'_> {
         if !projected.is_empty() {
             state.messages = projected;
         }
+        crate::untrusted::attribute_request(
+            &mut state.messages,
+            channel_ctx.visibility,
+            channel_ctx.sender_id.as_deref(),
+        );
         // A turn whose input is someone else's, or whose transcript still
         // holds a turn that read untrusted content, starts tainted.
         let tainted_turns = crate::untrusted::tainted_turns(self.settings(), session_id)
@@ -1216,6 +1221,22 @@ impl TurnEngine<'_> {
         let summary_tainted = conversation_summary.is_some()
             && crate::turn::compaction::summary_is_tainted(&*self.compaction_store(), session_id)
                 .await;
+        // Guidance from a repository outside the trusted roots (one cloned
+        // this session, a downloaded folder) is someone else's text in the
+        // prompt.
+        let untrusted_instructions = instruction_tracker
+            .as_ref()
+            .map(|tracker| {
+                tracker.untrusted_loaded(&aidaemon_tools::semantics::TrustRoots::new(&trust_roots))
+            })
+            .unwrap_or_default();
+        if !untrusted_instructions.is_empty() {
+            info!(
+                session_id,
+                sources = ?untrusted_instructions,
+                "Project instructions from outside the trusted roots: the turn starts tainted"
+            );
+        }
         let starts_tainted = crate::untrusted::starts_tainted(&crate::untrusted::TaintFacts {
             user_role,
             visibility: channel_ctx.visibility,
@@ -1223,6 +1244,7 @@ impl TurnEngine<'_> {
             projected_turn_ids: &projected_source_turn_ids,
             tainted_turns: tainted_turns.as_deref(),
             summary_tainted,
+            instructions_untrusted: !untrusted_instructions.is_empty(),
             inherited: self
                 .inherited_authority()
                 .as_ref()

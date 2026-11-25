@@ -1987,11 +1987,13 @@ impl TurnEngine<'_> {
         if targets.is_empty() {
             return None;
         }
-        let discovered = tracker
-            .lock()
-            .await
-            .discover_for_targets(self.execution_backend_handle().clone(), &targets)
-            .await;
+        let (discovered, owner_file) = {
+            let mut tracker = tracker.lock().await;
+            let discovered = tracker
+                .discover_for_targets(self.execution_backend_handle().clone(), &targets)
+                .await;
+            (discovered, tracker.owner_file().map(str::to_string))
+        };
         let instructions = match discovered {
             Ok(Some(instructions)) => instructions,
             Ok(None) => return None,
@@ -2059,7 +2061,23 @@ impl TurnEngine<'_> {
         {
             warn!(task_id = scope.task_id, %error, "SDK engine: could not record a deferred call");
         }
-        Some(sdk::ToolOutput::error(notice))
+        // Guidance from outside the trusted roots is someone else's text
+        // now in the run's context: the deferred result carries that, and
+        // the kernel taints the run.
+        let untrusted = instructions.untrusted_sources(
+            &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
+            owner_file.as_deref(),
+        );
+        let mut output = sdk::ToolOutput::error(notice);
+        if !untrusted.is_empty() {
+            info!(
+                task_id = scope.task_id,
+                sources = ?untrusted,
+                "Nested project instructions from outside the trusted roots taint the run"
+            );
+            output.trust = Some(sdk::SourceTrust::Untrusted);
+        }
+        Some(output)
     }
 
     /// Outside a mandate run: `Ok(None)`. Inside one: the grant for this exact

@@ -45,13 +45,16 @@ pub struct TaintFacts<'a> {
     pub inherited: bool,
     /// The session's summary folded in a turn that read untrusted content.
     pub summary_tainted: bool,
+    /// Project instructions in the prompt came from outside the turn's
+    /// trusted roots (`project_instructions::untrusted_instruction_sources`).
+    pub instructions_untrusted: bool,
 }
 
 /// Whether the turn starts as if it had already read untrusted content:
 /// someone other than the owner is asking, other people can write into the
 /// chat, the input is a trigger's, the transcript still holds a turn that
-/// read untrusted content (an unreadable record counts), or the parent was
-/// tainted.
+/// read untrusted content (an unreadable record counts), the parent was
+/// tainted, or project instructions came from outside the trusted roots.
 pub fn starts_tainted(facts: &TaintFacts<'_>) -> bool {
     let prefix_tainted = match facts.tainted_turns {
         None => true,
@@ -62,15 +65,53 @@ pub fn starts_tainted(facts: &TaintFacts<'_>) -> bool {
     };
     facts.inherited
         || facts.summary_tainted
+        || facts.instructions_untrusted
         || facts.user_role != UserRole::Owner
-        || matches!(
-            facts.visibility,
-            ChannelVisibility::PrivateGroup
-                | ChannelVisibility::Public
-                | ChannelVisibility::PublicExternal
-        )
+        || shared_chat(facts.visibility)
         || crate::turn::loop_utils::is_trigger_session(facts.session_id)
         || prefix_tainted
+}
+
+/// Whether other people can write into a chat with `visibility`.
+fn shared_chat(visibility: ChannelVisibility) -> bool {
+    matches!(
+        visibility,
+        ChannelVisibility::PrivateGroup
+            | ChannelVisibility::Public
+            | ChannelVisibility::PublicExternal
+    )
+}
+
+/// Stands in for the requester of a shared chat whose platform gave no
+/// sender id: only the current request then counts as typed by them.
+const UNIDENTIFIED_SENDER: &str = "unidentified-sender";
+
+/// Attribute the run's latest request to its sender in a chat other people
+/// write into, so the kernel counts a string as typed by the user only when
+/// the requester typed it (`aidaemon_core::Message::sender`). Earlier user
+/// messages of the projected history carry no sender and so do not count:
+/// in a shared chat they may be anyone's. A one-person chat stays
+/// unattributed, and every user message in it counts.
+pub fn attribute_request(
+    messages: &mut [sdk::Message],
+    visibility: ChannelVisibility,
+    sender_id: Option<&str>,
+) {
+    if !shared_chat(visibility) {
+        return;
+    }
+    let Some(request) = messages.iter_mut().rev().find(|message| {
+        message.role == sdk::Role::User
+            && matches!(message.origin, None | Some(sdk::MessageOrigin::User))
+    }) else {
+        return;
+    };
+    request.sender = Some(
+        sender_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(UNIDENTIFIED_SENDER)
+            .to_string(),
+    );
 }
 
 /// How many tainted turns a session remembers.
@@ -875,6 +916,44 @@ mod tests {
 
     use super::*;
 
+    /// In a group chat only the latest request is the requester's; a
+    /// one-person chat stays unattributed.
+    #[test]
+    fn a_shared_chats_request_is_attributed_to_its_sender() {
+        let history = || {
+            vec![
+                sdk::Message::user("earlier, from anyone"),
+                sdk::Message::assistant("ok", Vec::new()),
+                sdk::Message::user("the request"),
+                sdk::Message::from_origin(sdk::MessageOrigin::Harness, "a note"),
+            ]
+        };
+        let mut group = history();
+        attribute_request(
+            &mut group,
+            ChannelVisibility::PrivateGroup,
+            Some("telegram:synthetic-user-1"),
+        );
+        assert_eq!(group[0].sender, None);
+        assert_eq!(
+            group[2].sender.as_deref(),
+            Some("telegram:synthetic-user-1")
+        );
+        assert_eq!(group[3].sender, None);
+
+        let mut unnamed = history();
+        attribute_request(&mut unnamed, ChannelVisibility::Public, None);
+        assert_eq!(unnamed[2].sender.as_deref(), Some(UNIDENTIFIED_SENDER));
+
+        let mut private = history();
+        attribute_request(
+            &mut private,
+            ChannelVisibility::Private,
+            Some("telegram:synthetic-user-1"),
+        );
+        assert!(private.iter().all(|message| message.sender.is_none()));
+    }
+
     /// A message sent mid-run is part of the request a call is judged
     /// against; with none, the request is unchanged.
     #[test]
@@ -1407,6 +1486,7 @@ mod tests {
             tainted_turns: tainted,
             inherited: false,
             summary_tainted: false,
+            instructions_untrusted: false,
         }
     }
 
@@ -1441,6 +1521,10 @@ mod tests {
         }));
         assert!(starts_tainted(&TaintFacts {
             inherited: true,
+            ..owner_private(&none, Some(&none))
+        }));
+        assert!(starts_tainted(&TaintFacts {
+            instructions_untrusted: true,
             ..owner_private(&none, Some(&none))
         }));
     }

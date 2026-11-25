@@ -57,6 +57,8 @@ pub struct ProjectInstructionTracker {
     project_root: BackendPath,
     base_directory: BackendPath,
     loaded_source_paths: HashSet<String>,
+    /// The owner's own instruction file, when it was loaded.
+    owner_file: Option<String>,
 }
 
 impl ProjectInstructions {
@@ -65,6 +67,21 @@ impl ProjectInstructions {
             .iter()
             .map(|source| source.path.to_string())
             .collect()
+    }
+
+    /// The sources someone other than the owner may have written: those
+    /// outside the turn's trusted roots, the owner's own file aside. Their
+    /// guidance taints the run (see [`untrusted_instruction_sources`]).
+    pub fn untrusted_sources(
+        &self,
+        roots: &aidaemon_tools::semantics::TrustRoots<'_>,
+        owner_file: Option<&str>,
+    ) -> Vec<String> {
+        untrusted_instruction_sources(
+            self.sources.iter().map(|source| source.path.as_str()),
+            roots,
+            owner_file,
+        )
     }
 
     /// Render instructions into a system/developer prompt surface. The guard
@@ -170,6 +187,45 @@ impl ProjectInstructionTracker {
     fn loaded_source_paths(&self) -> &HashSet<String> {
         &self.loaded_source_paths
     }
+
+    /// Every instruction file loaded so far that lies outside the turn's
+    /// trusted roots (see [`untrusted_instruction_sources`]).
+    pub fn untrusted_loaded(
+        &self,
+        roots: &aidaemon_tools::semantics::TrustRoots<'_>,
+    ) -> Vec<String> {
+        let mut paths: Vec<&str> = self
+            .loaded_source_paths
+            .iter()
+            .map(String::as_str)
+            .collect();
+        paths.sort_unstable();
+        untrusted_instruction_sources(paths, roots, self.owner_file.as_deref())
+    }
+
+    /// The owner's own instruction file, when this hierarchy loaded it.
+    pub fn owner_file(&self) -> Option<&str> {
+        self.owner_file.as_deref()
+    }
+}
+
+/// Instruction files whose guidance must taint the run: those outside the
+/// turn's trusted roots (`[authority] trusted_roots`, the execution
+/// workspace, a bound workspace or a workspace grant), where anyone may have
+/// written them: a repository cloned this session, a downloaded folder. The
+/// owner's own file (`~/.aidaemon/AGENTS.md`) is theirs wherever it is.
+/// Trust is by location, the rule file reads follow
+/// ([`aidaemon_tools::semantics::file_output_trust`]).
+pub fn untrusted_instruction_sources<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    roots: &aidaemon_tools::semantics::TrustRoots<'_>,
+    owner_file: Option<&str>,
+) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| Some(*path) != owner_file && !roots.contains(path))
+        .map(str::to_string)
+        .collect()
 }
 
 fn path_is_within(root: &BackendPath, candidate: &BackendPath) -> bool {
@@ -442,6 +498,7 @@ async fn initialize_with_user_file(
         .and_then(user_instruction_source)
         .into_iter()
         .collect();
+    let owner_file = sources.first().map(|source| source.path.to_string());
     for directory in directory_chain(&root, &leaf) {
         if let Some(source) = read_instruction_source(&backend, &root, &directory).await {
             // The owner's file may also be the project's own (a project
@@ -451,7 +508,7 @@ async fn initialize_with_user_file(
         }
     }
     enforce_aggregate_limit(&mut sources);
-    let loaded_source_paths = sources
+    let loaded_source_paths: HashSet<String> = sources
         .iter()
         .map(|source| source.path.to_string())
         .collect();
@@ -464,6 +521,9 @@ async fn initialize_with_user_file(
         scope,
         project_root: root,
         base_directory: leaf,
+        // Still the owner's only if no project file of the same path replaced
+        // it, and the aggregate cap kept it.
+        owner_file: owner_file.filter(|path| loaded_source_paths.contains(path)),
         loaded_source_paths,
     };
 
@@ -576,6 +636,47 @@ mod tests {
         let rendered = capped.render_for_prompt();
         assert!(rendered.contains("project instruction"));
         assert!(rendered.contains("[Instruction file truncated"));
+    }
+
+    /// A repository inside the trusted roots gives trusted guidance; the same
+    /// files outside them (a clone in a scratch folder) taint the run. The
+    /// owner's own file never does.
+    #[tokio::test]
+    async fn instructions_outside_the_trusted_roots_are_untrusted() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cloned");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "project instruction").unwrap();
+        let user = temp.path().join("owner").join("AGENTS.md");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, "owner instruction").unwrap();
+        let (instructions, tracker) = initialize_with_user_file(
+            local_backend(temp.path()).await,
+            repo.to_string_lossy().as_ref(),
+            Some(&user),
+        )
+        .await
+        .unwrap();
+        let instructions = instructions.unwrap();
+
+        let inside = vec![repo.to_string_lossy().into_owned()];
+        let inside = aidaemon_tools::semantics::TrustRoots::new(&inside);
+        assert!(tracker.untrusted_loaded(&inside).is_empty());
+        assert!(
+            instructions
+                .untrusted_sources(&inside, tracker.owner_file())
+                .is_empty()
+        );
+
+        let elsewhere = vec![temp.path().join("workspace").to_string_lossy().into_owned()];
+        let elsewhere = aidaemon_tools::semantics::TrustRoots::new(&elsewhere);
+        let untrusted = tracker.untrusted_loaded(&elsewhere);
+        assert_eq!(untrusted.len(), 1, "{untrusted:?}");
+        assert!(untrusted[0].ends_with("cloned/AGENTS.md"), "{untrusted:?}");
+        assert_eq!(
+            instructions.untrusted_sources(&elsewhere, tracker.owner_file()),
+            untrusted
+        );
     }
 
     #[tokio::test]

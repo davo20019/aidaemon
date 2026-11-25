@@ -12,6 +12,9 @@ stability promise.
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `aidaemon-core`: `Message` gained `sender` (who typed a user message, when the application tells participants apart; `Message::with_sender`). `UntrustedHook` counts an `Outbound::Exact` string as the user's only when it appears in a message from the sender of the run's latest request; when that request carries a sender, a message without one does not count.
+
 ## [0.23.1] - 2026-11-25
 
 No changes in the crates: released with the daemon's 0.23.1, whose 0.23.0 never shipped. Everything under 0.23.0 is in it.

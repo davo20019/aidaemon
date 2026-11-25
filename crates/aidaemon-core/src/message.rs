@@ -193,6 +193,14 @@ pub struct Message {
     /// [`ToolCall::provider_data`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Who typed a `Role::User` message, when the application tells people
+    /// apart (a group chat's participants). `None` when it does not: a
+    /// one-person conversation, or history stored before senders were
+    /// recorded. The untrusted-content rule counts a string as the user's
+    /// only when the run's latest request and the message naming it share a
+    /// sender (see [`crate::UntrustedHook`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 impl Message {
@@ -243,6 +251,7 @@ impl Message {
             is_error: false,
             origin: None,
             reasoning: None,
+            sender: None,
         }
     }
 
@@ -257,6 +266,7 @@ impl Message {
             is_error: false,
             origin: None,
             reasoning: None,
+            sender: None,
         }
     }
 
@@ -278,6 +288,13 @@ impl Message {
         self
     }
 
+    /// Attribute a user message to the person who typed it (see
+    /// [`Message::sender`]).
+    pub fn with_sender(mut self, sender: impl Into<String>) -> Self {
+        self.sender = Some(sender.into());
+        self
+    }
+
     pub fn with_error(mut self, is_error: bool) -> Self {
         self.is_error = is_error;
         self
@@ -294,6 +311,7 @@ impl Message {
             is_error: false,
             origin: None,
             reasoning: None,
+            sender: None,
         }
     }
 }
