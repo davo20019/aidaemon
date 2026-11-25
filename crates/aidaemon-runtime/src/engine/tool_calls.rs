@@ -641,6 +641,13 @@ impl ExecutedOutcome {
         }
     }
 
+    pub fn metadata_mut(&mut self) -> &mut aidaemon_tools::semantics::ToolCallMetadata {
+        match self {
+            Self::Returned { outcome, .. } => &mut outcome.metadata,
+            Self::Raised { metadata, .. } => metadata,
+        }
+    }
+
     /// The same test the receipt makes.
     pub fn failed(&self) -> bool {
         match self {

@@ -536,7 +536,7 @@ impl TurnEngine<'_> {
             &site_grant,
             &scope.spawn_family.owned_folders().list(),
         );
-        let executed = match self
+        let mut executed = match self
             .execute_tool_with_watchdog_outcome(&request.name, arguments, &ctx)
             .await
         {
@@ -680,8 +680,35 @@ impl TurnEngine<'_> {
                 }
             }
         }
-        let trust =
+        let mut trust =
             self.call_output_trust(scope, &request.name, arguments, Some(executed.metadata()));
+        // What the call declares it reads and writes, made absolute against
+        // the run's working directory (write provenance, see
+        // `untrusted_writes`).
+        let (read_paths, written_paths) = self
+            .turn_tool(scope, &request.name)
+            .map(|tool| {
+                let (reads, writes) = tool.guarded_paths(arguments);
+                (
+                    absolute_paths(reads, &scope.cwd),
+                    absolute_paths(writes, &scope.cwd),
+                )
+            })
+            .unwrap_or_default();
+        // A file still holding what a run that had read someone else's text
+        // wrote is that text, wherever it lies.
+        if trust == sdk::SourceTrust::Trusted
+            && !failed
+            && crate::untrusted_writes::holds_untrusted_write(self.settings(), &read_paths).await
+        {
+            info!(
+                tool = %request.name,
+                paths = ?read_paths,
+                "Read a file a tainted run wrote: its content is untrusted"
+            );
+            trust = sdk::SourceTrust::Untrusted;
+            executed.metadata_mut().output_trust = Some(trust);
+        }
         // A site on this computer named in a trusted result, or in the
         // output of a call that set something up here within this run's
         // authority (its own install or start command, whatever program;
@@ -749,6 +776,17 @@ impl TurnEngine<'_> {
             .await
         {
             warn!(session_id = scope.session_id, %error, "Could not record a tainted turn");
+        }
+        // A tainted run's writes keep its taint for whoever reads them next.
+        if !failed
+            && !written_paths.is_empty()
+            && scope
+                .untrusted_seen
+                .load(std::sync::atomic::Ordering::SeqCst)
+            && let Err(error) =
+                crate::untrusted_writes::record(self.settings(), &written_paths).await
+        {
+            warn!(session_id = scope.session_id, %error, "Could not record a tainted run's writes");
         }
         scope.executed_calls.insert(
             request.run_id,
@@ -2137,4 +2175,19 @@ pub(crate) fn step_kind(
         return aidaemon_core::card::ActivityKind::Delegate;
     }
     facts.activity.kind(mutates)
+}
+
+/// `paths` made absolute against `cwd` (a relative path is the run's).
+fn absolute_paths(paths: Vec<String>, cwd: &str) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            if aidaemon_tools::BackendPath::is_absolute(&path) {
+                path
+            } else {
+                format!("{}/{}", cwd.trim_end_matches('/'), path)
+            }
+        })
+        .collect()
 }
