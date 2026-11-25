@@ -342,7 +342,6 @@ impl ChannelHub {
 
     /// Register a new channel dynamically.
     /// Returns the channel name after registration.
-    #[allow(dead_code)]
     pub async fn register_channel(&self, channel: Arc<dyn HubChannel>) -> String {
         let name = channel.name();
         let mut channels = match tokio::time::timeout(
@@ -362,18 +361,7 @@ impl ChannelHub {
         name
     }
 
-    /// The names of the channels registered now.
-    pub async fn channel_names(&self) -> Vec<String> {
-        self.channels
-            .read()
-            .await
-            .iter()
-            .map(|c| c.name())
-            .collect()
-    }
-
     /// Get a reference to the shared session map.
-    #[allow(dead_code)]
     pub fn session_map(&self) -> &SessionMap {
         &self.session_map
     }
@@ -878,7 +866,6 @@ impl ChannelHub {
     }
 
     /// Send text to the channel that owns a specific session.
-    #[allow(dead_code)]
     pub async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         let (channel, routed_session) = self
             .routed_channel(session_id)

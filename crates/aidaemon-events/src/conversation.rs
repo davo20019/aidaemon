@@ -260,7 +260,6 @@ pub struct Message {
     #[serde(default = "default_importance")]
     pub importance: f32,
     #[serde(skip)] // Don't serialize embedding to JSON (client doesn't need it)
-    #[allow(dead_code)] // Reserved for semantic-memory paths that may be feature-gated.
     pub embedding: Option<Vec<f32>>,
     /// Conversation turn this message belongs to. Stamped automatically by
     /// the agent when persisting messages, so boundary detection can group
@@ -351,7 +350,6 @@ impl Message {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_structural_only(&self) -> bool {
         self.content.as_deref().is_none_or(|content| {
             message_content_is_structural_only(content, &self.effective_annotations())

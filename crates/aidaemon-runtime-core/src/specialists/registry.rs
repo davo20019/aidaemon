@@ -134,7 +134,6 @@ impl SpecialistRegistry {
     // introspection, future callers). Production code goes through `get` /
     // `render` for a specific kind; this iterator currently has no
     // non-test consumers.
-    #[allow(dead_code)]
     pub fn kinds(&self) -> impl Iterator<Item = SpecialistKind> + '_ {
         self.by_kind.keys().copied()
     }

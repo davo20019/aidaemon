@@ -28,7 +28,6 @@ fn owner_scores(hits: &[EmbeddingHit]) -> std::collections::HashMap<i64, f32> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MemoryClaimRecord {
     pub id: i64,
     pub claim_text: String,
@@ -446,23 +445,6 @@ impl SqliteMemory {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn rebuild_memory_projections(&self) -> anyhow::Result<(usize, usize)> {
-        let fact_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM facts ORDER BY id")
-            .fetch_all(&self.pool)
-            .await?;
-        for id in &fact_ids {
-            self.project_fact_memory(*id).await?;
-        }
-        let episode_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM episodes ORDER BY id")
-            .fetch_all(&self.pool)
-            .await?;
-        for id in &episode_ids {
-            self.project_episode_memory(*id).await?;
-        }
-        Ok((fact_ids.len(), episode_ids.len()))
-    }
-
     pub async fn backfill_missing_memory_projections(
         &self,
     ) -> anyhow::Result<(usize, usize, usize, usize, usize)> {
@@ -621,14 +603,6 @@ impl SqliteMemory {
         ))
     }
 
-    pub async fn sync_fact_memory_category(&self, category: &str) -> anyhow::Result<()> {
-        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM facts WHERE category = ?")
-            .bind(category)
-            .fetch_all(&self.pool)
-            .await?;
-        self.sync_fact_memory_rows(category, &ids).await
-    }
-
     /// Project the facts one write changed: the rows of `category` whose
     /// `updated_at` or `superseded_at` is that write's timestamp. Every row
     /// a fact upsert touches carries its timestamp, and re-projecting the
@@ -738,7 +712,6 @@ impl SqliteMemory {
     }
 
     /// Traverse active graph edges to at most `max_depth` (clamped to two).
-    #[allow(dead_code)]
     pub async fn memory_graph_neighbors(
         &self,
         start_entity_id: i64,

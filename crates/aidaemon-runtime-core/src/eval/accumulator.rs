@@ -10,14 +10,9 @@ use super::scoring::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Budget/Timeout wired incrementally; all variants used in snapshots
 pub enum StopReason {
     Completed,
-    Stall,
-    Budget,
-    Timeout,
     Error,
-    Cancelled,
     DirectReturn,
     Other,
 }
@@ -26,11 +21,7 @@ impl StopReason {
     pub fn as_str(self) -> &'static str {
         match self {
             StopReason::Completed => "completed",
-            StopReason::Stall => "stall",
-            StopReason::Budget => "budget",
-            StopReason::Timeout => "timeout",
             StopReason::Error => "error",
-            StopReason::Cancelled => "cancelled",
             StopReason::DirectReturn => "direct_return",
             StopReason::Other => "other",
         }

@@ -48,7 +48,6 @@ fn default_empty_json() -> String {
 pub trait SkillStore: Send + Sync {
     /// Store a dynamically added skill.
     /// Deprecated: use filesystem skills instead.
-    #[allow(dead_code)]
     async fn add_dynamic_skill(&self, _skill: &DynamicSkill) -> anyhow::Result<i64> {
         Ok(0)
     }
@@ -61,14 +60,12 @@ pub trait SkillStore: Send + Sync {
 
     /// Delete a dynamic skill by ID.
     /// Deprecated: use filesystem skills instead.
-    #[allow(dead_code)]
     async fn delete_dynamic_skill(&self, _id: i64) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Update the enabled flag of a dynamic skill.
     /// Deprecated: file existence = active, no enable/disable needed.
-    #[allow(dead_code)]
     async fn update_dynamic_skill_enabled(&self, _id: i64, _enabled: bool) -> anyhow::Result<()> {
         Ok(())
     }

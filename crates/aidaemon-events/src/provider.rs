@@ -52,7 +52,6 @@ impl ProviderErrorKind {
 
 /// Structured response mode requested for a provider call.
 #[derive(Debug, Clone, PartialEq, Default)]
-#[allow(dead_code)]
 pub enum ResponseMode {
     /// Default free-form text / tool-call behavior.
     #[default]
@@ -72,7 +71,6 @@ pub enum ResponseMode {
 
 /// Tool-call behavior requested for a provider call.
 #[derive(Debug, Clone, PartialEq, Default)]
-#[allow(dead_code)]
 pub enum ToolChoiceMode {
     /// Provider decides whether to call tools.
     #[default]
@@ -222,13 +220,9 @@ pub struct TokenUsageRecord {
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    #[allow(dead_code)] // Used for diagnostics and future cost reports
     pub cached_input_tokens: Option<i64>,
-    #[allow(dead_code)] // Used for diagnostics and future cost reports
     pub cache_creation_input_tokens: Option<i64>,
-    #[allow(dead_code)] // Used by reconciliation/reporting paths that need correlation IDs.
     pub call_id: Option<String>,
-    #[allow(dead_code)] // Used for database queries
     pub created_at: String,
 }
 
@@ -236,7 +230,6 @@ pub struct TokenUsageRecord {
 #[async_trait::async_trait]
 pub trait TokenUsageStore: Send + Sync {
     /// Record token usage from an LLM call.
-    #[allow(dead_code)]
     async fn record_token_usage(
         &self,
         _session_id: &str,
@@ -253,7 +246,6 @@ pub trait TokenUsageStore: Send + Sync {
 
     /// Get token usage grouped by session_id since a given datetime.
     /// Returns Vec of (session_id, total_input_tokens, total_output_tokens, request_count).
-    #[allow(dead_code)] // Used by token usage tooling when that tool is enabled.
     async fn get_token_usage_by_session(
         &self,
         _since: &str,

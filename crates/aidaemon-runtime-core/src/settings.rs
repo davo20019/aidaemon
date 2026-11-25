@@ -150,7 +150,6 @@ pub struct ContextWindowConfig {
     pub model_tool_result_chars: HashMap<String, usize>,
     /// Legacy message-window setting retained for configuration compatibility.
     /// Runtime compaction now protects recent raw context by token budget.
-    #[allow(dead_code)]
     #[serde(default = "default_summary_window")]
     pub summary_window: usize,
     /// Enable progressive fact extraction after each interaction (default: true).
@@ -158,7 +157,6 @@ pub struct ContextWindowConfig {
     pub progressive_facts: bool,
     /// Legacy message-count threshold retained for configuration compatibility.
     /// Runtime compaction uses `summarize_token_threshold` instead.
-    #[allow(dead_code)]
     #[serde(default = "default_summarize_threshold")]
     pub summarize_threshold: usize,
     /// Cap on the estimated unsummarized conversation tokens that trigger

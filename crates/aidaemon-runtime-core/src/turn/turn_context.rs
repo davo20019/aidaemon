@@ -33,7 +33,6 @@ use crate::turn::project_scope::{
 
 #[derive(Debug, Clone, Default)]
 pub struct TurnContext {
-    #[allow(dead_code)] // Retained as an inspectable trace of contract-inference input.
     pub goal_user_text: String,
     /// Bounded prior messages exposed only to the relationship assessor. They
     /// carry stable message IDs so a continuation must select an exact

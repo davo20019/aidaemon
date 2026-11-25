@@ -17,7 +17,6 @@ use aidaemon_tools::semantics::{
 };
 
 /// The kind of media being sent.
-#[allow(dead_code)]
 pub enum MediaKind {
     /// An in-memory photo (e.g. screenshot).
     Photo { data: Vec<u8> },
@@ -116,7 +115,6 @@ pub trait ApprovalTap: Send + Sync {
 ///
 /// Used by the agent and hub to adapt output format for each channel.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ChannelCapabilities {
     /// Whether the channel supports markdown/rich text formatting.
     pub markdown: bool,
@@ -271,7 +269,6 @@ pub trait DynamicBotStore: Send + Sync {
     }
 
     /// Update the allowed_user_ids for a dynamic bot identified by its token.
-    #[allow(dead_code)]
     async fn update_dynamic_bot_allowed_users(
         &self,
         _bot_token: &str,
@@ -281,7 +278,6 @@ pub trait DynamicBotStore: Send + Sync {
     }
 
     /// Delete a dynamic bot by ID.
-    #[allow(dead_code)]
     async fn delete_dynamic_bot(&self, _id: i64) -> anyhow::Result<()> {
         Ok(())
     }

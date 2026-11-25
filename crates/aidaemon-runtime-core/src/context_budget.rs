@@ -286,7 +286,6 @@ pub fn compute_available_budget_precomputed(
 /// Convenience wrapper: computes the system-token count from the combined prompt
 /// string. Use [`compute_available_budget_precomputed`] when components are already
 /// computed separately to avoid an extra allocation.
-#[allow(dead_code)]
 pub fn compute_available_budget(
     model: &str,
     system_prompt: &str,

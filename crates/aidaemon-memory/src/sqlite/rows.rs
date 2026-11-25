@@ -160,7 +160,6 @@ impl SqliteMemory {
     }
 
     /// Increment recall count for an episode.
-    #[allow(dead_code)]
     pub async fn increment_episode_recall(&self, episode_id: i64) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("UPDATE episodes SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?")
@@ -168,25 +167,6 @@ impl SqliteMemory {
             .bind(episode_id)
             .execute(&self.pool)
             .await?;
-        Ok(())
-    }
-
-    /// Update episode embedding.
-    #[allow(dead_code)]
-    pub async fn update_episode_embedding(
-        &self,
-        episode_id: i64,
-        embedding: &[f32],
-    ) -> anyhow::Result<()> {
-        let blob = encode_embedding(embedding);
-        sqlx::query("UPDATE episodes SET embedding = ? WHERE id = ?")
-            .bind(blob)
-            .bind(episode_id)
-            .execute(&self.pool)
-            .await?;
-        if let Err(error) = self.project_episode_memory(episode_id).await {
-            tracing::warn!(%error, episode_id, "Deferred episode memory projection");
-        }
         Ok(())
     }
 
@@ -434,7 +414,6 @@ impl SqliteMemory {
     }
 
     /// Update user profile fields.
-    #[allow(dead_code)]
     pub async fn update_user_profile(&self, profile: &UserProfile) -> anyhow::Result<()> {
         let active_hours_json = profile
             .active_hours
@@ -469,7 +448,6 @@ impl SqliteMemory {
     // ==================== BehaviorPattern Methods ====================
 
     /// Insert a new behavior pattern.
-    #[allow(dead_code)]
     pub async fn insert_behavior_pattern(&self, pattern: &BehaviorPattern) -> anyhow::Result<i64> {
         let result = sqlx::query(
             "INSERT INTO behavior_patterns (pattern_type, description, trigger_context, action, confidence, occurrence_count, last_seen_at, created_at)
@@ -588,7 +566,6 @@ impl SqliteMemory {
     }
 
     /// Update pattern occurrence and confidence.
-    #[allow(dead_code)]
     pub async fn update_behavior_pattern(
         &self,
         pattern_id: i64,
@@ -746,7 +723,6 @@ impl SqliteMemory {
     }
 
     /// Update procedure success/failure and optionally update steps.
-    #[allow(dead_code)] // Wired to trait but reserved for feedback loop
     pub async fn update_procedure(
         &self,
         procedure_id: i64,
@@ -1098,7 +1074,6 @@ impl SqliteMemory {
     }
 
     /// Update error solution success/failure.
-    #[allow(dead_code)] // Wired to trait but reserved for feedback loop
     pub async fn update_error_solution(
         &self,
         solution_id: i64,
@@ -1155,7 +1130,6 @@ impl SqliteMemory {
     // ==================== Fact History Methods ====================
 
     /// Get the history of a fact (all versions including superseded).
-    #[allow(dead_code)]
     pub async fn get_fact_history(&self, category: &str, key: &str) -> anyhow::Result<Vec<Fact>> {
         let rows = sqlx::query(
             "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at
@@ -1174,7 +1148,6 @@ impl SqliteMemory {
     }
 
     /// Increment recall count for a fact.
-    #[allow(dead_code)]
     pub async fn increment_fact_recall(&self, fact_id: i64) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1187,7 +1160,6 @@ impl SqliteMemory {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(super) fn row_to_fact_with_history(
         &self,
         row: &sqlx::sqlite::SqliteRow,

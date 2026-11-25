@@ -51,7 +51,6 @@ pub enum ServerEnvBinding {
 
 /// Summary info about a registered MCP server (for list action).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used by ManageMcpTool list action
 pub struct ServerInfo {
     pub name: String,
     pub command: String,

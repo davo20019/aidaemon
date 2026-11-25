@@ -311,7 +311,6 @@ Use one of these instead:\n\
 
 /// True only for the filesystem root or the home directory itself — the scan
 /// roots that make `du`/`find` pathologically slow. Subdirectories return false.
-#[allow(dead_code)]
 pub(super) fn is_broad_scan_root(path: &str) -> bool {
     let p = path.trim();
     if p == "/" {
@@ -334,7 +333,6 @@ pub(super) fn is_broad_scan_root(path: &str) -> bool {
 /// `du` over a broad root is always flagged (it walks the full subtree to sum
 /// sizes; `-d` only limits output depth). `find` over a broad root is flagged
 /// unless `-maxdepth` is present (which bounds traversal). Returns (tool, root).
-#[allow(dead_code)]
 pub(super) fn detect_unbounded_disk_scan_segment(segment: &str) -> Option<(String, String)> {
     let tokens = shell_words::split(segment).ok()?;
     let first = tokens.first()?;

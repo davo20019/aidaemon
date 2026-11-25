@@ -5,7 +5,6 @@ pub const DEFAULT_PROJECT_ID: &str = "default";
 /// Snapshot of a goal's token budget state.
 #[derive(Debug, Clone)]
 pub struct GoalTokenBudgetStatus {
-    #[allow(dead_code)] // Reserved for future per-check budget enforcement.
     pub budget_per_check: Option<i64>,
     pub budget_daily: Option<i64>,
     pub tokens_used_today: i64,
@@ -350,7 +349,6 @@ pub struct GoalSchedule {
 
 /// A task — a discrete unit of work within a goal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // Used in Phase 2; StateStore methods and SQLite impl ready
 pub struct Task {
     pub id: String,
     pub goal_id: String,
@@ -740,7 +738,6 @@ pub const REMOTE_CHANGE_ACTIVITY: &str = "remote_change";
 
 /// A task activity log entry — records tool calls and results within a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // Used in Phase 2; StateStore methods and SQLite impl ready
 pub struct TaskActivity {
     pub id: i64,
     pub task_id: String,

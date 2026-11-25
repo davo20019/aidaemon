@@ -18,6 +18,17 @@ stability promise.
 - `aidaemon-client-protocol` 1.52: `SessionSummary::agent`, the coding agent a conversation is set to; the gateway publishes `session_updated` when it changes.
 - `aidaemon-client-core`: `Client::session_agent`; the model list is read once a listed conversation names an agent.
 
+### Removed
+Public items nothing in the workspace used (a breaking change, so the next release is 0.25.0):
+- `aidaemon-channels`: `ChannelHub::channel_names`, the policy's `refusal_message`, the task registry's `work_key` and `get_running_task_description`, terminal-lite's `has_active_session`.
+- `aidaemon-memory`: `with_tools` on the full memory system, `rebuild_memory_projections`, `sync_fact_memory_category`, `update_episode_embedding`.
+- `aidaemon-work`: the `plans::detection` module (`PlanTrigger`, `should_create_plan`), the never-run token spike scan (`token_alerts::migrate` stays), unused health-probe, trend and plan-store helpers.
+- `aidaemon-skills`: `build_system_prompt` and `build_system_prompt_with_memory`; `build_system_prompt_with_memory_report` remains.
+- `aidaemon-events`: the `SessionStartData`, `SessionEndData` and `UserConstraintViolationData` payloads and unused event-store getters.
+- `aidaemon-runtime-core`: `StopReason`'s never-constructed `Stall`, `Budget`, `Timeout` and `Cancelled`; unused completion-contract, metrics and audio helpers.
+- `aidaemon-client-core`: `Client::saving_project`.
+- Smaller unused helpers in `aidaemon-tools`, `aidaemon-shells`, `aidaemon-eval`, `aidaemon-agents` and `aidaemon-channel-discord`.
+
 ## [0.24.0] - 2026-11-25
 
 ### Changed

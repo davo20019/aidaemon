@@ -164,7 +164,6 @@ pub trait LearningStore: Send + Sync {
     }
 
     /// Update procedure outcome after execution.
-    #[allow(dead_code)] // Reserved for procedure feedback loop
     async fn update_procedure_outcome(
         &self,
         _procedure_id: i64,
@@ -180,7 +179,6 @@ pub trait LearningStore: Send + Sync {
     }
 
     /// Update error solution outcome.
-    #[allow(dead_code)] // Reserved for error solution feedback loop
     async fn update_error_solution_outcome(&self, _solution_id: i64, _success: bool) -> Result<()> {
         Ok(())
     }

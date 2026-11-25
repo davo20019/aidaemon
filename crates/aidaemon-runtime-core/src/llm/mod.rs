@@ -371,7 +371,6 @@ struct LlmRuntimeState {
 pub struct SharedLlmRuntime(Arc<RwLock<LlmRuntimeState>>);
 
 impl SharedLlmRuntime {
-    #[allow(dead_code)] // Retained for single-provider call sites and tests.
     pub fn new(
         provider: ModelBackend,
         router: Option<Router>,
@@ -460,7 +459,6 @@ impl SharedLlmRuntime {
     }
 }
 
-#[allow(dead_code)] // Retained for test helpers and lightweight single-provider wiring.
 pub fn router_from_models(models: ModelsConfig) -> Option<Router> {
     let router = Router::new(models);
     if router.is_uniform() {

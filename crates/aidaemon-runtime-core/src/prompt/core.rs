@@ -103,7 +103,6 @@ impl CoreInputs {
 
     /// Aggregate hash over all component hashes. Used in tests only; the
     /// production cache path calls `component_hashes().aggregate()` directly.
-    #[allow(dead_code)]
     pub fn aggregate_hash(&self) -> String {
         self.component_hashes().aggregate()
     }

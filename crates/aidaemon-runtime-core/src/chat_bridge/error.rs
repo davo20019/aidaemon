@@ -293,7 +293,6 @@ impl ProviderError {
     }
 
     /// Whether this error is worth retrying (same request, same model).
-    #[allow(dead_code)]
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,

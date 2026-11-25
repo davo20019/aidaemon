@@ -830,7 +830,6 @@ impl ToolEvidenceCapability {
 }
 
 /// Fine-grained semantic capability advertised by a tool.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSemanticFacet {

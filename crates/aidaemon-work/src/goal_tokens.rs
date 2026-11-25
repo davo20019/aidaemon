@@ -348,7 +348,6 @@ impl GoalTokenRegistry {
         Some(Self::run_budget_status_from_state(state))
     }
 
-    #[allow(dead_code)]
     pub async fn set_run_budget(
         &self,
         goal_id: &str,

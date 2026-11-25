@@ -21,9 +21,7 @@ pub(crate) struct LocalAttachClient {
 #[derive(Debug)]
 pub(crate) struct LocalAttachAccepted {
     pub(crate) session_id: String,
-    #[allow(dead_code)]
     pub(crate) resume_code: Option<String>,
-    #[allow(dead_code)]
     pub(crate) resume_expires_at_unix: Option<i64>,
 }
 

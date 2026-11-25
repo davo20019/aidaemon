@@ -24,7 +24,6 @@ pub struct LearningContext {
     pub errors: Vec<(String, bool)>, // (error_text, was_recovered)
     pub first_error: Option<String>,
     pub recovery_actions: Vec<String>,
-    #[allow(dead_code)] // Reserved for duration-based learning
     pub start_time: chrono::DateTime<Utc>,
     pub completed_naturally: bool,
     /// Semantic outcome emitted at task end; authoritative for learning when set.

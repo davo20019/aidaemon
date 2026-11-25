@@ -29,9 +29,8 @@
 //! count as point of action.
 
 // `classify` is intentionally public so Task 7 can call it.  It has no callers
-// yet (Task 7 is a separate commit), so `#[allow(dead_code)]` prevents a spurious
+// yet (Task 7 is a separate commit), so `` prevents a spurious
 // Clippy warning until Task 7 wires approval enforcement.
-#![allow(dead_code)]
 
 pub use aidaemon_tools::web::local_site_key;
 use aidaemon_tools::web::{BlockedHostClass, classify_blocked_host};

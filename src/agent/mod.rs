@@ -183,7 +183,7 @@ mod policy_metrics {
 }
 pub use policy_metrics::apply_bounded_autotune_from_failure_ratio;
 // `PolicyAutotuneSnapshot` is part of the public surface but currently has no
-// in-tree consumer (the legacy definition carried `#[allow(dead_code)]`).
+// in-tree consumer (the legacy definition carried ``).
 #[allow(unused_imports)]
 pub use policy_metrics::PolicyAutotuneSnapshot;
 

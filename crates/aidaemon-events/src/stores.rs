@@ -38,7 +38,6 @@ pub trait MessageStore: Send + Sync {
     /// was removed when the turn-anchored fetch took over history retention.
     /// Retained as part of the `MessageStore` contract (still exercised by the
     /// sqlite store tests); allow dead_code until a future caller or removal.
-    #[allow(dead_code)]
     async fn get_context(
         &self,
         session_id: &str,
@@ -88,7 +87,6 @@ pub trait DialogueStateStore: Send + Sync {
 
     async fn upsert_dialogue_state(&self, state: &DialogueState) -> anyhow::Result<()>;
 
-    #[allow(dead_code)]
     async fn delete_dialogue_state(&self, session_id: &str) -> anyhow::Result<()>;
 }
 
@@ -128,7 +126,6 @@ pub trait PromptSnapshotStore: Send + Sync {
     }
 
     /// Fetch a stored prompt snapshot by exact hash.
-    #[allow(dead_code)] // Read path is db_probe; kept on the trait for tests/tools.
     async fn get_prompt_snapshot(&self, _hash: &str) -> anyhow::Result<Option<String>> {
         Ok(None)
     }

@@ -25,7 +25,6 @@ type PatternRow = (
 
 /// A learned command pattern with approval history.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CommandPattern {
     pub id: i64,
     pub pattern: String,
@@ -309,7 +308,6 @@ pub async fn find_matching_pattern(
 
 /// Statistics about learned command patterns.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct PatternStats {
     pub total_patterns: usize,
     pub trusted_patterns: usize,

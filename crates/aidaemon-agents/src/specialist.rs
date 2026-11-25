@@ -52,7 +52,6 @@ impl SpecialistKind {
     // Test-only oracle: iterates every variant for exhaustiveness checks in
     // `SpecialistRegistry` unit tests. Production code dispatches on
     // `SpecialistKind` values directly, so this helper is unused there.
-    #[allow(dead_code)]
     pub fn all() -> &'static [SpecialistKind] {
         &[
             SpecialistKind::TaskLead,

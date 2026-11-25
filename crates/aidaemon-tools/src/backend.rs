@@ -378,9 +378,7 @@ pub trait ExecutionBackend: Send + Sync {
     ) -> anyhow::Result<()>;
     async fn create_dir_all(&self, path: &BackendPath) -> anyhow::Result<()>;
     async fn copy(&self, source: &BackendPath, destination: &BackendPath) -> anyhow::Result<()>;
-    #[allow(dead_code)]
     async fn rename(&self, source: &BackendPath, destination: &BackendPath) -> anyhow::Result<()>;
-    #[allow(dead_code)]
     async fn remove_file(&self, path: &BackendPath) -> anyhow::Result<()>;
     /// Remove a directory only if it is empty; never recursive.
     async fn remove_empty_dir(&self, path: &BackendPath) -> anyhow::Result<()>;

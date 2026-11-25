@@ -10,7 +10,6 @@ pub struct ReadyMedia {
 /// Error variants carry the originally-requested path (or recovery context)
 /// so callers can construct user-facing messages that include the relevant detail.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum DeliveryError {
     FileNotFound(String),
     NotRegularFile(String),

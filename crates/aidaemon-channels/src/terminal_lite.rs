@@ -311,13 +311,6 @@ impl TerminalLiteManager {
         self.allowed_prefixes.iter().cloned().collect()
     }
 
-    /// Returns `true` if there is an active terminal-lite session for the
-    /// given chat id.
-    #[allow(dead_code)]
-    pub async fn has_active_session(&self, chat_id: i64) -> bool {
-        self.sessions.lock().await.contains_key(&chat_id)
-    }
-
     /// Start (or restart) a terminal-lite session.  Returns a human-readable
     /// status string suitable for sending back to the user.
     pub async fn start_session(&self, chat_id: i64, user_id: u64, args: Vec<String>) -> String {

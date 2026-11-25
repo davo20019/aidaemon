@@ -199,7 +199,6 @@ pub struct QueueTelemetry {
 }
 
 impl QueueTelemetry {
-    #[allow(dead_code)]
     pub fn new(approval_capacity: usize, media_capacity: usize, trigger_capacity: usize) -> Self {
         Self::new_with_policy(
             approval_capacity,

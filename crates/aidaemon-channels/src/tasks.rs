@@ -43,7 +43,6 @@ pub struct QueuedMessage {
     /// Attachments belong to the individual sender/message and must travel
     /// through the queue with that identity.
     pub attachments: Vec<MessageAttachment>,
-    #[allow(dead_code)]
     pub queued_at: DateTime<Utc>,
     /// Optional transport timing follows the exact message through queue
     /// coalescing and later agent dispatch.
@@ -283,7 +282,6 @@ impl TaskRegistry {
     /// Mark a task as completed.
     /// Channel loops now use [`Self::finalize_and_drain`]; retained for
     /// callers that finalize without a session queue (and for tests).
-    #[allow(dead_code)]
     pub async fn complete(&self, task_id: u64) {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id) {
@@ -294,7 +292,6 @@ impl TaskRegistry {
     }
 
     /// Mark a task as failed.
-    #[allow(dead_code)] // Retained for non-queued registry consumers.
     pub async fn fail(&self, task_id: u64, error: &str) {
         let mut tasks = self.tasks.write().await;
         if let Some(handle) = tasks.get_mut(&task_id) {
@@ -384,17 +381,6 @@ impl TaskRegistry {
         assigned
     }
 
-    /// The work key the chat's number `number` names, if it names one.
-    pub fn work_key(&self, session_id: &str, number: u64) -> Option<String> {
-        self.work_numbers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)?
-            .iter()
-            .find(|(_, known)| *known == number)
-            .map(|(key, _)| key.clone())
-    }
-
     /// The turn `task_id` as the registry holds it now.
     pub async fn entry(&self, task_id: u64) -> Option<TaskEntry> {
         self.tasks
@@ -480,15 +466,6 @@ impl TaskRegistry {
             .any(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status))
     }
 
-    /// Get the description of the currently running task for a session (if any).
-    pub async fn get_running_task_description(&self, session_id: &str) -> Option<String> {
-        let tasks = self.tasks.read().await;
-        tasks
-            .values()
-            .find(|h| h.entry.session_id == session_id && Self::is_active(&h.entry.status))
-            .map(|h| h.entry.description.clone())
-    }
-
     /// Atomically mark a message as "seen" for dedup purposes.
     /// Returns `true` if this is the first time (caller should proceed),
     /// or `false` if a duplicate (caller should drop the message).
@@ -535,7 +512,6 @@ impl TaskRegistry {
     /// already exists in the queue or was recently processed).
     /// Channel loops now use [`Self::queue_message_if_running`]; retained
     /// for queue-only callers and tests.
-    #[allow(dead_code)]
     pub async fn queue_message(
         &self,
         session_id: &str,
@@ -569,7 +545,6 @@ impl TaskRegistry {
     }
 
     /// Pop the next queued message for a session.
-    #[allow(dead_code)] // Retained for compatibility with single-pop queue consumers.
     pub async fn pop_queued_message(&self, session_id: &str) -> Option<QueuedMessage> {
         let mut queues = self.queues.write().await;
         queues.get_mut(session_id).and_then(|q| q.pop_front())
@@ -613,7 +588,6 @@ impl TaskRegistry {
     /// adjacent fragments. Different security contexts remain queued.
     /// Channel loops now use [`Self::finalize_and_drain`]; retained for
     /// drain-only callers and tests.
-    #[allow(dead_code)]
     pub async fn pop_all_queued_messages(&self, session_id: &str) -> Option<QueuedMessage> {
         let mut queues = self.queues.write().await;
         let queue = queues.get_mut(session_id)?;
@@ -843,7 +817,6 @@ impl TaskRegistry {
     }
 
     /// Clear all queued messages for a session.
-    #[allow(dead_code)] // Explicit queue discard is reserved for reset/wipe flows.
     pub async fn clear_queue(&self, session_id: &str) {
         let mut queues = self.queues.write().await;
         if let Some(queue) = queues.get_mut(session_id) {

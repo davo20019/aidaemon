@@ -86,7 +86,6 @@ pub fn format_specialist_arg_description<S: AsRef<str>>(entries: &[(S, String)])
 
 impl SpawnAgentTool {
     /// Create a SpawnAgentTool with a known child-runtime reference.
-    #[allow(dead_code)]
     pub fn new(
         agent: Weak<dyn ChildAgentRuntime>,
         max_response_chars: usize,

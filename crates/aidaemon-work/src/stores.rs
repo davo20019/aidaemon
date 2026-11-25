@@ -15,19 +15,16 @@ pub trait GoalStore: Send + Sync {
     }
 
     /// Get a goal by ID.
-    #[allow(dead_code)] // Used in Phase 2
     async fn get_goal(&self, _id: &str) -> anyhow::Result<Option<crate::traits::Goal>> {
         Ok(None)
     }
 
     /// Update a goal (full replacement).
-    #[allow(dead_code)] // Used in Phase 2
     async fn update_goal(&self, _goal: &crate::traits::Goal) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Get all active orchestration goals (status = "active" or "pending").
-    #[allow(dead_code)] // Used in Phase 2
     async fn get_active_goals(&self) -> anyhow::Result<Vec<crate::traits::Goal>> {
         Ok(vec![])
     }
@@ -51,7 +48,6 @@ pub trait GoalStore: Send + Sync {
     }
 
     /// Get orchestration goals for a specific session.
-    #[allow(dead_code)] // Used in Phase 2
     async fn get_goals_for_session(
         &self,
         _session_id: &str,
@@ -60,7 +56,6 @@ pub trait GoalStore: Send + Sync {
     }
 
     /// Get scheduled goals awaiting confirmation in a session.
-    #[allow(dead_code)]
     async fn get_pending_confirmation_goals(
         &self,
         _session_id: &str,
@@ -331,7 +326,6 @@ pub trait MandateStore: Send + Sync {
 
     /// Persist one bounded, advisory learning note only after all cited
     /// receipts are proven to belong to this mandate.
-    #[allow(dead_code)]
     async fn record_mandate_learning_note(
         &self,
         _note: &crate::traits::MandateLearningNote,
@@ -427,43 +421,36 @@ pub trait MandateStore: Send + Sync {
 #[async_trait]
 pub trait TaskStore: Send + Sync {
     /// Create a new task within a goal.
-    #[allow(dead_code)] // Used in Phase 2
     async fn create_task(&self, _task: &crate::traits::Task) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Get a task by ID.
-    #[allow(dead_code)] // Used in Phase 2
     async fn get_task(&self, _id: &str) -> anyhow::Result<Option<crate::traits::Task>> {
         Ok(None)
     }
 
     /// Update a task (full replacement).
-    #[allow(dead_code)] // Used in Phase 2
     async fn update_task(&self, _task: &crate::traits::Task) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Get all tasks for a goal.
-    #[allow(dead_code)] // Used in Phase 2
     async fn get_tasks_for_goal(&self, _goal_id: &str) -> anyhow::Result<Vec<crate::traits::Task>> {
         Ok(vec![])
     }
 
     /// Count completed/skipped tasks for a goal (used by progress-based circuit breaker).
-    #[allow(dead_code)] // Retained for stores and diagnostics; run-scoped code filters task rows.
     async fn count_completed_tasks_for_goal(&self, _goal_id: &str) -> anyhow::Result<i64> {
         Ok(0)
     }
 
     /// Atomically claim a pending task for an executor.
-    #[allow(dead_code)] // Used in Phase 2
     async fn claim_task(&self, _task_id: &str, _agent_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
 
     /// Log an activity entry for a task.
-    #[allow(dead_code)] // Used in Phase 2
     async fn log_task_activity(
         &self,
         _activity: &crate::traits::TaskActivity,
@@ -472,7 +459,6 @@ pub trait TaskStore: Send + Sync {
     }
 
     /// Get activity log for a task.
-    #[allow(dead_code)] // Used in Phase 2
     async fn get_task_activities(
         &self,
         _task_id: &str,
@@ -651,7 +637,6 @@ pub trait TaskDispatchStore: Send + Sync {
     }
 
     /// Get tasks completed after a given timestamp.
-    #[allow(dead_code)]
     async fn get_recently_completed_tasks(
         &self,
         _since: &str,

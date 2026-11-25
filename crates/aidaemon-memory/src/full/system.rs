@@ -240,12 +240,6 @@ impl FullMemory {
         });
         Ok(system)
     }
-
-    /// Offer `tools` on every turn that may read or write memory.
-    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
-        self.tools = tools;
-        self
-    }
 }
 
 /// How many facts recall renders at most, by default (the daemon's

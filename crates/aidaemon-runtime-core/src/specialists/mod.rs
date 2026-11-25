@@ -47,7 +47,6 @@ pub struct SpecialistRenderContext {
 
 // Keep the parsed representation faithful to the on-disk schema. Some fields
 // also feed discovery and durable worker-profile snapshots.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SpecialistDef {
     pub kind: SpecialistKind,
@@ -69,7 +68,7 @@ pub enum SpecialistSource {
     Bundled,
     // `PathBuf` payload is recorded for diagnostics / future logging; current
     // production callers only discriminate on the variant tag.
-    UserOverride(#[allow(dead_code)] PathBuf),
+    UserOverride(PathBuf),
 }
 
 #[derive(Debug, Default)]

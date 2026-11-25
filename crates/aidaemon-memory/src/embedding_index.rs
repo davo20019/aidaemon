@@ -56,7 +56,6 @@ pub trait EmbeddingIndex: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<EmbeddingHit>>;
     async fn mark_stale(&self, owner: &MemoryOwner) -> anyhow::Result<()>;
-    #[allow(dead_code)]
     async fn purge_stale(&self) -> anyhow::Result<u64>;
 }
 

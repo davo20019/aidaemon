@@ -215,7 +215,6 @@ pub enum ModelProfile {
 
 /// Tier-based model selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Tier {
     Fast,
     Primary,

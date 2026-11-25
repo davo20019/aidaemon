@@ -7,7 +7,6 @@ use crate::semantics::ToolCallContext;
 
 /// Status updates emitted by tools and the agent loop for live feedback to the user.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum StatusUpdate {
     /// A chunk of the reply as the model writes it, for app clients that
     /// stream it. Only a top-level turn sends it; the runner hands it to the

@@ -73,12 +73,6 @@ impl AccessPolicy {
         self
     }
 
-    /// The reply sent to unknown senders. `None` refuses silently.
-    pub fn refusal_message(mut self, message: Option<String>) -> Self {
-        self.refusal = message;
-        self
-    }
-
     /// In group and thread conversations, handle only messages that address
     /// the bot (`InboundMessage::addressed`). Default: true.
     pub fn require_addressed_in_groups(mut self, required: bool) -> Self {
