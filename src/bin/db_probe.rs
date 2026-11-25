@@ -1826,6 +1826,11 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         println!("Dropped {removed} superseded run updates; vacuuming…");
         sqlx::query("VACUUM").execute(&pool).await?;
+        // In WAL mode VACUUM writes through the WAL; fold it back and
+        // truncate it, or the file's space stays in the WAL.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&pool)
+            .await?;
         println!("Done.");
         return Ok(());
     }
