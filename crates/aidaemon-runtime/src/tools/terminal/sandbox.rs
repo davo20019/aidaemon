@@ -289,6 +289,9 @@ pub(super) async fn confined_terminal_execution_request_inner(
                 shell_source.to_string(),
             ]);
         }
+        if capabilities.protect_persistence {
+            create_missing_persistence_dirs(backend, &policy_writes).await;
+        }
         let (program, args) = match &adapter {
             LinuxSandboxAdapter::Codex(codex) => {
                 let sandbox_state =
@@ -1553,6 +1556,69 @@ pub(super) fn bubblewrap_sandbox_args(
         args.splice(at..at, protected);
     }
     args
+}
+
+/// The persistence directories to create on the host before a Linux
+/// confined run: `.git/hooks` of each write root whose `.git` is a
+/// directory but has no hooks folder. bubblewrap's `--ro-bind-try` and the
+/// Codex entries skip a path that does not exist, so a run could otherwise
+/// create the hooks folder and plant a hook; once it exists, the read-only
+/// bind covers it.
+///
+/// Nothing is created under a write root that does not exist yet (Codex's
+/// bubblewrap cannot mount under it), nor for `.git/config` (it exists
+/// whenever `.git` does) or `.husky` (husky hooks run only when
+/// `core.hooksPath` names them, which lives in the protected `.git/config`).
+/// A run that creates its own fresh repository can still write that
+/// repository's hooks: the daemon runs git with hooks disabled
+/// (`aidaemon_tools::git_guard`), so only a later run of the owner's own git
+/// in that new folder would use them.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(super) fn persistence_dirs_to_create(
+    write_paths: &[String],
+    is_dir: &dyn Fn(&str) -> bool,
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut create = Vec::new();
+    for root in write_paths {
+        let root = root.trim_end_matches('/');
+        let hooks = format!("{root}/.git/hooks");
+        if is_dir(&format!("{root}/.git")) && !exists(&hooks) && !create.contains(&hooks) {
+            create.push(hooks);
+        }
+    }
+    create
+}
+
+/// Create [`persistence_dirs_to_create`] through the backend, best effort:
+/// a folder that cannot be created leaves the run as protected as before.
+#[cfg(not(target_os = "macos"))]
+async fn create_missing_persistence_dirs(backend: &SharedExecutionBackend, write_paths: &[String]) {
+    let mut dirs = std::collections::HashSet::new();
+    let mut present = std::collections::HashSet::new();
+    for root in write_paths {
+        let root = root.trim_end_matches('/');
+        for path in [format!("{root}/.git"), format!("{root}/.git/hooks")] {
+            if let Ok(meta) = backend
+                .metadata(&aidaemon_tools::BackendPath::new(path.clone()))
+                .await
+            {
+                if meta.is_dir() {
+                    dirs.insert(path.clone());
+                }
+                present.insert(path);
+            }
+        }
+    }
+    for dir in persistence_dirs_to_create(
+        write_paths,
+        &|path: &str| dirs.contains(path),
+        &|path: &str| present.contains(path),
+    ) {
+        let _ = backend
+            .create_dir_all(&aidaemon_tools::BackendPath::new(dir))
+            .await;
+    }
 }
 
 /// The persistence paths ([`PERSISTENCE_SUBPATHS`]) inside each write root.

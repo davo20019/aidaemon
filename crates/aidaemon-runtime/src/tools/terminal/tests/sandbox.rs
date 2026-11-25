@@ -1078,6 +1078,38 @@ fn linux_sandboxes_keep_persistence_paths_read_only_in_write_roots() {
 }
 
 #[test]
+fn linux_runs_create_a_missing_hooks_folder_only_in_an_existing_repository() {
+    let dirs = [
+        "/work/repo/.git",
+        "/work/hooked/.git",
+        "/work/hooked/.git/hooks",
+    ];
+    let is_dir = |path: &str| dirs.contains(&path);
+    let exists = |path: &str| dirs.contains(&path);
+    let roots = [
+        // A repository without a hooks folder: create it.
+        "/work/repo/".to_string(),
+        // One that has it: nothing to do.
+        "/work/hooked".to_string(),
+        // Not a repository, or a root the run has yet to create: nothing
+        // (Codex's bubblewrap cannot mount under a missing root).
+        "/work/plain".to_string(),
+        "/work/not-yet".to_string(),
+        "/work/repo".to_string(),
+    ];
+    assert_eq!(
+        persistence_dirs_to_create(&roots, &is_dir, &exists),
+        vec!["/work/repo/.git/hooks".to_string()]
+    );
+    // A worktree's `.git` is a file: its hooks live in the common dir.
+    let file_git = |_: &str| false;
+    let exists_file = |path: &str| path == "/work/tree/.git";
+    assert!(
+        persistence_dirs_to_create(&["/work/tree".to_string()], &file_git, &exists_file).is_empty()
+    );
+}
+
+#[test]
 fn native_sandbox_state_preserves_exact_dotted_and_split_paths() {
     let state = codex_sandbox_state_json(
         "/synthetic/work.tree",
