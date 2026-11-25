@@ -418,7 +418,23 @@ impl State {
                 }
             }
         }
+        // The files' links as history has them now: the gateway's links
+        // expire, so what is shown takes the freshly signed one.
+        let links: BTreeMap<String, String> = lines
+            .iter()
+            .flat_map(line_attachments)
+            .filter_map(|a| Some((a.id.clone(), a.url.clone()?)))
+            .collect();
         view.lines = merge_history(lines, std::mem::take(&mut view.lines));
+        for line in &mut view.lines {
+            if let Line::User { attachments, .. } | Line::Assistant { attachments, .. } = line {
+                for file in attachments {
+                    if let Some(url) = links.get(&file.id) {
+                        file.url = Some(url.clone());
+                    }
+                }
+            }
+        }
     }
 
     fn live_turn<'a>(&'a mut self, turn_id: &str) -> Option<&'a mut LiveTurn> {
@@ -781,6 +797,13 @@ fn short(id: &str) -> String {
 
 /// A said message's identity across history and the live stream: who said
 /// it and its words (history has no event ids to match on).
+fn line_attachments(line: &Line) -> &[AttachmentRef] {
+    match line {
+        Line::User { attachments, .. } | Line::Assistant { attachments, .. } => attachments,
+        _ => &[],
+    }
+}
+
 fn said(line: &Line) -> Option<(bool, &str)> {
     match line {
         Line::User { text, .. } => Some((true, text)),
@@ -1015,6 +1038,41 @@ mod tests {
         assert_eq!(runs.len(), MAX_ENDED_RUNS + 1);
         assert!(runs.iter().any(|run| run.id == "live"));
         assert!(!runs.iter().any(|run| run.id == "done-0"));
+    }
+
+    /// A history read again gives the files already shown their new
+    /// links (the gateway's expire).
+    #[test]
+    fn a_history_read_again_signs_shown_files_again() {
+        let history = |url: &str| {
+            serde_json::from_value::<Vec<aidaemon_client_protocol::HistoryMessage>>(
+                serde_json::json!([{
+                    "id": "m1", "role": "user", "text": "the synthetic plan", "at_ms": 5,
+                    "attachments": [{"id": "f_1", "name": "plan.png", "url": url}]
+                }]),
+            )
+            .expect("history")
+        };
+        let mut state = State::default();
+        for url in [
+            "/client/v1/files/f_1?sig=old",
+            "/client/v1/files/f_1?sig=new",
+        ] {
+            state.apply_result(CommandResult::History {
+                session_id: "app:s1".into(),
+                messages: history(url),
+                more: false,
+                runs: Vec::new(),
+                agent_names: Default::default(),
+            });
+        }
+        let lines = &state.sessions["app:s1"].lines;
+        let urls: Vec<_> = lines
+            .iter()
+            .flat_map(line_attachments)
+            .map(|a| a.url.as_deref())
+            .collect();
+        assert_eq!(urls, vec![Some("/client/v1/files/f_1?sig=new")]);
     }
 
     /// A conversation's history brings back its runs; a snapshot keeps

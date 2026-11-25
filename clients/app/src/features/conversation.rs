@@ -2560,6 +2560,9 @@ fn files(store: Store, attached: impl Fn() -> Vec<AttachmentRef> + 'static, mine
                                 pixels,
                             });
                         },
+                        // Its link may have expired: read the conversation
+                        // again for a freshly signed one.
+                        move || store.file_failed(),
                     ));
                 } else {
                     list = list.child(

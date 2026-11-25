@@ -344,6 +344,9 @@ pub struct Client {
     outgoing: Vec<(String, Command)>,
     /// Sessions whose history was asked for.
     fetched: BTreeSet<String>,
+    /// Sessions read again because a file link failed (see
+    /// [`Client::resign_files`]).
+    resigned: BTreeSet<String>,
     /// The request of a message that starts a new session.
     starting: Option<String>,
     turns: BTreeMap<String, TurnLog>,
@@ -2351,6 +2354,18 @@ impl Client {
         }
     }
 
+    /// A file or picture link of `id`'s failed to load. The gateway's links
+    /// expire, so read the conversation's history again: it brings each
+    /// file a freshly signed link. Once per conversation, so a link that
+    /// fails for another reason never loops; whether it asked.
+    pub fn resign_files(&mut self, id: &str) -> bool {
+        if !self.is_online() || !self.resigned.insert(id.to_owned()) {
+            return false;
+        }
+        self.read_history(id);
+        true
+    }
+
     /// Read `id`'s latest history now; it merges with what is shown.
     fn read_history(&mut self, id: &str) -> String {
         self.fetched.insert(id.to_owned());
@@ -3518,6 +3533,24 @@ mod tests {
             };
             assert_eq!(client.can_send_queued_now(), supported, "1.{minor}");
         }
+    }
+
+    /// A failed file link reads the conversation again once, never more.
+    #[test]
+    fn a_failed_file_link_reads_the_history_again_once() {
+        let mut client = Client::new();
+        assert!(!client.resign_files("app:s1"), "offline: nothing to read");
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        assert!(client.resign_files("app:s1"));
+        let sent = client.take_outgoing();
+        assert!(sent.iter().any(|(_, c)| matches!(
+            c,
+            Command::GetHistory { session_id, .. } if session_id == "app:s1"
+        )));
+        assert!(!client.resign_files("app:s1"));
+        assert!(client.take_outgoing().is_empty());
+        assert!(client.resign_files("app:s2"));
     }
 
     #[test]

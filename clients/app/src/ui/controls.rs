@@ -1021,6 +1021,7 @@ pub fn picture(
     label: String,
     pixels: Option<(u32, u32)>,
     on_press: impl Fn() + 'static,
+    on_error: impl Fn() + 'static,
 ) -> View {
     const MAX_W: f32 = 320.0;
     const MAX_H: f32 = 360.0;
@@ -1050,7 +1051,13 @@ pub fn picture(
                 .focus(focus_band)
                 .accessibility_label(label)
                 .on_press(on_press)
-                .child(image(src).w_full().h_full().object_fit(fit)),
+                .child(
+                    image(src)
+                        .w_full()
+                        .h_full()
+                        .object_fit(fit)
+                        .on_error(move |_: &str| on_error()),
+                ),
         )
 }
 

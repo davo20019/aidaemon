@@ -3153,6 +3153,14 @@ impl Store {
         Some(format!("{}{url}", self.gateway_base.with(|b| b.clone())))
     }
 
+    /// A file of the conversation on screen failed to load: its link may
+    /// have expired, so the conversation is read again (once) for new ones.
+    pub fn file_failed(&self) {
+        if let Some(id) = self.selected_untracked() {
+            self.act(|c| c.resign_files(&id));
+        }
+    }
+
     pub fn draft_files(&self) -> Vec<DraftFile> {
         self.reads.draft_files.get()
     }
