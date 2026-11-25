@@ -144,6 +144,30 @@ pub(crate) async fn spawn_local_attach_listener(
     Ok(())
 }
 
+/// Read one line, but never more than one byte past the largest frame: a
+/// client that sends no newline cannot make the bridge buffer without end.
+/// A line longer than [`LOCAL_ATTACH_MAX_FRAME_BYTES`] comes back over that
+/// length, for the caller to refuse.
+async fn read_bounded_line<R>(reader: &mut R, line: &mut String) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut limited = reader.take(LOCAL_ATTACH_MAX_FRAME_BYTES as u64 + 1);
+    limited.read_line(line).await
+}
+
+/// Whether `given` is the attach secret, compared in constant time over
+/// equal lengths so the comparison leaks nothing of how much matched.
+pub(crate) fn same_secret(given: &str, expected: &str) -> bool {
+    given.len() == expected.len()
+        && given
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 pub(crate) async fn handle_local_attach_socket(
     socket: TcpStream,
     events_tx: tokio::sync::mpsc::UnboundedSender<LocalAttachEvent>,
@@ -153,7 +177,7 @@ pub(crate) async fn handle_local_attach_socket(
     let mut reader = BufReader::new(read_half);
 
     let mut first_line = String::new();
-    let first_read = reader.read_line(&mut first_line).await?;
+    let first_read = read_bounded_line(&mut reader, &mut first_line).await?;
     if first_read == 0 || first_line.len() > LOCAL_ATTACH_MAX_FRAME_BYTES {
         anyhow::bail!("missing or oversized attach frame");
     }
@@ -289,7 +313,7 @@ pub(crate) async fn handle_local_attach_socket(
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = reader.read_line(&mut line).await?;
+                let n = read_bounded_line(&mut reader, &mut line).await?;
                 if n == 0 {
                     break;
                 }
@@ -428,5 +452,32 @@ pub(crate) async fn handle_local_attach_socket(
             .await?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_line_without_end_is_read_only_to_the_frame_limit() {
+        let endless = vec![b'a'; LOCAL_ATTACH_MAX_FRAME_BYTES * 4];
+        let mut reader = tokio::io::BufReader::new(&endless[..]);
+        let mut line = String::new();
+        let n = read_bounded_line(&mut reader, &mut line).await.unwrap();
+        assert_eq!(n, LOCAL_ATTACH_MAX_FRAME_BYTES + 1);
+        assert!(line.len() > LOCAL_ATTACH_MAX_FRAME_BYTES);
+        let mut short = tokio::io::BufReader::new(&b"{\"type\":\"attach\"}\nnext"[..]);
+        let mut line = String::new();
+        read_bounded_line(&mut short, &mut line).await.unwrap();
+        assert_eq!(line, "{\"type\":\"attach\"}\n");
+    }
+
+    #[test]
+    fn the_secret_matches_only_itself() {
+        assert!(same_secret("s3cret-synthetic", "s3cret-synthetic"));
+        assert!(!same_secret("s3cret-synthetiX", "s3cret-synthetic"));
+        assert!(!same_secret("s3cret", "s3cret-synthetic"));
+        assert!(!same_secret("", "s3cret-synthetic"));
     }
 }

@@ -115,7 +115,7 @@ impl TerminalBridge {
                 tx,
                 response_tx,
             } => {
-                if secret != self.local_attach_secret {
+                if !crate::local_attach::same_secret(&secret, &self.local_attach_secret) {
                     let _ =
                         response_tx.send(Err(anyhow::anyhow!("local attach authorization failed")));
                     return Ok(());
@@ -185,7 +185,7 @@ impl TerminalBridge {
                 tx,
                 response_tx,
             } => {
-                if secret != self.local_attach_secret {
+                if !crate::local_attach::same_secret(&secret, &self.local_attach_secret) {
                     let _ =
                         response_tx.send(Err(anyhow::anyhow!("local start authorization failed")));
                     return Ok(());
@@ -266,7 +266,7 @@ impl TerminalBridge {
                 session_id,
                 response_tx,
             } => {
-                if secret != self.local_attach_secret {
+                if !crate::local_attach::same_secret(&secret, &self.local_attach_secret) {
                     let _ =
                         response_tx.send(Err(anyhow::anyhow!("local share authorization failed")));
                     return Ok(());
