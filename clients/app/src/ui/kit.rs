@@ -1670,6 +1670,9 @@ pub struct ViewerActions {
     pub mark_up: MarkUp,
     /// It opened on a picture (the share sheet fetches it ahead).
     pub opened: std::rc::Rc<dyn Fn(&Viewed)>,
+    /// Its picture failed to load: its link may have expired, so where it
+    /// came from is read again for a new one.
+    pub failed: std::rc::Rc<dyn Fn(&Viewed)>,
 }
 
 /// The picture viewer: the picture over a dark backdrop, as large as fits,
@@ -1852,7 +1855,11 @@ fn viewer(
             image(shown.url.clone())
                 .w_full()
                 .h_full()
-                .object_fit(ResizeMode::Contain),
+                .object_fit(ResizeMode::Contain)
+                .on_error({
+                    let (failed, shown) = (actions.failed.clone(), shown.clone());
+                    move |_: &str| failed(&shown)
+                }),
         )
         .child(marks)
         .child(when(move || marking.get(), move || pad.clone()));
@@ -1984,7 +1991,13 @@ fn viewer(
 /// A picture filling its place, fitted whole, that zooms where it is:
 /// a press or click (in to 2.5x, then back out), pinch, or Ctrl + wheel.
 /// `pixels` gives its shape (square until known).
-pub fn zoomable_picture(url: String, label: String, pixels: Option<(u32, u32)>) -> View {
+/// `on_error`: the picture failed to load (its link may have expired).
+pub fn zoomable_picture(
+    url: String,
+    label: String,
+    pixels: Option<(u32, u32)>,
+    on_error: impl Fn() + 'static,
+) -> View {
     let room = signal((0.0f32, 0.0f32));
     let ratio = pixels
         .filter(|(w, h)| *w > 0 && *h > 0)
@@ -2015,7 +2028,13 @@ pub fn zoomable_picture(url: String, label: String, pixels: Option<(u32, u32)>) 
             commanded.set(Some(now()));
             zoomer.zoom_to(to, None, true);
         })
-        .child(image(url).w_full().h_full().object_fit(ResizeMode::Contain));
+        .child(
+            image(url)
+                .w_full()
+                .h_full()
+                .object_fit(ResizeMode::Contain)
+                .on_error(move |_: &str| on_error()),
+        );
     let zoomable = scroll()
         .w_full()
         .h_full()

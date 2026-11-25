@@ -3155,11 +3155,70 @@ impl Store {
     }
 
     /// A file of the conversation on screen failed to load: its link may
-    /// have expired, so the conversation is read again (once) for new ones.
+    /// have expired (or every link stopped: a device was revoked), so the
+    /// conversation is read again for new ones, once per batch of links.
     pub fn file_failed(&self) {
         if let Some(id) = self.selected_untracked() {
-            self.act(|c| c.resign_files(&id));
+            self.act(|c| c.resign_files(&id, now_ms()));
         }
+    }
+
+    /// The open project file's picture failed to load: read the file
+    /// again for a freshly signed link, once per batch of links.
+    pub fn project_file_failed(&self) {
+        self.act(|c| c.resign_project_file(now_ms()));
+    }
+
+    /// The picture in the viewer failed to load: it came from the
+    /// conversation on screen or the open project file, so both are read
+    /// again for new links (each once per batch).
+    pub fn viewed_failed(&self) {
+        self.file_failed();
+        self.project_file_failed();
+    }
+
+    /// Keep the viewer's link current: when a read again brings its
+    /// picture a freshly signed link (the conversation on screen, or the
+    /// open project file), the viewer takes it. Mount once.
+    pub fn keep_viewed_link_fresh(&self) {
+        let store = *self;
+        effect(move || {
+            let Some(shown) = store.viewing.get() else {
+                return;
+            };
+            let fresh = store.fresh_link(&shown.id);
+            if let Some(url) = fresh
+                && url != shown.url
+            {
+                store.viewing.set(Some(crate::ui::Viewed { url, ..shown }));
+            }
+        });
+    }
+
+    /// The current link of the file `id`: in the conversation on screen,
+    /// else the open project file's.
+    fn fresh_link(&self, id: &str) -> Option<String> {
+        let session = self.selected.get();
+        let file = self.read(|c| {
+            let in_session = session
+                .as_ref()
+                .and_then(|s| c.state.sessions.get(s))
+                .and_then(|view| {
+                    view.lines.iter().find_map(|line| match line {
+                        Line::User { attachments, .. } | Line::Assistant { attachments, .. } => {
+                            attachments.iter().find(|a| a.id == id).cloned()
+                        }
+                        _ => None,
+                    })
+                });
+            in_session.or_else(|| match &c.files_file {
+                aidaemon_client_core::Read::Ready(file) => {
+                    file.link.clone().filter(|link| link.id == id)
+                }
+                _ => None,
+            })
+        })?;
+        self.file_url(&file)
     }
 
     pub fn draft_files(&self) -> Vec<DraftFile> {

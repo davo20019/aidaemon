@@ -530,6 +530,8 @@ fn shown_file(store: Store, link: AttachmentRef, size_bytes: u64) -> View {
                 url,
                 format!("Picture: {}", link.name),
                 pixels,
+                // Its link may have expired: read the file again.
+                move || store.project_file_failed(),
             ))
             .child(view().flex_row().justify_center().p_2().child(ui::btn(
                 "Full screen",

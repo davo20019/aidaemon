@@ -256,10 +256,10 @@ pub fn shell(store: Store) -> View {
         }))
         .child(when(palette, move || palette_dialog(store, palette)))
         .child(crate::features::sidebar::move_picker(store))
-        .child(crate::ui::picture_viewer(
-            store.viewing(),
-            picture_actions(store),
-        ))
+        .child({
+            store.keep_viewed_link_fresh();
+            crate::ui::picture_viewer(store.viewing(), picture_actions(store))
+        })
         .child(crate::ui::live_screen(live_screen(store, false)))
         // A phone's open list is a surface of its own, over this one: a
         // note about what was done there shows in it (see the drawer).
@@ -771,6 +771,7 @@ fn picture_actions(store: Store) -> crate::ui::ViewerActions {
             can_mark_up: Rc::new(move || store.takes_files()),
             mark_up: Rc::new(move |shown: &Viewed, strokes| store.attach_marked(shown, strokes)),
             opened: Rc::new(|shown: &Viewed| web::prefetch_share(&shown.url)),
+            failed: Rc::new(move |_: &Viewed| store.viewed_failed()),
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -793,6 +794,7 @@ fn picture_actions(store: Store) -> crate::ui::ViewerActions {
             can_mark_up: Rc::new(|| false),
             mark_up: Rc::new(|_: &Viewed, _| {}),
             opened: Rc::new(|_: &Viewed| {}),
+            failed: Rc::new(move |_: &Viewed| store.viewed_failed()),
         }
     }
 }

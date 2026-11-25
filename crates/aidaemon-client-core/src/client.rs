@@ -344,9 +344,9 @@ pub struct Client {
     outgoing: Vec<(String, Command)>,
     /// Sessions whose history was asked for.
     fetched: BTreeSet<String>,
-    /// Sessions read again because a file link failed (see
+    /// Sessions read again because a file link failed, and when (see
     /// [`Client::resign_files`]).
-    resigned: BTreeSet<String>,
+    resigned: BTreeMap<String, u64>,
     /// The request of a message that starts a new session.
     starting: Option<String>,
     turns: BTreeMap<String, TurnLog>,
@@ -414,6 +414,9 @@ pub struct Client {
     pub files_file: Read<ProjectFile>,
     files_file_request: Option<String>,
     files_file_asked: Option<Command>,
+    /// The open file read again because its link failed, and when (see
+    /// [`Client::resign_project_file`]).
+    files_file_resigned: Option<(Command, u64)>,
     /// The daemon's slash commands.
     pub commands: Vec<SlashCommand>,
     project_request: Option<String>,
@@ -1580,6 +1583,29 @@ impl Client {
         self.files_file_request = Some(self.send(command));
     }
 
+    /// The open project file's link (a picture or PDF) failed to load at
+    /// `now_ms`: links expire, and all stop when a device is revoked, so
+    /// read the file again for a freshly signed one, keeping what shows
+    /// until it comes. As [`Client::resign_files`]: once per batch of
+    /// links, not again within [`RESIGN_AGAIN_MS`]; whether it asked.
+    pub fn resign_project_file(&mut self, now_ms: u64) -> bool {
+        let Some(command) = self.files_file_asked.clone() else {
+            return false;
+        };
+        if !self.is_online() || self.files_file_request.is_some() {
+            return false;
+        }
+        if let Some((asked, at)) = &self.files_file_resigned
+            && *asked == command
+            && now_ms.saturating_sub(*at) < RESIGN_AGAIN_MS
+        {
+            return false;
+        }
+        self.files_file_resigned = Some((command.clone(), now_ms));
+        self.files_file_request = Some(self.send(command));
+        true
+    }
+
     /// Close the open file; an answer still on its way is dropped.
     pub fn close_project_file(&mut self) {
         self.files_file_request = None;
@@ -2354,14 +2380,23 @@ impl Client {
         }
     }
 
-    /// A file or picture link of `id`'s failed to load. The gateway's links
-    /// expire, so read the conversation's history again: it brings each
-    /// file a freshly signed link. Once per conversation, so a link that
-    /// fails for another reason never loops; whether it asked.
-    pub fn resign_files(&mut self, id: &str) -> bool {
-        if !self.is_online() || !self.resigned.insert(id.to_owned()) {
+    /// A file or picture link of `id`'s failed to load at `now_ms`. The
+    /// gateway's links expire, and all of them stop at once when a device
+    /// is revoked (its link key rotates), so read the conversation's
+    /// history again: it brings each file a freshly signed link. Once per
+    /// batch of links: not again within [`RESIGN_AGAIN_MS`] of the last
+    /// read, so a link that fails for another reason, right after the
+    /// fresh ones came, never loops; whether it asked.
+    pub fn resign_files(&mut self, id: &str, now_ms: u64) -> bool {
+        if !self.is_online() {
             return false;
         }
+        if let Some(at) = self.resigned.get(id)
+            && now_ms.saturating_sub(*at) < RESIGN_AGAIN_MS
+        {
+            return false;
+        }
+        self.resigned.insert(id.to_owned(), now_ms);
         self.read_history(id);
         true
     }
@@ -3361,6 +3396,11 @@ pub fn platform_name(id: &str) -> &'static str {
     }
 }
 
+/// How soon a conversation whose file links failed may be read again for
+/// new ones ([`Client::resign_files`]): long enough that links failing for
+/// another reason, right after fresh ones came, do not loop.
+pub const RESIGN_AGAIN_MS: u64 = 60_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3535,22 +3575,76 @@ mod tests {
         }
     }
 
-    /// A failed file link reads the conversation again once, never more.
+    /// A failed file link reads the conversation again once per batch of
+    /// links: not right after a read, again once the links can have
+    /// stopped anew (expiry, a revoked device rotating the key).
+    /// A project file whose link failed is read again, once per batch.
     #[test]
-    fn a_failed_file_link_reads_the_history_again_once() {
+    fn a_failed_project_file_link_reads_the_file_again_once_per_batch() {
         let mut client = Client::new();
-        assert!(!client.resign_files("app:s1"), "offline: nothing to read");
+        client.update(Update::Connected, &cx(None));
+        assert!(!client.resign_project_file(1_000), "no file open");
+        client.read_project_file("p1", "docs/plan.pdf");
+        let first = client.take_outgoing();
+        let (request, _) = first.last().expect("read sent").clone();
+        // Still reading: the answer brings fresh links anyway.
+        assert!(!client.resign_project_file(1_000));
+        client.update(
+            Update::Frame(ServerFrame::Ack {
+                request_id: request,
+                result: CommandResult::ProjectFile {
+                    file: serde_json::from_value(serde_json::json!({
+                        "project_id": "p1", "path": "docs/plan.pdf", "size_bytes": 10, "version": "sha256:00"
+                    }))
+                    .expect("file"),
+                },
+            }),
+            &cx(None),
+        );
+        assert!(client.resign_project_file(2_000));
+        let sent = client.take_outgoing();
+        assert!(sent.iter().any(|(_, c)| matches!(
+            c,
+            Command::ReadProjectFile { path, .. } if path == "docs/plan.pdf"
+        )));
+        assert!(matches!(client.files_file, Read::Ready(_)), "keeps what shows");
+        let (request, _) = sent.last().expect("read sent").clone();
+        client.update(
+            Update::Frame(ServerFrame::Ack {
+                request_id: request,
+                result: CommandResult::ProjectFile {
+                    file: serde_json::from_value(serde_json::json!({
+                        "project_id": "p1", "path": "docs/plan.pdf", "size_bytes": 10, "version": "sha256:00"
+                    }))
+                    .expect("file"),
+                },
+            }),
+            &cx(None),
+        );
+        // Right after the fresh link came: no loop.
+        assert!(!client.resign_project_file(2_000 + RESIGN_AGAIN_MS - 1));
+        assert!(client.resign_project_file(2_000 + RESIGN_AGAIN_MS));
+    }
+
+    #[test]
+    fn a_failed_file_link_reads_the_history_again_once_per_batch() {
+        let mut client = Client::new();
+        assert!(!client.resign_files("app:s1", 1_000), "offline: nothing to read");
         client.update(Update::Connected, &cx(None));
         client.take_outgoing();
-        assert!(client.resign_files("app:s1"));
+        assert!(client.resign_files("app:s1", 1_000));
         let sent = client.take_outgoing();
         assert!(sent.iter().any(|(_, c)| matches!(
             c,
             Command::GetHistory { session_id, .. } if session_id == "app:s1"
         )));
-        assert!(!client.resign_files("app:s1"));
+        // A failure right after the fresh links came does not loop.
+        assert!(!client.resign_files("app:s1", 1_000 + RESIGN_AGAIN_MS - 1));
         assert!(client.take_outgoing().is_empty());
-        assert!(client.resign_files("app:s2"));
+        assert!(client.resign_files("app:s2", 1_500));
+        // Later the links stop again (a device revoked): read again.
+        assert!(client.resign_files("app:s1", 1_000 + RESIGN_AGAIN_MS));
+        assert!(!client.take_outgoing().is_empty());
     }
 
     #[test]
