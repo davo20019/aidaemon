@@ -56,11 +56,14 @@ pub fn approvals(store: Store) {
                 if permission != NotificationPermission::Granted {
                     return;
                 }
+                // A system notification shows on a locked screen: it names
+                // the conversation, never what is asked (a command, a
+                // file's contents), which the app shows once opened.
                 for approval in new {
                     let body = format!("In {} · tap to review", store.title(&approval.session_id));
                     let _ = show_notification(Notification::new(
                         format!("{PREFIX}{}", approval.id),
-                        format!("Approval needed: {}", approval.summary),
+                        "Approval needed".to_owned(),
                         body,
                     ))
                     .await;
