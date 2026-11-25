@@ -215,23 +215,23 @@ pub async fn can_listen() -> bool {
     #[cfg(target_arch = "wasm32")]
     return web::dictation_available();
     #[cfg(not(target_arch = "wasm32"))]
-    nsh_core::prelude::speech_available().await
+    nsh_extra::speech::available().await
 }
 
 /// A dictation session: the transcript as it grows, then its end. Dropping
 /// it ends it at once.
 pub struct Listening {
     #[cfg(not(target_arch = "wasm32"))]
-    inner: nsh_core::element::SpeechRecognition,
+    inner: nsh_extra::speech::SpeechRecognition,
     #[cfg(target_arch = "wasm32")]
     inner: web::Dictation,
 }
 
 impl Listening {
     /// Start listening as `request` asks.
-    pub fn start(request: nsh_core::speech::SpeechRequest) -> Self {
+    pub fn start(request: nsh_extra::speech::SpeechRequest) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let inner = nsh_core::prelude::recognize_speech(request);
+        let inner = nsh_extra::speech::recognize(request);
         #[cfg(target_arch = "wasm32")]
         let inner = web::Dictation::start(request);
         Self { inner }
@@ -241,7 +241,7 @@ impl Listening {
     pub fn poll_next(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<nsh_core::speech::SpeechEvent>> {
+    ) -> std::task::Poll<Option<nsh_extra::speech::SpeechEvent>> {
         self.inner.poll_next(cx)
     }
 

@@ -16,8 +16,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NSH_VERSION: "0.6.1"
-  NSH_LINUX_SHA256: "9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070"
+  NSH_VERSION: "0.7.1"
+  NSH_LINUX_SHA256: "04457ad3a53c91b66efcee537968c5af7c90df25cf61c18d51135ecc051e22b3"
 
 jobs:
   android-beta:

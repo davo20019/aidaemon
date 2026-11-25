@@ -872,7 +872,7 @@ fn reply_actions(store: Store, reply: String) -> View {
         .items_center()
         .gap_4()
         .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
-            set_clipboard(copied.clone());
+            drop(set_clipboard(copied.clone()));
             store.say("Copied the reply");
         }))
         .child(super::conversation::read_aloud(store, move || {

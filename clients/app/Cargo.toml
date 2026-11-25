@@ -14,8 +14,9 @@ name = "aidaemon-app"
 path = "src/main.rs"
 
 [dependencies]
-nsh-core = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6" }
-nsh-base = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6" }
+nsh-extra = { version = "0.7.1", features = ["speech"] }
+nsh-core = "0.7.1"
+nsh-base = "0.7.1"
 env_logger = "0.11"
 log = "0.4"
 serde_json = "1"
@@ -38,9 +39,9 @@ dirs = "6"
 # The terminal build (`--tui`, the desktops only): NSH's terminal surface
 # and its input glue. iOS and Android build the library alone.
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nsh-platform-tui = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6", default-features = false, features = ["run-app"] }
-nsh-tui-host = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6" }
-nsh-engine = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6" }
+nsh-platform-tui = { version = "0.7.1", default-features = false, features = ["run-app"] }
+nsh-tui-host = "0.7.1"
+nsh-engine = "0.7.1"
 ratatui-core = { version = "0.1.2", features = ["std", "layout-cache", "underline-color"] }
 ratatui-crossterm = "0.1.2"
 crossterm = "0.29"
@@ -54,24 +55,18 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
-nsh-engine = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6" }
-nsh-testing = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6" }
+nsh-engine = "0.7.1"
+nsh-testing = "0.7.1"
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nsh-platform-linux = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-linux = { version = "0.7.1", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nsh-platform-macos = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-macos = { version = "0.7.1", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nsh-platform-windows = { git = "https://github.com/davo20019/nsh", rev = "70040584fcbe236c95a1a1b05c533ba300def8b6", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-windows = { version = "0.7.1", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
 
 [build-dependencies]
 serde_json = "1"
-
-# nsh's crates come from a fork at v0.6.1 plus one web fix: an autoFocus
-# input focused in the batch that shows it, inside the tap, where iOS
-# Safari raises the keyboard (longbridge/nsh#2888, PR #2889). `nsh package`
-# ignores [patch], so every nsh crate names the fork; CI checks the web
-# build took it. Back to crates.io once a release has #2889.

@@ -1006,7 +1006,7 @@ fn direct_agent_answer(
                 let spoken = reply_text.clone();
                 actions = actions
                     .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
-                        set_clipboard(copied.clone());
+                        drop(set_clipboard(copied.clone()));
                         store.say("Copied the reply");
                     }))
                     .child(read_aloud(store, move || spoken.clone()));
@@ -1616,7 +1616,7 @@ fn header(store: Store, session: Option<String>) -> View {
                             move || {
                                 let _ = &label;
                                 if let Some(text) = store.transcript_markdown() {
-                                    set_clipboard(text);
+                                    drop(set_clipboard(text));
                                     store.say("Copied the conversation");
                                 }
                             },
@@ -2417,7 +2417,7 @@ fn reply_footer(
         .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, {
             let content = content.clone();
             move || {
-                set_clipboard(content());
+                drop(set_clipboard(content()));
                 store.say("Copied the reply");
             }
         }))
@@ -2503,7 +2503,7 @@ fn message_footer(
         .gap_1()
         .child(stamp(at))
         .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
-            set_clipboard(copied());
+            drop(set_clipboard(copied()));
             store.say("Copied the message");
         }))
         .child(ui::icon_btn(
@@ -3572,7 +3572,7 @@ pub(crate) fn dictation_for(
     };
 
     use crate::link::Listening;
-    use nsh_core::speech::{SpeechEvent, SpeechRequest};
+    use nsh_extra::speech::{SpeechEvent, SpeechRequest};
 
     let available = signal(false);
     if !terminal {
@@ -3739,8 +3739,8 @@ fn after_heard(transcript: &str, heard: &str) -> String {
 
 /// What to tell the owner when listening failed; nothing when it only
 /// heard nothing.
-fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
-    use nsh_core::speech::SpeechError;
+fn speech_note(error: nsh_extra::speech::SpeechError) -> Option<&'static str> {
+    use nsh_extra::speech::SpeechError;
     match error {
         SpeechError::NoSpeech => None,
         SpeechError::NotAllowed => Some(

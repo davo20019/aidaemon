@@ -286,14 +286,14 @@ pub fn dictation_available() -> bool {
 /// recognizer does. Dropping it aborts it.
 pub struct Dictation {
     js: DictationJs,
-    events: mpsc::UnboundedReceiver<nsh_core::speech::SpeechEvent>,
+    events: mpsc::UnboundedReceiver<nsh_extra::speech::SpeechEvent>,
     // Called by the page until the session ends; kept as long as it can be.
     _event: Closure<dyn FnMut(String, String)>,
 }
 
 impl Dictation {
-    pub fn start(request: nsh_core::speech::SpeechRequest) -> Self {
-        use nsh_core::speech::SpeechEvent;
+    pub fn start(request: nsh_extra::speech::SpeechRequest) -> Self {
+        use nsh_extra::speech::SpeechEvent;
         let (tx, events) = mpsc::unbounded();
         let event = Closure::<dyn FnMut(String, String)>::new(move |kind: String, text: String| {
             // `kind` is one of the names `Dictation` in js/browser.js sends
@@ -330,10 +330,10 @@ impl Dictation {
     pub fn poll_next(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<nsh_core::speech::SpeechEvent>> {
+    ) -> std::task::Poll<Option<nsh_extra::speech::SpeechEvent>> {
         let polled = self.events.poll_next_unpin(cx);
         // Nothing comes after the end.
-        if let std::task::Poll::Ready(Some(nsh_core::speech::SpeechEvent::End { .. })) = &polled {
+        if let std::task::Poll::Ready(Some(nsh_extra::speech::SpeechEvent::End { .. })) = &polled {
             self.events.close();
         }
         polled
@@ -352,8 +352,8 @@ impl Drop for Dictation {
 
 /// A Web Speech API error name as NSH names it; `None` when the session
 /// only ended or was aborted. Names are the API's own (a machine format).
-fn speech_error(name: &str) -> Option<nsh_core::speech::SpeechError> {
-    use nsh_core::speech::SpeechError;
+fn speech_error(name: &str) -> Option<nsh_extra::speech::SpeechError> {
+    use nsh_extra::speech::SpeechError;
     match name {
         "" | "aborted" => None,
         "service-not-allowed" => Some(SpeechError::NotAllowed),

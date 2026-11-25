@@ -434,7 +434,7 @@ fn file_view(
                 )
                 .child(ui::btn("Copy path", Variant::Ghost, Size::Sm, {
                     let path = path.clone();
-                    move || set_clipboard(path.clone())
+                    move || drop(set_clipboard(path.clone()))
                 }))
                 .child(full_screen(store, id, path.clone(), in_page)),
         )

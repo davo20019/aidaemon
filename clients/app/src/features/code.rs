@@ -303,7 +303,7 @@ fn file_diff(
                     move || split.update(|s| *s = !*s),
                 ))
                 .child(ui::btn("Copy", Variant::Ghost, Size::Sm, move || {
-                    set_clipboard(section.get_untracked())
+                    drop(set_clipboard(section.get_untracked()));
                 })),
         )
         .child(dynamic(move || {

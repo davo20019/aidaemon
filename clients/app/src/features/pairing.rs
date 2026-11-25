@@ -286,7 +286,7 @@ fn phone_pairing(store: Store, auto: bool, on_paired: Option<std::rc::Rc<dyn Fn(
                         }))
                         .child(btn("Copy link", Variant::Ghost, Size::Sm, {
                             let link = offer.phone_link();
-                            move || set_clipboard(link.clone())
+                            move || drop(set_clipboard(link.clone()))
                         }))
                         .child(btn("Cancel", Variant::Ghost, Size::Sm, move || {
                             phase.set(Phone::Idle)

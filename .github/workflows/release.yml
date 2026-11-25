@@ -16,10 +16,10 @@ env:
   CODEX_CLI_VERSION: "0.151.0"
   # The app (clients/app) toolchain: the web bundle needs the nsh CLI and the
   # wasm-bindgen CLI matching the app's wasm-bindgen crate.
-  NSH_VERSION: "0.6.1"
-  NSH_LINUX_SHA256: "9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070"
-  NSH_MACOS_SHA256: "ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de"
-  WASM_BINDGEN_CLI_VERSION: "0.2.130"
+  NSH_VERSION: "0.7.1"
+  NSH_LINUX_SHA256: "04457ad3a53c91b66efcee537968c5af7c90df25cf61c18d51135ecc051e22b3"
+  NSH_MACOS_SHA256: "28e349b59c0b46e964010c8f858a78af5db4d26012d213c03d15ce28ddff0650"
+  WASM_BINDGEN_CLI_VERSION: "0.2.129"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the
   # integration suite needs. Match the daemon's own worker stack budget.

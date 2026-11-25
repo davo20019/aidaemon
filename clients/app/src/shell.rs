@@ -421,7 +421,7 @@ fn always() -> KeyOptions {
 fn copy_reply(store: Store) {
     match store.last_reply() {
         Some(reply) => {
-            set_clipboard(reply);
+            drop(set_clipboard(reply));
             store.say("Copied the last reply");
         }
         None => store.say("No reply to copy yet"),
@@ -597,7 +597,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 "copy-reply" => copy_reply(store),
                                 "copy-all" => {
                                     if let Some(text) = store.transcript_markdown() {
-                                        set_clipboard(text);
+                                        drop(set_clipboard(text));
                                         store.say("Copied the conversation");
                                     }
                                 }

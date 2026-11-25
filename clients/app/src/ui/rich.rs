@@ -226,7 +226,7 @@ pub fn output_panel(detail: impl Fn() -> String + Clone + 'static, label: &'stat
                     }))
                 }))
                 .child(btn("Copy", Variant::Ghost, Size::Sm, move || {
-                    set_clipboard(copy())
+                    drop(set_clipboard(copy()));
                 })),
         )
 }

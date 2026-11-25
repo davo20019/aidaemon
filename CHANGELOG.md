@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The app's conversation list names the coding agent a conversation is set to** (`project · Claude Code`; just the agent inside a project), so a conversation whose messages go straight to a CLI stands apart. A conversation's agents line under its row opens its Agents tab.
+- **The app is on Native Shell 0.7.1 from crates.io,** no longer a fork of 0.6.1: dictation comes from the `nsh-extra` speech module, the desktop app draws in an explicit main window that quits the app when closed, and CI and releases use the 0.7.1 `nsh` CLI.
 
 ## [0.24.0] - 2026-11-25
 

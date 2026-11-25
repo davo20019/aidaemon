@@ -1417,6 +1417,7 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
             x: Points(0.0),
             y: Points(-45.0),
         },
+        nsh_testing::DragOptions::default(),
     )?;
     app.wait_until(
         "Delta api above Charlie docs",
@@ -1441,6 +1442,7 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
             x: Points(0.0),
             y: Points(-31.0),
         },
+        nsh_testing::DragOptions::default(),
     )?;
     app.wait_until(
         "Beta app above Acme site",
@@ -1673,9 +1675,9 @@ fn resting_the_pointer_on_a_conversation_previews_it() -> Result<(), String> {
 /// A recognizer that hears one sentence and ends when stopped.
 struct Hears;
 
-struct Session(nsh_core::speech::SpeechSink);
+struct Session(nsh_extra::speech::SpeechSink);
 
-impl nsh_core::speech::SpeechControl for Session {
+impl nsh_extra::speech::SpeechControl for Session {
     fn stop(&mut self) {
         self.0.result("and add a test", true);
         self.0.end(None);
@@ -1683,12 +1685,12 @@ impl nsh_core::speech::SpeechControl for Session {
     fn abort(&mut self) {}
 }
 
-impl nsh_core::speech::SpeechBackend for Hears {
+impl nsh_extra::speech::SpeechBackend for Hears {
     fn start(
         &self,
-        _: nsh_core::speech::SpeechRequest,
-        events: nsh_core::speech::SpeechSink,
-    ) -> Box<dyn nsh_core::speech::SpeechControl> {
+        _: nsh_extra::speech::SpeechRequest,
+        events: nsh_extra::speech::SpeechSink,
+    ) -> Box<dyn nsh_extra::speech::SpeechControl> {
         events.start();
         events.result("and add", false);
         Box::new(Session(events))
@@ -1703,7 +1705,16 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.os = nsh_core::platform::Os::MacOs;
     config.environment.idiom = nsh_core::platform::Idiom::Desktop;
-    config.speech = Some(std::sync::Arc::new(Hears));
+    // Process-wide in nsh-extra: put the platform's back when done, so
+    // later tests see no recognizer where the host has none.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            nsh_extra::speech::set_backend(None);
+        }
+    }
+    let _restore = Restore;
+    nsh_extra::speech::set_backend(Some(std::sync::Arc::new(Hears)));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("What can I help you with?")?;
     app.type_text("label:Message", "Fix the footer")?;

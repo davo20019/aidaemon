@@ -153,11 +153,7 @@ pub fn Offline() -> impl IntoElement {
             }
         }
     });
-    view()
-        .flex_1()
-        .bg(ui::colors::BACKGROUND)
-        .text_color(ui::colors::TEXT)
-        .child(shell::shell(store))
+    main_window(store)
 }
 
 /// The root: the store, the link, the shell.
@@ -171,11 +167,23 @@ pub fn App() -> impl IntoElement {
     store.restore();
     ui::face::load();
     link::start(store);
-    view()
-        .flex_1()
-        .bg(ui::colors::BACKGROUND)
-        .text_color(ui::colors::TEXT)
-        .child(shell::shell(store))
+    main_window(store)
+}
+
+/// The app's one window (NSH draws nothing on a desktop outside a
+/// window), holding the shell; its content is the whole screen elsewhere.
+/// Closing it quits, as the app has no other window to keep running for.
+fn main_window(store: store::Store) -> impl IntoElement {
+    nsh_core::element::desktop::set_quit_mode(nsh_core::desktop::QuitMode::LastWindowClosed);
+    nsh_core::element::desktop::window()
+        .id("main")
+        .content(move || {
+            view()
+                .flex_1()
+                .bg(ui::colors::BACKGROUND)
+                .text_color(ui::colors::TEXT)
+                .child(shell::shell(store))
+        })
 }
 
 #[cfg(test)]
