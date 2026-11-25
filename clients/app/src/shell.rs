@@ -277,33 +277,70 @@ pub fn shell(store: Store) -> View {
 /// The app's notes, wherever they are shown.
 /// Pairing links opened on this device (a QR code, a tapped link), whatever
 /// screen is up: nsh hands each to one listener, so this is the only one.
-/// The pairing screen uses it; an app already paired asks first, since
-/// pairing again forgets the daemon it has (which may be unreachable at its
-/// old address, the reason to open a new link).
+/// Every link is confirmed first, naming the daemon it pairs with: any page
+/// or message can open an `aidaemon-pair:` link, and pairing hands that
+/// daemon what is typed here next (model keys in setup, messages). An app
+/// already paired is also told that pairing replaces its pairing. A link
+/// is kept for the pairing screen only when that screen is what comes next;
+/// one that has nothing to pair is dropped, never kept for later.
 fn listen_for_pairing_links(store: Store) {
     spawn(async move {
         loop {
             let opened = next_url_scheme_open().await;
-            let signed_in_elsewhere = crate::link::signs_in_paired()
-                && !matches!(
+            let Some(parsed) = aidaemon_client_core::signin::PairingLink::parse(&opened) else {
+                log::warn!("ignored a link that is not a pairing link");
+                continue;
+            };
+            let daemon = pairing_target(&parsed.gateway, parsed.remote.as_deref());
+            let paired = crate::link::signs_in_paired();
+            let detail = if paired {
+                format!(
+                    "This link pairs this app with {daemon}. This app is paired already: pairing with this link replaces that pairing. Pair only if you opened this link from your own AIDaemon."
+                )
+            } else {
+                format!(
+                    "This link pairs this app with {daemon}. Pair only if you opened this link from your own AIDaemon: it receives what you type here."
+                )
+            };
+            crate::ui::confirm("Pair with this AIDaemon?", detail, "Pair", move || {
+                let waiting_for_pairing = matches!(
                     store.connection_untracked(),
                     Connection::NoDaemon | Connection::NeedsPairing
                 );
-            if signed_in_elsewhere {
-                crate::ui::confirm(
-                    "Pair with this AIDaemon?",
-                    "This app is paired already. Pairing with this link replaces that pairing.",
-                    "Pair",
-                    move || {
-                        store.open_pairing_link(opened);
-                        crate::link::pair_again(store);
-                    },
-                );
-            } else {
-                store.open_pairing_link(opened);
-            }
+                if waiting_for_pairing {
+                    store.open_pairing_link(opened);
+                } else if paired {
+                    store.open_pairing_link(opened);
+                    crate::link::pair_again(store);
+                } else {
+                    // Signed in on the daemon's own machine: nothing to pair.
+                    log::warn!("ignored a pairing link: this app signs in on its daemon's machine");
+                }
+            });
         }
     });
+}
+
+/// The daemon a pairing link names, as the owner can check it: the key of
+/// its peer-to-peer address when it has one (machine format: the authority
+/// of an `iroh://<key>@<relay>` URL), and its gateway's host.
+fn pairing_target(gateway: &str, remote: Option<&str>) -> String {
+    let host = gateway
+        .split_once("://")
+        .map_or(gateway, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let key = remote
+        .and_then(|r| r.strip_prefix("iroh://"))
+        .and_then(|r| r.split(['@', '/', '?']).next())
+        .filter(|k| !k.is_empty());
+    match (key, host.is_empty()) {
+        (Some(key), true) => format!("the AIDaemon whose key is {key}"),
+        (Some(key), false) => format!("the AIDaemon at {host}, whose key is {key}"),
+        (None, false) => format!("the AIDaemon at {host}"),
+        (None, true) => "an AIDaemon this link does not name".to_owned(),
+    }
 }
 
 fn toasts(store: Store) -> impl IntoElement {

@@ -21,10 +21,13 @@ fn native(registry: &mut Registry) {
 /// scroll, search and copy.
 static PARTING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// Keep `text` to print once the terminal app has quit.
+/// Keep `text` to print once the terminal app has quit. It goes to the
+/// real terminal, outside the app's drawing, and holds what the model and
+/// its tools wrote: escape sequences in it (a title, the clipboard, links,
+/// cursor moves over the scrollback) are taken out first.
 pub fn set_parting_words(text: String) {
     if let Ok(mut parting) = PARTING.lock() {
-        *parting = Some(text);
+        *parting = Some(aidaemon_client_core::text::plain_output(&text));
     }
 }
 
@@ -173,4 +176,20 @@ pub fn App() -> impl IntoElement {
         .bg(ui::colors::BACKGROUND)
         .text_color(ui::colors::TEXT)
         .child(shell::shell(store))
+}
+
+#[cfg(test)]
+mod parting_tests {
+    #[test]
+    fn the_quit_transcript_carries_no_escape_sequences() {
+        super::set_parting_words(
+            "Reply\u{1b}]52;c;ZXZpbA==\u{7} done\u{1b}]0;title\u{7}\n\u{9b}2J\u{1b}[2Jend".into(),
+        );
+        let text = super::take_parting_words().unwrap();
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.starts_with("Reply done"), "{text:?}");
+    }
 }

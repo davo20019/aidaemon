@@ -545,8 +545,8 @@ pub struct Store {
     /// before any link: what is happening, or why it stopped.
     starting_daemon: Signal<Option<(String, bool)>>,
     /// A pairing link opened on this device (a QR code, a tapped link) that
-    /// the pairing screen has not used yet.
-    pairing_link: Signal<Option<String>>,
+    /// the pairing screen has not used yet, and when the owner confirmed it.
+    pairing_link: Signal<Option<(String, u64)>>,
     /// The live view's newest picture (beside the client: frames never
     /// enter its state).
     live_frame: Signal<Option<crate::ui::LiveFrame>>,
@@ -561,6 +561,9 @@ pub struct Store {
     live_typed: Signal<Option<usize>>,
     /// The room for the picture the daemon last heard (a touch screen's).
     live_room_sent: Stored<Option<(u32, u32)>>,
+    /// The terminal's approval keys: when the card they answer came into
+    /// view, and a first press of the key that allows for the session.
+    key_arming: Stored<KeyArming>,
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
@@ -650,6 +653,7 @@ impl Store {
             live_typing: signal(None),
             live_typed: signal(None),
             live_room_sent: stored(None),
+            key_arming: stored(KeyArming::default()),
             media: stored(None),
             media_epoch: stored(0),
             shell: stored(None),
@@ -1204,21 +1208,22 @@ impl Store {
 
     /// A pairing link opened on this device, for the pairing screen.
     pub fn open_pairing_link(&self, link: String) {
-        self.pairing_link.set(Some(link));
+        self.pairing_link.set(Some((link, now_ms())));
     }
 
     /// The pairing link waiting for the pairing screen, if any (tracked).
     pub fn pairing_link(&self) -> Option<String> {
-        self.pairing_link.get()
+        self.pairing_link.get().map(|(link, _)| link)
     }
 
-    /// Takes the waiting pairing link, so it is used once.
+    /// Takes the waiting pairing link, so it is used once. One confirmed
+    /// more than [`PAIRING_LINK_KEEPS_MS`] ago is dropped: the owner agreed
+    /// to pair then, not whenever the pairing screen comes up later.
     pub fn take_pairing_link(&self) -> Option<String> {
-        let link = self.pairing_link.with_untracked(Clone::clone);
-        if link.is_some() {
-            self.pairing_link.set(None);
-        }
-        link
+        let link = self.pairing_link.with_untracked(Clone::clone)?;
+        self.pairing_link.set(None);
+        let (link, at) = link;
+        (now_ms().saturating_sub(at) <= PAIRING_LINK_KEEPS_MS).then_some(link)
     }
 
     /// Whether this app should offer to pair again now: refused, or not
@@ -3558,23 +3563,65 @@ impl Store {
         self.read(|c| c.key_approval(&session, &draft).map(|a| a.id))
     }
 
-    /// Whether `key` can answer the open conversation's approval now.
+    /// Whether `key` can answer the open conversation's approval now. It
+    /// reruns when a card comes into view or the conversation on screen
+    /// changes, which is when the keys' arming delay starts again.
     pub fn key_answer(&self, key: &str) -> bool {
         let Some(session) = self.selected() else {
             return false;
         };
         let draft = self.draft();
-        self.read(|c| c.key_answer(&session, &draft, key).is_some())
+        let answer = self.read(|c| c.key_answer(&session, &draft, key));
+        if let Some((id, _)) = &answer {
+            let shown = (session.clone(), id.clone());
+            let mut arming = self.key_arming.get();
+            if arming.shown.as_ref().map(|(s, i, _)| (s, i)) != Some((&shown.0, &shown.1)) {
+                arming.shown = Some((shown.0, shown.1, now_ms()));
+                arming.session_key = None;
+                self.key_arming.replace(arming);
+            }
+        }
+        answer.is_some()
     }
 
     /// Answer the conversation on screen's waiting approval with `key`
-    /// (`1`, `2`, `3`); whether it did.
+    /// (`1`, `2`, `3`); whether it did. A key pressed within
+    /// [`KEYS_ARM_AFTER_MS`] of the card coming into view answers nothing:
+    /// the owner was typing for something else (or was asked to, by the
+    /// agent, just before the card). Allowing for the whole conversation
+    /// takes its key twice.
     pub fn answer_by_key(&self, key: &str) -> bool {
         let Some(session) = self.selected_untracked() else {
             return false;
         };
         let draft = self.draft_untracked();
-        self.act(|c| c.answer_by_key(&session, &draft, key))
+        let Some((id, decision)) = self
+            .client
+            .with_untracked(|c| c.key_answer(&session, &draft, key))
+        else {
+            return false;
+        };
+        let now = now_ms();
+        let mut arming = self.key_arming.get();
+        match key_press(&mut arming, &session, &id, decision, now) {
+            KeyPress::TooSoon => {
+                self.key_arming.replace(arming);
+                self.say("The approval just appeared: press its key again to answer it");
+                false
+            }
+            KeyPress::Again => {
+                self.key_arming.replace(arming);
+                if let Some(key) = aidaemon_client_core::client::key_for_approval(decision) {
+                    self.say(format!("Press {key} again to allow for this conversation"));
+                }
+                false
+            }
+            KeyPress::Answer => {
+                arming.session_key = None;
+                self.key_arming.replace(arming);
+                self.act(|c| c.answer_by_key(&session, &draft, key))
+            }
+        }
     }
 
     /// The link found no paired key on this device.
@@ -3628,6 +3675,65 @@ fn store_lines<'a>(key: &str, ids: impl Iterator<Item = &'a String>) {
     let _ = nsh_core::storage::Storage::set_item(key, text);
 }
 
+/// How long after an approval card comes into view (or the conversation on
+/// screen changes) its keys start answering it.
+const KEYS_ARM_AFTER_MS: u64 = 1_000;
+/// How long a first press of the allow-for-the-session key waits for the
+/// second.
+const SESSION_KEY_AGAIN_MS: u64 = 3_000;
+
+/// See [`Store::key_answer`] and [`Store::answer_by_key`].
+#[derive(Clone, Default)]
+struct KeyArming {
+    /// The conversation and approval the keys answer, and when it was shown.
+    shown: Option<(String, String, u64)>,
+    /// A first press of the session key: for which approval, and when.
+    session_key: Option<(String, u64)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyPress {
+    TooSoon,
+    Again,
+    Answer,
+}
+
+fn key_press(
+    arming: &mut KeyArming,
+    session: &str,
+    id: &str,
+    decision: aidaemon_client_protocol::ApprovalDecision,
+    now: u64,
+) -> KeyPress {
+    let shown_at = match &arming.shown {
+        Some((s, i, at)) if s == session && i == id => *at,
+        // Not seen as shown yet: it is being shown now.
+        _ => {
+            arming.shown = Some((session.to_owned(), id.to_owned(), now));
+            arming.session_key = None;
+            now
+        }
+    };
+    if now.saturating_sub(shown_at) < KEYS_ARM_AFTER_MS {
+        return KeyPress::TooSoon;
+    }
+    if decision != aidaemon_client_protocol::ApprovalDecision::ApproveSession {
+        return KeyPress::Answer;
+    }
+    match &arming.session_key {
+        Some((i, at)) if i == id && now.saturating_sub(*at) <= SESSION_KEY_AGAIN_MS => {
+            KeyPress::Answer
+        }
+        _ => {
+            arming.session_key = Some((id.to_owned(), now));
+            KeyPress::Again
+        }
+    }
+}
+
+/// How long a confirmed pairing link waits for the pairing screen.
+const PAIRING_LINK_KEEPS_MS: u64 = 60_000;
+
 /// A file's link as the gateway serves it: a path under `/client/v1/`
 /// without `..`, a backslash or a second `//` (machine format: a URL path).
 fn gateway_file_path(url: &str) -> Option<&str> {
@@ -3639,6 +3745,56 @@ fn gateway_file_path(url: &str) -> Option<&str> {
         && !path.split(['/', '?']).any(|part| part == "..")
         && !url.chars().any(|c| c.is_control() || c == '@');
     clean.then_some(url)
+}
+
+#[cfg(test)]
+mod key_press_tests {
+    use super::{KeyArming, KeyPress, key_press};
+    use aidaemon_client_protocol::ApprovalDecision::{ApproveOnce, ApproveSession};
+
+    #[test]
+    fn approval_keys_wait_for_the_card_and_session_takes_two_presses() {
+        let mut arming = KeyArming::default();
+        // A key the moment the card appears answers nothing.
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a1", ApproveOnce, 10_000),
+            KeyPress::TooSoon
+        );
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a1", ApproveOnce, 10_500),
+            KeyPress::TooSoon
+        );
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a1", ApproveOnce, 11_000),
+            KeyPress::Answer
+        );
+        // A new card (or another conversation) arms again.
+        assert_eq!(
+            key_press(&mut arming, "app:s2", "a1", ApproveOnce, 11_100),
+            KeyPress::TooSoon
+        );
+        // Allowing for the session takes its key twice, close together.
+        let mut arming = KeyArming::default();
+        key_press(&mut arming, "app:s1", "a2", ApproveSession, 0);
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a2", ApproveSession, 2_000),
+            KeyPress::Again
+        );
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a2", ApproveSession, 2_500),
+            KeyPress::Answer
+        );
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a3", ApproveSession, 3_000),
+            KeyPress::TooSoon
+        );
+        arming.session_key = Some(("a3".into(), 3_000));
+        arming.shown = Some(("app:s1".into(), "a3".into(), 0));
+        assert_eq!(
+            key_press(&mut arming, "app:s1", "a3", ApproveSession, 9_000),
+            KeyPress::Again
+        );
+    }
 }
 
 #[cfg(test)]
