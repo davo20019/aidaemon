@@ -466,6 +466,11 @@ pub async fn pair(
     fingerprint: Option<String>,
 ) -> Result<(), String> {
     ready().await?;
+    // The link's daemon address counts only while this browser has no key
+    // (`remoteAddress` in js/browser.js), so it is read before the key is
+    // kept: read after, it was lost and every later request went to the
+    // site instead of the daemon.
+    let remote = over_iroh().then(remote_address);
     let request = PairRequest {
         gateway: base(),
         offer_id: offer,
@@ -478,10 +483,10 @@ pub async fn pair(
     let id = signin::redeem_and_wait(&PageHttp, &request, public, Duration::from_millis(1500))
         .await
         .map_err(|e| e.to_string())?;
-    text_of(keep_key(&id)).await?;
-    if over_iroh() {
-        keep_remote_gateway(&remote_address());
+    if let Some(remote) = &remote {
+        keep_remote_gateway(remote);
     }
+    text_of(keep_key(&id)).await?;
     forget_pairing_link();
     // The link (owned by the root, waiting for a key) picks it up.
     store.update(Update::Connecting);
