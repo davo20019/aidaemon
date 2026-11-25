@@ -393,6 +393,17 @@ impl Http for PageHttp {
     async fn sleep(&self, duration: Duration) {
         timer(duration).await;
     }
+
+    /// Over iroh the page's requests go to its service-worker base, but
+    /// they reach the daemon at `remote_address()`: name that one in a
+    /// challenge, or the daemon refuses it as meant for another.
+    fn audience(&self, gateway: &str) -> Option<String> {
+        if over_iroh() {
+            aidaemon_client_protocol::sign_in_audience(&remote_address())
+        } else {
+            aidaemon_client_protocol::sign_in_audience(gateway)
+        }
+    }
 }
 
 /// The page's key.
