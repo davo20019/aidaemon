@@ -164,6 +164,14 @@ impl TelegramTerminal {
             return false;
         }
         let bot = tg.bot().clone();
+        // A share code hands a terminal session to the computer: owners only.
+        if !shares_terminal(tg.owner_user_ids(), user_id) {
+            let _ = bot
+                .answer_callback_query(q.id.clone())
+                .text("Only the owner can continue a session on the computer.")
+                .await;
+            return true;
+        }
         let explicit_relay_session_id = data
             .strip_prefix("agent:share:")
             .map(str::trim)
@@ -211,6 +219,15 @@ impl TelegramTerminal {
         relay_session_id: Option<String>,
     ) {
         let bot = tg.bot().clone();
+        if !shares_terminal(tg.owner_user_ids(), user_id) {
+            let _ = bot
+                .send_message(
+                    msg.chat.id,
+                    "Only the owner can continue a session on the computer.",
+                )
+                .await;
+            return;
+        }
         self.cx(tg)
             .send_agent_share_code(&bot, msg.chat.id, user_id, relay_session_id)
             .await;
@@ -223,6 +240,12 @@ impl TelegramTerminal {
             .sync_terminal_tenant_bot_token_for_allowed_users(label)
             .await;
     }
+}
+
+/// Whether `user_id` may mint a code that continues a terminal session on
+/// the computer: the owner only, as every other terminal command.
+fn shares_terminal(owner_user_ids: &[u64], user_id: u64) -> bool {
+    determine_role(owner_user_ids, user_id) == UserRole::Owner
 }
 
 /// One bot and the terminal surface, for one command.
@@ -1580,4 +1603,13 @@ async fn sync_tenant_bot_token(
         tokio::time::sleep(Duration::from_millis(150 * (attempt + 1) + jitter)).await;
     }
     Err(last_error)
+}
+
+#[cfg(test)]
+mod share_tests {
+    #[test]
+    fn only_the_owner_continues_a_session_on_the_computer() {
+        assert!(super::shares_terminal(&[111], 111));
+        assert!(!super::shares_terminal(&[111], 222));
+    }
 }
