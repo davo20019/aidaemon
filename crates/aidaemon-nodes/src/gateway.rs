@@ -29,9 +29,15 @@ pub struct NodeGatewayState {
     pub rate_limiter: Arc<NodeRateLimiter>,
 }
 
+/// Per-minute budgets. Nodes that signed in are counted by their id in a
+/// map of their own; what anyone can send before signing in (offer and
+/// credential ids it names itself) is counted apart, so names made up in
+/// bulk never touch a signed-in Node's budget. A full map makes room by
+/// dropping its oldest window, never by refusing everyone.
 #[derive(Default)]
 pub struct NodeRateLimiter {
     windows: tokio::sync::Mutex<HashMap<(String, &'static str), RateWindow>>,
+    unauthenticated: tokio::sync::Mutex<HashMap<(String, &'static str), RateWindow>>,
 }
 
 struct RateWindow {
@@ -42,8 +48,43 @@ struct RateWindow {
 impl NodeRateLimiter {
     const MAX_WINDOWS: usize = 4096;
 
+    /// Count `units` against a signed-in Node's (`identity`) budget.
     async fn consume(
         &self,
+        identity: &str,
+        bucket: &'static str,
+        units: u64,
+        limit: u64,
+    ) -> Result<(), GatewayError> {
+        Self::take(
+            &mut *self.windows.lock().await,
+            identity,
+            bucket,
+            units,
+            limit,
+        )
+    }
+
+    /// Count `units` against a name a request made before signing in gives
+    /// itself (an offer or credential id).
+    async fn consume_unauthenticated(
+        &self,
+        identity: &str,
+        bucket: &'static str,
+        units: u64,
+        limit: u64,
+    ) -> Result<(), GatewayError> {
+        Self::take(
+            &mut *self.unauthenticated.lock().await,
+            identity,
+            bucket,
+            units,
+            limit,
+        )
+    }
+
+    fn take(
+        windows: &mut HashMap<(String, &'static str), RateWindow>,
         identity: &str,
         bucket: &'static str,
         units: u64,
@@ -52,12 +93,16 @@ impl NodeRateLimiter {
         if limit == 0 {
             return Err(GatewayError::rate_limited());
         }
-        let mut windows = self.windows.lock().await;
         let key = (identity.to_string(), bucket);
         if windows.len() >= Self::MAX_WINDOWS && !windows.contains_key(&key) {
             windows.retain(|_, window| window.started.elapsed() < Duration::from_secs(60));
-            if windows.len() >= Self::MAX_WINDOWS {
-                return Err(GatewayError::rate_limited());
+            if windows.len() >= Self::MAX_WINDOWS
+                && let Some(oldest) = windows
+                    .iter()
+                    .min_by_key(|(_, window)| window.started)
+                    .map(|(key, _)| key.clone())
+            {
+                windows.remove(&oldest);
             }
         }
         let window = windows.entry(key).or_insert_with(|| RateWindow {
@@ -221,7 +266,7 @@ async fn redeem(
 ) -> Result<Json<RedeemEnrollmentResponse>, GatewayError> {
     state
         .rate_limiter
-        .consume(&request.offer_id, "enrollment", 1, 10)
+        .consume_unauthenticated(&request.offer_id, "enrollment", 1, 10)
         .await?;
     state
         .service
@@ -237,7 +282,7 @@ async fn challenge(
 ) -> Result<Json<SessionChallengeResponse>, GatewayError> {
     state
         .rate_limiter
-        .consume(&request.credential_id, "authentication", 1, 30)
+        .consume_unauthenticated(&request.credential_id, "authentication", 1, 30)
         .await?;
     state
         .service
@@ -253,7 +298,7 @@ async fn open_session(
 ) -> Result<Json<OpenSessionResponse>, GatewayError> {
     state
         .rate_limiter
-        .consume(&request.credential_id, "authentication", 1, 30)
+        .consume_unauthenticated(&request.credential_id, "authentication", 1, 30)
         .await?;
     state
         .service
@@ -835,12 +880,17 @@ mod tests {
         let error = limiter.consume("node-1", "turns", 1, 1).await.unwrap_err();
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
 
+        limiter.consume("node-2", "requests", 1, 10).await.unwrap();
         for index in 0..NodeRateLimiter::MAX_WINDOWS + 100 {
-            let _ = limiter
-                .consume(&format!("untrusted-{index}"), "authentication", 1, 30)
-                .await;
+            limiter
+                .consume_unauthenticated(&format!("untrusted-{index}"), "authentication", 1, 30)
+                .await
+                .expect("a full map makes room, it never refuses everyone");
         }
-        assert!(limiter.windows.lock().await.len() <= NodeRateLimiter::MAX_WINDOWS);
+        assert!(limiter.unauthenticated.lock().await.len() <= NodeRateLimiter::MAX_WINDOWS);
+        // Names made up before signing in never touch a signed-in Node's.
+        assert_eq!(limiter.windows.lock().await.len(), 2);
+        limiter.consume("node-2", "requests", 1, 10).await.unwrap();
     }
 
     /// A Node that observes `gateway.trust` learns the local listener and
