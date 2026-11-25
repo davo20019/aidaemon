@@ -76,8 +76,9 @@ pub fn spawn(
 
 /// Tells the link the device woke (the app came back to the foreground, the
 /// network returned): a link waiting to try again tries now, and a quiet
-/// open socket is pinged and dropped when it does not answer within
-/// [`crate::machine::WAKE_ANSWER`] ([`LinkMachine::woke`]).
+/// open socket is pinged and dropped when it does not answer within a few
+/// of its measured round trips ([`LinkMachine::wake_answer`],
+/// [`LinkMachine::woke`]).
 #[derive(Clone, Default)]
 pub struct Waker(Arc<tokio::sync::Notify>);
 
@@ -326,7 +327,7 @@ impl Link {
         for frame in frames {
             socket.send(send(frame)?).await.map_err(failed)?;
         }
-        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut ticks = tokio::time::interval(crate::machine::TICK_EVERY);
         ticks.tick().await;
         let woke = self.waker.0.clone();
         loop {

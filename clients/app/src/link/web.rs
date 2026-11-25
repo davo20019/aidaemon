@@ -644,7 +644,7 @@ pub fn start(store: Store) {
                 }
             };
             let disconnect = loop {
-                let mut tick = Box::pin(timer(Duration::from_secs(1)));
+                let mut tick = Box::pin(timer(aidaemon_client_core::machine::TICK_EVERY));
                 let event = futures::select! {
                     heard = events.next() => Some(heard),
                     _ = wakes.next() => {

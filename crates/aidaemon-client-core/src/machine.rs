@@ -32,8 +32,19 @@ pub const RETRY_MAX_SEEN: Duration = Duration::from_secs(2);
 /// A socket quiet this long when the device wakes is asked whether it is
 /// still there.
 pub const WAKE_QUIET: Duration = Duration::from_secs(3);
-/// How long a socket asked on waking has to answer before it is dropped.
+/// The longest a socket asked on waking has to answer before it is
+/// dropped: for a link with no round trip measured yet, and the cap on one
+/// with a slow one.
 pub const WAKE_ANSWER: Duration = Duration::from_secs(4);
+/// The shortest it has: a measured round trip of tens of milliseconds still
+/// leaves room for a phone's radio waking up.
+pub const WAKE_ANSWER_MIN: Duration = Duration::from_secs(1);
+/// How often a link calls [`LinkMachine::tick`]: often enough that a
+/// socket asked on waking is dropped close to [`WAKE_ANSWER_MIN`], not a
+/// second past it.
+pub const TICK_EVERY: Duration = Duration::from_millis(250);
+/// How many measured round trips a socket asked on waking has to answer.
+const WAKE_ANSWER_TRIPS: u64 = 4;
 
 /// What the client says it is in `hello`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +120,13 @@ pub struct LinkMachine {
     /// When the device woke and asked a quiet socket whether it is alive;
     /// cleared by anything heard.
     asked_ms: Option<u64>,
+    /// When `hello` or a ping went out that its answer (`welcome`, `pong`)
+    /// has not come back for: the start of a round trip being measured.
+    timing_ms: Option<u64>,
+    /// This link's round trip, smoothed over the ones measured (each
+    /// `hello` → `welcome` and ping → `pong`); it sets how long a socket
+    /// asked on waking has to answer.
+    round_trip_ms: Option<u64>,
     /// The owner is looking at the app (a browser page shown).
     seen: bool,
     /// The wait before the next try.
@@ -132,6 +150,8 @@ impl LinkMachine {
             last_heard_ms: 0,
             last_ping_ms: 0,
             asked_ms: None,
+            timing_ms: None,
+            round_trip_ms: None,
             seen: false,
             wait: RETRY_MIN,
         }
@@ -166,6 +186,7 @@ impl LinkMachine {
         self.last_heard_ms = now_ms;
         self.last_ping_ms = now_ms;
         self.asked_ms = None;
+        self.timing_ms = Some(now_ms);
         let mut frames = vec![ClientFrame::Hello {
             version: ProtocolVersion::CURRENT,
             client: ClientInfo {
@@ -204,8 +225,36 @@ impl LinkMachine {
     pub fn received(&mut self, text: &str, now_ms: u64) -> Option<ServerFrame> {
         self.heard(now_ms);
         let frame = serde_json::from_str::<ServerFrame>(text).ok()?;
+        if matches!(frame, ServerFrame::Pong | ServerFrame::Welcome { .. })
+            && let Some(sent) = self.timing_ms.take()
+        {
+            self.measured(now_ms.saturating_sub(sent));
+        }
         self.note(&frame);
         Some(frame)
+    }
+
+    /// One round trip took `trip_ms`: smoothed as TCP does (7/8 old, 1/8
+    /// new), but a slower one counts at once, so a link that got slower is
+    /// not dropped for it.
+    fn measured(&mut self, trip_ms: u64) {
+        self.round_trip_ms = Some(match self.round_trip_ms {
+            Some(old) => trip_ms.max((old * 7 + trip_ms) / 8),
+            None => trip_ms,
+        });
+    }
+
+    /// How long a socket asked on waking has to answer: a few of this
+    /// link's measured round trips, within [`WAKE_ANSWER_MIN`] and
+    /// [`WAKE_ANSWER`]; [`WAKE_ANSWER`] before any is measured. Over a
+    /// relay a healthy answer takes tens of milliseconds, so a socket the
+    /// sleep or a network change killed is found out in about a second,
+    /// not four.
+    pub fn wake_answer(&self) -> Duration {
+        self.round_trip_ms.map_or(WAKE_ANSWER, |trip| {
+            Duration::from_millis(trip.saturating_mul(WAKE_ANSWER_TRIPS))
+                .clamp(WAKE_ANSWER_MIN, WAKE_ANSWER)
+        })
     }
 
     /// Anything else arrived (a pong, a binary message): the socket is
@@ -219,7 +268,7 @@ impl LinkMachine {
     /// A phone freezes a page in the background, and its socket can be
     /// dead without a close: a quiet open socket is pinged, and dropped by
     /// [`LinkMachine::tick`] when it does not answer within
-    /// [`WAKE_ANSWER`]. With no socket, the backoff starts over, so the
+    /// [`LinkMachine::wake_answer`]. With no socket, the backoff starts over, so the
     /// next try is now.
     pub fn woke(&mut self, now_ms: u64) -> Option<ClientFrame> {
         if !self.open {
@@ -232,6 +281,7 @@ impl LinkMachine {
         }
         self.asked_ms = Some(now_ms);
         self.last_ping_ms = now_ms;
+        self.timing_ms = Some(now_ms);
         Some(ClientFrame::Ping)
     }
 
@@ -268,12 +318,13 @@ impl LinkMachine {
         }
         let unanswered = self
             .asked_ms
-            .is_some_and(|asked| now_ms.saturating_sub(asked) > millis(WAKE_ANSWER));
+            .is_some_and(|asked| now_ms.saturating_sub(asked) > millis(self.wake_answer()));
         if unanswered || now_ms.saturating_sub(self.last_heard_ms) > millis(SILENT_LIMIT) {
             return Tick::Dead(self.closed("no answer from the gateway"));
         }
         if now_ms.saturating_sub(self.last_ping_ms) >= millis(PING_EVERY) {
             self.last_ping_ms = now_ms;
+            self.timing_ms = Some(now_ms);
             return Tick::Ping(ClientFrame::Ping);
         }
         Tick::Wait
@@ -284,6 +335,7 @@ impl LinkMachine {
     pub fn closed(&mut self, reason: impl Into<String>) -> Disconnect {
         self.open = false;
         self.asked_ms = None;
+        self.timing_ms = None;
         let (kind, reason) = match self.refused.take() {
             Some(why) => (DropKind::Unauthorized, why),
             None => (DropKind::Dropped, reason.into()),
@@ -571,6 +623,33 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_link_with_a_fast_round_trip_gives_up_on_a_woken_socket_sooner() {
+        const WELCOME: &str = r#"{"type":"welcome","version":{"major":1,"minor":53},"owner":{"name":"Alice Rivera"},"latest_seq":0}"#;
+        let mut m = machine();
+        m.opened(0);
+        assert_eq!(m.wake_answer(), WAKE_ANSWER, "nothing measured yet");
+        // hello → welcome in 60 ms, as over a relay.
+        m.received(WELCOME, 60);
+        assert_eq!(m.wake_answer(), WAKE_ANSWER_MIN);
+
+        // Woken after the socket died: dropped after a second, not four.
+        let woke = 10_000;
+        assert_eq!(m.woke(woke), Some(ClientFrame::Ping));
+        assert_eq!(m.tick(woke + millis(WAKE_ANSWER_MIN)), Tick::Wait);
+        assert!(matches!(
+            m.tick(woke + millis(WAKE_ANSWER_MIN) + 1),
+            Tick::Dead(_)
+        ));
+
+        // A slower trip widens the window at once, up to the cap.
+        m.opened(20_000);
+        m.received(WELCOME, 20_700);
+        assert_eq!(m.wake_answer(), Duration::from_millis(2_800));
+        m.measured(5_000);
+        assert_eq!(m.wake_answer(), WAKE_ANSWER);
     }
 
     #[test]
