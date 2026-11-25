@@ -393,10 +393,10 @@ impl TerminalTool {
     /// Order (load-bearing; do not reorder):
     ///   1. capability escalation  → new authority always asks
     ///   2. daemonization          → the owner's Critical daemonization card
-    ///   3. untrusted trigger      → external triggers always ask
-    ///  3b. persistence path       → a change naming a shell start-up file,
-    ///      launch agent, cron entry, git hook or the daemon's instructions
-    ///      always asks (before the trusted session and every grant)
+    ///   3. untrusted trigger      → external triggers always ask; then a
+    ///      persistence path (a change naming a shell start-up file, launch
+    ///      agent, cron entry, git hook or the daemon's instructions) always
+    ///      asks, before the trusted session and every grant
     ///   4. detach && !allowed     → novel detached commands ask
     ///   5. trusted session        → scheduled tasks run without asking; this
     ///      precedes the floor on purpose (an explicit owner grant: unattended
