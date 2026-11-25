@@ -10,14 +10,8 @@ use sqlx::SqlitePool;
 
 use crate::error::{MemoryError, Result};
 
-/// One schema step.
-#[derive(Debug, Clone, Copy)]
-pub struct Migration {
-    /// Strictly increasing, starting at 1.
-    pub version: i64,
-    pub name: &'static str,
-    pub sql: &'static str,
-}
+/// One schema step (the shape `aidaemon-store-sqlite` applies).
+pub use aidaemon_store_sqlite::Migration;
 
 /// Every migration this build knows, in order.
 pub const MIGRATIONS: &[Migration] = &[
@@ -104,58 +98,29 @@ pub fn latest_version() -> i64 {
 }
 
 pub(crate) async fn current_version(pool: &SqlitePool) -> Result<i64> {
-    let version: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(version) FROM memory_schema_migrations")
-            .fetch_one(pool)
-            .await?;
-    Ok(version.unwrap_or(0))
+    Ok(aidaemon_store_sqlite::recorded_version(pool, VERSION_TABLE).await?)
 }
+
+/// The table this store records its versions in.
+const VERSION_TABLE: &str = "memory_schema_migrations";
 
 /// Bring the schema up to date. Idempotent and refuses newer databases.
 pub(crate) async fn run(pool: &SqlitePool) -> Result<()> {
-    debug_assert!(
-        MIGRATIONS
-            .windows(2)
-            .all(|w| w[1].version == w[0].version + 1)
-    );
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS memory_schema_migrations (
-            version    INTEGER PRIMARY KEY,
-            applied_at TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    let found = current_version(pool).await?;
-    let supported = latest_version();
-    if found > supported {
-        return Err(MemoryError::SchemaTooNew { found, supported });
-    }
-
-    for migration in MIGRATIONS.iter().filter(|m| m.version > found) {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-        let claimed = sqlx::query(
-            "INSERT OR IGNORE INTO memory_schema_migrations (version, applied_at)
-             VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        )
-        .bind(migration.version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if claimed == 0 {
-            tx.rollback().await?;
-            continue;
-        }
-        sqlx::Executor::execute(&mut *tx, migration.sql)
-            .await
-            .map_err(|source| MemoryError::Migration {
-                version: migration.version,
-                name: migration.name,
+    aidaemon_store_sqlite::apply_migrations(pool, VERSION_TABLE, MIGRATIONS)
+        .await
+        .map_err(|error| match error {
+            aidaemon_store_sqlite::MigrateError::Sqlx(error) => MemoryError::Sqlx(error),
+            aidaemon_store_sqlite::MigrateError::SchemaTooNew { found, supported } => {
+                MemoryError::SchemaTooNew { found, supported }
+            }
+            aidaemon_store_sqlite::MigrateError::Step {
+                version,
+                name,
                 source,
-            })?;
-        tx.commit().await?;
-    }
-    Ok(())
+            } => MemoryError::Migration {
+                version,
+                name,
+                source,
+            },
+        })
 }

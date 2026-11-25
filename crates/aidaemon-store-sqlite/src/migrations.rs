@@ -79,55 +79,116 @@ pub fn latest_version() -> i64 {
 
 /// The version recorded in the database (0 for a fresh one).
 pub async fn current_version(pool: &SqlitePool) -> Result<i64, Error> {
-    let version: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
-        .fetch_one(pool)
-        .await?;
-    Ok(version.unwrap_or(0))
+    Ok(recorded_version(pool, VERSION_TABLE).await?)
 }
 
 /// Bring the schema up to [`latest_version`]. Idempotent, safe to call from
 /// several processes at once, and refuses databases written by newer code.
 pub(crate) async fn run(pool: &SqlitePool) -> Result<(), Error> {
+    apply(pool, VERSION_TABLE, MIGRATIONS)
+        .await
+        .map_err(Into::into)
+}
+
+/// The table this store records its versions in.
+const VERSION_TABLE: &str = "schema_migrations";
+
+/// Why [`apply`] stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateError {
+    #[error("sqlite: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    /// The database was written by a newer build.
+    #[error("schema version {found} is newer than this build supports ({supported})")]
+    SchemaTooNew { found: i64, supported: i64 },
+    /// One step failed; the database stays at the version before it.
+    #[error("migration {version} ({name}) failed: {source}")]
+    Step {
+        version: i64,
+        name: &'static str,
+        source: sqlx::Error,
+    },
+}
+
+impl From<MigrateError> for Error {
+    fn from(error: MigrateError) -> Self {
+        match error {
+            MigrateError::Sqlx(error) => Error::Sqlx(error),
+            MigrateError::SchemaTooNew { found, supported } => {
+                Error::SchemaTooNew { found, supported }
+            }
+            MigrateError::Step {
+                version,
+                name,
+                source,
+            } => Error::Migration {
+                version,
+                name,
+                source,
+            },
+        }
+    }
+}
+
+/// The highest version recorded in `table` (0 for none).
+pub async fn recorded_version(pool: &SqlitePool, table: &str) -> sqlx::Result<i64> {
+    let version: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT MAX(version) FROM {table}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(version.unwrap_or(0))
+}
+
+/// Apply `migrations` (strictly increasing versions from 1) that `table`
+/// has not recorded, each in its own `BEGIN IMMEDIATE` transaction with the
+/// row that records it, and refuse a database a newer build wrote. A store
+/// sharing the database file keeps its own `table`, so the version
+/// sequences never collide. Idempotent and safe from several processes.
+pub async fn apply(
+    pool: &SqlitePool,
+    table: &'static str,
+    migrations: &[Migration],
+) -> Result<(), MigrateError> {
     debug_assert!(
-        MIGRATIONS
+        migrations
             .windows(2)
             .all(|w| w[1].version == w[0].version + 1)
     );
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
             version    INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
-        )",
-    )
+        )"
+    )))
     .execute(pool)
     .await?;
 
-    let found = current_version(pool).await?;
-    let supported = latest_version();
+    let found = recorded_version(pool, table).await?;
+    let supported = migrations.last().map(|m| m.version).unwrap_or(0);
     if found > supported {
-        return Err(Error::SchemaTooNew { found, supported });
+        return Err(MigrateError::SchemaTooNew { found, supported });
     }
-
-    for migration in MIGRATIONS.iter().filter(|m| m.version > found) {
+    let claim = format!(
+        "INSERT OR IGNORE INTO {table} (version, applied_at)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+    );
+    for migration in migrations.iter().filter(|m| m.version > found) {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         // Claim the version first: this takes the write lock, and if another
         // process applied it meanwhile the insert is ignored and we skip.
-        let claimed = sqlx::query(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at)
-             VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        )
-        .bind(migration.version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let claimed = sqlx::query(sqlx::AssertSqlSafe(claim.as_str()))
+            .bind(migration.version)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if claimed == 0 {
             tx.rollback().await?;
             continue;
         }
         sqlx::Executor::execute(&mut *tx, migration.sql)
             .await
-            .map_err(|source| Error::Migration {
+            .map_err(|source| MigrateError::Step {
                 version: migration.version,
                 name: migration.name,
                 source,

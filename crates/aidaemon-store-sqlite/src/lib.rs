@@ -66,7 +66,10 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 
-pub use migrations::{MIGRATIONS, Migration, latest_version};
+pub use migrations::{
+    MIGRATIONS, MigrateError, Migration, apply as apply_migrations, latest_version,
+    recorded_version,
+};
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
