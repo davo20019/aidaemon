@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 50;
+pub const PROTOCOL_MINOR: u16 = 51;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3820,9 +3820,56 @@ pub struct Challenge {
     pub expires_at_ms: u64,
 }
 
-/// The exact bytes a device signs (ECDSA P-256, SHA-256) for a challenge.
+/// The exact bytes a device signs (ECDSA P-256, SHA-256) for a challenge,
+/// as clients before protocol 1.51 sign them: bound to no daemon, so a
+/// gateway takes it only from a client on its own computer.
 pub fn challenge_message(challenge_id: &str, nonce: &str) -> String {
     format!("aidaemon-client-v1:{challenge_id}:{nonce}")
+}
+
+/// The exact bytes a device signs for a challenge (protocol 1.51): bound to
+/// the daemon the device meant to reach (`audience`, from
+/// [`sign_in_audience`] on the address it dialed) and to the endpoint key
+/// its challenge request named (`-` for none). A daemon that relays another
+/// daemon's challenge to a device gets a signature naming itself, which the
+/// other daemon refuses.
+pub fn challenge_message_v2(
+    challenge_id: &str,
+    nonce: &str,
+    audience: &str,
+    endpoint: Option<&str>,
+) -> String {
+    let endpoint = endpoint
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .unwrap_or("-");
+    format!("aidaemon-client-v2:{challenge_id}:{nonce}:{audience}:{endpoint}")
+}
+
+/// Who a device signs in to, as [`challenge_message_v2`] names it: for a
+/// daemon dialed by key (`iroh://<key>@…`), `iroh:<key>` (64 lowercase hex
+/// digits); for an HTTP gateway, its origin (`https://host[:port]`,
+/// lowercase, default port dropped). `None` for anything else. Machine
+/// formats: URLs and our own peer-to-peer address.
+pub fn sign_in_audience(gateway: &str) -> Option<String> {
+    let (scheme, rest) = gateway.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if scheme == "iroh" {
+        let key = authority.split('@').next()?.to_ascii_lowercase();
+        return (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| format!("iroh:{key}"));
+    }
+    if !matches!(scheme.as_str(), "http" | "https") || authority.contains('@') {
+        return None;
+    }
+    let authority = authority.to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let default_port = if scheme == "https" { ":443" } else { ":80" };
+    let host = authority.strip_suffix(default_port).unwrap_or(&authority);
+    Some(format!("{scheme}://{host}"))
 }
 
 /// The header a socket upgrade over a peer-to-peer transport may carry
@@ -3877,6 +3924,12 @@ pub struct SessionRequest {
     pub challenge_id: String,
     /// The signature as `r || s` (64 bytes), base64url.
     pub signature: String,
+    /// The daemon the signature names (protocol 1.51): it signs
+    /// [`challenge_message_v2`] for this audience. Absent: the older
+    /// [`challenge_message`], which a gateway takes from its own computer
+    /// only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
 }
 
 /// A short-lived access token for one device.
@@ -3992,6 +4045,38 @@ mod tests {
         // No challenge message can be the same bytes: their prefixes differ.
         assert!(!message.starts_with("aidaemon-client-v1:"));
         assert!(!challenge_message("ch-1", "n").starts_with("aidaemon-socket-sign-in-v1:"));
+    }
+
+    #[test]
+    fn a_challenge_signature_names_the_daemon_and_the_endpoint() {
+        let key = "ab".repeat(32);
+        assert_eq!(
+            sign_in_audience(&format!(
+                "iroh://{}@relay.example.invalid",
+                key.to_uppercase()
+            )),
+            Some(format!("iroh:{key}"))
+        );
+        assert_eq!(
+            sign_in_audience("HTTPS://App.Example.com:443/client/v1/pair"),
+            Some("https://app.example.com".into())
+        );
+        assert_eq!(
+            sign_in_audience("http://127.0.0.1:8788"),
+            Some("http://127.0.0.1:8788".into())
+        );
+        assert_eq!(sign_in_audience("https://user@app.example.com"), None);
+        assert_eq!(sign_in_audience("iroh://short@relay"), None);
+        assert_eq!(sign_in_audience("ftp://app.example.com"), None);
+        assert_eq!(
+            challenge_message_v2("ch-1", "n", "https://app.example.com", None),
+            "aidaemon-client-v2:ch-1:n:https://app.example.com:-"
+        );
+        assert_ne!(
+            challenge_message_v2("ch-1", "n", "https://a.example.com", Some("e")),
+            challenge_message_v2("ch-1", "n", "https://b.example.com", Some("e"))
+        );
+        assert!(!challenge_message_v2("ch-1", "n", "x", None).starts_with("aidaemon-client-v1:"));
     }
 
     #[test]

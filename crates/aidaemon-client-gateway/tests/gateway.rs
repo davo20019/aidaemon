@@ -1094,6 +1094,10 @@ async fn the_local_bridge_carries_requests_files_and_sockets_over_iroh() {
     )
     .await
     .unwrap();
+    // As the daemon does once remote access is up: it knows its own key.
+    f.gateway
+        .pairing()
+        .set_remote_url(Some(listener.url().to_string()));
     remote::learn(listener.addr());
     let device = pair_over_iroh(&f, &listener).await;
     let dialer = Dialer::for_device(&device).unwrap();
@@ -1753,6 +1757,13 @@ impl Fixture {
 
     /// Sign `device` in at `url` (another listener of this gateway).
     async fn sign_in_at(&self, url: &str, device: &Device) -> reqwest::Response {
+        self.sign_in_for(url, device, &format!("http://{url}"))
+            .await
+    }
+
+    /// Sign `device` in at `url` with a signature naming `audience` (the
+    /// daemon it means to reach).
+    async fn sign_in_for(&self, url: &str, device: &Device, audience: &str) -> reqwest::Response {
         let response = self
             .http()
             .post(format!("http://{url}/client/v1/sessions/challenge"))
@@ -1767,14 +1778,16 @@ impl Fixture {
             return response;
         }
         let challenge: Challenge = response.json().await.unwrap();
-        let signature: Signature = device
-            .key
-            .sign(challenge_message(&challenge.challenge_id, &challenge.nonce).as_bytes());
+        let signature: Signature = device.key.sign(
+            challenge_message_v2(&challenge.challenge_id, &challenge.nonce, audience, None)
+                .as_bytes(),
+        );
         self.http()
             .post(format!("http://{url}/client/v1/sessions"))
             .json(&SessionRequest {
                 challenge_id: challenge.challenge_id,
                 signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                audience: Some(audience.to_string()),
             })
             .send()
             .await
@@ -1889,6 +1902,10 @@ async fn any_transport_with_a_peer_key_gets_the_remote_guard() {
             url
         }
     };
+    let daemon = "6b".repeat(32);
+    f.gateway
+        .pairing()
+        .set_remote_url(Some(format!("iroh://{daemon}@relay.example.test")));
     let mine = serve([7; 32]).await;
     let other = serve([8; 32]).await;
     let glance = |url: &str, token: &str| {
@@ -1900,7 +1917,12 @@ async fn any_transport_with_a_peer_key_gets_the_remote_guard() {
     assert_eq!(glance(&mine, &f.token).send().await.unwrap().status(), 401);
 
     let phone = f.pair(vec![Scope::Observe, Scope::Chat]).await;
-    let grant: AccessGrant = f.sign_in_at(&mine, &phone).await.json().await.unwrap();
+    let grant: AccessGrant = f
+        .sign_in_for(&mine, &phone, &format!("iroh:{daemon}"))
+        .await
+        .json()
+        .await
+        .unwrap();
     assert_eq!(
         glance(&mine, &grant.access_token)
             .send()
@@ -1996,7 +2018,12 @@ async fn a_socket_signs_itself_in_once_from_its_own_peer() {
 
     // Never signed in from this peer: a challenge first.
     assert_eq!(refused(open(mine.clone(), proof(mine_key)).await), 401);
-    let first: AccessGrant = f.sign_in_at(&mine, &phone).await.json().await.unwrap();
+    let first: AccessGrant = f
+        .sign_in_for(&mine, &phone, &format!("iroh:{daemon}"))
+        .await
+        .json()
+        .await
+        .unwrap();
     assert!(!first.access_token.is_empty());
 
     // Now one round trip: no token in the upgrade or the hello.

@@ -478,15 +478,24 @@ async fn challenge(
 
 async fn open_session(
     State(gateway): State<Arc<ClientGateway>>,
+    exposed: Option<axum::Extension<Exposed>>,
     bytes: axum::body::Bytes,
 ) -> Response {
     let request: SessionRequest = match body(&bytes) {
         Ok(request) => request,
         Err(refused) => return refused,
     };
+    // On this computer: not through a tunnel, a proxy or a peer-to-peer
+    // transport (each marks the request `Exposed`).
+    let local = exposed.is_none();
     let result = gateway
         .pairing
-        .open_session(&request.challenge_id, &request.signature)
+        .open_session(
+            &request.challenge_id,
+            &request.signature,
+            request.audience.as_deref(),
+            local,
+        )
         .await;
     match &result {
         Ok(grant) => tracing::info!(device = %grant.device_id, "Device signed in"),

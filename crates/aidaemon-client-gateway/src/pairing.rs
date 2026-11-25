@@ -19,7 +19,8 @@ use aidaemon_channels::hub::ApprovalRequest;
 use aidaemon_client_protocol::{
     ALL_SCOPES, AccessGrant, Challenge, ClientKind, DeviceInfo, Enrollment, EnrollmentState,
     ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk, SOCKET_SIGN_IN_MAX_AGE_MS,
-    SOCKET_SIGN_IN_MAX_AHEAD_MS, Scope, SocketSignIn, challenge_message, socket_sign_in_message,
+    SOCKET_SIGN_IN_MAX_AHEAD_MS, Scope, SocketSignIn, challenge_message, challenge_message_v2,
+    is_loopback_url, sign_in_audience, socket_sign_in_message,
 };
 use aidaemon_store_sqlite::{DeviceRow, PairingRow, SqliteClientEventLog};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -115,6 +116,11 @@ struct PendingChallenge {
     /// The endpoint key the device says it dials with, recorded once the
     /// signature verifies.
     endpoint: Option<String>,
+    /// That endpoint as the request named it: a daemon-bound signature
+    /// ([`challenge_message_v2`]) covers it.
+    named_endpoint: Option<String>,
+    /// When it was made: the oldest goes first when a device has too many.
+    created_ms: u64,
 }
 
 /// Who the peer-to-peer listener lets past its handshake.
@@ -162,6 +168,21 @@ fn verify(device: &DeviceRow, message: &str, signature: &str) -> Result<(), Prot
 fn own_key(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
     endpoint_of(rest.split(['@', '/']).next()?)
+}
+
+/// Drop the oldest of `challenges` that `which` picks.
+fn evict_oldest(
+    challenges: &mut HashMap<String, PendingChallenge>,
+    which: impl Fn(&PendingChallenge) -> bool,
+) {
+    if let Some(oldest) = challenges
+        .iter()
+        .filter(|(_, c)| which(c))
+        .min_by_key(|(_, c)| c.created_ms)
+        .map(|(id, _)| id.clone())
+    {
+        challenges.remove(&oldest);
+    }
 }
 
 /// An endpoint key as sign-in names it: 64 lowercase hex digits.
@@ -731,24 +752,28 @@ impl Pairing {
         let now = now_ms();
         challenges.retain(|_, c| c.expires_at_ms > now);
         // Per device too: one device (or anyone who learned its id) asking
-        // over and over must not use up everyone's sign-ins.
+        // over and over must not use up everyone's sign-ins. Its oldest
+        // challenge makes way, so asking with someone else's id never
+        // locks that device out: its own sign-in, the newest, still works.
         let own = challenges
             .values()
             .filter(|c| c.device_id == device.device_id)
             .count();
-        if own >= MAX_OPEN_CHALLENGES_PER_DEVICE || challenges.len() >= MAX_OPEN_CHALLENGES {
-            return Err(ProtocolError::new(
-                ErrorCode::RateLimited,
-                "Too many sign-ins at once; try again in a minute",
-            ));
+        if own >= MAX_OPEN_CHALLENGES_PER_DEVICE {
+            evict_oldest(&mut challenges, |c| c.device_id == device.device_id);
+        } else if challenges.len() >= MAX_OPEN_CHALLENGES {
+            evict_oldest(&mut challenges, |_| true);
         }
+        let named_endpoint = endpoint.map(str::trim).filter(|e| !e.is_empty());
         challenges.insert(
             challenge_id.clone(),
             PendingChallenge {
                 device_id: device.device_id,
                 nonce: nonce.clone(),
                 expires_at_ms,
-                endpoint: endpoint.and_then(endpoint_of),
+                endpoint: named_endpoint.and_then(endpoint_of),
+                named_endpoint: named_endpoint.map(str::to_string),
+                created_ms: now,
             },
         );
         Ok(Challenge {
@@ -768,11 +793,40 @@ impl Pairing {
         }
     }
 
-    /// Trade a signed challenge for an access token.
+    /// Whether `audience` ([`sign_in_audience`]) names this daemon: its
+    /// peer-to-peer key, an origin it is published at, or (`local`, for a
+    /// request made on this computer, and only then) a loopback address: a
+    /// loopback address names whatever listens there on the device's own
+    /// computer, not this daemon.
+    fn is_own_audience(&self, audience: &str, local: bool) -> bool {
+        if let Some(key) = self.remote_url().and_then(|url| own_key(&url))
+            && audience == format!("iroh:{key}")
+        {
+            return true;
+        }
+        if audience.starts_with("http") && is_loopback_url(audience) {
+            return local;
+        }
+        let mut origins = self.public_url.endpoints.current();
+        origins.push(self.public_url.fallback.clone());
+        origins
+            .iter()
+            .filter_map(|origin| sign_in_audience(origin))
+            .any(|origin| origin == audience)
+    }
+
+    /// Trade a signed challenge for an access token. `audience`: the daemon
+    /// the signature names ([`challenge_message_v2`]); `None` is the older
+    /// [`challenge_message`], bound to no daemon, taken only when `local`
+    /// (the request came on this computer, not through a tunnel or a
+    /// peer-to-peer transport), so a daemon that relays this one's
+    /// challenge to a device never gets a signature it can use here.
     pub async fn open_session(
         &self,
         challenge_id: &str,
         signature: &str,
+        audience: Option<&str>,
+        local: bool,
     ) -> Result<AccessGrant, ProtocolError> {
         let challenge = self
             .challenges
@@ -784,11 +838,31 @@ impl Pairing {
                 ProtocolError::new(ErrorCode::Unauthorized, "Unknown or expired challenge")
             })?;
         let device = self.active_device(&challenge.device_id).await?;
-        verify(
-            &device,
-            &challenge_message(challenge_id, &challenge.nonce),
-            signature,
-        )?;
+        let message = match audience.map(str::trim) {
+            Some(audience) => {
+                if !self.is_own_audience(audience, local) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Unauthorized,
+                        "This sign-in was signed for another daemon",
+                    ));
+                }
+                challenge_message_v2(
+                    challenge_id,
+                    &challenge.nonce,
+                    audience,
+                    challenge.named_endpoint.as_deref(),
+                )
+            }
+            None if local => challenge_message(challenge_id, &challenge.nonce),
+            None => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "Update the app: signing in from another computer needs a sign-in \
+                     bound to this daemon",
+                ));
+            }
+        };
+        verify(&device, &message, signature)?;
         let grant = self.grant(&device).await;
         if let Some(endpoint) = &challenge.endpoint {
             self.record_endpoint(&device.device_id, endpoint).await;
@@ -1260,6 +1334,123 @@ mod tests {
                     "issued at {at} (now {now})"
                 );
             }
+        }
+
+        /// A challenge sign-in names the daemon it was signed for: this
+        /// daemon's own key passes; a signature for another daemon (one that
+        /// relayed this daemon's challenge) does not, and an unbound one
+        /// passes only from this computer.
+        #[tokio::test]
+        async fn a_challenge_signature_counts_only_at_the_daemon_it_names() {
+            let s = setup().await;
+            let sign = |challenge: &Challenge, audience: &str| {
+                signed(
+                    &s.key,
+                    &challenge_message_v2(
+                        &challenge.challenge_id,
+                        &challenge.nonce,
+                        audience,
+                        Some(PHONE),
+                    ),
+                )
+            };
+            let own = format!("iroh:{DAEMON}");
+            let c = s.pairing.challenge("dv-phone", Some(PHONE)).await.unwrap();
+            assert!(
+                s.pairing
+                    .open_session(&c.challenge_id, &sign(&c, &own), Some(&own), false)
+                    .await
+                    .is_ok()
+            );
+            let other = format!("iroh:{OTHER_DAEMON}");
+            let c = s.pairing.challenge("dv-phone", Some(PHONE)).await.unwrap();
+            assert_eq!(
+                refused(
+                    s.pairing
+                        .open_session(&c.challenge_id, &sign(&c, &other), Some(&other), false)
+                        .await
+                ),
+                ErrorCode::Unauthorized
+            );
+            // Claiming this daemon over a signature for another fails too.
+            let c = s.pairing.challenge("dv-phone", Some(PHONE)).await.unwrap();
+            assert_eq!(
+                refused(
+                    s.pairing
+                        .open_session(&c.challenge_id, &sign(&c, &other), Some(&own), false)
+                        .await
+                ),
+                ErrorCode::Unauthorized
+            );
+            // A loopback address is this daemon only for a request made here.
+            let local = "http://127.0.0.1:8788";
+            let c = s.pairing.challenge("dv-phone", Some(PHONE)).await.unwrap();
+            assert_eq!(
+                refused(
+                    s.pairing
+                        .open_session(&c.challenge_id, &sign(&c, local), Some(local), false)
+                        .await
+                ),
+                ErrorCode::Unauthorized
+            );
+            let c = s.pairing.challenge("dv-phone", Some(PHONE)).await.unwrap();
+            assert!(
+                s.pairing
+                    .open_session(&c.challenge_id, &sign(&c, local), Some(local), true)
+                    .await
+                    .is_ok()
+            );
+            // The unbound message of older clients: from this computer only.
+            let old = |c: &Challenge| signed(&s.key, &challenge_message(&c.challenge_id, &c.nonce));
+            let c = s.pairing.challenge("dv-phone", None).await.unwrap();
+            assert_eq!(
+                refused(
+                    s.pairing
+                        .open_session(&c.challenge_id, &old(&c), None, false)
+                        .await
+                ),
+                ErrorCode::Unauthorized
+            );
+            let c = s.pairing.challenge("dv-phone", None).await.unwrap();
+            assert!(
+                s.pairing
+                    .open_session(&c.challenge_id, &old(&c), None, true)
+                    .await
+                    .is_ok()
+            );
+        }
+
+        /// Asking for challenges in a device's name over and over never locks
+        /// it out: the oldest makes way, the newest still signs in.
+        #[tokio::test]
+        async fn many_challenges_for_one_device_never_lock_it_out() {
+            let s = setup().await;
+            let first = s.pairing.challenge("dv-phone", None).await.unwrap();
+            for _ in 0..(MAX_OPEN_CHALLENGES_PER_DEVICE * 3) {
+                s.pairing.challenge("dv-phone", None).await.unwrap();
+            }
+            let last = s.pairing.challenge("dv-phone", None).await.unwrap();
+            let own = format!("iroh:{DAEMON}");
+            let sign = |c: &Challenge| {
+                signed(
+                    &s.key,
+                    &challenge_message_v2(&c.challenge_id, &c.nonce, &own, None),
+                )
+            };
+            assert!(
+                s.pairing
+                    .open_session(&last.challenge_id, &sign(&last), Some(&own), false)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(
+                refused(
+                    s.pairing
+                        .open_session(&first.challenge_id, &sign(&first), Some(&own), false)
+                        .await
+                ),
+                ErrorCode::Unauthorized
+            );
         }
 
         #[tokio::test]

@@ -1,15 +1,16 @@
 //! Device-key sign-in: pair once (redeem an offer with a fresh P-256
 //! public key, wait for the owner to confirm),
 //! then on each connection ask for a challenge, sign
-//! [`challenge_message`] and trade the signature for a 15-minute
+//! [`challenge_message_v2`] for the daemon it dialed and trade the
+//! signature for a 15-minute
 //! [`AccessGrant`], renewed before it runs out.
 
 use std::time::Duration;
 
 use aidaemon_client_protocol::{
     AccessGrant, Challenge, ChallengeRequest, ClientKind, Enrollment, EnrollmentState,
-    RedeemRequest, ServerFrame, SessionRequest, SocketSignIn, challenge_message,
-    socket_sign_in_message,
+    RedeemRequest, ServerFrame, SessionRequest, SocketSignIn, challenge_message_v2,
+    sign_in_audience, socket_sign_in_message,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -56,11 +57,23 @@ impl DeviceKey {
     }
 
     /// The signature (`r || s`, base64url) the gateway checks for a
-    /// challenge.
-    pub fn sign_challenge(&self, challenge: &Challenge) -> String {
-        let signature: Signature = self
-            .0
-            .sign(challenge_message(&challenge.challenge_id, &challenge.nonce).as_bytes());
+    /// challenge from the daemon `audience` names ([`sign_in_audience`]),
+    /// asked for with `endpoint`.
+    pub fn sign_challenge(
+        &self,
+        challenge: &Challenge,
+        audience: &str,
+        endpoint: Option<&str>,
+    ) -> String {
+        let signature: Signature = self.0.sign(
+            challenge_message_v2(
+                &challenge.challenge_id,
+                &challenge.nonce,
+                audience,
+                endpoint,
+            )
+            .as_bytes(),
+        );
         URL_SAFE_NO_PAD.encode(signature.to_bytes())
     }
 }
@@ -111,6 +124,14 @@ pub trait Http {
     fn get(&self, url: &str) -> impl std::future::Future<Output = Result<HttpReply, SignInError>>;
     /// Wait `duration` (between pairing polls).
     fn sleep(&self, duration: Duration) -> impl std::future::Future<Output = ()>;
+    /// The daemon a sign-in at `gateway` names ([`sign_in_audience`]): the
+    /// one the device means to reach, so a challenge another daemon relays
+    /// is useless there. A client whose requests go somewhere other than
+    /// `gateway` names (a page whose service worker carries them over
+    /// iroh) answers with the daemon they really reach.
+    fn audience(&self, gateway: &str) -> Option<String> {
+        sign_in_audience(gateway)
+    }
 }
 
 /// POST `body` to `base + path` and read a `T`, or the gateway's error.
@@ -229,20 +250,27 @@ async fn sign_in_from(
     signer: &impl Signer,
     endpoint: Option<String>,
 ) -> Result<AccessGrant, SignInError> {
+    let audience = http.audience(gateway).ok_or_else(|| {
+        SignInError::Refused(format!(
+            "{gateway} is not an address a device can sign in at"
+        ))
+    })?;
     let challenge: Challenge = post(
         http,
         gateway,
         "/client/v1/sessions/challenge",
         &ChallengeRequest {
             device_id: device_id.to_owned(),
-            endpoint,
+            endpoint: endpoint.clone(),
         },
     )
     .await?;
     let signature = signer
-        .sign(&challenge_message(
+        .sign(&challenge_message_v2(
             &challenge.challenge_id,
             &challenge.nonce,
+            &audience,
+            endpoint.as_deref(),
         ))
         .await?;
     post(
@@ -252,6 +280,7 @@ async fn sign_in_from(
         &SessionRequest {
             signature,
             challenge_id: challenge.challenge_id,
+            audience: Some(audience),
         },
     )
     .await
@@ -582,7 +611,7 @@ mod tests {
             expires_at_ms: 1,
         };
         let signature = URL_SAFE_NO_PAD
-            .decode(back.sign_challenge(&challenge))
+            .decode(back.sign_challenge(&challenge, "http://127.0.0.1:1", None))
             .unwrap();
         assert_eq!(signature.len(), 64);
         let public = URL_SAFE_NO_PAD.decode(key.public_key_b64()).unwrap();
@@ -590,7 +619,7 @@ mod tests {
         use p256::ecdsa::signature::Verifier;
         verifying
             .verify(
-                challenge_message("c1", "n1").as_bytes(),
+                challenge_message_v2("c1", "n1", "http://127.0.0.1:1", None).as_bytes(),
                 &Signature::from_slice(&signature).unwrap(),
             )
             .unwrap();

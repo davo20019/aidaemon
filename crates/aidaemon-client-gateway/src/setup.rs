@@ -319,7 +319,13 @@ async fn open_session(
     reply(
         gateway
             .pairing
-            .open_session(&request.challenge_id, &request.signature)
+            // Setup mode listens on loopback only: every request is local.
+            .open_session(
+                &request.challenge_id,
+                &request.signature,
+                request.audience.as_deref(),
+                true,
+            )
             .await,
     )
 }

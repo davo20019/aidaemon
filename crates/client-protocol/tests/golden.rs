@@ -1752,6 +1752,7 @@ fn http_samples() -> Vec<(&'static str, Value)> {
             serde_json::to_value(SessionRequest {
                 challenge_id: "ch-1".into(),
                 signature: "c2ln...".into(),
+                audience: None,
             })
             .unwrap(),
         ),

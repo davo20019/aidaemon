@@ -586,13 +586,15 @@ mod client_gateway {
                 .unwrap(),
         )
         .await;
-        let signature: p256::ecdsa::Signature =
-            key.sign(challenge_message(&challenge.challenge_id, &challenge.nonce).as_bytes());
+        let signature: p256::ecdsa::Signature = key.sign(
+            challenge_message_v2(&challenge.challenge_id, &challenge.nonce, &base, None).as_bytes(),
+        );
         let grant: AccessGrant = http_json(
             http.post(format!("{base}/client/v1/sessions"))
                 .json(&SessionRequest {
                     challenge_id: challenge.challenge_id,
                     signature: b64.encode(signature.to_bytes()),
+                    audience: Some(base.clone()),
                 })
                 .send()
                 .await
