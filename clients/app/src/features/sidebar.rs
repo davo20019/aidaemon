@@ -1565,29 +1565,8 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
             }))
         })
     };
-    if !ui::touch() {
-        return view()
-            .flex_1()
-            .min_w(px(0.0))
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(title)
-            .child(star)
-            // One slot for the project and the agent: the title keeps the
-            // rest of the line, and in the slot the project gives way first.
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .min_w(px(0.0))
-                    .max_w(percentage(0.45))
-                    .child(tag_text().min_w(px(0.0)).flex_shrink(1.0))
-                    .child(agent_text().max_w(percentage(1.0))),
-            )
-            .child(mark());
-    }
+    // Two lines everywhere: the title, then where it is and who answers
+    // (one desktop line had no room for both beside a title).
     let said = move || {
         !row_tag(store, &any_id).is_empty()
             || row_glyph(store, &any_id).is_some()
