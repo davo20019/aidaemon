@@ -1536,6 +1536,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 agents: vec![AgentOption {
                     id: "codex".into(),
                     name: "Codex".into(),
+                    mark: Some("openai".into()),
                 }],
             },
         }),

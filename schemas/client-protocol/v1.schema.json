@@ -85,6 +85,13 @@
           "description": "What an `agent` choice names it by.",
           "type": "string"
         },
+        "mark": {
+          "description": "The mark a client shows for it (protocol 1.53): the id of its\nmaker's model provider (\"anthropic\", \"openai\", \"gemini\"). `None`: a\ngeneric agent mark.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "description": "In plain words (\"Claude Code\", \"Codex\").",
           "type": "string"

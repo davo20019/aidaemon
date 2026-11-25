@@ -38,6 +38,8 @@ pub struct AcpAgent {
     arguments: Option<LaunchArguments>,
     /// Whose account it works with, in plain words.
     account: &'static str,
+    /// What a client draws for it ([`CodingAgent::mark`]).
+    mark: Option<&'static str>,
 }
 
 impl AcpAgent {
@@ -51,6 +53,7 @@ impl AcpAgent {
             discovery: None,
             arguments: None,
             account: "",
+            mark: None,
         }
     }
 
@@ -69,6 +72,7 @@ impl AcpAgent {
                 subcommands: &["acp"],
             }),
             account: "Its own Antigravity sign-in: your Google account and its plan.",
+            mark: Some("gemini"),
             ..Self::custom("Antigravity CLI", "agy", &["acp"])
         }
     }
@@ -90,6 +94,7 @@ impl AcpAgent {
                 subcommands: &[],
             }),
             account: "Its own Gemini CLI sign-in: a Google account or a Gemini API key.",
+            mark: Some("gemini"),
             ..Self::custom("Gemini CLI", "gemini", &["--acp"])
         }
     }
@@ -106,6 +111,10 @@ impl CodingAgent for AcpAgent {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn mark(&self) -> Option<&str> {
+        self.mark
     }
 
     fn launches(&self, program: &str) -> bool {

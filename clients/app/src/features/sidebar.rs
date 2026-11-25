@@ -237,14 +237,7 @@ fn work_line(store: Store, id: String) -> View {
                             .pl(px(WORK_INDENT))
                             .pr_2()
                             .py_1()
-                            .child(
-                                text(words)
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .number_of_lines(1)
-                                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                                    .text_color(color),
-                            )
+                            .child(work_marks(store, &work, words, color))
                             .child(
                                 text(move || {
                                     store.tick();
@@ -258,6 +251,60 @@ fn work_line(store: Store, id: String) -> View {
             )
         }))
     }))
+}
+
+/// The work line's body: a failure in words; else how far along, then
+/// each kind of agent by its mark with how many ("1 of 3 done · ◆×2 ●"),
+/// a lone agent by its mark and name. The words stay the line's label.
+fn work_marks(
+    store: Store,
+    work: &crate::store::AgentWork,
+    words: String,
+    color: AdaptiveColor,
+) -> View {
+    let size = px(if ui::touch() { 12.0 } else { type_scale::XS });
+    let line = view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_1()
+        .min_w(px(0.0));
+    if !work.failed.is_empty() {
+        return line.child(
+            text(words)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .text_size(size)
+                .text_color(color),
+        );
+    }
+    let mut line = line;
+    if work.total > 1 {
+        line = line.child(
+            text(format!("{} of {} done ·", work.done, work.total))
+                .flex_shrink(0.0)
+                .text_size(size)
+                .text_color(color),
+        );
+    }
+    let alone = work.kinds.len() == 1 && work.total == 1;
+    for (name, count) in &work.kinds {
+        let glyph = store.agent_glyph_named(name);
+        line = line.child(ui::icon_inline(glyph).text_color(color));
+        if alone {
+            line = line.child(
+                text(name.clone())
+                    .min_w(px(0.0))
+                    .number_of_lines(1)
+                    .text_size(size)
+                    .text_color(color),
+            );
+        } else if *count > 1 {
+            line = line.child(text(format!("×{count}")).text_size(size).text_color(color));
+        }
+    }
+    line
 }
 
 /// Where a row's work line starts: under its title, past the unread dot.
@@ -433,8 +480,7 @@ fn rename_field(store: Store, id: String) -> View {
 /// More about a conversation than its row says: its title, where it is,
 /// who answers it, when it last moved, and its last message.
 fn session_preview(store: Store, id: String) -> View {
-    let (title, place, agent, when, last) =
-        (id.clone(), id.clone(), id.clone(), id.clone(), id);
+    let (title, place, agent, when, last) = (id.clone(), id.clone(), id.clone(), id.clone(), id);
     view()
         .gap_1()
         .child(
@@ -1549,15 +1595,18 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
             .text_color(colors::MUTED)
     };
     // The coding agent the conversation is set to (messages there go
-    // straight to it), kept whole: a long project name gives way first.
+    // straight to it), by its maker's mark; the row's label names it.
     let has_agent = move || store.session_agent(&agent_shown_id).is_some();
     let agent_text = move || {
         let id = agent_id.clone();
-        text(move || row_agent(store, &id))
-            .number_of_lines(1)
-            .flex_shrink(0.0)
-            .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-            .text_color(colors::MUTED)
+        dynamic(move || {
+            let glyph = store.session_agent_glyph(&id);
+            Some(untracked(move || {
+                ui::icon_inline(glyph)
+                    .flex_shrink(0.0)
+                    .text_color(colors::FAINT)
+            }))
+        })
     };
     let mark = move || {
         let id = mark_id.clone();
@@ -1632,17 +1681,6 @@ fn row_tag(store: Store, id: &str) -> String {
         };
     }
     tag
-}
-
-/// The coding agent's name after a row's tag ("· Claude Code"), alone
-/// when the row has no tag (inside its project); empty when AIDaemon
-/// answers the conversation.
-fn row_agent(store: Store, id: &str) -> String {
-    match store.session_agent(id) {
-        None => String::new(),
-        Some(agent) if row_tag(store, id).is_empty() => agent,
-        Some(agent) => format!("· {agent}"),
-    }
 }
 
 fn row_place(store: Store, id: &str) -> String {

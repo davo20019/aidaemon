@@ -396,13 +396,19 @@ pub fn platform_glyph(channel: &str) -> Option<Glyph> {
     }
 }
 
+/// A coding agent's mark: its maker's logo for the provider id the daemon
+/// names (`AgentOption::mark`), else the generic agent mark.
+pub fn agent_glyph(mark: Option<&str>) -> Glyph {
+    mark.and_then(provider_glyph).unwrap_or(Glyph::Work)
+}
+
 /// The mark of a model provider, from its catalog preset (`openai_chatgpt`,
 /// `google_ai_studio`...): `None` for one with no mark of its own.
 pub fn provider_glyph(preset: &str) -> Option<Glyph> {
     match preset {
         "openai" | "openai_chatgpt" => Some(Glyph::OpenAi),
         "anthropic_native" | "anthropic" | "anthropic_openrouter" => Some(Glyph::Anthropic),
-        "google_ai_studio" => Some(Glyph::Gemini),
+        "google_ai_studio" | "gemini" => Some(Glyph::Gemini),
         "openrouter" => Some(Glyph::OpenRouter),
         "deepseek" => Some(Glyph::DeepSeek),
         "moonshot" => Some(Glyph::Kimi),

@@ -323,6 +323,10 @@ impl CodingAgent for ClaudeCode {
         "Claude Code"
     }
 
+    fn mark(&self) -> Option<&str> {
+        Some("anthropic")
+    }
+
     fn launches(&self, program: &str) -> bool {
         program
             .trim_end_matches(".exe")

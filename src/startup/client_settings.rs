@@ -1448,6 +1448,7 @@ pub(crate) async fn direct_agents(
         .filter(|info| permissions.agent_mode(&info.name, &*info.agent).is_some())
         .map(|info| aidaemon_client_protocol::AgentOption {
             name: info.agent.name().to_string(),
+            mark: info.agent.mark().map(str::to_string),
             id: info.name,
         })
         .collect()

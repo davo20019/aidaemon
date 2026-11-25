@@ -323,7 +323,28 @@ struct RowFacts {
     project: Option<String>,
     /// The coding agent it is set to, by name.
     agent: Option<String>,
+    /// That agent's mark (a provider id), when the daemon names one.
+    agent_mark: Option<String>,
     last_activity: Option<u64>,
+}
+
+/// The mark of the coding agent conversation `id` is set to.
+fn agent_mark_of(c: &Client, id: &str) -> Option<String> {
+    let agent = c
+        .state
+        .sessions
+        .get(id)?
+        .summary
+        .as_ref()?
+        .agent
+        .as_deref()?;
+    c.models
+        .ready()?
+        .agents
+        .iter()
+        .find(|a| a.id == agent)?
+        .mark
+        .clone()
 }
 
 impl RowFacts {
@@ -339,6 +360,7 @@ impl RowFacts {
             archived: c.is_archived(id),
             project: c.session_project(id),
             agent: c.session_agent(id),
+            agent_mark: agent_mark_of(c, id),
             last_activity: c.last_activity(id),
         }
     }
@@ -1870,6 +1892,25 @@ impl Store {
     /// answers it.
     pub fn session_agent(&self, session: &str) -> Option<String> {
         self.row(session, |r| r.agent.clone())
+    }
+
+    /// The mark of the coding agent `session` is set to: its maker's logo,
+    /// else the generic agent mark.
+    pub fn session_agent_glyph(&self, session: &str) -> crate::ui::Glyph {
+        crate::ui::agent_glyph(self.row(session, |r| r.agent_mark.clone()).as_deref())
+    }
+
+    /// The mark of the coding agent named `name` (as a run names it).
+    pub fn agent_glyph_named(&self, name: &str) -> crate::ui::Glyph {
+        let mark = match self.model_options() {
+            Read::Ready(options) => options
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.mark.clone()),
+            _ => None,
+        };
+        crate::ui::agent_glyph(mark.as_deref())
     }
 
     /// The project of what is on screen: the selected conversation's, or

@@ -14,6 +14,13 @@ pub trait CodingAgent: Send + Sync {
     /// Its name in plain words ("Claude Code").
     fn name(&self) -> &str;
 
+    /// The mark a client shows for it: the id of its maker's model
+    /// provider ("anthropic", "openai", "gemini"), which clients draw as
+    /// that provider's logo. `None`: a generic agent mark.
+    fn mark(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether the program a launch runs (its file name: `claude`,
     /// `codex.exe`) is this agent.
     fn launches(&self, program: &str) -> bool;

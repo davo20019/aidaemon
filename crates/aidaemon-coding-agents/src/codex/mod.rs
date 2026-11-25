@@ -227,6 +227,10 @@ impl CodingAgent for Codex {
         "Codex"
     }
 
+    fn mark(&self) -> Option<&str> {
+        Some("openai")
+    }
+
     fn launches(&self, program: &str) -> bool {
         program
             .trim_end_matches(".exe")

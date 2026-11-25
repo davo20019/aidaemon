@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 52;
+pub const PROTOCOL_MINOR: u16 = 53;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -780,6 +780,11 @@ pub struct AgentOption {
     pub id: String,
     /// In plain words ("Claude Code", "Codex").
     pub name: String,
+    /// The mark a client shows for it (protocol 1.53): the id of its
+    /// maker's model provider ("anthropic", "openai", "gemini"). `None`: a
+    /// generic agent mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<String>,
 }
 
 /// A connected provider, as a model picker lists it.
