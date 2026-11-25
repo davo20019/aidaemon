@@ -85,6 +85,7 @@ impl ChannelSetup {
                     .any(|channel| channel_is(channel, &platform)),
                 platform,
                 bot,
+                claim_code: progress.bot_claim_code.clone(),
             }),
             on_server: progress.on_server,
             ..SetupState::default()
@@ -118,7 +119,7 @@ impl ChannelSetup {
                 token,
                 app_token,
             } => {
-                let bot = connect_bot(
+                let (bot, claim_code) = connect_bot(
                     self.state.as_ref(),
                     &platform,
                     token.0.trim(),
@@ -126,6 +127,7 @@ impl ChannelSetup {
                 )
                 .await?;
                 progress.bot = Some((platform.clone(), bot));
+                progress.bot_claim_code = claim_code;
                 progress::save(&self.config_path, &progress).map_err(|e| e.to_string())?;
                 // Bots start with the daemon: restart in place, and the app
                 // reconnects to a daemon running it.
@@ -217,13 +219,14 @@ fn channel_is(channel: &str, platform: &str) -> bool {
 }
 
 /// Check a bot's tokens with its platform and keep it as a runtime bot.
-/// Returns the bot as the owner finds it.
+/// Returns the bot as the owner finds it and, for a new bot, the one-time
+/// code whose direct message claims it.
 async fn connect_bot(
     state: &dyn StateStore,
     platform: &str,
     token: &str,
     app_token: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     use crate::channels::connect;
     if token.is_empty() {
         return Err("Paste the bot's token".into());
@@ -244,13 +247,15 @@ async fn connect_bot(
         other => return Err(format!("{other} is not a chat this daemon connects")),
     };
     if connect::check_bot_exists(state, platform, token).await? {
-        return Ok(name);
+        return Ok((name, None));
     }
     let extra = if platform == "telegram" {
         serde_json::json!({ "username": name.trim_start_matches('@') }).to_string()
     } else {
         "{}".to_string()
     };
+    let claim_code = aidaemon_channels::claim::new_claim_code();
+    let extra = aidaemon_channels::claim::extra_with_claim_code(&extra, &claim_code);
     connect::persist_dynamic_bot(
         state,
         &crate::traits::DynamicBot {
@@ -258,14 +263,14 @@ async fn connect_bot(
             channel_type: platform.to_string(),
             bot_token: token.to_string(),
             app_token,
-            // Empty: the first person to message it claims it.
+            // Empty: the direct message carrying the claim code claims it.
             allowed_user_ids: Vec::new(),
             extra_config: extra,
             created_at: String::new(),
         },
     )
     .await?;
-    Ok(name)
+    Ok((name, Some(claim_code)))
 }
 
 #[cfg(test)]

@@ -953,11 +953,17 @@ fn channel_step(store: Store) -> View {
                         })),
                     Some(wait) => view()
                         .gap_3()
-                        .child(lead(format!(
-                            "Now send any message to {} from your phone. The first person to \
-                             message it becomes its owner, so do it now. Its answer arrives there.",
-                            wait.bot
-                        )))
+                        .child(lead(match &wait.claim_code {
+                            Some(code) => format!(
+                                "Now send this message to {} from your phone to make it yours: \
+                                 /claim {code}. Only this code claims it. Its answer arrives there.",
+                                wait.bot
+                            ),
+                            None => format!(
+                                "Now send any message to {} from your phone. Its answer arrives there.",
+                                wait.bot
+                            ),
+                        }))
                         .child(ui::working("Waiting for your first message")),
                     None => {
                         let mut choices = view().flex_row().gap_2();

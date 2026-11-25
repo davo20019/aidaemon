@@ -338,11 +338,13 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             crate::config::TelegramWebhookConfig::default()
                         };
                         info!(bot_id = bot.id, "Loading dynamic Telegram bot");
-                        dynamic_telegram_bots.push(make_telegram(
-                            &bot.bot_token,
-                            allowed_user_ids,
-                            webhook,
-                        ));
+                        let loaded = make_telegram(&bot.bot_token, allowed_user_ids, webhook);
+                        if let Some(code) =
+                            aidaemon_channels::claim::claim_code_from_extra(&bot.extra_config)
+                        {
+                            loaded.owner_claim().set_code(&code);
+                        }
+                        dynamic_telegram_bots.push(loaded);
                     }
                     #[cfg(feature = "discord")]
                     "discord" => {
@@ -362,11 +364,13 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                             serde_json::from_str(&bot.extra_config).unwrap_or_default();
                         let guild_id = extra["guild_id"].as_u64();
                         info!(bot_id = bot.id, "Loading dynamic Discord bot");
-                        dynamic_discord_bots.push(make_discord(
-                            &bot.bot_token,
-                            allowed_user_ids,
-                            guild_id,
-                        ));
+                        let loaded = make_discord(&bot.bot_token, allowed_user_ids, guild_id);
+                        if let Some(code) =
+                            aidaemon_channels::claim::claim_code_from_extra(&bot.extra_config)
+                        {
+                            loaded.owner_claim().set_code(&code);
+                        }
+                        dynamic_discord_bots.push(loaded);
                     }
                     #[cfg(not(feature = "discord"))]
                     "discord" => {
@@ -393,12 +397,18 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
                                 serde_json::from_str(&bot.extra_config).unwrap_or_default();
                             let use_threads = extra["use_threads"].as_bool().unwrap_or(false);
                             info!(bot_id = bot.id, "Loading dynamic Slack bot");
-                            dynamic_slack_bots.push(make_slack(
+                            let loaded = make_slack(
                                 app_token,
                                 &bot.bot_token,
                                 bot.allowed_user_ids.clone(),
                                 use_threads,
-                            ));
+                            );
+                            if let Some(code) =
+                                aidaemon_channels::claim::claim_code_from_extra(&bot.extra_config)
+                            {
+                                loaded.owner_claim().set_code(&code);
+                            }
+                            dynamic_slack_bots.push(loaded);
                         }
                     }
                     #[cfg(not(feature = "slack"))]
@@ -421,6 +431,22 @@ pub async fn build_channels(config: &AppConfig, runtime: ChannelRuntimeDeps) -> 
         Err(e) => {
             warn!("Failed to load dynamic bots: {}", e);
         }
+    }
+
+    // A bot nobody owns yet is claimed only with its one-time code: the
+    // chat or setup screen that connected it showed the code, and the log
+    // shows it here for a bot from the config file (or one connected before
+    // codes were stored).
+    for bot in telegram_bots.iter().chain(dynamic_telegram_bots.iter()) {
+        bot.announce_claim_if_unowned();
+    }
+    #[cfg(feature = "discord")]
+    for bot in discord_bots.iter().chain(dynamic_discord_bots.iter()) {
+        bot.announce_claim_if_unowned();
+    }
+    #[cfg(feature = "slack")]
+    for bot in slack_bots.iter().chain(dynamic_slack_bots.iter()) {
+        bot.announce_claim_if_unowned();
     }
 
     let mut channels: Vec<Arc<dyn HubChannel>> = telegram_bots

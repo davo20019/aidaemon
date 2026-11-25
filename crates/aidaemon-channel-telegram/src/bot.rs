@@ -204,6 +204,9 @@ pub struct TelegramBot {
     bot_token: String,
     webhook: TelegramWebhookSettings,
     allowed_user_ids: StdRwLock<Vec<u64>>,
+    /// The one-time code a direct message must carry to claim the bot
+    /// while its allowlist is empty.
+    owner_claim: aidaemon_channels::claim::OwnerClaim,
     /// Telegram user IDs recognized as owners (from `users.owner_ids.telegram`).
     owner_user_ids: Vec<u64>,
     deps: BotDeps,
@@ -272,6 +275,7 @@ impl TelegramBot {
             bot_token: bot_token.to_string(),
             webhook,
             allowed_user_ids: StdRwLock::new(allowed_user_ids),
+            owner_claim: aidaemon_channels::claim::OwnerClaim::new("Telegram", None),
             owner_user_ids,
             deps,
             host,
@@ -296,6 +300,23 @@ impl TelegramBot {
     /// Who may talk to the bot.
     pub fn allowed_user_ids(&self) -> &StdRwLock<Vec<u64>> {
         &self.allowed_user_ids
+    }
+
+    /// The code that claims the bot while it has no allowed users.
+    pub fn owner_claim(&self) -> &aidaemon_channels::claim::OwnerClaim {
+        &self.owner_claim
+    }
+
+    /// Writes the claim code to the log when nobody is allowed yet.
+    pub fn announce_claim_if_unowned(&self) {
+        let unowned = self
+            .allowed_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        if unowned {
+            self.owner_claim.announce();
+        }
     }
 
     /// Who counts as an owner (empty: every allowed user).
@@ -1262,16 +1283,21 @@ impl TelegramBot {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if allowed.is_empty() {
                 if is_private {
-                    warn!(
-                        user_id,
-                        "No allowed_user_ids configured — auto-claiming first DM user as owner."
-                    );
+                    // Only the one-time claim code makes a sender the owner:
+                    // a stranger who finds the bot first gets nothing.
                     drop(allowed);
-                    let mut allowed = self
-                        .allowed_user_ids
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    check_auth(&mut allowed, user_id)
+                    let text = msg.text().unwrap_or_default();
+                    match self.owner_claim.attempt(text) {
+                        aidaemon_channels::claim::ClaimAttempt::Claimed => {
+                            warn!(user_id, "Telegram bot claimed with its claim code.");
+                            let mut allowed = self
+                                .allowed_user_ids
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            check_auth(&mut allowed, user_id)
+                        }
+                        aidaemon_channels::claim::ClaimAttempt::Refused => AuthResult::ClaimNeeded,
+                    }
                 } else {
                     // Group message before any owner is set — reject
                     AuthResult::Unauthorized
@@ -1299,7 +1325,18 @@ impl TelegramBot {
                     welcome.push_str(&note);
                 }
                 let _ = bot.send_message(msg.chat.id, welcome).await;
-                // Fall through to process the message normally
+                // The message was the claim code: nothing for the agent.
+                return;
+            }
+            AuthResult::ClaimNeeded => {
+                warn!(
+                    user_id,
+                    "Direct message to an unclaimed bot without its claim code"
+                );
+                let _ = bot
+                    .send_message(msg.chat.id, self.owner_claim.refusal())
+                    .await;
+                return;
             }
             AuthResult::Unauthorized => {
                 warn!(user_id, "Unauthorized user attempted access");
@@ -2073,6 +2110,9 @@ pub enum AuthResult {
     AutoClaimed,
     /// User is not allowed.
     Unauthorized,
+    /// The bot has no owner yet and the message did not carry its claim
+    /// code.
+    ClaimNeeded,
 }
 
 /// Pure authorization check against the allow list with first-user auto-claim.

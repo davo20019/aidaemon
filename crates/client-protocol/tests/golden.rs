@@ -923,6 +923,7 @@ fn server_samples() -> Vec<ServerFrame> {
                         platform: "telegram".into(),
                         bot: "@synthetic_bot".into(),
                         connected: true,
+                        claim_code: None,
                     }),
                     ..SetupState::default()
                 },

@@ -2114,6 +2114,10 @@ pub struct ChannelWait {
     /// The owner's first message arrived and was answered there.
     #[serde(default)]
     pub connected: bool,
+    /// The one-time code whose direct message claims the bot (`None` for a
+    /// bot connected before). Only this screen shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_code: Option<String>,
 }
 
 /// One step of first-run setup.

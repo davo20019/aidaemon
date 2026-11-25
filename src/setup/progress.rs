@@ -15,6 +15,9 @@ pub(crate) struct Progress {
     /// A bot connected in the chat step: its platform and name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot: Option<(String, String)>,
+    /// The one-time code that claims that bot, shown to the owner here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_claim_code: Option<String>,
     /// The first conversation's greeting was posted.
     #[serde(default)]
     pub greeted: bool,

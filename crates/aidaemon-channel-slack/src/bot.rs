@@ -333,6 +333,9 @@ pub struct SlackBot {
     /// Explicit owners from `users.owner_ids.slack`. When empty, allowed users
     /// retain legacy owner behavior for backward compatibility.
     owner_user_ids: std::sync::RwLock<Vec<String>>,
+    /// The one-time code a direct message must carry to claim the bot
+    /// while it has neither allowed users nor owners.
+    owner_claim: aidaemon_channels::claim::OwnerClaim,
     workspace_grants: std::sync::RwLock<Vec<WorkspaceGrant>>,
     use_threads: bool,
     /// Threads (`channel:thread_ts`) the bot is known to be answering in.
@@ -404,6 +407,28 @@ pub struct SlackBotSettings {
 }
 
 impl SlackBot {
+    /// The code that claims the bot while it has no allowed users or owners.
+    pub fn owner_claim(&self) -> &aidaemon_channels::claim::OwnerClaim {
+        &self.owner_claim
+    }
+
+    /// Writes the claim code to the log when nobody is allowed or owns it.
+    pub fn announce_claim_if_unowned(&self) {
+        let unowned = self
+            .allowed_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+            && self
+                .owner_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty();
+        if unowned {
+            self.owner_claim.announce();
+        }
+    }
+
     pub fn new(settings: SlackBotSettings, deps: BotDeps, host: Arc<dyn SlackHost>) -> Self {
         let SlackBotSettings {
             app_token,
@@ -423,6 +448,7 @@ impl SlackBot {
             bot_token,
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids: std::sync::RwLock::new(owner_user_ids),
+            owner_claim: aidaemon_channels::claim::OwnerClaim::new("Slack", None),
             workspace_grants: std::sync::RwLock::new(workspace_grants),
             use_threads,
             host,
@@ -1496,30 +1522,47 @@ impl SlackBot {
 
         // Auto-claim only when neither an allowlist nor an explicit owner exists.
         // Persist both lists together so the claimed user is unambiguously Owner.
-        let auto_claimed = if is_dm {
-            let mut allowed = self
+        // An unowned bot is claimed only by a direct message carrying its
+        // one-time claim code; any other message to it is refused.
+        let unclaimed = {
+            let allowed = self
                 .allowed_user_ids
-                .write()
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut owners = self
+            let owners = self
                 .owner_user_ids
-                .write()
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if allowed.is_empty() && owners.is_empty() {
-                allowed.push(user.clone());
-                owners.push(user.clone());
-                true
-            } else {
-                false
+            allowed.is_empty() && owners.is_empty()
+        };
+        let auto_claimed = if unclaimed && is_dm {
+            match self.owner_claim.attempt(&raw_text) {
+                aidaemon_channels::claim::ClaimAttempt::Claimed => {
+                    let mut allowed = self
+                        .allowed_user_ids
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut owners = self
+                        .owner_user_ids
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    allowed.push(user.clone());
+                    owners.push(user.clone());
+                    true
+                }
+                aidaemon_channels::claim::ClaimAttempt::Refused => {
+                    warn!(user = %user, "Direct message to an unclaimed Slack bot without its claim code");
+                    let _ = self
+                        .post_message(&channel_id, &self.owner_claim.refusal(), None)
+                        .await;
+                    return;
+                }
             }
         } else {
             false
         };
         if auto_claimed {
-            warn!(
-                user = %user,
-                "No Slack users configured — auto-claiming first DM user as owner."
-            );
+            warn!(user = %user, "Slack bot claimed with its claim code.");
         }
 
         if auto_claimed {
@@ -1542,6 +1585,8 @@ impl SlackBot {
                 "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat.",
                 None,
             ).await;
+            // The message was the claim code: nothing for the agent.
+            return;
         }
 
         let allowed_snapshot = self

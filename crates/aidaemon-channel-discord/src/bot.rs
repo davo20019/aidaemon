@@ -213,6 +213,9 @@ pub struct DiscordBot {
     allowed_user_ids: std::sync::RwLock<Vec<u64>>,
     /// Discord user IDs recognized as owners (from `users.owner_ids.discord`).
     owner_user_ids: Vec<u64>,
+    /// The one-time code a direct message must carry to claim the bot
+    /// while it has no Discord user allowed.
+    owner_claim: aidaemon_channels::claim::OwnerClaim,
     deps: BotDeps,
     /// The shared slash commands.
     commands: Arc<dyn SharedCommandDispatch>,
@@ -246,6 +249,7 @@ impl DiscordBot {
             bot_token: bot_token.to_string(),
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids,
+            owner_claim: aidaemon_channels::claim::OwnerClaim::new("Discord", None),
             runner: TurnRunner::new(deps.turn_deps()),
             deps,
             commands,
@@ -450,10 +454,31 @@ impl DiscordBot {
             kept: None,
         };
         // Server members may talk to the bot (as guests); DMs need access.
-        if !guild && !self.is_authorized(user_id) && !self.try_auto_claim(user_id).await {
-            warn!(user_id, "Unauthorized Discord user attempted access");
-            let _ = outlet.say_all("Unauthorized.").await;
-            return;
+        if !guild && !self.is_authorized(user_id) {
+            match self.try_auto_claim(user_id, &message.text).await {
+                Claim::Claimed => {
+                    let _ = outlet
+                        .say_all(
+                            "Hey! You're now set as the owner. Ask me anything, give me tasks, or just chat.",
+                        )
+                        .await;
+                    // The message was the claim code: nothing for the agent.
+                    return;
+                }
+                Claim::CodeNeeded => {
+                    warn!(
+                        user_id,
+                        "Direct message to an unclaimed Discord bot without its claim code"
+                    );
+                    let _ = outlet.say_all(&self.owner_claim.refusal()).await;
+                    return;
+                }
+                Claim::NotClaimable => {
+                    warn!(user_id, "Unauthorized Discord user attempted access");
+                    let _ = outlet.say_all("Unauthorized.").await;
+                    return;
+                }
+            }
         }
         // A server member the owner never allowed is heard only when they
         // address the bot (a mention or a reply to it), and their files are
@@ -588,6 +613,25 @@ impl DiscordBot {
             .contains(&user_id)
     }
 
+    /// The code that claims the bot while it has no Discord user allowed.
+    pub fn owner_claim(&self) -> &aidaemon_channels::claim::OwnerClaim {
+        &self.owner_claim
+    }
+
+    /// Writes the claim code to the log when no Discord user is allowed.
+    pub fn announce_claim_if_unowned(&self) {
+        let unowned = self.owner_user_ids.is_empty()
+            && !self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|id| *id >= MIN_DISCORD_USER_ID);
+        if unowned {
+            self.owner_claim.announce();
+        }
+    }
+
     /// A sender's role. With owner ids configured, those are the owners and
     /// everyone else is a guest. Without them (a dynamic bot) the allowlist
     /// holds the owners: being in a server with the bot never makes anyone
@@ -610,25 +654,33 @@ impl DiscordBot {
     /// Discord bot via /connect) is claimed by the first DM user, and the
     /// claim is saved. Configured bots, which have owner ids, never are, and
     /// neither is a bot that already has a Discord user on its allowlist.
-    async fn try_auto_claim(&self, user_id: u64) -> bool {
+    async fn try_auto_claim(&self, user_id: u64, text: &str) -> Claim {
         if !self.owner_user_ids.is_empty() {
-            return false;
+            return Claim::NotClaimable;
+        }
+        {
+            let ids = self
+                .allowed_user_ids
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if ids.iter().any(|id| *id >= MIN_DISCORD_USER_ID) {
+                return Claim::NotClaimable;
+            }
+        }
+        // Only the one-time claim code shown where the bot was connected
+        // makes a sender the owner.
+        if self.owner_claim.attempt(text) != aidaemon_channels::claim::ClaimAttempt::Claimed {
+            return Claim::CodeNeeded;
         }
         {
             let mut ids = self
                 .allowed_user_ids
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if ids.contains(&user_id) {
-                return true;
-            }
-            if ids.iter().any(|id| *id >= MIN_DISCORD_USER_ID) {
-                return false;
-            }
             info!(
                 user_id,
                 old_ids = ?*ids,
-                "Auto-claiming Discord bot for DM user (replacing stale IDs)"
+                "Discord bot claimed with its claim code (replacing stale IDs)"
             );
             ids.clear();
             ids.push(user_id);
@@ -640,7 +692,7 @@ impl DiscordBot {
         {
             warn!("Failed to persist auto-claimed user to DB: {}", e);
         }
-        true
+        Claim::Claimed
     }
 
     /// The reply to a slash command `text` (the transport delivers it).
@@ -933,4 +985,15 @@ mod tests {
         };
         assert!(outlet.card_sink().is_some());
     }
+}
+
+/// What a direct message from someone not allowed did to an unowned bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// It carried the claim code: the sender owns the bot now.
+    Claimed,
+    /// The bot is unowned and the message did not carry its code.
+    CodeNeeded,
+    /// The bot has an owner: the sender is simply not allowed.
+    NotClaimable,
 }

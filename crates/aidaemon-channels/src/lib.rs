@@ -21,6 +21,7 @@ mod approvals;
 pub mod attachments;
 pub mod bot;
 pub mod channel;
+pub mod claim;
 pub mod commands;
 #[cfg(feature = "conformance")]
 pub mod conformance;

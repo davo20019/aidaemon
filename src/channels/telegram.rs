@@ -1848,15 +1848,17 @@ impl Cx<'_> {
             }
         }
 
-        // Discord user IDs differ from Telegram IDs — save empty and let
-        // the Discord bot auto-claim the first DM user as the owner.
+        // Discord user IDs differ from Telegram IDs: the bot starts with no
+        // one allowed, and the first DM that carries this one-time code
+        // (shown only in this owner's chat) claims it.
+        let claim_code = aidaemon_channels::claim::new_claim_code();
         let new_bot = crate::traits::DynamicBot {
             id: 0,
             channel_type: "discord".to_string(),
             bot_token: token.to_string(),
             app_token: None,
             allowed_user_ids: vec![],
-            extra_config: "{}".to_string(),
+            extra_config: aidaemon_channels::claim::extra_with_claim_code("{}", &claim_code),
             created_at: String::new(),
         };
 
@@ -1887,6 +1889,7 @@ impl Cx<'_> {
                 self.runtime_deps(),
             ));
 
+            new_channel.owner_claim().set_code(&claim_code);
             // Give the new channel a reference to the hub
             new_channel.set_channel_hub(weak_hub);
 
@@ -1901,18 +1904,18 @@ impl Cx<'_> {
 
             return format!(
                 "✓ Discord bot {} connected and started!\n\n\
-                    Send a DM to the bot on Discord to claim it as yours.\n\
+                    To claim it as yours, send it this DM on Discord:\n/claim {}\n\n\
                     Use /bots to see all connected bots.",
-                bot_name
+                bot_name, claim_code
             );
         }
 
         // Fallback: hub not available, require restart
         format!(
             "✓ Discord bot {} connected!\n\n\
-            Run /restart to activate the new bot.\n\
+            Run /restart to activate the new bot, then claim it by sending it this DM on Discord:\n/claim {}\n\n\
             Use /bots to see all connected bots.",
-            bot_name
+            bot_name, claim_code
         )
     }
 
@@ -1952,7 +1955,11 @@ impl Cx<'_> {
             }
         }
 
-        let allowed_user_ids_str = vec![user_id.to_string()];
+        // Slack user ids are not Telegram ids: the bot starts with no one
+        // allowed, and the first DM that carries this one-time code (shown
+        // only in this owner's chat) claims it.
+        let allowed_user_ids_str: Vec<String> = Vec::new();
+        let claim_code = aidaemon_channels::claim::new_claim_code();
 
         let new_bot = crate::traits::DynamicBot {
             id: 0,
@@ -1960,7 +1967,7 @@ impl Cx<'_> {
             bot_token: bot_token.to_string(),
             app_token: Some(app_token.to_string()),
             allowed_user_ids: allowed_user_ids_str.clone(),
-            extra_config: "{}".to_string(),
+            extra_config: aidaemon_channels::claim::extra_with_claim_code("{}", &claim_code),
             created_at: String::new(),
         };
 
@@ -1993,6 +2000,7 @@ impl Cx<'_> {
                 self.runtime_deps(),
             ));
 
+            new_channel.owner_claim().set_code(&claim_code);
             // Give the new channel a reference to the hub
             new_channel.set_channel_hub(weak_hub);
 
@@ -2007,18 +2015,18 @@ impl Cx<'_> {
 
             return format!(
                 "✓ Slack bot {} ({}) connected and started!\n\n\
-                    The bot is now active and ready to receive messages.\n\
+                    To claim it as yours, send it this direct message in Slack:\n/claim {}\n\n\
                     Use /bots to see all connected bots.",
-                bot_name, team_name
+                bot_name, team_name, claim_code
             );
         }
 
         // Fallback: hub not available, require restart
         format!(
             "✓ Slack bot {} ({}) connected!\n\n\
-            Run /restart to activate the new bot.\n\
+            Run /restart to activate the new bot, then claim it by sending it this direct message in Slack:\n/claim {}\n\n\
             Use /bots to see all connected bots.",
-            bot_name, team_name
+            bot_name, team_name, claim_code
         )
     }
 
