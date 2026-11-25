@@ -102,30 +102,56 @@ pub async fn health_response(
     )
 }
 
-/// Generate and write a systemd service file (Linux).
-#[cfg(target_os = "linux")]
-pub fn install_service() -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
-    let working_dir = std::env::current_dir()?;
+/// The account the legacy system unit runs as: the user who ran it under
+/// `sudo`. A system unit with no `User=` runs the daemon (its terminal, MCP
+/// servers and coding agents) as root, from a binary and config the user
+/// can rewrite, so a unit for root itself is refused.
+#[cfg(any(target_os = "linux", test))]
+fn legacy_unit_user(sudo_user: Option<&str>) -> anyhow::Result<String> {
+    match sudo_user.map(str::trim) {
+        Some(user) if !user.is_empty() && user != "root" && !user.contains(char::is_whitespace) => {
+            Ok(user.to_string())
+        }
+        _ => anyhow::bail!(
+            "Run this with sudo from the account that should own the daemon, or use \
+             `aidaemon service install`, which installs a per-user unit and needs no root. \
+             AIDaemon does not install a system unit that runs as root."
+        ),
+    }
+}
 
-    let unit = format!(
+#[cfg(any(target_os = "linux", test))]
+fn legacy_system_unit(exe: &std::path::Path, working_dir: &std::path::Path, user: &str) -> String {
+    format!(
         r#"[Unit]
 Description=aidaemon - AI personal daemon
 After=network.target
 
 [Service]
 Type=simple
+User={user}
 ExecStart={}
 WorkingDirectory={}
 Restart=on-failure
 RestartSec=10
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 "#,
         exe.display(),
         working_dir.display()
-    );
+    )
+}
+
+/// Generate and write a systemd service file (Linux).
+#[cfg(target_os = "linux")]
+pub fn install_service() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let working_dir = std::env::current_dir()?;
+    let user = legacy_unit_user(std::env::var("SUDO_USER").ok().as_deref())?;
+
+    let unit = legacy_system_unit(&exe, &working_dir, &user);
 
     let path = "/etc/systemd/system/aidaemon.service";
     std::fs::write(path, unit)?;
@@ -486,6 +512,20 @@ pub fn spawn_macos_keep_awake() {
 mod tests {
     use super::*;
     use crate::events::EventStoreForTests as _;
+
+    #[test]
+    fn the_legacy_system_unit_never_runs_as_root() {
+        assert!(legacy_unit_user(None).is_err());
+        assert!(legacy_unit_user(Some("root")).is_err());
+        assert!(legacy_unit_user(Some("")).is_err());
+        let user = legacy_unit_user(Some("alice")).unwrap();
+        let unit = legacy_system_unit(
+            std::path::Path::new("/opt/aidaemon/aidaemon"),
+            std::path::Path::new("/home/alice/.aidaemon"),
+            &user,
+        );
+        assert!(unit.contains("\nUser=alice\n"));
+    }
 
     async fn health_fixture() -> (
         SqlitePool,
