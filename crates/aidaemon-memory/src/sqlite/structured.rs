@@ -9,14 +9,7 @@ use crate::records::{
     PersonalMemoryWrite, PersonalMemoryWriteResult, PersonalRelationshipCandidate,
 };
 
-fn words(value: &str) -> String {
-    value
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use crate::text::normalize_fact_value as words;
 
 fn token(value: &str) -> String {
     words(value).replace(' ', "_")

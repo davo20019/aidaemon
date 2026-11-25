@@ -6,13 +6,17 @@ pub(crate) use aidaemon_tools::text::truncate_str as truncate_chars;
 /// Lowercased words of a fact value, punctuation and spacing ignored, for
 /// comparing values written by different extractors ("~/projects/" and
 /// "~/projects" are one value).
-pub(crate) fn normalize_fact_value(value: &str) -> String {
-    value
-        .split(|c: char| !c.is_alphanumeric())
+/// The lowercase words of `text` (runs of letters and digits, any script).
+pub(crate) fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ")
+}
+
+/// `value`'s lowercase words joined by single spaces: two values that
+/// differ only in case, spacing or punctuation compare equal.
+pub(crate) fn normalize_fact_value(value: &str) -> String {
+    words(value).collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn canonicalize_fact_key(key: &str) -> String {

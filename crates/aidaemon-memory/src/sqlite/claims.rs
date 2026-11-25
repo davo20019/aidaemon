@@ -942,14 +942,7 @@ fn normalize_graph_token(value: &str, max_len: usize) -> String {
         .collect()
 }
 
-fn normalize_graph_name(value: &str) -> String {
-    value
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use crate::text::normalize_fact_value as normalize_graph_name;
 
 /// Whether an extracted entity is named in its evidence: its name or an
 /// alias (two characters or more) occurs there as whole words, in order
@@ -974,10 +967,7 @@ fn entity_is_grounded(name: &str, aliases: &[String], evidence: &str) -> bool {
 
 /// Lowercase alphanumeric words of `text`, in order.
 fn word_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    crate::text::words(text).collect()
 }
 
 async fn resolve_entity_identity(

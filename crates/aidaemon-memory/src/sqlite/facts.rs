@@ -206,11 +206,7 @@ pub fn fact_category_is_personal(category: &str) -> bool {
 }
 
 fn value_tokens(value: &str) -> std::collections::HashSet<String> {
-    value
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    crate::text::words(value).collect()
 }
 
 /// Values carry the same claim: identical numbers (versions, dates, counts,

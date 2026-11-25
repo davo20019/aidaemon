@@ -66,11 +66,10 @@ pub fn is_relationship_key(key: &str) -> bool {
 /// Underscores and hyphens in fact KEYS (e.g. `"partner_name"`) act as word
 /// separators just like spaces, so `"partner"` is a whole word inside
 /// `"partner_name"`.  All tokens are lowercased.
+/// Lowercase words (any script: an ASCII-only lowercase left "É" and "é"
+/// apart).
 fn word_tokens(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_ascii_lowercase())
-        .collect()
+    crate::text::words(s).collect()
 }
 
 /// True if every significant word of `entity` appears as a whole word in
