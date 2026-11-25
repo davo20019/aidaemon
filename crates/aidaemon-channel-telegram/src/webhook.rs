@@ -74,6 +74,17 @@ struct Listener {
     updates: mpsc::Sender<Value>,
 }
 
+/// Compares the presented secret with ours in time that does not depend on
+/// where they first differ.
+fn same_secret(presented: &str, secret: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), secret.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for (i, byte) in b.iter().enumerate() {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ byte);
+    }
+    diff == 0
+}
+
 async fn deliver(
     State(listener): State<Listener>,
     headers: HeaderMap,
@@ -82,7 +93,7 @@ async fn deliver(
     let presented = headers
         .get(SECRET_HEADER)
         .and_then(|value| value.to_str().ok());
-    if presented != Some(listener.secret.as_str()) {
+    if !presented.is_some_and(|presented| same_secret(presented, &listener.secret)) {
         return StatusCode::UNAUTHORIZED;
     }
     let Ok(update) = serde_json::from_slice::<Value>(&body) else {
@@ -122,6 +133,16 @@ pub(crate) async fn serve(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_secret_compare_matches_only_the_exact_secret() {
+        use super::same_secret;
+        assert!(same_secret("synthetic-secret-1", "synthetic-secret-1"));
+        assert!(!same_secret("synthetic-secret-", "synthetic-secret-1"));
+        assert!(!same_secret("synthetic-secret-12", "synthetic-secret-1"));
+        assert!(!same_secret("", "synthetic-secret-1"));
+        assert!(!same_secret("synthetic-secret-2", "synthetic-secret-1"));
+    }
+
     use super::*;
 
     #[test]
