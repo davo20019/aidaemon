@@ -259,6 +259,15 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.startMessages();
 }
 
+/**
+ * Start the iroh connection over (remote/'s Daemon.reset): after a drop, or
+ * a wake while still dialing, a fresh relay link beats waiting on one the
+ * network change or a sleep left dead. Nothing to do before the module loads.
+ */
+export async function resetRemote() {
+  if (remoteDaemon) await (await remoteDaemon).reset();
+}
+
 /** The endpoint key (hex) this browser dials its daemon with over iroh. */
 export async function remoteEndpoint() {
   return (await daemon()).endpoint();

@@ -86,6 +86,18 @@ impl Daemon {
         })
     }
 
+    /// Start over: close this browser's connection to the daemon and its
+    /// relay link, failing a dial still in flight at once, so the next
+    /// request or socket dials afresh. For a link that dropped, or a page
+    /// that woke or came back online while still dialing.
+    pub fn reset(&self) -> js_sys::Promise {
+        let (url, dialer) = (self.url.clone(), self.dialer.clone());
+        wasm_bindgen_futures::future_to_promise(async move {
+            remote::reset(&url, &dialer).await.map_err(error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
     /// One request to the daemon: `path` with its query, `headers` as flat
     /// pairs. Resolves to a [`Reply`], whatever its status; rejects when the
     /// daemon cannot be reached.

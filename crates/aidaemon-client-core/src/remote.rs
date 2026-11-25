@@ -162,12 +162,48 @@ pub(crate) async fn connection(
     {
         addr.addrs.extend(known.addrs.iter().cloned());
     }
-    let conn = n0_future::time::timeout(DIAL_TIMEOUT, client.connect(addr))
-        .await
-        .map_err(|_| SignInError::Unreachable("reaching the daemon over iroh timed out".into()))?
-        .map_err(|e| SignInError::Unreachable(format!("{e:#}")))?;
-    open.insert(slot, conn.clone());
-    Ok(conn)
+    let dialed = match n0_future::time::timeout(DIAL_TIMEOUT, client.connect(addr)).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(SignInError::Unreachable(format!("{e:#}"))),
+        Err(_) => Err(SignInError::Unreachable(
+            "reaching the daemon over iroh timed out".into(),
+        )),
+    };
+    match dialed {
+        Ok(conn) => {
+            open.insert(slot, conn.clone());
+            Ok(conn)
+        }
+        Err(why) => {
+            // An endpoint that could not dial may have lost its relay
+            // without knowing it (the network moved, the device slept):
+            // the next dial binds a fresh one rather than waiting on it.
+            drop_endpoint(slot.0, &relays).await;
+            Err(why)
+        }
+    }
+}
+
+/// Close the endpoint `key` dials with on `relays`, if one is bound: its
+/// connections end and a dial in flight on it fails at once; the next call
+/// binds a fresh endpoint.
+async fn drop_endpoint(key: Key, relays: &Relays) {
+    let client = clients().lock().await.remove(&(key, relays.clone()));
+    if let Some(client) = client {
+        n0_future::task::spawn(async move { client.close().await });
+    }
+}
+
+/// Start over with `url`'s daemon: close the endpoint that reaches it (so a
+/// dial waiting on a dead relay link fails now instead of at
+/// [`DIAL_TIMEOUT`]) and forget its connection; the next call dials afresh.
+/// For when the link dropped, or the page or device woke while it was
+/// still dialing.
+pub async fn reset(url: &str, dialer: &Dialer) -> Result<(), SignInError> {
+    let daemon = parse(url)?;
+    drop_endpoint(dialer.key().to_bytes(), &daemon.dial_relays()).await;
+    forget(&daemon, dialer).await;
+    Ok(())
 }
 
 /// Dial `url`'s daemon ahead of the first request, so the relay and the
@@ -317,6 +353,27 @@ pub async fn websocket_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dial that cannot get anywhere (its only relay does not exist)
+    /// waits out its timeout; `reset` ends it at once.
+    #[tokio::test]
+    async fn reset_ends_a_dial_in_flight() {
+        let daemon = SecretKey::from_bytes(&[3; 32]).public();
+        let url = format!("iroh://{daemon}@relay.example.invalid");
+        let dialer = Dialer::with_key([7; 32]);
+        let dialing = tokio::spawn({
+            let (url, dialer) = (url.clone(), dialer.clone());
+            async move { dial(&url, &dialer).await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!dialing.is_finished(), "the dial should still be waiting");
+        reset(&url, &dialer).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), dialing)
+            .await
+            .expect("reset ends the dial")
+            .unwrap();
+        assert!(ended.is_err());
+    }
 
     #[test]
     fn the_path_follows_the_authority() {

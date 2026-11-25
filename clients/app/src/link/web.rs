@@ -53,6 +53,8 @@ extern "C" {
     fn remote_ready() -> js_sys::Promise;
     #[wasm_bindgen(js_name = remoteEndpoint)]
     fn remote_endpoint() -> js_sys::Promise;
+    #[wasm_bindgen(js_name = resetRemote)]
+    fn reset_remote() -> js_sys::Promise;
     #[wasm_bindgen(js_name = takePicture)]
     fn take_picture_js(max_dimension: u32) -> js_sys::Promise;
     #[wasm_bindgen(js_name = downloadUrl)]
@@ -632,6 +634,10 @@ pub fn start(store: Store) {
                 &on_event,
             );
             let mut opened = false;
+            // Woken (shown again, back online) while still dialing over
+            // iroh: that dial may wait on a relay link the sleep or the
+            // network change killed, for its whole timeout. Start over now.
+            let mut redial = false;
             let send = |frame: &aidaemon_client_protocol::ClientFrame| {
                 if let Ok(text) = serde_json::to_string(frame) {
                     socket.send(&text);
@@ -642,6 +648,13 @@ pub fn start(store: Store) {
                 let event = futures::select! {
                     heard = events.next() => Some(heard),
                     _ = wakes.next() => {
+                        if iroh && !opened {
+                            redial = true;
+                            break machine.failed(
+                                DropKind::DaemonNotRunning,
+                                "woke while dialing".to_owned(),
+                            );
+                        }
                         if let Some(frame) = machine.woke(now()) {
                             send(&frame);
                         }
@@ -718,6 +731,20 @@ pub fn start(store: Store) {
             };
             socket.close();
             drop(on_event);
+            // Over iroh every drop but a refusal starts the connection over:
+            // the old one, or its relay link, is likely what failed, and a
+            // dial on it can hang for its whole timeout.
+            if iroh && disconnect.kind != DropKind::Unauthorized {
+                let _ = JsFuture::from(reset_remote()).await;
+            }
+            if redial {
+                // As `woke` would have: the next try goes at once. One wake
+                // fires several events (shown, focused, online); the rest
+                // must not cancel the dial they started.
+                machine.woke(now());
+                while wakes.try_recv().is_ok() {}
+                continue;
+            }
             // The daemon refused the socket's own sign-in (an older daemon,
             // a clock too far off, an endpoint not yet this device's): sign
             // in with a challenge now, which says what is wrong if anything

@@ -23,7 +23,10 @@ version="$(cat "$here/dist/remote/aidaemon_app_remote.js" "$here/dist/remote/aid
 mkdir -p "$here/dist/remote/v/$version"
 cp "$here/dist/remote/aidaemon_app_remote.js" "$here/dist/remote/aidaemon_app_remote_bg.wasm" "$here/dist/remote/v/$version/"
 module="remote/v/$version/aidaemon_app_remote.js"
-tag="<meta name=\"aidaemon-remote\" content=\"$module\"><link rel=\"modulepreload\" href=\"$module\">"
+# The module's wasm downloads with the app's own, not after its script has
+# run (wasm-bindgen's init fetches it same-origin, which `crossorigin` matches).
+wasm="remote/v/$version/aidaemon_app_remote_bg.wasm"
+tag="<meta name=\"aidaemon-remote\" content=\"$module\"><link rel=\"modulepreload\" href=\"$module\"><link rel=\"preload\" href=\"$wasm\" as=\"fetch\" type=\"application/wasm\" crossorigin>"
 python3 - "$here/dist/index.html" "$tag" <<'PY'
 import sys
 path, tag = sys.argv[1], sys.argv[2]
@@ -32,6 +35,19 @@ assert page.count("</head>") == 1, "index.html has no single </head>"
 open(path, "w").write(page.replace("</head>", tag + "</head>"))
 PY
 cp "$here/_headers" "$here/dist/_headers"
+# nsh names every file but the page and the manifest by a digest of its
+# content (nsh.<digest>.wasm, browser.<digest>/, …), so browsers keep them
+# without asking again: otherwise each launch revalidates the 12 MB engine
+# and every module with the host before the app starts. Listed by name, as a
+# catch-all rule would add its Cache-Control to the no-cache ones above.
+for entry in "$here/dist"/*; do
+  name="$(basename "$entry")"
+  case "$name" in
+    index.html | manifest.webmanifest | sw.js | _headers | remote) continue ;;
+  esac
+  if [ -d "$entry" ]; then rule="/$name/*"; else rule="/$name"; fi
+  printf '%s\n  Cache-Control: public, max-age=31536000, immutable\n' "$rule" >>"$here/dist/_headers"
+done
 # nsh builds the app's describe program from a workspace of its own in the
 # app's target dir, so Cargo keeps a second copy of most dependencies, and an
 # older copy stays whenever that workspace changes. Units no build has read
