@@ -275,7 +275,10 @@ mod notify_tests {
         // The daemon's note closes before the report starts, and the report
         // stays inside one wrapper.
         let note_end = note.find("]\n").unwrap();
-        assert!(note.find("[CONTENT FILTERED]").unwrap() > note_end, "{note}");
+        assert!(
+            note.find("[CONTENT FILTERED]").unwrap() > note_end,
+            "{note}"
+        );
         assert_eq!(
             note.matches("[END UNTRUSTED EXTERNAL DATA]").count(),
             1,
