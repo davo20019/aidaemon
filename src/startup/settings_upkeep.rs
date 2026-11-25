@@ -334,7 +334,7 @@ pub(crate) fn begin_trial(config_path: &Path) -> anyhow::Result<()> {
     }
     write_owner_only(
         &trial_marker(config_path),
-        &format!("{{\"at_ms\":{}}}", now_ms()),
+        format!("{{\"at_ms\":{}}}", now_ms()),
     )?;
     Ok(())
 }

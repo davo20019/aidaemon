@@ -46,7 +46,7 @@ impl LanAuthority {
                 .with_context(|| format!("{} holds no CA key", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-                aidaemon_tools::config_file::write_owner_only(path, &key.serialize_pem())
+                aidaemon_tools::config_file::write_owner_only(path, key.serialize_pem())
                     .with_context(|| format!("could not save the CA key at {}", path.display()))?;
                 key
             }

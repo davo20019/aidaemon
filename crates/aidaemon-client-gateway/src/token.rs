@@ -25,7 +25,7 @@ pub fn mint(path: &Path) -> std::io::Result<String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    aidaemon_tools::config_file::write_owner_only(path, &format!("{}\n", hash(&token)))?;
+    aidaemon_tools::config_file::write_owner_only(path, format!("{}\n", hash(&token)))?;
     Ok(token)
 }
 
@@ -76,7 +76,7 @@ pub fn client_token_file(config: &ClientGatewayConfig) -> PathBuf {
 pub fn mint_local_token(config: &ClientGatewayConfig) -> std::io::Result<PathBuf> {
     let token = mint(&token_file(config))?;
     let path = client_token_file(config);
-    aidaemon_tools::config_file::write_owner_only(&path, &format!("{token}\n"))?;
+    aidaemon_tools::config_file::write_owner_only(&path, format!("{token}\n"))?;
     Ok(path)
 }
 
@@ -108,8 +108,7 @@ pub fn install_fingerprint(token_file: &Path) -> String {
         }
     }
     let fresh = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-    if let Err(error) = aidaemon_tools::config_file::write_owner_only(&path, &format!("{fresh}\n"))
-    {
+    if let Err(error) = aidaemon_tools::config_file::write_owner_only(&path, format!("{fresh}\n")) {
         tracing::warn!(%error, path = %path.display(), "Could not keep the daemon fingerprint");
     }
     fresh
