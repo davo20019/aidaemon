@@ -77,7 +77,7 @@ pub use anthropic::{
 pub use chatgpt::{
     CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_LIST_CLIENT_VERSIONS,
     CHATGPT_REASONING_EFFORTS, ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials,
-    ChatGptModel, StaticChatGptAuth,
+    ChatGptModel, StaticChatGptAuth, chatgpt_base_url_refusal,
 };
 pub use errors::{affordable_tokens, context_overflow, error_for_status};
 pub use google::{

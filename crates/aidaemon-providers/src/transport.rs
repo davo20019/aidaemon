@@ -32,11 +32,18 @@ pub enum ConfigError {
     InvalidHeader(String),
     #[error("could not build HTTP client: {0}")]
     Client(String),
+    #[error("refused base URL `{0}`: {1}")]
+    BaseUrl(String, &'static str),
 }
 
 pub(crate) fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, ConfigError> {
+    // No redirects: a provider endpoint that answers 3xx would otherwise
+    // carry the request body and custom key headers (`x-api-key`,
+    // `x-goog-api-key`, extra headers) to whatever host it names; reqwest
+    // strips only `Authorization` across hosts.
     reqwest::Client::builder()
         .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| ConfigError::Client(err.to_string()))
 }

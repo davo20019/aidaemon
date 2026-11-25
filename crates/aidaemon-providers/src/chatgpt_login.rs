@@ -64,6 +64,9 @@ const AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 /// practice: signing in to ChatGPT, clearing 2FA, and approving can easily
 /// outlast it, and the failure costs the user the whole flow.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long one connection to the callback listener may take to send its
+/// request line.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Refresh this far ahead of actual expiry so an in-flight request cannot
 /// straddle the boundary.
@@ -803,7 +806,13 @@ async fn await_callback(
         loop {
             let (mut socket, _) = listener.accept().await.context("callback accept failed")?;
             let mut buf = vec![0u8; 8192];
-            let n = socket.read(&mut buf).await.unwrap_or(0);
+            // A connection that sends nothing must not hold the only
+            // accept loop until the whole sign-in times out.
+            let n = tokio::time::timeout(CALLBACK_READ_TIMEOUT, socket.read(&mut buf))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
             // Request line: "GET /auth/callback?code=...&state=... HTTP/1.1"
             let target = request
@@ -822,6 +831,20 @@ async fn await_callback(
                 continue;
             }
 
+            // Only the redirect carrying this attempt's `state` ends the
+            // wait: any other request to the callback path (a stray tab, or
+            // a page in the browser probing localhost) gets a refusal and
+            // the listener keeps waiting for the real one.
+            if !callback_has_state(&target, expected_state) {
+                let _ = socket
+                    .write_all(
+                        callback_page("<h2>This redirect is not for the sign-in in progress.</h2>")
+                            .as_bytes(),
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+                continue;
+            }
             let result = parse_callback(&target, expected_state);
             let page = match &result {
                 Ok(_) => callback_page(&format!(
@@ -850,6 +873,15 @@ async fn await_callback(
         })?
 }
 
+/// Whether a callback request target carries `expected_state` as its state.
+fn callback_has_state(target: &str, expected_state: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else {
+        return false;
+    };
+    url.query_pairs()
+        .any(|(key, value)| key == "state" && value == expected_state)
+}
+
 /// Escape text interpolated into the callback page.
 fn html_escape(input: &str) -> String {
     input
@@ -874,6 +906,34 @@ pub enum CallbackMode {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_silent_or_foreign_callback_does_not_end_the_sign_in() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wait =
+            tokio::spawn(
+                async move { await_callback(listener, "state-synthetic-1", "Test").await },
+            );
+        // A connection that never sends, then one with another state.
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut foreign = tokio::net::TcpStream::connect(addr).await.unwrap();
+        foreign
+            .write_all(b"GET /auth/callback?code=x&state=other HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut sink = Vec::new();
+        let _ = foreign.read_to_end(&mut sink).await;
+        assert!(!wait.is_finished());
+        let mut real = tokio::net::TcpStream::connect(addr).await.unwrap();
+        real.write_all(
+            b"GET /auth/callback?code=code-synthetic&state=state-synthetic-1 HTTP/1.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let code = wait.await.unwrap().unwrap();
+        assert_eq!(code, "code-synthetic");
+    }
 
     /// Build a synthetic, unsigned JWT. No real tokens in fixtures.
     fn fake_jwt(claims: serde_json::Value) -> String {

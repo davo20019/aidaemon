@@ -205,6 +205,7 @@ impl ChatGptBuilder {
         let auth = self
             .auth
             .ok_or(ConfigError::Missing("ChatGPT credentials (auth)"))?;
+        check_base_url(&self.base_url)?;
         Ok(ChatGpt {
             client: build_client(Duration::from_secs(30))?,
             base_url: self.base_url,
@@ -222,6 +223,49 @@ impl ChatGptBuilder {
             originator: self.originator,
             timeout: self.timeout,
         })
+    }
+}
+
+/// The subscription's bearer token and account id go to this URL on every
+/// request, so only ChatGPT's own backend (https, `chatgpt.com` or a
+/// subdomain) or this machine (a test server) may receive them: a base URL
+/// left over from another provider, or plain http, would hand the token
+/// to that host or to anyone on the path.
+fn check_base_url(base_url: &str) -> Result<(), ConfigError> {
+    chatgpt_base_url_refusal(base_url).map_or(Ok(()), |why| {
+        Err(ConfigError::BaseUrl(base_url.to_string(), why))
+    })
+}
+
+/// Why [`ChatGptBuilder::build`] would refuse `base_url`, or `None` when
+/// the subscription's token may go there: https on `chatgpt.com` (or a
+/// subdomain), or a server on this machine.
+pub fn chatgpt_base_url_refusal(base_url: &str) -> Option<&'static str> {
+    let refuse = Some;
+    let base_url = base_url.trim().trim_end_matches('/');
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return refuse("not a URL");
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return refuse("credentials in the URL");
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let loopback = host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback && matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.scheme() != "https" {
+        return refuse("ChatGPT sign-in tokens go over https only");
+    }
+    if host == "chatgpt.com" || host.ends_with(".chatgpt.com") {
+        None
+    } else {
+        refuse("ChatGPT sign-in tokens go only to chatgpt.com")
     }
 }
 
@@ -1182,6 +1226,29 @@ mod strict_tool_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_token_goes_only_to_chatgpt_or_this_machine() {
+        for ok in [
+            CHATGPT_DEFAULT_BASE_URL,
+            "https://api.chatgpt.com/backend-api/codex",
+            "http://127.0.0.1:8765/codex",
+            "http://[::1]:8765",
+            "http://localhost:9",
+        ] {
+            assert!(check_base_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://chatgpt.com/backend-api/codex",
+            "https://api.openai.com/v1",
+            "https://chatgpt.com.attacker.example/x",
+            "https://user:pw@chatgpt.com/x",
+            "http://192.168.1.20:8080",
+            "not a url",
+        ] {
+            assert!(check_base_url(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn a_model_listing_reads_both_shapes() {
