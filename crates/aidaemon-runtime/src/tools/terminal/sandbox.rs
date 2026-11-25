@@ -1597,12 +1597,19 @@ pub(super) fn codex_sandbox_state_json(
     }));
     if capabilities.protect_persistence {
         // A more specific entry overrides the write grant that contains it.
-        filesystem_entries.extend(persistence_paths(write_paths).into_iter().map(|path| {
-            json!({
-                "path": { "type": "path", "path": path },
-                "access": "read"
-            })
-        }));
+        // Only paths that exist: Codex's bubblewrap cannot mount under a
+        // write root the command has yet to create (like bwrap's `-try`).
+        filesystem_entries.extend(
+            persistence_paths(write_paths)
+                .into_iter()
+                .filter(|path| std::path::Path::new(path).exists())
+                .map(|path| {
+                    json!({
+                        "path": { "type": "path", "path": path },
+                        "access": "read"
+                    })
+                }),
+        );
     }
     let sandbox_cwd = reqwest::Url::from_file_path(cwd)
         .map_err(|_| anyhow::anyhow!("sandbox working directory must be an absolute local path"))?;

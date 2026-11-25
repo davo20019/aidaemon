@@ -1048,7 +1048,17 @@ fn linux_sandboxes_keep_persistence_paths_read_only_in_write_roots() {
     .join(" ");
     assert!(!unprotected.contains(".git/hooks"), "{unprotected}");
 
-    let state = codex_sandbox_state_json("/work/repo", &[], &["/work/repo".to_string()], protect)
+    // Codex gets entries only for persistence paths that exist: its
+    // bubblewrap cannot mount under a write root not created yet.
+    let absent = codex_sandbox_state_json("/work/repo", &[], &["/work/repo".to_string()], protect)
+        .expect("sandbox state");
+    assert!(!absent.contains(".git/hooks"), "{absent}");
+    let repo = tempfile::tempdir().expect("repo");
+    for sub in PERSISTENCE_SUBPATHS {
+        std::fs::create_dir_all(repo.path().join(sub)).expect("persistence path");
+    }
+    let root = repo.path().to_string_lossy().to_string();
+    let state = codex_sandbox_state_json(&root, &[], std::slice::from_ref(&root), protect)
         .expect("sandbox state");
     let state: Value = serde_json::from_str(&state).expect("valid JSON");
     let entries = state
@@ -1056,7 +1066,7 @@ fn linux_sandboxes_keep_persistence_paths_read_only_in_write_roots() {
         .and_then(Value::as_array)
         .expect("filesystem entries");
     for sub in PERSISTENCE_SUBPATHS {
-        let path = format!("/work/repo/{sub}");
+        let path = format!("{root}/{sub}");
         assert!(
             entries.iter().any(|entry| {
                 entry.pointer("/path/path").and_then(Value::as_str) == Some(path.as_str())
