@@ -27,7 +27,7 @@ use crate::pairing::Principal;
 use crate::{Caller, ClientGateway};
 
 /// The largest frame or request body accepted.
-const MAX_BODY: usize = 256 * 1024;
+pub(crate) const MAX_BODY: usize = 256 * 1024;
 /// The largest command a signed-in client may send: an `upload_file`
 /// carries its file as base64.
 const MAX_COMMAND: usize = crate::files::MAX_UPLOAD_BYTES / 3 * 4 + 64 * 1024;
@@ -348,7 +348,7 @@ fn caller_of(
     }
 }
 
-fn refusal(error: ProtocolError) -> Response {
+pub(crate) fn refusal(error: ProtocolError) -> Response {
     (
         status_of(error.code),
         Json(ServerFrame::Error {
@@ -359,7 +359,7 @@ fn refusal(error: ProtocolError) -> Response {
         .into_response()
 }
 
-fn reply<T: serde::Serialize>(result: Result<T, ProtocolError>) -> Response {
+pub(crate) fn reply<T: serde::Serialize>(result: Result<T, ProtocolError>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => refusal(error),
@@ -611,10 +611,14 @@ fn the_pair_page_route_is_the_protocols() {
 }
 
 async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
-    // With the app's web build served, links to this path (pairing links,
-    // bookmarks) open it; the browser keeps the `#offer=…`.
-    if gateway
-        .config
+    web_page_for(&gateway.config)
+}
+
+/// The gateway's page: the app's web build when one is served (links to
+/// this path, pairing links and bookmarks, open it; the browser keeps the
+/// `#offer=...`), else a page saying it is not installed.
+pub(crate) fn web_page_for(config: &crate::ClientGatewayConfig) -> Response {
+    if config
         .app_dir
         .as_deref()
         .is_some_and(|d| !d.trim().is_empty())
@@ -636,7 +640,7 @@ async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
 
 /// The nsh app's web build: `app_dir` from the config, read file by file.
 /// Only plain relative paths inside the directory are served.
-async fn app_root() -> Response {
+pub(crate) async fn app_root() -> Response {
     axum::response::Redirect::permanent("/client/v1/next/").into_response()
 }
 
@@ -912,13 +916,17 @@ async fn websocket(
         })
 }
 
-async fn send(socket: &mut WebSocket, frame: &ServerFrame) -> anyhow::Result<()> {
+pub(crate) async fn send(socket: &mut WebSocket, frame: &ServerFrame) -> anyhow::Result<()> {
     let text = serde_json::to_string(frame)?;
     socket.send(Message::Text(text.into())).await?;
     Ok(())
 }
 
-async fn refuse(socket: &mut WebSocket, code: ErrorCode, message: &str) -> anyhow::Result<()> {
+pub(crate) async fn refuse(
+    socket: &mut WebSocket,
+    code: ErrorCode,
+    message: &str,
+) -> anyhow::Result<()> {
     send(
         socket,
         &ServerFrame::Error {

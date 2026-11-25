@@ -36,10 +36,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::pairing::{Pairing, Principal};
-use crate::server::{bearer, body, error_response, serve_app_file, status_of};
+use crate::server::{
+    MAX_BODY, app_root, bearer, body, error_response, refusal, refuse, reply, send, serve_app_file,
+    web_page_for,
+};
 use crate::{ClientGatewayConfig, PublicUrl};
 
-const MAX_BODY: usize = 256 * 1024;
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
 
@@ -210,24 +212,6 @@ pub async fn serve(
     Ok(())
 }
 
-fn refusal(error: ProtocolError) -> Response {
-    (
-        status_of(error.code),
-        Json(ServerFrame::Error {
-            request_id: None,
-            error,
-        }),
-    )
-        .into_response()
-}
-
-fn reply<T: serde::Serialize>(result: Result<T, ProtocolError>) -> Response {
-    match result {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => refusal(error),
-    }
-}
-
 async fn http_command(
     State(gateway): State<Arc<SetupGateway>>,
     headers: HeaderMap,
@@ -332,29 +316,7 @@ async fn open_session(
 }
 
 async fn web_page(State(gateway): State<Arc<SetupGateway>>) -> Response {
-    if gateway
-        .config
-        .app_dir
-        .as_deref()
-        .is_some_and(|d| !d.trim().is_empty())
-    {
-        return axum::response::Redirect::temporary("/client/v1/next/").into_response();
-    }
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (
-                axum::http::header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'unsafe-inline'",
-            ),
-        ],
-        crate::server::NOT_INSTALLED_PAGE,
-    )
-        .into_response()
-}
-
-async fn app_root() -> Response {
-    axum::response::Redirect::permanent("/client/v1/next/").into_response()
+    web_page_for(&gateway.config)
 }
 
 async fn app_index(State(gateway): State<Arc<SetupGateway>>, headers: HeaderMap) -> Response {
@@ -390,26 +352,6 @@ async fn websocket(
                 debug!(%error, "Setup socket closed");
             }
         })
-}
-
-async fn send(socket: &mut WebSocket, frame: &ServerFrame) -> anyhow::Result<()> {
-    socket
-        .send(Message::Text(serde_json::to_string(frame)?.into()))
-        .await?;
-    Ok(())
-}
-
-async fn refuse(socket: &mut WebSocket, code: ErrorCode, message: &str) -> anyhow::Result<()> {
-    send(
-        socket,
-        &ServerFrame::Error {
-            request_id: None,
-            error: ProtocolError::new(code, message),
-        },
-    )
-    .await?;
-    let _ = socket.send(Message::Close(None)).await;
-    anyhow::bail!("{message}")
 }
 
 async fn run_socket(
