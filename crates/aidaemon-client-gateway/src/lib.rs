@@ -1265,7 +1265,13 @@ impl ClientGateway {
                         ),
                     ));
                 }
-                self.slash(&session_id, &command, &args).await
+                let result = self.slash(&session_id, &command, &args).await;
+                // Exact command words: `/model` and `/auto` may set or clear
+                // a coding agent, which lists show (protocol 1.52).
+                if matches!(command.as_str(), "model" | "auto") {
+                    self.publish_session(&session_id).await;
+                }
+                result
             }
             Command::GetGlance => Ok(CommandResult::Glance {
                 glance: self.glance(caller.compact).await,

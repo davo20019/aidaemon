@@ -1525,11 +1525,22 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
         .text_size(px(type_scale::XS))
         .text_color(colors::FAINT);
     let (tag_id, mark_id, any_id) = (g, id.clone(), id);
+    let agent_id = tag_id.clone();
     let tag = move || row_tag(store, &tag_id);
     let tag_text = move || {
         let tag = tag.clone();
         text(tag)
             .number_of_lines(1)
+            .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+            .text_color(colors::MUTED)
+    };
+    // The coding agent the conversation is set to (messages there go
+    // straight to it), kept whole: a long project name gives way first.
+    let agent_text = move || {
+        let id = agent_id.clone();
+        text(move || row_agent(store, &id))
+            .number_of_lines(1)
+            .flex_shrink(0.0)
             .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
             .text_color(colors::MUTED)
     };
@@ -1564,9 +1575,14 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
             .child(title)
             .child(star)
             .child(tag_text().max_w(percentage(0.4)))
+            .child(agent_text())
             .child(mark());
     }
-    let said = move || !row_tag(store, &any_id).is_empty() || row_glyph(store, &any_id).is_some();
+    let said = move || {
+        !row_tag(store, &any_id).is_empty()
+            || row_glyph(store, &any_id).is_some()
+            || store.session_agent(&any_id).is_some()
+    };
     view()
         .flex_1()
         .min_w(px(0.0))
@@ -1589,6 +1605,7 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
                 .min_w(px(0.0))
                 .gap_1()
                 .child(tag_text().min_w(px(0.0)).flex_shrink(1.0))
+                .child(agent_text())
                 .child(mark())
         }))
 }
@@ -1607,15 +1624,22 @@ fn row_tag(store: Store, id: &str) -> String {
     tag
 }
 
+/// The coding agent's name after a row's tag ("· Claude Code"), alone
+/// when the row has no tag (inside its project); empty when AIDaemon
+/// answers the conversation.
+fn row_agent(store: Store, id: &str) -> String {
+    match store.session_agent(id) {
+        None => String::new(),
+        Some(agent) if row_tag(store, id).is_empty() => agent,
+        Some(agent) => format!("· {agent}"),
+    }
+}
+
 fn row_place(store: Store, id: &str) -> String {
     if let Some(project) = store.session_project(id).and_then(|p| store.project(&p)) {
-        // A conversation set to a coding agent says which: messages there
-        // go straight to it.
-        let agent = store.session_agent(id);
-        return match (store.sidebar_view(), agent) {
-            (SidebarView::Project(_), agent) => agent.unwrap_or_default(),
-            (_, Some(agent)) => format!("{} · {agent}", project.name),
-            (_, None) => project.name,
+        return match store.sidebar_view() {
+            SidebarView::Project(_) => String::new(),
+            _ => project.name,
         };
     }
     match source_glyph(store.source(id)) {
