@@ -2138,6 +2138,19 @@ pub enum ApprovalScope {
     Request { method: String, url: String },
 }
 
+/// Refuse `what` (the tool and action, as the refusal names them) unless the
+/// agent kernel approved the whole call ([`ApprovalScope::Call`]). An
+/// approval scoped to one inner request never authorizes the outer call.
+pub fn require_call_approval(scope: Option<&ApprovalScope>, what: &str) -> anyhow::Result<()> {
+    if scope != Some(&ApprovalScope::Call) {
+        anyhow::bail!(
+            "{what} requires approval through the agent kernel; it was called outside an \
+             approved agent call"
+        );
+    }
+    Ok(())
+}
+
 /// One call as the kernel's approval rules show it to
 /// [`ToolSemantics::owner_approval_request`].
 #[derive(Debug, Clone, Copy)]

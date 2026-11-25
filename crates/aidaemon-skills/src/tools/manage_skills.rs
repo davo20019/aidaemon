@@ -3086,14 +3086,11 @@ impl ManageSkillsTool {
     pub async fn run(&self, arguments: &str, facts: &ToolCallContext) -> anyhow::Result<String> {
         let args: ManageSkillsArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
-        if Self::approval_for(&args, !self.registry_urls.is_empty()).is_some()
-            && facts.kernel_approved != Some(aidaemon_tools::semantics::ApprovalScope::Call)
-        {
-            anyhow::bail!(
-                "manage_skills {} requires approval through the agent kernel; it was called \
-                 outside an approved agent call",
-                args.action
-            );
+        if Self::approval_for(&args, !self.registry_urls.is_empty()).is_some() {
+            aidaemon_tools::semantics::require_call_approval(
+                facts.kernel_approved.as_ref(),
+                &format!("manage_skills {}", args.action),
+            )?;
         }
 
         match args.action.as_str() {

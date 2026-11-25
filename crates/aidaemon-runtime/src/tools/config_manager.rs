@@ -193,10 +193,9 @@ impl ConfigManagerTool {
         if args.kernel_approved {
             return Ok(());
         }
-        anyhow::bail!(
-            "manage_config {} requires approval through the agent kernel; it was called outside \
-             an approved agent call",
-            args.action
+        aidaemon_tools::semantics::require_call_approval(
+            None,
+            &format!("manage_config {}", args.action),
         )
     }
 
@@ -2255,7 +2254,10 @@ impl ConfigManagerTool {
         facts: &ToolCallContext,
     ) -> anyhow::Result<ConfigReply> {
         let mut args: ConfigArgs = serde_json::from_str(arguments)?;
-        args.kernel_approved = facts.kernel_approved.is_some();
+        // Only an approval of this whole call counts: one scoped to an inner
+        // request (`ApprovalScope::Request`) never authorizes a config write.
+        args.kernel_approved =
+            facts.kernel_approved == Some(aidaemon_tools::semantics::ApprovalScope::Call);
         let reply = self.run_args(args).await;
         self.refresh_permissions().await;
         reply
@@ -3626,6 +3628,28 @@ token_file = "{}"
                 .get("enabled")
                 .and_then(toml::Value::as_bool),
             Some(true)
+        );
+        assert!(!tokens.path().join("client-token").exists());
+    }
+
+    /// An approval scoped to one inner request is not the owner's approval
+    /// of a config change: only `ApprovalScope::Call` authorizes the write.
+    #[tokio::test]
+    async fn a_request_scoped_approval_does_not_authorize_a_config_change() {
+        let tokens = tempfile::tempdir().unwrap();
+        let (_dir, path) = write_temp_config(&gateway_config(tokens.path(), ""));
+        let tool = approving_tool(path.clone());
+        let facts = ToolCallContext {
+            kernel_approved: Some(aidaemon_tools::semantics::ApprovalScope::Request {
+                method: "GET".into(),
+                url: "https://example.com/".into(),
+            }),
+            ..ToolCallContext::default()
+        };
+        assert!(
+            tool.run_reply(r#"{"action":"enable_client_gateway"}"#, &facts)
+                .await
+                .is_err()
         );
         assert!(!tokens.path().join("client-token").exists());
     }

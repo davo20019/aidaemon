@@ -412,13 +412,10 @@ impl ManageHttpAuthTool {
         kernel_approved: Option<&ApprovalScope>,
         action: &str,
     ) -> anyhow::Result<()> {
-        if kernel_approved != Some(&ApprovalScope::Call) {
-            anyhow::bail!(
-                "manage_http_auth `{action}` requires approval through the agent kernel; it was \
-                 called outside an approved agent call"
-            );
-        }
-        Ok(())
+        crate::semantics::require_call_approval(
+            kernel_approved,
+            &format!("manage_http_auth `{action}`"),
+        )
     }
 
     /// The owner approval one call needs: an `upsert` or `remove` that

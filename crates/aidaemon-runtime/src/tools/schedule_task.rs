@@ -380,13 +380,11 @@ impl ScheduledWork {
         // The owner confirmed this work through the agent kernel
         // (`owner_approval_request`) before the call ran. Outside the
         // kernel nothing is created.
-        if plan.needs_owner_approval()
-            && facts.kernel_approved != Some(crate::tools::traits::ApprovalScope::Call)
-        {
-            anyhow::bail!(
-                "schedule_task requires approval through the agent kernel; it was called \
-                 outside an approved agent call"
-            );
+        if plan.needs_owner_approval() {
+            aidaemon_tools::semantics::require_call_approval(
+                facts.kernel_approved.as_ref(),
+                "schedule_task",
+            )?;
         }
         let mut goal = if plan.is_one_shot {
             crate::tools::traits::Goal::new_deferred_finite(&plan.desc, &plan.session_id)
