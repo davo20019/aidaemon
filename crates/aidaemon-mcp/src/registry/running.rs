@@ -276,6 +276,23 @@ impl McpRegistry {
         Ok(())
     }
 
+    /// Another server among `servers` whose own `mcp_{server}_{KEY}` keys
+    /// could equal `secret_key`, which belongs to `name`.
+    fn secret_key_owner_conflict<'a>(
+        servers: impl Iterator<Item = &'a String>,
+        name: &str,
+        secret_key: &str,
+    ) -> Option<String> {
+        servers
+            .filter(|other| other.as_str() != name)
+            .find(|other| {
+                secret_key
+                    .strip_prefix(&format!("mcp_{other}_"))
+                    .is_some_and(|rest| !rest.is_empty())
+            })
+            .cloned()
+    }
+
     /// The secret-store key server `name`'s env var `key` is read from.
     pub fn env_secret_key(name: &str, key: &str) -> String {
         format!("mcp_{}_{}", name, key)
@@ -292,11 +309,31 @@ impl McpRegistry {
         Self::validate_server_name(name)?;
         Self::validate_env_key(key)?;
         let secret_key = Self::env_secret_key(name, key);
+        // Every server the daemon knows, running or stored (disabled).
+        let stored: Vec<String> = self
+            .state
+            .list_dynamic_mcp_servers()
+            .await?
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+        let mut servers = self.servers.write().await;
+        // `mcp_{server}_{KEY}` is ambiguous when one server's name is
+        // another's plus `_...` (`a` + `b_TOKEN` and `a_b` + `TOKEN` are the
+        // same key): refuse a binding that would read, or later delete,
+        // the secret stored for another server.
+        if let Some(other) =
+            Self::secret_key_owner_conflict(servers.keys().chain(stored.iter()), name, &secret_key)
+        {
+            anyhow::bail!(
+                "the secret key `{secret_key}` would also name a secret of server '{other}'; \
+                 rename the variable or the server"
+            );
+        }
         if !self.secrets.contains(&secret_key) {
             return Ok(ServerEnvBinding::MissingSecret { secret_key });
         }
 
-        let mut servers = self.servers.write().await;
         if let Some(entry) = servers.get_mut(name) {
             entry
                 .config
@@ -772,6 +809,22 @@ fn extract_explicit_mcp_server_refs(user_message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::extract_explicit_mcp_server_refs;
+
+    #[test]
+    fn a_secret_key_another_server_could_own_is_a_conflict() {
+        let servers = ["a".to_string(), "docs".to_string()];
+        // `a_b` + `TOKEN` is the key `a` + `b_TOKEN` reads.
+        let key = super::McpRegistry::env_secret_key("a_b", "TOKEN");
+        assert_eq!(
+            super::McpRegistry::secret_key_owner_conflict(servers.iter(), "a_b", &key),
+            Some("a".to_string())
+        );
+        let own = super::McpRegistry::env_secret_key("docs", "TOKEN");
+        assert_eq!(
+            super::McpRegistry::secret_key_owner_conflict(servers.iter(), "docs", &own),
+            None
+        );
+    }
 
     #[test]
     fn extracts_prefixed_mcp_refs() {

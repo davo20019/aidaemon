@@ -172,7 +172,14 @@ pub fn read_project_servers(root: &Path, project_id: &str) -> Result<Vec<Project
             let unexpanded = raw.args.iter().any(|a| a.contains("${"))
                 || raw.env.values().any(|v| v.contains("${"))
                 || raw.command.as_deref().is_some_and(|c| c.contains("${"));
-            let unusable = if remote {
+            // A name the owner could not read on a card (blank, padded,
+            // control characters) never starts: the card would name a
+            // server other than the one that runs.
+            let unreadable_name =
+                name.trim().is_empty() || name.trim() != name || name.chars().any(char::is_control);
+            let unusable = if unreadable_name {
+                Some("its name is blank or has hidden characters".to_string())
+            } else if remote {
                 Some("a remote (http/sse) server; only local commands are started".to_string())
             } else if raw.command.as_deref().is_none_or(|c| c.trim().is_empty()) {
                 Some("no command".to_string())

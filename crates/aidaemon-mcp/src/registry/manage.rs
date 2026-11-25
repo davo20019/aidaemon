@@ -25,11 +25,37 @@ const ALLOWED_COMMANDS: &[&str] = &["npx", "uvx", "node", "python", "python3"];
 
 pub struct ManageMcpTool {
     registry: McpRegistry,
+    /// The project servers the owner was asked to start, as the card showed
+    /// them, by (project id, name): a start runs exactly this entry, and a
+    /// `.mcp.json` changed after the card is refused, not run.
+    approved_starts: std::sync::Mutex<
+        std::collections::HashMap<(String, String), super::project::ProjectServer>,
+    >,
 }
 
 impl ManageMcpTool {
     pub fn new(registry: McpRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            approved_starts: std::sync::Mutex::default(),
+        }
+    }
+
+    fn remember_carded_start(
+        &self,
+        project: &aidaemon_core::ProjectRef,
+        server: &super::project::ProjectServer,
+    ) {
+        if let Ok(mut approved) = self.approved_starts.lock() {
+            approved.insert((project.id.clone(), server.name.clone()), server.clone());
+        }
+    }
+
+    fn carded_start(&self, project_id: &str, name: &str) -> Option<super::project::ProjectServer> {
+        self.approved_starts
+            .lock()
+            .ok()?
+            .remove(&(project_id.to_string(), name.to_string()))
     }
 
     /// The project's declared server `name`, when the turn works in a
@@ -65,13 +91,37 @@ impl ManageMcpTool {
         project: Option<&aidaemon_core::ProjectRef>,
         name: Option<&str>,
     ) -> OwnerApprovalNeed {
+        Self::project_start_judgment(project, name).0
+    }
+
+    /// [`Self::project_start_approval`] with the entry the card shows, read
+    /// once, so what is remembered as approved is exactly what was shown.
+    fn project_start_judgment(
+        project: Option<&aidaemon_core::ProjectRef>,
+        name: Option<&str>,
+    ) -> (
+        OwnerApprovalNeed,
+        Option<(aidaemon_core::ProjectRef, super::project::ProjectServer)>,
+    ) {
+        Self::project_start_card(project, name)
+    }
+
+    fn project_start_card(
+        project: Option<&aidaemon_core::ProjectRef>,
+        name: Option<&str>,
+    ) -> (
+        OwnerApprovalNeed,
+        Option<(aidaemon_core::ProjectRef, super::project::ProjectServer)>,
+    ) {
+        // A blank name is refused at the start too (`handle_project_start`),
+        // and `.mcp.json` never yields a usable server under one.
         let Some(name) = name.filter(|name| !name.trim().is_empty()) else {
-            return OwnerApprovalNeed::NotNeeded;
+            return (OwnerApprovalNeed::NotNeeded, None);
         };
         // Fails closed: a start judged without its project still asks, so a
         // judgment that cannot see what will run never lets it run unasked.
         let Ok((project, server)) = Self::project_server(project, name) else {
-            return OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            return (OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
                 card: None,
                 effects: Vec::new(),
                 summary: format!("Start the project's MCP server '{name}'"),
@@ -80,14 +130,14 @@ impl ManageMcpTool {
                 warnings: vec![
                     "The project's repository chose this server's command. Only approve if you trust the repository.".to_string(),
                 ],
-            });
+            }), None);
         };
         // What the start refuses never reaches the owner: it never runs.
         if server.unusable.is_some() || !ALLOWED_COMMANDS.contains(&server.command.as_str()) {
-            return OwnerApprovalNeed::NotNeeded;
+            return (OwnerApprovalNeed::NotNeeded, None);
         }
         let env_keys: Vec<&String> = server.env.keys().collect();
-        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+        let need = OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
             card: None,
             effects: Vec::new(),
             summary: format!(
@@ -124,7 +174,8 @@ impl ManageMcpTool {
                     )
                 }
             )],
-        })
+        });
+        (need, Some((project, server)))
     }
 
     async fn handle_project_list(
@@ -196,6 +247,12 @@ impl ManageMcpTool {
         project: Option<&aidaemon_core::ProjectRef>,
         name: &str,
     ) -> anyhow::Result<String> {
+        if name.trim().is_empty() || name.trim() != name {
+            return Ok(
+                "A project server is started by its exact name; this one is blank or padded."
+                    .to_string(),
+            );
+        }
         let (project, server) = match Self::project_server(project, name) {
             Ok(found) => found,
             Err(why) => return Ok(why),
@@ -220,6 +277,26 @@ impl ManageMcpTool {
                 "'{}' is already running for {}.",
                 server.name, project.name
             ));
+        }
+        // Run what the owner's card showed, never a re-read that changed
+        // since: no card for this entry, or a different entry now, refuses.
+        match self.carded_start(&project.id, &server.name) {
+            Some(carded) if carded == server => {}
+            Some(_) => {
+                return Ok(format!(
+                    "'{}' was not started: {} changed after the approval card. Start it again to \
+                     see its current command.",
+                    server.name,
+                    super::project::PROJECT_MCP_FILE
+                ));
+            }
+            None => {
+                return Ok(format!(
+                    "'{}' was not started: starting a project's server needs the owner's \
+                     approval of its exact command.",
+                    server.name
+                ));
+            }
         }
         // Not saved: a project server lasts until the daemon restarts.
         let tools = self
@@ -268,6 +345,9 @@ impl ManageMcpTool {
         let Ok(args) = serde_json::from_value::<ManageMcpArgs>(arguments.clone()) else {
             return OwnerApprovalNeed::NotNeeded;
         };
+        if let Some(need) = Self::binding_or_removal_approval(&args) {
+            return need;
+        }
         if args.action != "add" {
             return OwnerApprovalNeed::NotNeeded;
         }
@@ -290,6 +370,51 @@ impl ManageMcpTool {
             risk: aidaemon_core::ApprovalRisk::High,
             warnings: vec!["This will download and execute an unverified package and register an external MCP server. Only approve if you trust the source.".to_string()],
         })
+    }
+
+    /// The owner approval for `set_env` (it hands a stored secret to a
+    /// process the agent configured) and `remove` (it deletes a server the
+    /// owner set up, with its stored secrets). `None` for other actions.
+    fn binding_or_removal_approval(args: &ManageMcpArgs) -> Option<OwnerApprovalNeed> {
+        let name = args.name.as_deref().filter(|name| !name.trim().is_empty());
+        let request = match (args.action.as_str(), name) {
+            ("set_env", Some(name)) => {
+                let key = args.key.as_deref().filter(|key| !key.trim().is_empty())?;
+                // A value sent as an argument is refused before anything runs.
+                if args.value.is_some() {
+                    return Some(OwnerApprovalNeed::NotNeeded);
+                }
+                let secret = McpRegistry::env_secret_key(name, key);
+                aidaemon_core::OwnerApprovalRequest {
+                    card: None,
+                    effects: Vec::new(),
+                    summary: format!(
+                        "Give MCP server '{name}' the stored secret `{secret}` as its environment \
+                         variable {key}"
+                    ),
+                    subject: json!({"action": "set_env", "name": name, "key": key}).to_string(),
+                    risk: aidaemon_core::ApprovalRisk::High,
+                    warnings: vec![
+                        "The server's process can read and send this secret anywhere. Only \
+                         approve for a server you trust with it."
+                            .to_string(),
+                    ],
+                }
+            }
+            ("remove", Some(name)) => aidaemon_core::OwnerApprovalRequest {
+                card: None,
+                effects: Vec::new(),
+                summary: format!(
+                    "Remove MCP server '{name}', its saved settings and the secrets stored for it"
+                ),
+                subject: json!({"action": "remove", "name": name}).to_string(),
+                risk: aidaemon_core::ApprovalRisk::Medium,
+                warnings: Vec::new(),
+            },
+            ("set_env" | "remove", None) => return Some(OwnerApprovalNeed::NotNeeded),
+            _ => return None,
+        };
+        Some(OwnerApprovalNeed::Ask(request))
     }
 
     /// The typed effects of one call: starting a server runs its command as a
@@ -683,7 +808,12 @@ impl ToolSemantics for ManageMcpTool {
         if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
             && args.action == "project_start"
         {
-            return Self::project_start_approval(facts.project.as_ref(), args.name.as_deref());
+            let (need, carded) =
+                Self::project_start_judgment(facts.project.as_ref(), args.name.as_deref());
+            if let Some((project, server)) = carded {
+                self.remember_carded_start(&project, &server);
+            }
+            return need;
         }
         if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
             && matches!(args.action.as_str(), "restart" | "enable")
@@ -799,6 +929,48 @@ mod tests {
         (project, dir)
     }
 
+    #[test]
+    fn binding_a_secret_or_removing_a_server_asks() {
+        let OwnerApprovalNeed::Ask(bind) = ManageMcpTool::owner_approval(
+            &json!({"action": "set_env", "name": "docs", "key": "API_TOKEN"}),
+        ) else {
+            panic!("set_env must ask");
+        };
+        assert!(
+            bind.summary.contains("mcp_docs_API_TOKEN"),
+            "{}",
+            bind.summary
+        );
+        assert_eq!(bind.risk, aidaemon_core::ApprovalRisk::High);
+        assert!(matches!(
+            ManageMcpTool::owner_approval(&json!({"action": "remove", "name": "docs"})),
+            OwnerApprovalNeed::Ask(_)
+        ));
+        // Refused before anything runs: no card.
+        assert!(matches!(
+            ManageMcpTool::owner_approval(
+                &json!({"action": "set_env", "name": "docs", "key": "K", "value": "v"})
+            ),
+            OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
+    /// The kernel's judgment of one call, as the dispatcher asks it before
+    /// running the call (the card it would show).
+    async fn judge(
+        tool: &ManageMcpTool,
+        project: &aidaemon_core::ProjectRef,
+        arguments: &str,
+    ) -> OwnerApprovalNeed {
+        let arguments: Value = serde_json::from_str(arguments).unwrap();
+        let facts = ToolCallContext {
+            project: Some(project.clone()),
+            ..ToolCallContext::default()
+        };
+        tool.owner_approval_request(&ApprovalCall::as_sent(&arguments), &facts)
+            .await
+    }
+
     const DOCS: &str = r#"{"mcpServers": {
         "docs": {"command": "npx", "args": ["-y", "docs-mcp"], "env": {"MODE": "ro"}},
         "shell": {"command": "bash", "args": ["-c", "evil"]},
@@ -897,6 +1069,40 @@ mod tests {
         assert!(tool.registry.list_servers().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn a_blank_name_or_an_entry_changed_after_its_card_never_starts() {
+        use aidaemon_secrets::MemorySecretStore;
+        let tool = ManageMcpTool::new(McpRegistry::new(
+            std::sync::Arc::new(OneServerStore::default()),
+            std::sync::Arc::new(MemorySecretStore::default()),
+        ));
+        let (project, dir) = project_with(Some(
+            r#"{"mcpServers": {" ": {"command": "python3", "args": ["-c", "print(1)"]},
+                "docs ": {"command": "npx", "args": ["-y", "docs-mcp"]},
+                "docs": {"command": "npx", "args": ["-y", "docs-mcp"]}}}"#,
+        ));
+        for name in [" ", "docs "] {
+            let call = json!({"action": "project_start", "name": name}).to_string();
+            let _ = judge(&tool, &project, &call).await;
+            let reply = tool.run_in(&call, Some(&project)).await.unwrap();
+            assert!(!reply.starts_with("Started"), "{name:?}: {reply}");
+        }
+        // The card showed one command; the file then changed: refused.
+        let call = r#"{"action":"project_start","name":"docs"}"#;
+        let OwnerApprovalNeed::Ask(card) = judge(&tool, &project, call).await else {
+            panic!("a project server start must ask");
+        };
+        assert!(card.summary.contains("npx -y docs-mcp"), "{}", card.summary);
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"docs": {"command": "npx", "args": ["-y", "other-mcp"]}}}"#,
+        )
+        .unwrap();
+        let reply = tool.run_in(call, Some(&project)).await.unwrap();
+        assert!(reply.contains("changed after the approval card"), "{reply}");
+        assert!(tool.registry.list_servers().await.is_empty());
+    }
+
     /// A minimal stdio MCP server in Python, with one tool `lookup`.
     const PY_SERVER: &str = r#"
 import json, sys
@@ -947,6 +1153,25 @@ for line in sys.stdin:
         let tool = ManageMcpTool::new(McpRegistry::new(
             store.clone(),
             std::sync::Arc::new(MemorySecretStore::default()),
+        ));
+        // Without the card the kernel shows, nothing starts.
+        let unasked = tool
+            .run_in(
+                r#"{"action":"project_start","name":"dict"}"#,
+                Some(&project),
+            )
+            .await
+            .unwrap();
+        assert!(unasked.contains("needs the owner's approval"), "{unasked}");
+        assert!(tool.registry.list_servers().await.is_empty());
+        assert!(matches!(
+            judge(
+                &tool,
+                &project,
+                r#"{"action":"project_start","name":"dict"}"#
+            )
+            .await,
+            OwnerApprovalNeed::Ask(_)
         ));
         let started = tool
             .run_in(
