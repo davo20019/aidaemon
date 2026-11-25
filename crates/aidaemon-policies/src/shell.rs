@@ -919,15 +919,15 @@ fn data_from_file(arg: &str, next: Option<&str>) -> bool {
     }
     // `-d`, `-F` (possibly the last of a cluster) with the value glued on
     // or in the next word.
-    if let Some(rest) = arg.strip_prefix('-').filter(|rest| !rest.starts_with('-')) {
-        if let Some(at) = rest.find(['d', 'F']) {
-            let glued = &rest[at + 1..];
-            return if glued.is_empty() {
-                next.is_some_and(|value| value.contains('@'))
-            } else {
-                glued.contains('@')
-            };
-        }
+    if let Some(rest) = arg.strip_prefix('-').filter(|rest| !rest.starts_with('-'))
+        && let Some(at) = rest.find(['d', 'F'])
+    {
+        let glued = &rest[at + 1..];
+        return if glued.is_empty() {
+            next.is_some_and(|value| value.contains('@'))
+        } else {
+            glued.contains('@')
+        };
     }
     false
 }
