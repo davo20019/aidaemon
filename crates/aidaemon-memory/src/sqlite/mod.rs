@@ -245,9 +245,7 @@ impl SqliteMemory {
 }
 
 fn parse_dt(s: String) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(&s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+    crate::types::parse_ts(&s).unwrap_or_else(Utc::now)
 }
 
 #[cfg(test)]

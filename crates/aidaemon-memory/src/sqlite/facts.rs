@@ -265,41 +265,7 @@ pub(crate) fn facts_make_the_same_claim(
     a == b || !keys_name_distinct_concepts(&a_tokens, &b_tokens)
 }
 
-pub(super) fn canonicalize_fact_key(key: &str) -> String {
-    let raw = key.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::with_capacity(raw.len());
-    let mut last_was_sep = false;
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_was_sep = false;
-        } else if !last_was_sep {
-            out.push('_');
-            last_was_sep = true;
-        }
-    }
-
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        raw.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn canonical_personal_key(key: &str) -> String {
-    match canonicalize_fact_key(key).as_str() {
-        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
-        "current_residence" | "home" | "location" => "residence".to_string(),
-        "place_of_birth" => "birthplace".to_string(),
-        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
-        other => other.to_string(),
-    }
-}
+pub(super) use crate::text::{canonical_personal_key, canonicalize_fact_key};
 
 fn prefer_canonical_facts(
     mut canonical: Vec<Fact>,
@@ -366,47 +332,7 @@ fn fact_freshness_boost(now: DateTime<Utc>, updated_at: DateTime<Utc>) -> f32 {
     FACT_FRESHNESS_MAX_BOOST * (1.0 - (age_hours / FACT_FRESHNESS_DECAY_HOURS).min(1.0))
 }
 
-pub(super) fn is_stopword(token: &str) -> bool {
-    matches!(
-        token,
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "did"
-            | "do"
-            | "does"
-            | "for"
-            | "from"
-            | "how"
-            | "i"
-            | "in"
-            | "is"
-            | "it"
-            | "me"
-            | "my"
-            | "of"
-            | "on"
-            | "or"
-            | "please"
-            | "tell"
-            | "that"
-            | "the"
-            | "to"
-            | "was"
-            | "we"
-            | "were"
-            | "what"
-            | "when"
-            | "where"
-            | "who"
-            | "why"
-            | "you"
-            | "your"
-    )
-}
+pub(super) use crate::scoring::is_stopword;
 
 fn query_tokens(query_lower: &str) -> Vec<&str> {
     query_lower
@@ -621,7 +547,7 @@ impl SqliteMemory {
                 .await?;
         let new_value = crate::text::normalize_fact_value(value);
         Ok(rows.into_iter().any(|(other, created_at)| {
-            DateTime::parse_from_rfc3339(&created_at).is_ok_and(|at| at.with_timezone(&Utc) > seen)
+            crate::types::parse_ts(&created_at).is_some_and(|at| at > seen)
                 && crate::text::normalize_fact_value(&other) != new_value
         }))
     }
@@ -657,9 +583,7 @@ impl SqliteMemory {
                 category,
                 key,
                 // An unreadable time still retires: no evidence is newer.
-                retired_at: DateTime::parse_from_rfc3339(&retired_at)
-                    .map(|at| at.with_timezone(&Utc))
-                    .unwrap_or(DateTime::<Utc>::MAX_UTC),
+                retired_at: crate::types::parse_ts(&retired_at).unwrap_or(DateTime::<Utc>::MAX_UTC),
             })
             .collect())
     }

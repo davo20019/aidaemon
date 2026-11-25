@@ -249,7 +249,7 @@ pub fn episode_importance(
 
 /// Function words that carry no retrieval signal. Used only to tokenize
 /// for lexical overlap and hashing, never to decide what is remembered.
-fn is_stopword(token: &str) -> bool {
+pub(crate) fn is_stopword(token: &str) -> bool {
     matches!(
         token,
         "a" | "an"

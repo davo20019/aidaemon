@@ -124,9 +124,7 @@ enum Bind<'a> {
 const COLUMNS: &str = "id, role, content, tool_calls, tool_name, created_at";
 
 fn parse_time(value: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|at| at.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+    crate::types::parse_ts(value).unwrap_or_else(Utc::now)
 }
 
 /// The filter after a session's latest episode, and its bind: past the last

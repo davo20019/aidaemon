@@ -38,16 +38,6 @@ fn compact_provenance_excerpt(text: &str) -> String {
     crate::text::truncate_chars(&single_line, 180)
 }
 
-fn canonical_personal_display_key(key: &str) -> String {
-    match key.trim().to_ascii_lowercase().as_str() {
-        "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
-        "current_residence" | "home" | "location" => "residence".to_string(),
-        "place_of_birth" => "birthplace".to_string(),
-        "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
-        other => other.to_string(),
-    }
-}
-
 /// The stored facts and episodes, managed by the model: list, search,
 /// forget, change who may see a fact, and check or repair the store.
 pub struct ManageMemoriesTool {
@@ -291,7 +281,7 @@ impl ManageMemoriesTool {
                 let canonical_owner_keys: std::collections::HashSet<String> = facts
                     .iter()
                     .filter(|fact| fact.category == "user")
-                    .map(|fact| canonical_personal_display_key(&fact.key))
+                    .map(|fact| crate::text::canonical_personal_key(&fact.key))
                     .collect();
                 facts.extend(
                     self.store
@@ -301,7 +291,7 @@ impl ManageMemoriesTool {
                         .filter(|fact| {
                             fact.category != "user"
                                 || !canonical_owner_keys
-                                    .contains(&canonical_personal_display_key(&fact.key))
+                                    .contains(&crate::text::canonical_personal_key(&fact.key))
                         }),
                 );
                 // The same visibility rule recall applies: what this turn's

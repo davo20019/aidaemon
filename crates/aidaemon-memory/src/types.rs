@@ -578,10 +578,19 @@ pub(crate) fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
+/// A stored timestamp: RFC3339, as the code writes it, or SQLite's
+/// `datetime('now')` form (`2026-07-04 13:10:45`, UTC), as column defaults
+/// and `updated_at = datetime('now')` writes leave it. `None` for anything
+/// else; each caller says what an unreadable time stands for.
 pub(crate) fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|t| t.with_timezone(&Utc))
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|t| t.and_utc())
+        })
 }
 
 /// Truncate to at most `max` characters on a char boundary.
@@ -713,5 +722,17 @@ mod tests {
             .normalized()
             .unwrap();
         assert_eq!(f.confidence, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod parse_ts_tests {
+    use super::parse_ts;
+
+    #[test]
+    fn sqlite_s_own_form_is_read_as_utc() {
+        let rfc = parse_ts("2026-07-04T13:10:45+00:00").unwrap();
+        assert_eq!(parse_ts("2026-07-04 13:10:45"), Some(rfc));
+        assert_eq!(parse_ts("yesterday"), None);
     }
 }

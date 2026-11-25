@@ -327,12 +327,8 @@ impl SqliteMemory {
         let first_seen_str: Option<String> = row.try_get("first_seen_at").unwrap_or(None);
         let source_excerpt: Option<String> = row.try_get("source_excerpt").unwrap_or(None);
 
-        let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        let created_at = crate::types::parse_ts(&created_str).unwrap_or_else(Utc::now);
+        let updated_at = crate::types::parse_ts(&updated_str).unwrap_or_else(Utc::now);
 
         Fact {
             id: row.get("id"),
@@ -342,26 +338,14 @@ impl SqliteMemory {
             source: row.get("source"),
             created_at,
             updated_at,
-            superseded_at: superseded_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
+            superseded_at: superseded_str.and_then(|s| crate::types::parse_ts(&s)),
             recall_count: row.try_get("recall_count").unwrap_or(0),
-            last_recalled_at: last_recalled_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
+            last_recalled_at: last_recalled_str.and_then(|s| crate::types::parse_ts(&s)),
             channel_id,
             privacy: privacy_str
                 .map(|s| FactPrivacy::from_str_lossy(&s))
                 .unwrap_or(FactPrivacy::Global),
-            first_seen_at: first_seen_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
+            first_seen_at: first_seen_str.and_then(|s| crate::types::parse_ts(&s)),
             source_excerpt,
         }
     }
@@ -385,21 +369,11 @@ impl SqliteMemory {
             outcome: row.get("outcome"),
             importance: row.get("importance"),
             recall_count: row.get("recall_count"),
-            last_recalled_at: last_recalled_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
+            last_recalled_at: last_recalled_str.and_then(|s| crate::types::parse_ts(&s)),
             message_count: row.get("message_count"),
-            start_time: chrono::DateTime::parse_from_rfc3339(&start_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            end_time: chrono::DateTime::parse_from_rfc3339(&end_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            start_time: crate::types::parse_ts(&start_str).unwrap_or_else(Utc::now),
+            end_time: crate::types::parse_ts(&end_str).unwrap_or_else(Utc::now),
+            created_at: crate::types::parse_ts(&created_str).unwrap_or_else(Utc::now),
             channel_id,
         })
     }
@@ -432,9 +406,7 @@ impl SqliteMemory {
                 asks_before_acting: row.get::<i32, _>("asks_before_acting") == 1,
                 prefers_explanations: row.get::<i32, _>("prefers_explanations") == 1,
                 likes_suggestions: row.get::<i32, _>("likes_suggestions") == 1,
-                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                updated_at: crate::types::parse_ts(&updated_str).unwrap_or_else(Utc::now),
             })
         } else {
             // Create default profile
@@ -542,14 +514,8 @@ impl SqliteMemory {
                 action: row.get("action"),
                 confidence: row.get("confidence"),
                 occurrence_count: row.get("occurrence_count"),
-                last_seen_at: last_seen_str.and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                }),
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                last_seen_at: last_seen_str.and_then(|s| crate::types::parse_ts(&s)),
+                created_at: crate::types::parse_ts(&created_str).unwrap_or_else(Utc::now),
             });
         }
         Ok(patterns)
@@ -848,17 +814,9 @@ impl SqliteMemory {
             success_count: row.get("success_count"),
             failure_count: row.get("failure_count"),
             avg_duration_secs: row.get("avg_duration_secs"),
-            last_used_at: last_used_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            last_used_at: last_used_str.and_then(|s| crate::types::parse_ts(&s)),
+            created_at: crate::types::parse_ts(&created_str).unwrap_or_else(Utc::now),
+            updated_at: crate::types::parse_ts(&updated_str).unwrap_or_else(Utc::now),
         })
     }
 
@@ -989,17 +947,9 @@ impl SqliteMemory {
             current_level: row.get("current_level"),
             confidence_score: row.get("confidence_score"),
             common_errors,
-            last_task_at: last_task_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            last_task_at: last_task_str.and_then(|s| crate::types::parse_ts(&s)),
+            created_at: crate::types::parse_ts(&created_str).unwrap_or_else(Utc::now),
+            updated_at: crate::types::parse_ts(&updated_str).unwrap_or_else(Utc::now),
         })
     }
 
@@ -1197,14 +1147,8 @@ impl SqliteMemory {
             solution_steps,
             success_count: row.get("success_count"),
             failure_count: row.get("failure_count"),
-            last_used_at: last_used_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
-            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            last_used_at: last_used_str.and_then(|s| crate::types::parse_ts(&s)),
+            created_at: crate::types::parse_ts(&created_str).unwrap_or_else(Utc::now),
         })
     }
 
@@ -1272,11 +1216,7 @@ impl SqliteMemory {
             notes: row.try_get("notes").unwrap_or(None),
             communication_style: row.try_get("communication_style").unwrap_or(None),
             language_preference: row.try_get("language_preference").unwrap_or(None),
-            last_interaction_at: last_interaction_str.and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
+            last_interaction_at: last_interaction_str.and_then(|s| crate::types::parse_ts(&s)),
             interaction_count: row.try_get("interaction_count").unwrap_or(0),
             created_at: parse_dt(created_str),
             updated_at: parse_dt(updated_str),

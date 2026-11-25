@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::*;
@@ -1143,10 +1143,10 @@ impl SqliteMemory {
         .await?;
         let mut output = Vec::new();
         for row in rows {
-            let asserted = DateTime::parse_from_rfc3339(&row.get::<String, _>("asserted_at"))?
-                .with_timezone(&Utc);
-            let updated = DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?
-                .with_timezone(&Utc);
+            let asserted = crate::types::parse_ts(&row.get::<String, _>("asserted_at"))
+                .ok_or_else(|| anyhow::anyhow!("unreadable asserted_at"))?;
+            let updated = crate::types::parse_ts(&row.get::<String, _>("updated_at"))
+                .ok_or_else(|| anyhow::anyhow!("unreadable updated_at"))?;
             let owner = row.get::<i64, _>("is_owner") != 0;
             let name: String = row.get("display_name");
             let pred: String = row.get("predicate");
@@ -1182,10 +1182,10 @@ impl SqliteMemory {
         .fetch_all(&self.pool)
         .await?;
         for row in aliases {
-            let asserted = DateTime::parse_from_rfc3339(&row.get::<String, _>("asserted_at"))?
-                .with_timezone(&Utc);
-            let updated = DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?
-                .with_timezone(&Utc);
+            let asserted = crate::types::parse_ts(&row.get::<String, _>("asserted_at"))
+                .ok_or_else(|| anyhow::anyhow!("unreadable asserted_at"))?;
+            let updated = crate::types::parse_ts(&row.get::<String, _>("updated_at"))
+                .ok_or_else(|| anyhow::anyhow!("unreadable updated_at"))?;
             let owner = row.get::<i64, _>("is_owner") != 0;
             let name: String = row.get("display_name");
             let kind: String = row.get("alias_type");
@@ -1222,10 +1222,10 @@ impl SqliteMemory {
         .fetch_all(&self.pool)
         .await?;
         for row in edges {
-            let asserted = DateTime::parse_from_rfc3339(&row.get::<String, _>("asserted_at"))?
-                .with_timezone(&Utc);
-            let updated = DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?
-                .with_timezone(&Utc);
+            let asserted = crate::types::parse_ts(&row.get::<String, _>("asserted_at"))
+                .ok_or_else(|| anyhow::anyhow!("unreadable asserted_at"))?;
+            let updated = crate::types::parse_ts(&row.get::<String, _>("updated_at"))
+                .ok_or_else(|| anyhow::anyhow!("unreadable updated_at"))?;
             let rel: String = row.get("relationship_type");
             output.push(Fact {
                 id: -3_000_000_000 - row.get::<i64, _>("id"),
