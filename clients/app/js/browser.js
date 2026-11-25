@@ -84,17 +84,67 @@ export async function sign(message) {
  * the daemon's iroh address when the link names one (`remote`).
  */
 export function pairingLink() {
+  // A link naming a daemon this browser is not paired with waits for the
+  // owner's word (unconfirmedRemote): until then it offers nothing.
+  if (unconfirmedRemote()) return ["", "", "", ""];
   const hash = new URLSearchParams(location.hash.slice(1));
   return [hash.get("offer") ?? "", hash.get("code") ?? "", hash.get("fp") ?? "", hash.get("remote") ?? ""];
 }
 
+/** The `iroh://` address a link in this page's address names, or "". */
+function offeredRemote() {
+  const offered = new URLSearchParams(location.hash.slice(1)).get("remote") ?? "";
+  return offered.startsWith("iroh://") ? offered : "";
+}
+
 /**
- * The daemon's iroh address for this page: a pairing link's, else the one
- * this browser was paired over, else "" (the daemon served this page).
+ * The daemon's endpoint key in an `iroh://<key>@<relay>` address (machine
+ * format: the scheme's own authority part), lowercased; "" when none.
+ */
+export function irohKey(url) {
+  const found = /^iroh:\/\/([^@/?#]+)/.exec(url ?? "");
+  return found ? found[1].toLowerCase() : "";
+}
+
+function hasDevice() {
+  try {
+    return !!localStorage.getItem(DEVICE_KEY);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The daemon's iroh address for this page: the one this browser was paired
+ * over, else "" (the daemon served this page). A link's address counts only
+ * when it names that same daemon, or when this browser has no daemon and no
+ * key yet (a first pairing). Any other link's daemon is unconfirmedRemote()
+ * until the owner agrees to switch (switchRemote): a link alone never moves
+ * a paired browser to another daemon.
  */
 export function remoteAddress() {
-  const offered = new URLSearchParams(location.hash.slice(1)).get("remote") ?? "";
-  return offered.startsWith("iroh://") ? offered : remoteGateway();
+  const offered = offeredRemote();
+  const kept = remoteGateway();
+  if (offered && (kept ? irohKey(kept) === irohKey(offered) : !hasDevice())) return offered;
+  return kept;
+}
+
+/** A link's daemon this browser is not paired with, waiting for the owner; or "". */
+export function unconfirmedRemote() {
+  const offered = offeredRemote();
+  return offered && remoteAddress() !== offered ? offered : "";
+}
+
+/**
+ * The owner chose the link's daemon: forget this browser's pairing (its key
+ * belongs to the other daemon), keep the new address and start afresh, the
+ * link's offer (if any) then pairing as a first visit would.
+ */
+export async function switchRemote(url) {
+  if (!irohKey(url)) throw new Error("not an iroh address");
+  await forget();
+  localStorage.setItem(REMOTE_KEY, url);
+  location.reload();
 }
 
 /** The daemon's iroh address this browser was paired over, or "". */

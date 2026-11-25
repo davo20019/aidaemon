@@ -41,6 +41,12 @@ extern "C" {
     fn remote_address() -> String;
     #[wasm_bindgen(js_name = keepRemoteGateway)]
     fn keep_remote_gateway(url: &str);
+    #[wasm_bindgen(js_name = unconfirmedRemote)]
+    fn unconfirmed_remote() -> String;
+    #[wasm_bindgen(js_name = irohKey)]
+    fn iroh_key(url: &str) -> String;
+    #[wasm_bindgen(js_name = switchRemote)]
+    fn switch_remote(url: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name = daemonBase)]
     fn daemon_base() -> String;
     #[wasm_bindgen(js_name = remoteReady)]
@@ -413,6 +419,33 @@ pub fn offered_pairing() -> Option<(String, String, Option<String>)> {
     (!offer.is_empty()).then(|| (offer, code, (!fp.is_empty()).then_some(fp)))
 }
 
+/// A link that names a daemon this browser is not paired with moves it only
+/// on the owner's word, shown that daemon's key: a link alone (from a page,
+/// a message, a model's reply) must not hand this browser, its messages and
+/// the keys typed into it, to another daemon. Until then the page keeps its
+/// own daemon and the link offers nothing (`js/browser.js`).
+fn confirm_link_daemon() {
+    let address = unconfirmed_remote();
+    if address.is_empty() {
+        return;
+    }
+    let key = iroh_key(&address);
+    crate::ui::confirm(
+        "Switch to another AIDaemon?",
+        format!(
+            "This link points to a different AIDaemon than the one this browser is paired with. \
+             Its key is {key}. Switch only if you started this pairing yourself and that key is \
+             your AIDaemon's: switching forgets this browser's pairing."
+        ),
+        "Switch",
+        move || {
+            spawn(async move {
+                let _ = JsFuture::from(switch_remote(&address)).await;
+            });
+        },
+    );
+}
+
 /// Pair this browser, then connect.
 pub async fn pair(
     store: Store,
@@ -474,6 +507,7 @@ pub async fn unpair() {
 }
 
 pub fn start(store: Store) {
+    confirm_link_daemon();
     // Files' links are on this page's own origin; opening one needs it
     // whole.
     store.set_gateway_base(base());
