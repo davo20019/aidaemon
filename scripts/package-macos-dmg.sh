@@ -116,9 +116,15 @@ rm -f "$out_dmg"
 # hdiutil fails now and then on CI's macOS runners while something else
 # holds the new image ("Resource busy"), and -quiet hid why: say what it
 # reported and try again a few times.
+# Its own size estimate for -srcfolder can come out short, and the copy
+# then fills the image ("No space left on device" with the runner's disk
+# far from full, v0.23.0's Apple Silicon image): size it from the folder,
+# with room for the file system's own overhead.
+volume_mb=$(du -sm "$volume" | cut -f1)
+image_mb=$((volume_mb + volume_mb / 4 + 64))
 made=0
 for attempt in 1 2 3 4 5; do
-  if hdiutil create -volname "AIdaemon" -srcfolder "$volume" -ov -format UDZO "$out_dmg"; then
+  if hdiutil create -volname "AIdaemon" -srcfolder "$volume" -size "${image_mb}m" -fs HFS+ -ov -format UDZO "$out_dmg"; then
     made=1
     break
   fi
