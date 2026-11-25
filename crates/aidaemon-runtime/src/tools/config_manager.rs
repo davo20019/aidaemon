@@ -321,13 +321,24 @@ impl ConfigManagerTool {
             "set" | "unset" => {
                 if args.key.is_empty()
                     || (args.action == "set" && args.value.is_empty())
-                    || !Self::change_needs_approval(args)
                     || Self::literal_secret_refusal(args).is_some()
                 {
                     return Ok(None);
                 }
-                Ok(Some(Self::set_summary(args)))
+                let needs = Self::change_needs_approval(args)
+                    || (args.action == "unset"
+                        && Self::unset_removes_approval_key(&self.config.read().await?, &args.key));
+                Ok(needs.then(|| Self::set_summary(args)))
             }
+            "enable_stt" => {
+                let probe = Self::stt_probe(args);
+                if !probe.is_complete() {
+                    return Ok(None);
+                }
+                Ok(Some(Self::stt_summary(&probe, Self::stt_language(args))))
+            }
+            "restore" => Ok(Self::restore_candidate(&self.config.backups())
+                .map(|(path, _)| Self::restore_summary(&path))),
             "enable_client_gateway" => {
                 let content = self.config.read().await?;
                 let settings = Self::client_gateway_settings(&content);
@@ -393,10 +404,77 @@ impl ConfigManagerTool {
         }
     }
 
+    /// The STT stack `enable_stt` would write: the overrides resolved the
+    /// same way the call resolves them.
+    fn stt_probe(args: &ConfigArgs) -> aidaemon_tools::stt_setup::SttProbe {
+        aidaemon_tools::stt_setup::SttProbe::resolve(
+            args.stt_cli_path.as_deref(),
+            args.stt_model_path.as_deref(),
+            args.stt_ffmpeg_path.as_deref(),
+        )
+    }
+
+    fn stt_language(args: &ConfigArgs) -> &str {
+        args.stt_language
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("en")
+    }
+
+    /// The card for `enable_stt`: the programs that will run on every voice
+    /// message, by full path.
+    fn stt_summary(probe: &aidaemon_tools::stt_setup::SttProbe, language: &str) -> String {
+        let show = |path: &Option<std::path::PathBuf>| {
+            path.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        format!(
+            "Turn on voice transcription: every voice message runs {} (with ffmpeg {}) on the \
+             model {}, language `{language}`. Applies after a restart.",
+            show(&probe.whisper_cli),
+            show(&probe.ffmpeg),
+            show(&probe.model_path),
+        )
+    }
+
+    /// The backup `restore` copies over the config: the first in the chain
+    /// that exists, with its content.
+    fn restore_candidate(backups: &[std::path::PathBuf]) -> Option<(std::path::PathBuf, String)> {
+        backups.iter().find_map(|candidate| {
+            std::fs::read_to_string(candidate)
+                .ok()
+                .map(|content| (candidate.clone(), content))
+        })
+    }
+
+    fn restore_summary(path: &std::path::Path) -> String {
+        format!(
+            "Replace config.toml with the backup {}: every setting, including who may reach \
+             the agent and what it may run, returns to what that backup holds. Applies after \
+             /reload.",
+            path.display()
+        )
+    }
+
+    /// Whether an `unset` would remove an approval-guarded key: the value at
+    /// `key` in the current config is a table or array holding one (say,
+    /// unsetting `memory` drops `memory.db_path`).
+    fn unset_removes_approval_key(content: &str, key: &str) -> bool {
+        let Ok(path) = ConfigPath::parse(key) else {
+            return true;
+        };
+        let Ok(root) = content.parse::<toml::Table>() else {
+            return true;
+        };
+        let root = toml::Value::Table(root);
+        plain_holds_approval_key(path.lookup(&root))
+    }
+
     /// The exact arguments the owner approves (a changed argument is a new
     /// card), with secret values replaced by their SHA-256 digest so no
     /// secret is kept in a grant or a decline.
-    fn approval_subject(args: &ConfigArgs) -> String {
+    fn approval_subject(&self, args: &ConfigArgs) -> String {
         use sha2::{Digest, Sha256};
         let secret = |value: &str| -> String {
             if value.is_empty() {
@@ -428,6 +506,25 @@ impl ConfigManagerTool {
                 "key": args.key,
                 "value": args.value,
             }),
+            // What runs for every voice message: the resolved programs and
+            // model, so a different binary is a new card.
+            "enable_stt" => {
+                let probe = Self::stt_probe(args);
+                json!({
+                    "action": args.action,
+                    "whisper_cli": probe.whisper_cli,
+                    "ffmpeg": probe.ffmpeg,
+                    "model_path": probe.model_path,
+                    "language": Self::stt_language(args),
+                })
+            }
+            // The backup's exact content: a backup that changed after the
+            // card is a new card.
+            "restore" => {
+                let digest = Self::restore_candidate(&self.config.backups())
+                    .map(|(_, content)| hex::encode(Sha256::digest(content.as_bytes())));
+                json!({"action": args.action, "backup_sha256": digest})
+            }
             _ => json!({
                 "action": args.action,
                 "provider": args.provider,
@@ -460,7 +557,7 @@ impl ConfigManagerTool {
             card: None,
             effects: Vec::new(),
             summary,
-            subject: Self::approval_subject(&args),
+            subject: self.approval_subject(&args),
             risk: aidaemon_core::ApprovalRisk::High,
             warnings: vec!["Modifying security-sensitive configuration".to_string()],
         })
@@ -499,21 +596,31 @@ impl ConfigManagerTool {
     }
 
     /// Restore from the first available backup in the chain.
-    async fn restore_backup(&self) -> anyhow::Result<String> {
-        let candidates = self.config.backups();
-
-        for candidate in &candidates {
-            if candidate.exists() {
-                tokio::fs::copy(candidate, self.config.path()).await?;
-                warn!(source = %candidate.display(), "Config restored from backup");
-                return Ok(format!(
-                    "Config restored from {}. Run /reload to apply.",
-                    candidate.display()
-                ));
-            }
+    async fn restore_backup(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+        let Some((candidate, backup)) = Self::restore_candidate(&self.config.backups()) else {
+            anyhow::bail!("No backups found (checked .bak, .bak.1, .bak.2)")
+        };
+        if let Err(e) = self.config.validate(&backup) {
+            anyhow::bail!(
+                "the backup {} is not a valid config: {e}",
+                candidate.display()
+            );
         }
-
-        anyhow::bail!("No backups found (checked .bak, .bak.1, .bak.2)")
+        let current = self.config.read().await.unwrap_or_default();
+        if let Some(refusal) = Self::writes_exposure_command(&current, &backup) {
+            anyhow::bail!("{refusal}");
+        }
+        // The whole config, allowlists included, comes back: the kernel
+        // asked the owner (with this backup's digest) before this runs.
+        Self::require_kernel_approval(args)?;
+        // Write the exact content judged above, not whatever the file holds
+        // by the time a copy would run.
+        self.config.write_checked(&backup).await?;
+        warn!(source = %candidate.display(), "Config restored from backup");
+        Ok(format!(
+            "Config restored from {}. Run /reload to apply.",
+            candidate.display()
+        ))
     }
 
     /// Why a change may not be written: it would add or change an
@@ -1740,11 +1847,7 @@ impl ConfigManagerTool {
     }
 
     async fn enable_stt(&self, args: &ConfigArgs) -> anyhow::Result<String> {
-        let probe = aidaemon_tools::stt_setup::SttProbe::resolve(
-            args.stt_cli_path.as_deref(),
-            args.stt_model_path.as_deref(),
-            args.stt_ffmpeg_path.as_deref(),
-        );
+        let probe = Self::stt_probe(args);
 
         let mut issues = Vec::new();
         if probe.whisper_cli.is_none() {
@@ -1768,11 +1871,10 @@ impl ConfigManagerTool {
             ));
         }
 
-        let language = args
-            .stt_language
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("en");
+        let language = Self::stt_language(args);
+        // The programs written here run on every voice message: the kernel
+        // showed the owner their paths before this runs.
+        Self::require_kernel_approval(args)?;
 
         let content = self.config.read().await?;
         let mut doc: toml::Table = content.parse()?;
@@ -2223,7 +2325,7 @@ impl ConfigManagerTool {
             }
             "get" => self.get_value(&args).await,
             "set" | "unset" => self.change_value(&args).await,
-            "restore" => match self.restore_backup().await {
+            "restore" => match self.restore_backup(&args).await {
                 Ok(msg) => Ok(ConfigReply::done(msg)),
                 Err(e) => Ok(ConfigReply::refused(format!("Restore failed: {}", e))),
             },
@@ -2334,7 +2436,9 @@ impl ConfigManagerTool {
         // A change that would be written needs the owner's approval unless
         // it is in a tuning table; the kernel asked before this runs. (A
         // change refused above writes nothing and needs none.)
-        if Self::change_needs_approval(args) {
+        if Self::change_needs_approval(args)
+            || (unset && Self::unset_removes_approval_key(&content, &args.key))
+        {
             Self::require_kernel_approval(args)?;
         }
 
@@ -3524,6 +3628,119 @@ token_file = "{}"
             Some(true)
         );
         assert!(!tokens.path().join("client-token").exists());
+    }
+
+    /// A complete synthetic STT stack in a temp dir: (dir, cli, model, ffmpeg).
+    fn fake_stt_stack() -> (TempDir, String, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("whisper-cli");
+        let model = dir.path().join("model.bin");
+        let ffmpeg = dir.path().join("ffmpeg");
+        fs::write(&cli, b"").unwrap();
+        fs::write(&model, b"fake").unwrap();
+        fs::write(&ffmpeg, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for bin in [&cli, &ffmpeg] {
+                fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let (cli, model, ffmpeg) = (s(&cli), s(&model), s(&ffmpeg));
+        (dir, cli, model, ffmpeg)
+    }
+
+    #[tokio::test]
+    async fn enable_stt_asks_the_owner_with_the_resolved_programs() {
+        let (_stack, cli, model, ffmpeg) = fake_stt_stack();
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let tool = approving_tool(path.clone());
+        let arguments = json!({
+            "action": "enable_stt",
+            "stt_cli_path": cli,
+            "stt_model_path": model,
+            "stt_ffmpeg_path": ffmpeg,
+        });
+        let OwnerApprovalNeed::Ask(request) = tool.owner_approval(&arguments).await else {
+            panic!("enable_stt must ask the owner");
+        };
+        assert!(request.summary.contains(&cli), "{}", request.summary);
+        assert!(request.summary.contains(&ffmpeg), "{}", request.summary);
+        assert!(request.subject.contains(&cli), "{}", request.subject);
+
+        let before = fs::read_to_string(&path).unwrap();
+        let mut args: ConfigArgs = serde_json::from_value(arguments).unwrap();
+        args.kernel_approved = false;
+        assert!(tool.enable_stt(&args).await.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn enable_stt_never_runs_a_shell_for_the_ffmpeg_override() {
+        let (_stack, cli, model, _ffmpeg) = fake_stt_stack();
+        let marker =
+            std::env::temp_dir().join(format!("aidaemon-stt-injection-{}", uuid::Uuid::new_v4()));
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "enable_stt".to_string();
+        args.stt_cli_path = Some(cli);
+        args.stt_model_path = Some(model);
+        args.stt_ffmpeg_path = Some(format!("x; touch {}", marker.display()));
+        let _ = tool
+            .owner_approval(&json!({
+                "action": "enable_stt",
+                "stt_ffmpeg_path": args.stt_ffmpeg_path,
+            }))
+            .await;
+        let reply = tool.enable_stt(&args).await.unwrap();
+        assert!(reply.contains("ffmpeg not found"), "{reply}");
+        assert!(!marker.exists(), "the override ran a shell command");
+    }
+
+    #[tokio::test]
+    async fn restore_asks_the_owner_and_writes_the_judged_backup() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let tool = approving_tool(path.clone());
+        let backup = "[provider]\nkind = \"openai_compatible\"\napi_key = \"keychain\"\n\n[provider.models]\ndefault = \"older-model\"\n";
+        fs::write(path.with_extension("toml.bak"), backup).unwrap();
+
+        let OwnerApprovalNeed::Ask(request) =
+            tool.owner_approval(&json!({"action": "restore"})).await
+        else {
+            panic!("restore must ask the owner");
+        };
+        assert!(
+            request.subject.contains("backup_sha256"),
+            "{}",
+            request.subject
+        );
+
+        let mut args: ConfigArgs = serde_json::from_value(json!({"action": "restore"})).unwrap();
+        args.kernel_approved = false;
+        assert!(tool.restore_backup(&args).await.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), PRIMARY_CONFIG);
+
+        args.kernel_approved = true;
+        tool.restore_backup(&args).await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), backup);
+    }
+
+    #[tokio::test]
+    async fn unsetting_a_free_table_that_holds_a_guarded_key_asks() {
+        let config = "[provider]\nkind = \"openai_compatible\"\napi_key = \"keychain\"\n\n[provider.models]\ndefault = \"primary-model\"\n\n[memory]\ndb_path = \"/tmp/synthetic-memory.db\"\n";
+        let (_dir, path) = write_temp_config(config);
+        let tool = approving_tool(path.clone());
+        let arguments = json!({"action": "unset", "key": "memory"});
+        assert!(matches!(
+            tool.owner_approval(&arguments).await,
+            OwnerApprovalNeed::Ask(_)
+        ));
+        let mut args: ConfigArgs = serde_json::from_value(arguments).unwrap();
+        args.kernel_approved = false;
+        assert!(tool.change_value(&args).await.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), config);
     }
 
     const PRIMARY_CONFIG: &str = "[provider]\nkind = \"openai_compatible\"\napi_key = \"keychain\"\n\n[provider.models]\ndefault = \"primary-model\"\n";

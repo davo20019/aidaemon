@@ -1,7 +1,6 @@
 //! Shared Whisper STT discovery and config helpers for wizard and manage_config.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Result of probing the local Whisper STT stack.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -207,7 +206,7 @@ fn resolve_model_path(override_path: Option<&str>, auto: Option<PathBuf>) -> Opt
     match override_path.filter(|s| !s.is_empty()) {
         Some(path) => {
             let expanded = expand_tilde(path);
-            expanded.is_file().then_some(expanded)
+            (expanded.is_absolute() && expanded.is_file()).then_some(expanded)
         }
         None => auto,
     }
@@ -231,24 +230,75 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).into_owned())
 }
 
+/// An override names an absolute executable file (after `~`), never a
+/// relative path resolved against whatever directory the daemon runs in.
 fn is_executable(path: &Path) -> bool {
-    path.is_file()
+    path.is_absolute() && is_runnable(path)
 }
 
+/// `binary` found on `PATH`, the way a shell's `command -v` finds it, but
+/// without a shell: a bare program name only (no separators, no shell
+/// syntax), so a configured name can never run anything.
 fn which_sync(binary: &str) -> Option<PathBuf> {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {binary}")])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|p| p.is_file())
+    let bare = !binary.is_empty()
+        && binary
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && binary != "."
+        && binary != "..";
+    if !bare {
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| {
+            let plain = dir.join(binary);
+            #[cfg(windows)]
+            let candidates = vec![plain.clone(), plain.with_extension("exe")];
+            #[cfg(not(windows))]
+            let candidates = vec![plain];
+            candidates
+        })
+        .find(|candidate| is_runnable(candidate))
+}
+
+#[cfg(unix)]
+fn is_runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_runnable(path: &Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn which_sync_never_runs_shell_syntax() {
+        let marker =
+            std::env::temp_dir().join(format!("aidaemon-stt-which-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        for name in [
+            format!("x; touch {}", marker.display()),
+            format!("$(touch {})", marker.display()),
+            "../ffmpeg".to_string(),
+            "/bin/sh".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(which_sync(&name), None, "{name}");
+        }
+        assert!(!marker.exists(), "a configured name ran a command");
+        assert_eq!(
+            resolve_ffmpeg_path(Some("ffmpeg; touch /tmp/x"), None),
+            None
+        );
+    }
 
     #[test]
     fn stt_config_section_disabled_is_commented() {
