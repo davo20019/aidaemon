@@ -57,7 +57,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub use format::split_message;
+pub use aidaemon_channels::split_message;
 pub use mapping::{CUSTOM_ID_MAX, decode_custom_id, encode_custom_id};
 pub use rest::validate_token;
 

@@ -88,8 +88,14 @@ fn convert_inline_formatting_to_plain(s: &str) -> String {
             continue;
         }
 
+        // _italic_ only at word boundaries (as the HTML converter), so
+        // snake_case stays intact.
         if chars[i] == '_'
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
             && let Some(end) = find_char(&chars, '_', i + 1)
+            && end > i + 1
+            && (end + 1 >= len || !chars[end + 1].is_alphanumeric())
+            && !chars[i + 1].is_whitespace()
         {
             result.extend(chars[i + 1..end].iter());
             i = end + 1;
@@ -182,4 +188,17 @@ pub fn split_text(text: &str, max_units: usize) -> Vec<String> {
         }
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::markdown_to_plain_fallback;
+
+    #[test]
+    fn snake_case_keeps_its_underscores() {
+        assert_eq!(
+            markdown_to_plain_fallback("set my_var_name and _this_"),
+            "set my_var_name and this"
+        );
+    }
 }
