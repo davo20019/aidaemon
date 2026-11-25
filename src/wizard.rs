@@ -1053,7 +1053,7 @@ fn write_config_with_backup(
     let rendered = toml::to_string_pretty(&toml::Value::Table(doc.clone()))?;
     rendered.parse::<toml::Table>()?;
 
-    if let Err(write_err) = std::fs::write(config_path, rendered) {
+    if let Err(write_err) = aidaemon_tools::config_file::write_owner_only(config_path, &rendered) {
         let _ = std::fs::copy(&backup_path, config_path);
         return Err(write_err.into());
     }

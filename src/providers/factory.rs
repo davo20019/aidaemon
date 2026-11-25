@@ -79,6 +79,19 @@ pub(crate) fn chatgpt_backend(
 ) -> anyhow::Result<aidaemon_providers::ChatGpt> {
     let client =
         super::build_http_client(std::time::Duration::from_secs(60)).map_err(anyhow::Error::msg)?;
+    // A base URL the subscription token may not go to (one left over from
+    // another provider, or plain http) is ignored, not obeyed: the token
+    // and account id would reach that host on every request.
+    let base_override =
+        base_override.filter(
+            |url| match aidaemon_providers::chatgpt_base_url_refusal(url) {
+                None => true,
+                Some(why) => {
+                    tracing::warn!(base_url = %url, "Ignoring the ChatGPT base_url: {why}");
+                    false
+                }
+            },
+        );
     let mut builder = aidaemon_providers::ChatGpt::builder()
         .base_url(base_override.unwrap_or(crate::providers::chatgpt_login::CODEX_BACKEND_BASE_URL))
         .auth(DaemonChatGptAuth {
