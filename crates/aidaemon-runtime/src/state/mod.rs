@@ -325,13 +325,13 @@ impl SqliteStateStore {
         }
 
         #[cfg(not(feature = "encryption"))]
-        if let Some(key) = encryption_key {
-            if !key.is_empty() {
-                anyhow::bail!(
-                    "Database encryption_key is set in config but aidaemon was compiled without the 'encryption' feature. \
-                     Rebuild with: cargo build --features encryption"
-                );
-            }
+        if let Some(key) = encryption_key
+            && !key.is_empty()
+        {
+            anyhow::bail!(
+                "Database encryption_key is set in config but aidaemon was compiled without the 'encryption' feature. \
+                 Rebuild with: cargo build --features encryption"
+            );
         }
 
         let pool = SqlitePoolOptions::new()
