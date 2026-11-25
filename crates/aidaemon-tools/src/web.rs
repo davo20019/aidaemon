@@ -229,8 +229,19 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
         return true;
     }
 
-    // Shared address space (CGNAT): 100.64.0.0/10
+    // Shared address space (CGNAT, tailnets): 100.64.0.0/10
     if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        return true;
+    }
+
+    // "This network" 0.0.0.0/8 (0.x.y.z reaches the local host on some
+    // systems), IETF protocol assignments 192.0.0.0/24, benchmarking
+    // 198.18.0.0/15, multicast 224.0.0.0/4 and reserved 240.0.0.0/4.
+    if octets[0] == 0
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        || octets[0] >= 224
+    {
         return true;
     }
 
@@ -253,8 +264,45 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
         return is_blocked_ipv4(ipv4);
     }
 
-    // Link-local: fe80::/10
     let segments = ip.segments();
+    let embedded_v4 = |high: u16, low: u16| {
+        Ipv4Addr::new(
+            (high >> 8) as u8,
+            (high & 0xff) as u8,
+            (low >> 8) as u8,
+            (low & 0xff) as u8,
+        )
+    };
+
+    // IPv4-compatible (deprecated) ::a.b.c.d: the first 96 bits are zero.
+    if segments[..6].iter().all(|segment| *segment == 0) {
+        return is_blocked_ipv4(embedded_v4(segments[6], segments[7]));
+    }
+
+    // NAT64 well-known prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48:
+    // a translator forwards these to the embedded IPv4 address.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b {
+        return segments[2..6].iter().all(|segment| *segment == 0)
+            && is_blocked_ipv4(embedded_v4(segments[6], segments[7]))
+            || segments[2] == 0x0001;
+    }
+
+    // 6to4 2002::/16 carries an IPv4 address in its next 32 bits.
+    if segments[0] == 0x2002 {
+        return is_blocked_ipv4(embedded_v4(segments[1], segments[2]));
+    }
+
+    // Teredo 2001::/32 tunnels to an obfuscated IPv4 address; discard-only
+    // 100::/64; site-local fec0::/10 (deprecated private); multicast ff00::/8.
+    if (segments[0] == 0x2001 && segments[1] == 0)
+        || (segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0))
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] & 0xff00) == 0xff00
+    {
+        return true;
+    }
+
+    // Link-local: fe80::/10
     if (segments[0] & 0xffc0) == 0xfe80 {
         return true;
     }
@@ -1607,6 +1655,43 @@ mod tests {
     }
     use crate::testutil::ctx;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Addresses that reach a private or local host through an embedding
+    /// (IPv4-compatible, NAT64, 6to4) or a reserved range are blocked;
+    /// ordinary public addresses are not.
+    #[test]
+    fn embedded_and_reserved_addresses_are_blocked() {
+        for blocked in [
+            "100.100.100.100",
+            "0.1.2.3",
+            "198.18.0.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "2002:7f00:1::1",
+            "2002:a9fe:a9fe::",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "fec0::1",
+            "ff02::1",
+            "100::1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{blocked}");
+        }
+        for public in [
+            "93.184.216.34",
+            "2606:4700::6810:84e5",
+            "64:ff9b::5db8:d822",
+            "2002:5db8:d822::1",
+        ] {
+            let ip: IpAddr = public.parse().unwrap();
+            assert!(!is_blocked_ip(ip), "{public}");
+        }
+    }
 
     #[test]
     fn web_fetch_declares_its_egress_host() {

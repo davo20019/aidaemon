@@ -33,8 +33,38 @@ pub const SENSITIVE_PATTERNS: &[&str] = &[
 
 /// Entries that hold secrets; a file read refuses these. Narrower than
 /// [`SENSITIVE_PATTERNS`], which also guards non-secret writes such as
-/// `.git`.
+/// `.git`. Multi-component entries name token stores whose file names do
+/// not look secret (a CLI's login file, a shell's history).
 pub const SECRET_READ_PATTERNS: &[&str] = &[
+    ".config/gh/hosts.yml",
+    ".codex/auth.json",
+    ".claude/.credentials.json",
+    ".config/gcloud/credentials.db",
+    ".config/gcloud/access_tokens.db",
+    ".config/gcloud/application_default_credentials.json",
+    ".docker/config.json",
+    ".kube/config",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    ".node_repl_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".lesshst",
+    ".local/share/fish/fish_history",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/BraveSoftware",
+    "Library/Safari",
+    "Library/Cookies",
+    "Library/Keychains",
+    ".mozilla/firefox",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".password-store",
     ".ssh",
     ".gnupg",
     ".aws",
@@ -363,6 +393,26 @@ mod tests {
         assert!(!classifier.is_sensitive(path("/srv/app/src/main.rs")));
         // A component name, not a substring: "monkey" is not ".key".
         assert!(!classifier.is_sensitive(path("/srv/app/monkey.txt")));
+    }
+
+    #[test]
+    fn token_stores_and_histories_are_secrets() {
+        let classifier = PathClassifier::default();
+        for secret in [
+            "/home/synthetic/.config/gh/hosts.yml",
+            "/home/synthetic/.codex/auth.json",
+            "/home/synthetic/.claude/.credentials.json",
+            "/home/synthetic/.zsh_history",
+            "/home/synthetic/.bash_history",
+            "/home/synthetic/.netrc",
+            "/home/synthetic/.docker/config.json",
+            "/home/synthetic/.kube/config",
+            "/Users/synthetic/Library/Application Support/Google/Chrome/Default/Cookies",
+            "/home/synthetic/.mozilla/firefox/abc.default/logins.json",
+        ] {
+            assert!(classifier.is_secret(path(secret)), "{secret}");
+        }
+        assert!(!classifier.is_secret(path("/srv/app/.config/settings.yml")));
     }
 
     #[test]
