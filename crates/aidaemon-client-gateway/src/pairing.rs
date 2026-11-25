@@ -338,12 +338,10 @@ impl Pairing {
         approvals: Option<mpsc::Sender<ApprovalRequest>>,
         public_url: crate::PublicUrl,
         watch_ceiling: Risk,
+        fingerprint: String,
     ) -> Self {
-        // The fingerprint identifies this daemon's database, which holds
-        // the devices it paired. It is keyed on the configured address,
-        // never a live tunnel origin, so it does not change when one does.
-        let fingerprint =
-            sha(&format!("aidaemon-client-gateway:{}", public_url.fallback))[..16].to_string();
+        // The fingerprint names this install ([`crate::token::install_fingerprint`]):
+        // random, so no other daemon can give it back to a device.
         Self {
             log,
             approvals,
@@ -1162,6 +1160,7 @@ mod tests {
                 fallback: "http://127.0.0.1:8788".into(),
             },
             Risk::Low,
+            "0123456789abcdef".into(),
         )
     }
 

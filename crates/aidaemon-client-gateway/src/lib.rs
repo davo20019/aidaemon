@@ -682,6 +682,7 @@ impl ClientGateway {
                 fallback: deps.config.public_url(),
             },
             deps.config.watch_risk_ceiling,
+            crate::token::install_fingerprint(&deps.token_file),
         ));
         let gateway = Arc::new(Self {
             pairing,

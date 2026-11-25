@@ -91,6 +91,7 @@ impl SetupGateway {
                 fallback: deps.config.public_url(),
             },
             deps.config.watch_risk_ceiling,
+            crate::token::install_fingerprint(&deps.token_file),
         ));
         let seen = pairing
             .devices()

@@ -94,6 +94,27 @@ pub fn local_token(config: &ClientGatewayConfig) -> Option<String> {
     verify(&token_file(config), &token).then_some(token)
 }
 
+/// This daemon's fingerprint, kept beside the token's hash at
+/// `token_file`: 64 random bits made once per install, so another daemon
+/// cannot compute it from anything public (its address). A pairing link
+/// carries it and the device checks the gateway it reaches gives it back.
+/// Unreadable and unwritable: a fresh one for this run (logged), which only
+/// makes links made before a restart fail that check.
+pub fn install_fingerprint(token_file: &Path) -> String {
+    let path = token_file.with_file_name("client-gateway-fingerprint");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let text = text.trim();
+        if text.len() == 16 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return text.to_ascii_lowercase();
+        }
+    }
+    let fresh = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    if let Err(error) = write_owner_only_file(&path, &format!("{fresh}\n")) {
+        tracing::warn!(%error, path = %path.display(), "Could not keep the daemon fingerprint");
+    }
+    fresh
+}
+
 fn write_owner_only_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -121,6 +142,20 @@ fn write_owner_only_file(path: &std::path::Path, contents: &str) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fingerprint_is_random_per_install_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("client-gateway-token.sha256");
+        let first = install_fingerprint(&token);
+        assert_eq!(first.len(), 16);
+        assert_eq!(install_fingerprint(&token), first);
+        let other = tempfile::tempdir().unwrap();
+        assert_ne!(
+            install_fingerprint(&other.path().join("client-gateway-token.sha256")),
+            first
+        );
+    }
 
     #[test]
     fn a_minted_token_verifies_until_replaced() {
