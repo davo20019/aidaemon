@@ -412,7 +412,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        crate::turn::opt_out::mark_turn_opted_out(
+        crate::opt_out::mark_turn_opted_out(
             &aidaemon_events::EventEmitter::new(events, "owner-dm"),
             "private-task",
             "private-turn",

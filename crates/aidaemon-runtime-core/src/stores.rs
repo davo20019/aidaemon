@@ -52,7 +52,7 @@ pub trait StateStore:
     Send
     + Sync
     + CliAgentStore
-    + crate::turn::compaction::CompactionStore
+    + crate::memory_port::CompactionStore
     + MessageStore
     + DialogueStateStore
     + HistorySearchStore

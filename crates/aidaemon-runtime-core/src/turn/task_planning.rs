@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
-/// The memory policy event's reason for a turn the user opted out of
-/// learning.
-pub const OPTED_OUT_REASON: &str = "learning_opted_out";
+pub use crate::opt_out::OPTED_OUT_REASON;
 
 /// Build bounded relationship-assessment context. This is not provider
 /// transcript carryover: stable message IDs let the router identify one

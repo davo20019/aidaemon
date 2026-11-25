@@ -451,7 +451,7 @@ impl aidaemon_memory::history::ConversationSource for EventHistory {
         ) {
             return None;
         }
-        crate::turn::turn_project::resolve_turn_project(
+        crate::turn_project::resolve_turn_project(
             state.as_ref() as &dyn aidaemon_work::stores::WorkCoordinationStore,
             &[session_id],
             None,

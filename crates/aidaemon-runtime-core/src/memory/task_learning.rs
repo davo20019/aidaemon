@@ -17,7 +17,7 @@ use crate::stores::StateStore;
 /// Maximum size of activity log text sent to the extraction prompt.
 const MAX_ACTIVITY_LOG_CHARS: usize = 4096;
 
-pub use crate::turn::memory_writer::RunTaint;
+pub use crate::memory_port::RunTaint;
 
 /// Extract durable knowledge from a completed task's activity log.
 ///

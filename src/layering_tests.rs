@@ -456,3 +456,17 @@ fn print_back_edges() {
         }
     }
 }
+
+/// Prints every module and the modules it uses:
+/// `cargo test --lib layering_tests::print_module_graph -- --ignored --nocapture`.
+#[test]
+#[ignore = "a report, not a check"]
+fn print_module_graph() {
+    let mut uses: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (a, b) in module_graph().into_keys() {
+        uses.entry(a).or_default().push(b);
+    }
+    for (module, used) in uses {
+        println!("{module}: {}", used.join(" "));
+    }
+}

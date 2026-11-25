@@ -42,6 +42,6 @@ pub mod tool_roster;
 pub mod tool_summary;
 pub mod turn_context;
 pub mod turn_eviction;
-pub mod turn_project;
+pub use crate::turn_project;
 pub mod turn_render;
 pub mod validation_state;

@@ -598,7 +598,7 @@ fn push_scope(qb: &mut QueryBuilder<Sqlite>, scope: &HistoryScope, alias: &str) 
                AND opt_out.event_type = 'memory_policy_compiled'
                AND json_extract(opt_out.data, '$.reason_code') = "
     ));
-    qb.push_bind(crate::turn::opt_out::OPTED_OUT_REASON);
+    qb.push_bind(crate::opt_out::OPTED_OUT_REASON);
     qb.push(")");
     if let Some(session) = scope.session_filter.as_deref() {
         qb.push(format!(" AND {alias}.session_id = "));
