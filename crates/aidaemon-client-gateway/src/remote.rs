@@ -35,6 +35,7 @@ use axum::http::{HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::ClientGateway;
 use crate::bus::now_ms;
@@ -46,17 +47,40 @@ use crate::pairing::Pairing;
 /// The largest sign-in reply read back to bind its token.
 const MAX_GRANT_BYTES: usize = 64 * 1024;
 
+/// One access token as the guard keeps it: the peer it was issued to, when
+/// it runs out, and what revoking its device cancels.
+struct Binding<P> {
+    peer: P,
+    expires_at_ms: u64,
+    revoked: CancellationToken,
+}
+
+impl<P: Eq> Binding<P> {
+    fn live_for(&self, peer: &P, now: u64) -> bool {
+        self.peer == *peer && self.expires_at_ms > now && !self.revoked.is_cancelled()
+    }
+}
+
 /// Access tokens and the peer key each was issued to.
 struct Bindings<P> {
-    tokens: Mutex<HashMap<String, (P, u64)>>,
+    tokens: Mutex<HashMap<String, Binding<P>>>,
 }
 
 impl<P: Clone + Eq> Bindings<P> {
-    fn bind(&self, token: &str, peer: P, expires_at_ms: u64) {
+    /// Tie `token` to `peer` until `expires_at_ms`, or until `revoked` (its
+    /// device's revocation) is cancelled.
+    fn bind(&self, token: &str, peer: P, expires_at_ms: u64, revoked: CancellationToken) {
         let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_ms();
-        tokens.retain(|_, (_, expires)| *expires > now);
-        tokens.insert(sha(token), (peer, expires_at_ms));
+        tokens.retain(|_, b| b.expires_at_ms > now && !b.revoked.is_cancelled());
+        tokens.insert(
+            sha(token),
+            Binding {
+                peer,
+                expires_at_ms,
+                revoked,
+            },
+        );
     }
 
     /// Whether `token` was issued to `peer` and has not run out.
@@ -64,17 +88,29 @@ impl<P: Clone + Eq> Bindings<P> {
         let tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         tokens
             .get(&sha(token))
-            .is_some_and(|(owner, expires)| owner == peer && *expires > now_ms())
+            .is_some_and(|b| b.live_for(peer, now_ms()))
     }
 
-    /// Whether `peer` holds any live token: it signed in as a paired device.
+    /// Whether `peer` holds any live token of a device not revoked since:
+    /// it signed in as a paired device.
     fn signed_in(&self, peer: &P) -> bool {
         let tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_ms();
-        tokens
-            .values()
-            .any(|(owner, expires)| owner == peer && *expires > now)
+        tokens.values().any(|b| b.live_for(peer, now))
     }
+}
+
+/// What revoking the device `token` belongs to cancels; a token the gateway
+/// no longer knows gets one already cancelled.
+fn revocation_of(gateway: &ClientGateway, token: &str) -> CancellationToken {
+    gateway
+        .principal(token)
+        .map(|principal| principal.revoked)
+        .unwrap_or_else(|| {
+            let gone = CancellationToken::new();
+            gone.cancel();
+            gone
+        })
 }
 
 fn sha(text: &str) -> String {
@@ -196,7 +232,8 @@ async fn sign_in_socket<P: Clone + Eq + AsRef<[u8]>>(
         .pairing
         .sign_in_socket(&proof, &hex::encode(peer.as_ref()))
         .await?;
-    bindings.bind(&grant.access_token, peer, grant.expires_at_ms);
+    let revoked = revocation_of(gateway, &grant.access_token);
+    bindings.bind(&grant.access_token, peer, grant.expires_at_ms, revoked);
     HeaderValue::from_str(&format!("Bearer {}", grant.access_token)).map_err(|_| malformed())
 }
 
@@ -221,7 +258,8 @@ async fn bind_grant<P: Clone + Eq + AsRef<[u8]>>(
             .pairing
             .record_endpoint(&grant.device_id, &hex::encode(peer.as_ref()))
             .await;
-        bindings.bind(&grant.access_token, peer, grant.expires_at_ms);
+        let revoked = revocation_of(gateway, &grant.access_token);
+        bindings.bind(&grant.access_token, peer, grant.expires_at_ms, revoked);
     }
     Response::from_parts(parts, Body::from(bytes))
 }
@@ -259,14 +297,25 @@ mod tests {
             tokens: Mutex::default(),
         };
         let later = now_ms() + 60_000;
-        bindings.bind("acs_one", 1, later);
+        let revoked = CancellationToken::new();
+        bindings.bind("acs_one", 1, later, revoked.clone());
         assert!(bindings.holds("acs_one", &1));
         assert!(!bindings.holds("acs_one", &2));
         assert!(!bindings.holds("acs_other", &1));
         assert!(bindings.signed_in(&1));
         assert!(!bindings.signed_in(&2));
-        bindings.bind("acs_old", 3, now_ms().saturating_sub(1));
+        bindings.bind(
+            "acs_old",
+            3,
+            now_ms().saturating_sub(1),
+            CancellationToken::new(),
+        );
         assert!(!bindings.holds("acs_old", &3));
         assert!(!bindings.signed_in(&3));
+        // Revoking the device ends what its peer may reach at once, signed
+        // file links included, not when the token would have run out.
+        revoked.cancel();
+        assert!(!bindings.holds("acs_one", &1));
+        assert!(!bindings.signed_in(&1));
     }
 }

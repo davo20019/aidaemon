@@ -32,6 +32,25 @@ pub struct FileRecord {
     /// by its id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marked_from: Option<String>,
+    /// What the file at `path` was when registered (its size and change
+    /// time, [`stamp_of`]): its link signs this too, and it is served only
+    /// while the file is still that, so a link never reads what is written
+    /// at the path later. `None`: registered before links were bound so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<String>,
+}
+
+/// The file at `path` as a link is bound to it: its size and modification
+/// time (nanoseconds), or `None` when it cannot be read.
+pub fn stamp_of(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("{}:{modified}", meta.len()))
 }
 
 /// A picture's width and height in pixels, from its header (PNG, GIF,
@@ -190,15 +209,19 @@ impl FileStore {
         })
     }
 
-    fn signature(&self, id: &str) -> String {
-        hex::encode(&hmac(&self.key, id.as_bytes())[..16])
+    fn signature(&self, id: &str, stamp: Option<&str>) -> String {
+        let signed = match stamp {
+            Some(stamp) => format!("{id}\n{stamp}"),
+            None => id.to_string(),
+        };
+        hex::encode(&hmac(&self.key, signed.as_bytes())[..16])
     }
 
-    /// Where a client fetches file `id`.
-    pub fn url(&self, id: &str, name: &str) -> String {
+    /// Where a client fetches file `id`, as registered with `stamp`.
+    fn url(&self, id: &str, stamp: Option<&str>, name: &str) -> String {
         format!(
             "/client/v1/files/{id}/{}/{}",
-            self.signature(id),
+            self.signature(id, stamp),
             percent_encode(name)
         )
     }
@@ -223,6 +246,7 @@ impl FileStore {
         let marked_from = self.get(&id).and_then(|r| r.marked_from);
         let record = FileRecord {
             marked_from,
+            stamp: stamp_of(path),
             path: path.to_path_buf(),
             name: name.clone(),
             mime: mime.to_string(),
@@ -236,7 +260,7 @@ impl FileStore {
         std::fs::write(&record_path, serde_json::to_vec(&record)?)?;
         aidaemon_tools::config_file::set_owner_only_permissions(&record_path);
         Ok(AttachmentRef {
-            url: Some(self.url(&id, &name)),
+            url: Some(self.url(&id, record.stamp.as_deref(), &name)),
             id,
             name,
             mime: Some(record.mime),
@@ -315,9 +339,14 @@ impl FileStore {
         serde_json::from_slice(&text).ok()
     }
 
-    /// The record of file `id` when `signature` is its link's.
+    /// The record of file `id` when `signature` is its link's and the file
+    /// is still what it was registered as.
     pub fn signed(&self, id: &str, signature: &str) -> Option<FileRecord> {
-        let expected = self.signature(id);
+        let record = self.get(id)?;
+        if record.stamp.is_some() && stamp_of(&record.path) != record.stamp {
+            return None;
+        }
+        let expected = self.signature(id, record.stamp.as_deref());
         // Constant time over equal lengths.
         if expected.len() != signature.len()
             || expected
@@ -328,7 +357,7 @@ impl FileStore {
         {
             return None;
         }
-        self.get(id)
+        Some(record)
     }
 
     /// Whether a file of `mime` is shown in place rather than downloaded.
@@ -415,6 +444,34 @@ mod tests {
         let store = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
         let saved = store.save("shot.png", None, &png).unwrap();
         assert_eq!((saved.width, saved.height), (Some(640), Some(480)));
+    }
+
+    #[test]
+    fn a_link_reads_only_what_was_registered_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
+        let path = dir.path().join("plan.pdf");
+        std::fs::write(&path, b"%PDF-1").unwrap();
+        let first = store
+            .register(&path, "plan.pdf", "application/pdf", 6)
+            .unwrap();
+        let parts = |url: &str| -> (String, String) {
+            let mut it = url.trim_start_matches("/client/v1/files/").split('/');
+            (it.next().unwrap().into(), it.next().unwrap().into())
+        };
+        let (id, sig) = parts(first.url.as_deref().unwrap());
+        assert!(store.signed(&id, &sig).is_some());
+        // Something else written at the path: the old link reads nothing.
+        std::fs::write(&path, b"%PDF-1.7 other").unwrap();
+        assert!(store.signed(&id, &sig).is_none());
+        // Shown again, it gets a link of its own.
+        let second = store
+            .register(&path, "plan.pdf", "application/pdf", 14)
+            .unwrap();
+        let (_, sig2) = parts(second.url.as_deref().unwrap());
+        assert_ne!(sig, sig2);
+        assert!(store.signed(&id, &sig2).is_some());
+        assert!(store.signed(&id, &sig).is_none());
     }
 
     #[test]
