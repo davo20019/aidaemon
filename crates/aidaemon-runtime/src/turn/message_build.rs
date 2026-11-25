@@ -67,6 +67,30 @@ pub struct MessageBuildData {
     /// rendering, compaction, and eviction into the provider-visible payload.
     pub projected_source_message_ids: Vec<String>,
     pub projected_source_turn_ids: Vec<String>,
+    /// For each `user` message of `messages`, in order, the persisted turn
+    /// it came from (`None` for one with no single source turn, such as
+    /// the current request before it is stored). The run attributes a
+    /// shared chat's earlier requests to their senders through it.
+    pub user_message_turns: Vec<Option<String>>,
+}
+
+/// Each `user` message's single source turn, in order (see
+/// [`MessageBuildData::user_message_turns`]). Reads the projection markers
+/// without removing them.
+pub fn user_message_turns(messages: &[Value]) -> Vec<Option<String>> {
+    messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|message| {
+            let ids = message
+                .get(crate::turn::turn_render::SOURCE_TURN_IDS_KEY)
+                .and_then(Value::as_array)?;
+            match ids.as_slice() {
+                [only] => only.as_str().map(str::to_string),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// The persisted turns projected into `messages`, without removing their
@@ -1640,6 +1664,7 @@ pub async fn build_turn_messages(
 
     // Internal projection identities are telemetry only. Remove them before
     // token estimation, fingerprinting, request dumps, or provider dispatch.
+    let user_message_turns = user_message_turns(&messages);
     let (projected_source_message_ids, projected_source_turn_ids) =
         take_projected_source_ids(&mut messages);
 
@@ -1733,6 +1758,7 @@ pub async fn build_turn_messages(
         tool_defs: effective_tool_defs,
         projected_source_message_ids,
         projected_source_turn_ids,
+        user_message_turns,
     })
 }
 

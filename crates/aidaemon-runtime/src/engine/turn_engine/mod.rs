@@ -228,6 +228,9 @@ pub struct SdkTurnSetup {
     /// prefix, recorded on every model call's telemetry.
     pub projected_source_message_ids: Vec<String>,
     pub projected_source_turn_ids: Vec<String>,
+    /// Each projected `user` message's source turn, in order
+    /// (`MessageBuildData::user_message_turns`).
+    pub user_message_turns: Vec<Option<String>>,
     /// A run that fails on the provider before any tool call is queued for
     /// an automatic re-run (`deferred_retry`). False for a continuation of
     /// another task, which that task's own recovery owns.
@@ -576,6 +579,7 @@ impl TurnEngine<'_> {
             scopes_are_guess,
             projected_source_message_ids,
             projected_source_turn_ids,
+            user_message_turns,
             defer_on_provider_failure,
             internal_continuation,
         } = setup;
@@ -1204,6 +1208,27 @@ impl TurnEngine<'_> {
         if !projected.is_empty() {
             state.messages = projected;
         }
+        // In a chat other people write into, each request is attributed to
+        // whoever sent it: the current one now, earlier ones from the
+        // senders recorded when they ran.
+        let turn_senders = crate::untrusted::record_turn_sender(
+            self.settings(),
+            session_id,
+            &turn_id,
+            channel_ctx.visibility,
+            channel_ctx.sender_id.as_deref(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            warn!(session_id, %error, "Could not record the request's sender");
+            Default::default()
+        });
+        crate::untrusted::attribute_history(
+            &mut state.messages,
+            &user_message_turns,
+            &turn_senders,
+            channel_ctx.visibility,
+        );
         crate::untrusted::attribute_request(
             &mut state.messages,
             channel_ctx.visibility,

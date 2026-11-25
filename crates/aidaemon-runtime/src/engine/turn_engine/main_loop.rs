@@ -1085,6 +1085,7 @@ impl TurnEngine<'_> {
                 tool_defs: offered_tool_defs,
                 projected_source_message_ids,
                 projected_source_turn_ids,
+                user_message_turns,
             } = crate::turn::message_build::build_turn_messages(
                 self.host,
                 &mut MessageBuildCtx {
@@ -1173,6 +1174,7 @@ impl TurnEngine<'_> {
                 authority: resolved_authority,
                 projected_source_message_ids,
                 projected_source_turn_ids,
+                user_message_turns,
                 authorized_scopes: owner_fallback_scopes(
                     &turn_context.authorized_project_scopes,
                     channel_ctx

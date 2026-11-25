@@ -114,6 +114,80 @@ pub fn attribute_request(
     );
 }
 
+/// Who sent each recorded request of a shared chat, by turn id.
+pub type TurnSenders = std::collections::HashMap<String, String>;
+
+/// How many requests' senders a session remembers.
+const TURN_SENDERS_KEPT: usize = 64;
+
+fn turn_senders_key(session_id: &str) -> String {
+    format!("turn_senders:{session_id}")
+}
+
+/// Serializes the read-modify-write in [`record_turn_sender`].
+static TURN_SENDERS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// In a chat other people write into, record who sent the request of
+/// `turn_id` (the latest 64 per session) and return every recorded sender.
+/// A one-person chat records nothing and returns none; so does a request
+/// whose platform gave no sender id, which then vouches for nothing later.
+pub async fn record_turn_sender(
+    state: &(impl SettingsStore + ?Sized),
+    session_id: &str,
+    turn_id: &str,
+    visibility: ChannelVisibility,
+    sender_id: Option<&str>,
+) -> anyhow::Result<TurnSenders> {
+    if !shared_chat(visibility) {
+        return Ok(TurnSenders::new());
+    }
+    let _write = TURN_SENDERS_WRITE.lock().await;
+    let key = turn_senders_key(session_id);
+    let mut senders = match state.get_setting(&key).await? {
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<Vec<(String, String)>>(&raw)
+            .unwrap_or_else(|error| {
+                warn!(session_id, %error, "Replacing an unreadable request-sender record");
+                Vec::new()
+            }),
+        _ => Vec::new(),
+    };
+    if let Some(sender) = sender_id.filter(|id| !id.trim().is_empty())
+        && !senders.iter().any(|(turn, _)| turn == turn_id)
+    {
+        senders.push((turn_id.to_string(), sender.to_string()));
+        let excess = senders.len().saturating_sub(TURN_SENDERS_KEPT);
+        senders.drain(..excess);
+        state
+            .set_setting(&key, &serde_json::to_string(&senders)?)
+            .await?;
+    }
+    Ok(senders.into_iter().collect())
+}
+
+/// Attribute a shared chat's earlier requests to their recorded senders:
+/// the k-th user message of `messages` came from `user_message_turns[k]`.
+/// A message with no single source turn, or whose turn has no recorded
+/// sender, stays unattributed and so vouches for nothing. A one-person chat
+/// is left as it is.
+pub fn attribute_history(
+    messages: &mut [sdk::Message],
+    user_message_turns: &[Option<String>],
+    senders: &TurnSenders,
+    visibility: ChannelVisibility,
+) {
+    if !shared_chat(visibility) {
+        return;
+    }
+    let users = messages
+        .iter_mut()
+        .filter(|message| message.role == sdk::Role::User);
+    for (message, turn) in users.zip(user_message_turns) {
+        if let Some(sender) = turn.as_ref().and_then(|turn| senders.get(turn)) {
+            message.sender = Some(sender.clone());
+        }
+    }
+}
+
 /// How many tainted turns a session remembers.
 const TAINTED_TURNS_KEPT: usize = 64;
 
@@ -952,6 +1026,68 @@ mod tests {
             Some("telegram:synthetic-user-1"),
         );
         assert!(private.iter().all(|message| message.sender.is_none()));
+    }
+
+    /// A shared chat's earlier requests take their recorded senders, so the
+    /// requester's own earlier words vouch and another participant's do
+    /// not; a one-person chat records and attributes nothing.
+    #[tokio::test]
+    async fn earlier_requests_of_a_shared_chat_keep_their_senders() {
+        let state = MemorySettings::default();
+        let group = ChannelVisibility::PrivateGroup;
+        let requester = "telegram:synthetic-user-1";
+        let other = "telegram:synthetic-user-2";
+        record_turn_sender(&state, "s", "t1", group, Some(requester))
+            .await
+            .unwrap();
+        record_turn_sender(&state, "s", "t2", group, Some(other))
+            .await
+            .unwrap();
+        // No sender id: nothing recorded for it.
+        record_turn_sender(&state, "s", "t3", group, None)
+            .await
+            .unwrap();
+        let senders = record_turn_sender(&state, "s", "t4", group, Some(requester))
+            .await
+            .unwrap();
+        assert_eq!(senders.len(), 3);
+
+        let mut messages = vec![
+            sdk::Message::user("mine, earlier"),
+            sdk::Message::assistant("ok", Vec::new()),
+            sdk::Message::user("someone else's"),
+            sdk::Message::user("unnamed"),
+            sdk::Message::user("summary-made, no turn"),
+            sdk::Message::user("the request"),
+        ];
+        let turns = [
+            Some("t1".to_string()),
+            Some("t2".to_string()),
+            Some("t3".to_string()),
+            None,
+            None,
+        ];
+        attribute_history(&mut messages, &turns, &senders, group);
+        attribute_request(&mut messages, group, Some(requester));
+        assert_eq!(messages[0].sender.as_deref(), Some(requester));
+        assert_eq!(messages[2].sender.as_deref(), Some(other));
+        assert_eq!(messages[3].sender, None);
+        assert_eq!(messages[4].sender, None);
+        assert_eq!(messages[5].sender.as_deref(), Some(requester));
+
+        let private = record_turn_sender(
+            &state,
+            "p",
+            "t1",
+            ChannelVisibility::Private,
+            Some(requester),
+        )
+        .await
+        .unwrap();
+        assert!(private.is_empty());
+        let mut one = vec![sdk::Message::user("hi")];
+        attribute_history(&mut one, &turns, &senders, ChannelVisibility::Private);
+        assert_eq!(one[0].sender, None);
     }
 
     /// A message sent mid-run is part of the request a call is judged
