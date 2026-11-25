@@ -109,6 +109,21 @@ pub(crate) fn save_attachment(
     Ok(path)
 }
 
+/// Write `bytes` to a new file `path` in `dir`, both private to this user
+/// (0700 / 0600 on Unix), refusing a file that is already there. For the
+/// bots' own attachment paths, which name their files themselves. Blocking.
+pub fn write_private_file(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    create_private_dir(dir)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -123,6 +138,20 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_owner_only_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("inbox");
+        let path = dir.join("a_synthetic.txt");
+        write_private_file(&dir, &path, b"hi").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        assert!(write_private_file(&dir, &path, b"again").is_err());
+    }
 
     #[test]
     fn images_are_known_by_their_bytes_not_their_label() {

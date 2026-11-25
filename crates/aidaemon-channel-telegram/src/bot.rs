@@ -1152,11 +1152,8 @@ impl TelegramBot {
         let dest_name = format!("{}_{}", uuid_prefix, sanitized);
         let dest_path = self.deps.inbox_dir.join(&dest_name);
 
-        // Ensure inbox directory exists
-        std::fs::create_dir_all(&self.deps.inbox_dir)?;
-
-        // Write file
-        std::fs::write(&dest_path, &bytes)?;
+        // Private to this user: other accounts on the machine never read it.
+        aidaemon_channels::write_private_file(&self.deps.inbox_dir, &dest_path, &bytes)?;
 
         info!(
             file = %dest_path.display(),
