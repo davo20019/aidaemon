@@ -30,8 +30,10 @@ costs a rebuild of it.
     scripts/prune-target.py --days 3 --max-gb 25 # also cap the dir, oldest first
 
 `--max-gb` deletes the least recently used units, after the age cut, until
-the target dir's units fit the budget. Units used in the last hour are never
-deleted for the budget (a build in progress may still want them).
+the target dir's units fit the budget. Units used in the last hour
+(`--keep-recent-min`) are never deleted for the budget (a build in progress
+may still want them). `--incremental-days` ages out incremental caches
+sooner than compiled units.
 `scripts/dev/target-gc.sh` runs this over every checkout's target dirs.
 
 The target dir is $CARGO_TARGET_DIR, else ./target, else --target.
@@ -95,7 +97,7 @@ def profile_dirs(target):
 
 
 def units(target):
-    """(path, fingerprint files) for every unit and incremental dir."""
+    """(path, fingerprint files, is incremental) for every unit and incremental dir."""
     for prof in profile_dirs(target):
         build = os.path.join(prof, "build")
         for pkg in sorted(os.listdir(build)):
@@ -108,18 +110,18 @@ def units(target):
                     continue
                 fp = os.path.join(unit, "fingerprint")
                 probe = list(files_under(fp)) if os.path.isdir(fp) else list(files_under(unit))
-                yield unit, probe
+                yield unit, probe, False
         inc = os.path.join(prof, "incremental")
         if os.path.isdir(inc):
             for name in sorted(os.listdir(inc)):
                 d = os.path.join(inc, name)
                 if os.path.isdir(d):
-                    yield d, list(files_under(d))
+                    yield d, list(files_under(d)), True
 
 
 def mark(target):
     count = 0
-    for _unit, probe in units(target):
+    for _unit, probe, _inc in units(target):
         for f in probe:
             try:
                 st = os.lstat(f)
@@ -149,6 +151,10 @@ def main():
     when.add_argument("--days", type=float, help="delete units unused for this many days")
     when.add_argument("--mark", action="store_true", help="start a --since-mark window")
     when.add_argument("--since-mark", action="store_true", help="delete units unused since --mark")
+    ap.add_argument("--incremental-days", type=float,
+                    help="with --days: incremental caches unused this long go sooner (default: --days)")
+    ap.add_argument("--keep-recent-min", type=float, default=60,
+                    help="--max-gb never deletes units used in this many minutes (default 60)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be deleted")
     ap.add_argument("-v", "--verbose", action="store_true", help="print each deleted unit")
     args = ap.parse_args()
@@ -170,6 +176,12 @@ def main():
             sys.exit("no mark: run --mark first, then your builds")
     else:
         cutoff = time.time() - args.days * 86400
+    # Incremental caches are the bulk of a dir (one per crate per feature set,
+    # profile and test/check variant) and cheap to lose: a full recompile of
+    # that one crate, whose compiled unit stays.
+    inc_cutoff = cutoff
+    if args.days is not None and args.incremental_days is not None:
+        inc_cutoff = max(cutoff, time.time() - args.incremental_days * 86400)
 
     freed = kept = removed = 0
     survivors = []  # (last use, size, unit) of the units the age cut keeps
@@ -183,9 +195,9 @@ def main():
         if not args.dry_run:
             shutil.rmtree(unit, ignore_errors=True)
 
-    for unit, probe in units(target):
+    for unit, probe, incremental in units(target):
         used = last_use(probe)
-        if used >= cutoff:
+        if used >= (inc_cutoff if incremental else cutoff):
             kept += 1
             if args.max_gb is not None:
                 survivors.append((used, size_of(unit), unit))
@@ -195,7 +207,7 @@ def main():
     if args.max_gb is not None:
         budget = args.max_gb * 1024**3
         total = sum(size for _used, size, _unit in survivors)
-        recent = time.time() - 3600
+        recent = time.time() - args.keep_recent_min * 60
         for used, size, unit in sorted(survivors):
             if total <= budget or used >= recent:
                 break

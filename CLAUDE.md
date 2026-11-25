@@ -26,7 +26,7 @@ crate asks of another run `scripts/dev/unify-dev-features.py` (it gives each
 crate's dev-dependencies the workspace build's feature sets, so
 `cargo test -p` reuses that build). CI's `hakari` job checks both. Target dirs only
 grow; `scripts/dev/target-gc.sh` prunes every checkout's to a budget
-(`scripts/dev/install-target-gc.sh` runs it daily).
+(`scripts/dev/install-target-gc.sh` runs it hourly, and harder when the disk is low).
 
 Integration tests drive the real `Agent::handle_message` path with
 `MockProvider`, `TestChannel` and temp stores; helpers are in `src/testing.rs`.
