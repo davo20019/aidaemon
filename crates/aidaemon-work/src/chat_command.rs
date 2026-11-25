@@ -462,17 +462,7 @@ fn short_id(id: &str) -> &str {
     &id[..end]
 }
 
-fn truncate_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    let mut truncated = value
-        .chars()
-        .take(max.saturating_sub(1))
-        .collect::<String>();
-    truncated.push('…');
-    truncated
-}
+use aidaemon_tools::text::truncate_ellipsis as truncate_chars;
 
 fn work_usage() -> String {
     "Usage:\n\

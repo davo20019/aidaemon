@@ -607,7 +607,7 @@ impl SearchResult {
                 if has_context && previous.is_some_and(|previous| *line_num > previous + 1) {
                     s.push_str("\n  --");
                 }
-                let truncated = crate::util::truncate_str(line, 203);
+                let truncated = crate::text::truncate_str(line, 203);
                 let mark = if *matched { ':' } else { '-' };
                 s.push_str(&format!("\n  {line_num:>4}{mark} {truncated}"));
                 previous = Some(*line_num);

@@ -33,6 +33,7 @@ pub mod context;
 pub mod download;
 pub mod hub;
 mod inbound_files;
+pub use aidaemon_tools::text::truncate_ellipsis;
 pub use inbound_files::write_private_file;
 pub mod latex;
 pub mod live_status;

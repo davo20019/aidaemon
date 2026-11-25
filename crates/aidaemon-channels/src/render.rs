@@ -95,15 +95,7 @@ pub(crate) fn receipt_word(status: ReceiptStatus) -> &'static str {
 }
 
 /// The first `max` characters, with an ellipsis if cut.
-pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let keep = max.saturating_sub(3);
-    let mut out: String = text.chars().take(keep).collect();
-    out.push_str("...");
-    out
-}
+pub(crate) use aidaemon_tools::text::truncate_str as truncate_chars;
 
 /// The last `max` characters, with a leading ellipsis if cut.
 pub(crate) fn tail_chars(text: &str, max: usize) -> String {

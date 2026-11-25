@@ -307,17 +307,7 @@ fn shorten_local_paths(text: &str) -> String {
         .into_owned()
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut truncated = text
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    truncated.push('…');
-    truncated
-}
+use aidaemon_tools::text::truncate_ellipsis as truncate_chars;
 
 fn is_verbose_step_echo(line: &str) -> bool {
     line.strip_prefix("Step:")

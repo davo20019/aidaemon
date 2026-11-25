@@ -35,6 +35,12 @@ pub fn truncate_with_note(s: &str, max_chars: usize) -> String {
     truncate_impl(s, max_chars, "\n... (truncated)")
 }
 
+/// Truncates to at most `max_chars` characters, ending in a single "…" when
+/// cut (for labels and chat text where every character counts).
+pub fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    truncate_impl(s, max_chars, "…")
+}
+
 /// Internal implementation for string truncation.
 fn truncate_impl(s: &str, max_chars: usize, suffix: &str) -> String {
     // Fast path: if string is short enough, return as-is

@@ -4,14 +4,7 @@
 //! fences closed and reopened across chunks).
 
 /// Truncate to `max_chars` characters, ending with an ellipsis if cut.
-pub fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
+pub use aidaemon_channels::truncate_ellipsis as truncate_chars;
 
 #[cfg(test)]
 mod tests {

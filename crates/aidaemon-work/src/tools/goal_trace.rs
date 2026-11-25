@@ -71,10 +71,6 @@ impl GoalTraceTool {
         super::goal_ids::short_goal_id(id)
     }
 
-    fn truncate(s: &str, max: usize) -> String {
-        s.chars().take(max).collect()
-    }
-
     fn format_duration(started_at: Option<&str>, completed_at: Option<&str>) -> String {
         aidaemon_tools::duration_format::compact_elapsed_timestamps(
             started_at,
@@ -108,7 +104,7 @@ impl GoalTraceTool {
         for goal in goals {
             out.push_str(&format!(
                 "- {} ({}) updated {}\n  id: {}",
-                Self::truncate(&goal.description, 100),
+                aidaemon_tools::text::truncate_str(&goal.description, 100),
                 goal.status,
                 goal.updated_at,
                 goal.id
@@ -320,12 +316,18 @@ impl GoalTraceTool {
 
             if t.status == "failed" {
                 if let Some(err) = &t.error {
-                    out.push_str(&format!("\n  error: {}", Self::truncate(err, 180)));
+                    out.push_str(&format!(
+                        "\n  error: {}",
+                        aidaemon_tools::text::truncate_str(err, 180)
+                    ));
                 }
             } else if t.status == "blocked"
                 && let Some(blocker) = &t.blocker
             {
-                out.push_str(&format!("\n  blocker: {}", Self::truncate(blocker, 180)));
+                out.push_str(&format!(
+                    "\n  blocker: {}",
+                    aidaemon_tools::text::truncate_str(blocker, 180)
+                ));
             }
         }
 
@@ -411,7 +413,7 @@ impl GoalTraceTool {
             let result = a
                 .result
                 .as_deref()
-                .map(|r| Self::truncate(r, 120))
+                .map(|r| aidaemon_tools::text::truncate_str(r, 120))
                 .unwrap_or_default();
             if result.is_empty() {
                 out.push_str(&format!(

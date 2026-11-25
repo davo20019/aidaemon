@@ -297,10 +297,6 @@ impl ScheduledGoalRuns {
         super::goal_ids::short_goal_id(id)
     }
 
-    fn truncate(s: &str, max: usize) -> String {
-        s.chars().take(max).collect()
-    }
-
     fn format_duration(started_at: Option<&str>, completed_at: Option<&str>) -> String {
         aidaemon_tools::duration_format::compact_elapsed_timestamps(
             started_at,
@@ -404,7 +400,7 @@ impl ScheduledGoalRuns {
                     "summary": run
                         .outcome_summary
                         .as_deref()
-                        .map(|summary| Self::truncate(summary, 200)),
+                        .map(|summary| aidaemon_tools::text::truncate_str(summary, 200)),
                 })
             });
             let mandate = self.state.get_mandate_for_goal(&goal.id).await?;
@@ -433,7 +429,7 @@ impl ScheduledGoalRuns {
                 .count();
             let mut record = json!({
                 "objective_id": crate::tools::objective_status::objective_resource_id(&goal.id),
-                "objective": Self::truncate(&goal.description, 240),
+                "objective": aidaemon_tools::text::truncate_str(&goal.description, 240),
                 "goal_status": goal.status,
                 "workspace_binding": workspace_binding,
                 "source_membership": row.source_membership_json(),
@@ -837,7 +833,7 @@ impl ScheduledGoalRuns {
                     task.id,
                     task.status,
                     task.created_at,
-                    Self::truncate(&task.description, 160)
+                    aidaemon_tools::text::truncate_str(&task.description, 160)
                 ));
             }
             out.push('\n');
@@ -855,7 +851,10 @@ impl ScheduledGoalRuns {
                 tasks.len()
             ));
             if let Some(summary) = &run.outcome_summary {
-                out.push_str(&format!("\n  summary: {}", Self::truncate(summary, 220)));
+                out.push_str(&format!(
+                    "\n  summary: {}",
+                    aidaemon_tools::text::truncate_str(summary, 220)
+                ));
             }
             for task in tasks
                 .iter()
@@ -865,13 +864,19 @@ impl ScheduledGoalRuns {
                     "\n  task {} status={} desc={}",
                     Self::short_id(&task.id),
                     task.status,
-                    Self::truncate(&task.description, 120)
+                    aidaemon_tools::text::truncate_str(&task.description, 120)
                 ));
                 if let Some(err) = &task.error {
-                    out.push_str(&format!("\n  error: {}", Self::truncate(err, 160)));
+                    out.push_str(&format!(
+                        "\n  error: {}",
+                        aidaemon_tools::text::truncate_str(err, 160)
+                    ));
                 }
                 if let Some(blocker) = &task.blocker {
-                    out.push_str(&format!("\n  blocker: {}", Self::truncate(blocker, 160)));
+                    out.push_str(&format!(
+                        "\n  blocker: {}",
+                        aidaemon_tools::text::truncate_str(blocker, 160)
+                    ));
                 }
             }
         }
@@ -908,10 +913,16 @@ impl ScheduledGoalRuns {
         );
 
         if let Some(err) = &task.error {
-            out.push_str(&format!("\n- Error: {}", Self::truncate(err, 300)));
+            out.push_str(&format!(
+                "\n- Error: {}",
+                aidaemon_tools::text::truncate_str(err, 300)
+            ));
         }
         if let Some(blocker) = &task.blocker {
-            out.push_str(&format!("\n- Blocker: {}", Self::truncate(blocker, 300)));
+            out.push_str(&format!(
+                "\n- Blocker: {}",
+                aidaemon_tools::text::truncate_str(blocker, 300)
+            ));
         }
 
         if !activities.is_empty() {
@@ -925,7 +936,7 @@ impl ScheduledGoalRuns {
                 let result = a
                     .result
                     .as_deref()
-                    .map(|r| Self::truncate(r, 140))
+                    .map(|r| aidaemon_tools::text::truncate_str(r, 140))
                     .unwrap_or_default();
                 if result.is_empty() {
                     out.push_str(&format!(

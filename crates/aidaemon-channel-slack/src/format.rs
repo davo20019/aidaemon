@@ -346,14 +346,7 @@ pub fn split_mrkdwn(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// Truncate to `max_chars` characters, marking the cut with an ellipsis.
-pub fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
+pub use aidaemon_channels::truncate_ellipsis as truncate_chars;
 
 #[cfg(test)]
 mod tests {
