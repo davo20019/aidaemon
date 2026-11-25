@@ -82,59 +82,27 @@ pub async fn run(
     url: String,
     ticket: String,
     events: tokio::sync::mpsc::UnboundedSender<ShellEvent>,
-    mut outgoing: tokio::sync::mpsc::UnboundedReceiver<String>,
+    outgoing: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> String {
-    use futures::{SinkExt, StreamExt};
+    use crate::ticketed::{Endings, Incoming};
     use tokio_tungstenite::tungstenite::Message;
 
-    let tls = match crate::tls::client_config() {
-        Ok(tls) => tls,
-        Err(error) => return format!("could not set up TLS: {error}"),
+    let endings = Endings {
+        opening: "the shell",
+        dropped: "the shell's connection dropped",
+        closed_here: "the terminal was closed",
     };
-    let socket = tokio_tungstenite::connect_async_tls_with_config(
-        url.as_str(),
-        None,
-        false,
-        Some(tokio_tungstenite::Connector::Rustls(tls)),
-    )
-    .await;
-    let mut socket = match socket {
-        Ok((socket, _)) => socket,
-        Err(error) => return format!("could not open the shell: {error}"),
-    };
-    if socket.send(Message::text(auth(&ticket))).await.is_err() {
-        return "the shell closed".to_string();
-    }
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                let message = match incoming {
-                    Some(Ok(message)) => message,
-                    _ => return "the shell's connection dropped".to_string(),
-                };
-                let Message::Text(text) = message else { continue };
-                let Some(event) = read(&text) else { continue };
-                if let ShellEvent::Closed(why) = &event {
-                    let why = why.clone();
-                    let _ = events.send(event);
-                    return why;
-                }
-                if events.send(event).is_err() {
-                    let _ = socket.close(None).await;
-                    return "the terminal was closed".to_string();
-                }
-            }
-            sent = outgoing.recv() => {
-                let Some(text) = sent else {
-                    let _ = socket.close(None).await;
-                    return "the terminal was closed".to_string();
-                };
-                if socket.send(Message::text(text)).await.is_err() {
-                    return "the shell's connection dropped".to_string();
-                }
-            }
+    crate::ticketed::run(url, auth(&ticket), endings, events, outgoing, |message| {
+        let Message::Text(text) = message else {
+            return Incoming::Skip;
+        };
+        match read(&text) {
+            None => Incoming::Skip,
+            Some(ShellEvent::Closed(why)) => Incoming::Closed(ShellEvent::Closed(why.clone()), why),
+            Some(event) => Incoming::Event(event),
         }
-    }
+    })
+    .await
 }
 
 #[cfg(test)]

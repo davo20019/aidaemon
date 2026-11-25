@@ -60,13 +60,20 @@ pub enum MediaEvent {
 /// The socket URL of a live view: `transport.url` (a path) on the gateway
 /// at `http_base` (`https://host` becomes `wss://host`).
 pub fn socket_url(http_base: &str, transport: &SurfaceTransport) -> String {
+    path_socket_url(http_base, &transport.url)
+}
+
+/// The WebSocket URL of `path` on the gateway at `http_base` (`https://host`
+/// becomes `wss://host`, `http://` becomes `ws://`): a live view's or a
+/// shell's socket.
+pub fn path_socket_url(http_base: &str, path: &str) -> String {
     let base = http_base.trim_end_matches('/');
     let ws = match base.split_once("://") {
         Some(("https", rest)) => format!("wss://{rest}"),
         Some(("http", rest)) => format!("ws://{rest}"),
         _ => format!("ws://{base}"),
     };
-    format!("{ws}{}", transport.url)
+    format!("{ws}{path}")
 }
 
 fn text(message: &MediaClientMessage) -> String {
@@ -217,67 +224,31 @@ pub async fn run(
     url: String,
     ticket: String,
     events: tokio::sync::mpsc::UnboundedSender<MediaEvent>,
-    mut outgoing: tokio::sync::mpsc::UnboundedReceiver<String>,
+    outgoing: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> String {
-    use futures::{SinkExt, StreamExt};
+    use crate::ticketed::{Endings, Incoming};
     use tokio_tungstenite::tungstenite::Message;
 
-    let tls = match crate::tls::client_config() {
-        Ok(tls) => tls,
-        Err(error) => return format!("could not set up TLS: {error}"),
+    let endings = Endings {
+        opening: "the live view",
+        dropped: "the live view closed",
+        closed_here: "the view was closed",
     };
-    let socket = tokio_tungstenite::connect_async_tls_with_config(
-        url.as_str(),
-        None,
-        false,
-        Some(tokio_tungstenite::Connector::Rustls(tls)),
-    )
-    .await;
-    let mut socket = match socket {
-        Ok((socket, _)) => socket,
-        Err(error) => return format!("could not open the live view: {error}"),
-    };
-    if socket.send(Message::text(auth(&ticket))).await.is_err() {
-        return "the live view closed".to_string();
-    }
-    loop {
-        tokio::select! {
-            incoming = socket.next() => {
-                let message = match incoming {
-                    Some(Ok(message)) => message,
-                    _ => return "the live view closed".to_string(),
-                };
-                let Message::Binary(bytes) = message else { continue };
-                let Some(event) = read(&bytes) else { continue };
-                let seq = match &event {
-                    MediaEvent::Frame { seq, .. } => Some(*seq),
-                    _ => None,
-                };
-                if let MediaEvent::Closed(why) = &event {
-                    let why = why.clone();
-                    let _ = events.send(event);
-                    return why;
-                }
-                if events.send(event).is_err() {
-                    return "the view was closed".to_string();
-                }
-                if let Some(seq) = seq
-                    && socket.send(Message::text(ack(seq))).await.is_err()
-                {
-                    return "the live view closed".to_string();
-                }
+    crate::ticketed::run(url, auth(&ticket), endings, events, outgoing, |message| {
+        let Message::Binary(bytes) = message else {
+            return Incoming::Skip;
+        };
+        match read(&bytes) {
+            None => Incoming::Skip,
+            Some(MediaEvent::Closed(why)) => Incoming::Closed(MediaEvent::Closed(why.clone()), why),
+            // A frame is acked once handed over.
+            Some(event @ MediaEvent::Frame { seq, .. }) => {
+                Incoming::EventThenReply(event, ack(seq))
             }
-            sent = outgoing.recv() => {
-                let Some(text) = sent else {
-                    let _ = socket.close(None).await;
-                    return "the view was closed".to_string();
-                };
-                if socket.send(Message::text(text)).await.is_err() {
-                    return "the live view closed".to_string();
-                }
-            }
+            Some(event) => Incoming::Event(event),
         }
-    }
+    })
+    .await
 }
 
 #[cfg(test)]

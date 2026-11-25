@@ -42,6 +42,8 @@ pub mod state;
 pub mod surfaces;
 pub mod text;
 #[cfg(feature = "native")]
+mod ticketed;
+#[cfg(feature = "native")]
 mod tls;
 pub mod tools;
 
