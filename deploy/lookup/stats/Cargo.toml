@@ -1,0 +1,18 @@
+[package]
+name = "lookup-stats"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Daily count of the daemons publishing to the project's address lookup"
+
+# Not part of the aidaemon workspace: it runs only on the lookup server.
+[workspace]
+
+[dependencies]
+# Must read the file format of the redb that iroh-dns-server was built with
+# (its Cargo.lock); bump both together.
+redb = "=4.4.0"
+ed25519-dalek = "2"
+
+[dev-dependencies]
+tempfile = "3"

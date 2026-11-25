@@ -1,0 +1,16 @@
+[Unit]
+Description=aidaemon lookup stats (daily count of publishing daemons)
+After=iroh-dns-server.service
+
+[Service]
+Type=oneshot
+User=iroh-dns
+Group=iroh-dns
+StateDirectory=aidaemon-stats
+ExecStart=/usr/local/bin/lookup-stats count --db /var/lib/iroh-dns/signed-packets-1.db --exclude /etc/aidaemon-stats/exclude --out /var/lib/aidaemon-stats/daily.csv --work /tmp
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateNetwork=true
+ReadOnlyPaths=/var/lib/iroh-dns

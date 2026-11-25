@@ -54,6 +54,20 @@ relays = ["https://relay.example.com"]
 Your devices then use only that relay. The project's address lookup goes
 with the project's relays only, so a self-hosted relay publishes nowhere.
 
+## Usage counts
+
+`lookup/stats/` counts, once a day, how many daemons published to the
+address lookup in the last day and the last 7 days (each daemon republishes
+every 5 minutes under a key that stays the same across restarts). It reads a
+copy of the lookup server's store and appends counts only, never keys or
+addresses, to `/var/lib/aidaemon-stats/daily.csv` on that server. It sees only
+daemons on the project's relays with remote access on (0.22.1 and later).
+`lookup/stats/deploy.sh` builds and installs it with its systemd timer and
+leaves the maintainers' own daemons out of the count (the public key of each
+file in `OWN_KEYS`, default `~/.aidaemon/remote-key`, goes to
+`/etc/aidaemon-stats/exclude`). Read the counts with
+`ssh ubuntu@dns.aidaemon.ai cat /var/lib/aidaemon-stats/daily.csv`.
+
 ## Upgrading iroh
 
 The servers must match the iroh version in `Cargo.toml`. When it changes,
