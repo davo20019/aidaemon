@@ -27,6 +27,12 @@ costs a rebuild of it.
     scripts/prune-target.py --mark               # start a precise window
     cargo test ...; cargo clippy ...             # the builds to keep
     scripts/prune-target.py --since-mark         # delete the rest
+    scripts/prune-target.py --days 3 --max-gb 25 # also cap the dir, oldest first
+
+`--max-gb` deletes the least recently used units, after the age cut, until
+the target dir's units fit the budget. Units used in the last hour are never
+deleted for the budget (a build in progress may still want them).
+`scripts/dev/target-gc.sh` runs this over every checkout's target dirs.
 
 The target dir is $CARGO_TARGET_DIR, else ./target, else --target.
 """
@@ -137,6 +143,8 @@ def human(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--target", help="target dir (default $CARGO_TARGET_DIR or ./target)")
+    ap.add_argument("--max-gb", type=float,
+                    help="then delete least recently used units until the units total this many GB")
     when = ap.add_mutually_exclusive_group(required=True)
     when.add_argument("--days", type=float, help="delete units unused for this many days")
     when.add_argument("--mark", action="store_true", help="start a --since-mark window")
@@ -164,17 +172,36 @@ def main():
         cutoff = time.time() - args.days * 86400
 
     freed = kept = removed = 0
-    for unit, probe in units(target):
-        if last_use(probe) >= cutoff:
-            kept += 1
-            continue
-        size = size_of(unit)
+    survivors = []  # (last use, size, unit) of the units the age cut keeps
+
+    def delete(unit, size):
+        nonlocal freed, removed
         freed += size
         removed += 1
         if args.verbose or args.dry_run:
             print(f"{human(size):>10}  {os.path.relpath(unit, target)}")
         if not args.dry_run:
             shutil.rmtree(unit, ignore_errors=True)
+
+    for unit, probe in units(target):
+        used = last_use(probe)
+        if used >= cutoff:
+            kept += 1
+            if args.max_gb is not None:
+                survivors.append((used, size_of(unit), unit))
+            continue
+        delete(unit, size_of(unit))
+
+    if args.max_gb is not None:
+        budget = args.max_gb * 1024**3
+        total = sum(size for _used, size, _unit in survivors)
+        recent = time.time() - 3600
+        for used, size, unit in sorted(survivors):
+            if total <= budget or used >= recent:
+                break
+            delete(unit, size)
+            total -= size
+            kept -= 1
     # Empty package dirs left behind.
     if not args.dry_run:
         for prof in profile_dirs(target):
