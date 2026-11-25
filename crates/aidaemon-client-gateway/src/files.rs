@@ -4,7 +4,8 @@
 //! served at a signed path, `/client/v1/files/{id}/{expires}-{sig}/{name}`,
 //! so an image element loads it with no token. The signing key is kept
 //! beside the records, so a link keeps working across restarts until it
-//! expires ([`LINK_LIFETIME`]); a conversation read again gets new links.
+//! expires ([`LINK_LIFETIME`]) or a device is revoked ([`FileStore::rotate_key`]);
+//! a conversation read again gets new links.
 
 use std::path::{Path, PathBuf};
 
@@ -145,7 +146,8 @@ pub struct FileStore {
     /// Where uploads are saved (the daemon's inbox, so the agent may read
     /// them like any file a chat sent).
     uploads: PathBuf,
-    key: [u8; 32],
+    /// Replaced when a device is revoked ([`Self::rotate_key`]).
+    key: std::sync::RwLock<[u8; 32]>,
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -191,6 +193,19 @@ fn hmac(key: &[u8; 32], message: &[u8]) -> [u8; 32] {
         .into()
 }
 
+/// A new random signing key, written owner-only to `path` (replacing the
+/// file whole, so a reader never sees half of it).
+fn write_new_key(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let staged = path.with_extension("key.new");
+    std::fs::write(&staged, key)?;
+    aidaemon_tools::config_file::set_owner_only_permissions(&staged);
+    std::fs::rename(&staged, path)?;
+    Ok(key)
+}
+
 fn valid_id(id: &str) -> bool {
     id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -208,27 +223,34 @@ impl FileStore {
                 key.copy_from_slice(&bytes);
                 key
             }
-            _ => {
-                let mut key = [0u8; 32];
-                key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-                key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-                std::fs::write(&key_path, key)?;
-                aidaemon_tools::config_file::set_owner_only_permissions(&key_path);
-                key
-            }
+            _ => write_new_key(&key_path)?,
         };
         Ok(Self {
             dir,
             uploads: uploads.into(),
-            key,
+            key: std::sync::RwLock::new(key),
         })
+    }
+
+    /// Sign links with a new key from now on, so every link signed before
+    /// stops working: what revoking a device does, since a link is a bearer
+    /// capability the revoked device may still hold. A link is one URL for
+    /// every device (broadcast, and kept in the event log), so it cannot be
+    /// bound to one device; the devices still paired get fresh links by
+    /// reading the conversation again, as the app does when a picture's
+    /// link fails, and a revoked device can read nothing again.
+    pub fn rotate_key(&self) -> std::io::Result<()> {
+        let mut key = self.key.write().unwrap_or_else(|p| p.into_inner());
+        *key = write_new_key(&self.dir.join("signing.key"))?;
+        Ok(())
     }
 
     /// The signature of file `id`'s link, as registered with `stamp`,
     /// working until `expires` (seconds since the epoch).
     fn signature(&self, id: &str, stamp: Option<&str>, expires: u64) -> String {
         let signed = format!("{id}\n{}\n{expires}", stamp.unwrap_or_default());
-        hex::encode(&hmac(&self.key, signed.as_bytes())[..16])
+        let key = *self.key.read().unwrap_or_else(|p| p.into_inner());
+        hex::encode(&hmac(&key, signed.as_bytes())[..16])
     }
 
     /// Where a client fetches file `id`, as registered with `stamp`, for
@@ -508,6 +530,34 @@ mod tests {
         assert_ne!(sig, sig2);
         assert!(store.signed(&id, &sig2).is_some());
         assert!(store.signed(&id, &sig).is_none());
+    }
+
+    #[test]
+    fn a_new_key_ends_every_link_signed_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
+        let link = |url: &str| -> (String, String) {
+            let mut it = url.trim_start_matches("/client/v1/files/").split('/');
+            (it.next().unwrap().into(), it.next().unwrap().into())
+        };
+        let saved = store.save("shot.png", None, PNG).unwrap();
+        let (id, old) = link(saved.url.as_deref().unwrap());
+        assert!(store.signed(&id, &old).is_some());
+        store.rotate_key().unwrap();
+        assert!(store.signed(&id, &old).is_none());
+        // Shown again, the file gets a link that works.
+        let record = store.get(&id).unwrap();
+        let again = store
+            .register(&record.path, &record.name, &record.mime, record.size_bytes)
+            .unwrap();
+        let (_, fresh) = link(again.url.as_deref().unwrap());
+        assert!(store.signed(&id, &fresh).is_some());
+        // The new key is the one kept: a restart keeps the fresh link and
+        // not the old one.
+        drop(store);
+        let reopened = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
+        assert!(reopened.signed(&id, &fresh).is_some());
+        assert!(reopened.signed(&id, &old).is_none());
     }
 
     #[test]

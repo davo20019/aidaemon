@@ -684,6 +684,9 @@ impl ClientGateway {
             deps.config.watch_risk_ceiling,
             crate::token::install_fingerprint(&deps.token_file),
         ));
+        if let Some(files) = deps.files.clone() {
+            pairing.set_files(files);
+        }
         let gateway = Arc::new(Self {
             pairing,
             bus,

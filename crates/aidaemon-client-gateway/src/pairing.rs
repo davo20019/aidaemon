@@ -12,7 +12,7 @@
 //! and its open sockets at once.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_channels::hub::ApprovalRequest;
@@ -219,6 +219,9 @@ pub struct Pairing {
     started_ms: u64,
     /// Per device, what revoking it cancels.
     revocations: Mutex<HashMap<String, CancellationToken>>,
+    /// The message files whose links a revoked device may still hold:
+    /// revoking one signs links with a new key ([`crate::files::FileStore::rotate_key`]).
+    files: Mutex<Option<Arc<crate::files::FileStore>>>,
     /// The ceiling a watch gets unless the owner sets another.
     watch_ceiling: Risk,
     admission: Mutex<Admission>,
@@ -355,6 +358,7 @@ impl Pairing {
             socket_sign_ins: Mutex::default(),
             started_ms: now_ms(),
             revocations: Mutex::default(),
+            files: Mutex::default(),
             watch_ceiling,
             admission: Mutex::default(),
         }
@@ -1121,13 +1125,29 @@ impl Pairing {
             .map_or_else(|| may(principal), |a| may(&a.principal))
     }
 
-    /// Revoke a device: its tokens stop working and its sockets close now.
+    /// The message files whose links revoking a device ends.
+    pub fn set_files(&self, files: Arc<crate::files::FileStore>) {
+        *self.files.lock().unwrap_or_else(|p| p.into_inner()) = Some(files);
+    }
+
+    /// Revoke a device: its tokens stop working, its sockets close now and
+    /// the file links it may hold stop working.
     pub async fn revoke(&self, device_id: &str) -> Result<bool, ProtocolError> {
         let revoked = self
             .log
             .revoke_device(device_id, now_ms())
             .await
             .map_err(internal)?;
+        if revoked {
+            let files = self.files.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(files) = files {
+                // A failure leaves links working until they expire
+                // (LINK_LIFETIME), not the device paired.
+                if let Err(error) = files.rotate_key() {
+                    warn!(%error, "Could not end the revoked device's file links");
+                }
+            }
+        }
         if let Some(token) = self
             .revocations
             .lock()
@@ -1567,6 +1587,48 @@ mod tests {
         pairing.revoke("dv-phone").await.unwrap();
         close_window(&pairing);
         assert!(!pairing.admits(PHONE));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_ends_the_file_links_it_may_hold() {
+        let pairing = pairing().await;
+        let dir = tempfile::tempdir().unwrap();
+        let files = Arc::new(
+            crate::files::FileStore::open(dir.path().join("files"), dir.path().join("inbox"))
+                .unwrap(),
+        );
+        pairing.set_files(files.clone());
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let link = |files: &crate::files::FileStore| {
+            let url = files
+                .register(&path, "note.txt", "text/plain", 9)
+                .unwrap()
+                .url
+                .unwrap();
+            let mut it = url.trim_start_matches("/client/v1/files/").split('/');
+            (
+                it.next().unwrap().to_string(),
+                it.next().unwrap().to_string(),
+            )
+        };
+        let (id, held) = link(&files);
+        pairing
+            .log
+            .add_device(&device("dv-phone", "mobile", now_ms()))
+            .await
+            .unwrap();
+
+        // No such device: nothing revoked, links keep working.
+        assert!(!pairing.revoke("dv-nobody").await.unwrap());
+        assert!(files.signed(&id, &held).is_some());
+
+        // The phone revoked: the link it held stops working; a device still
+        // paired reads the file again at a new link.
+        assert!(pairing.revoke("dv-phone").await.unwrap());
+        assert!(files.signed(&id, &held).is_none());
+        let (_, fresh) = link(&files);
+        assert!(files.signed(&id, &fresh).is_some());
     }
 
     #[tokio::test]
