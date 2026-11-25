@@ -700,14 +700,16 @@ mod tests {
                         "instructions": instructions
                     })
                     .to_string(),
+                    // The owner approved the change on its card.
                     crate::traits::ToolCallContext {
                         user_role: Some(crate::types::UserRole::Owner),
+                        kernel_approved: Some(aidaemon_tools::semantics::ApprovalScope::Call),
                         ..Default::default()
                     },
                 )
                 .await
                 .unwrap();
-            assert!(result.contains("No run was triggered"));
+            assert!(result.contains("No run was triggered"), "{result}");
         }
 
         let updated = state.get_goal(&goal.id).await.unwrap().unwrap();

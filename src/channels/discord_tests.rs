@@ -246,15 +246,34 @@ async fn a_dm_from_someone_else_is_refused_before_the_agent_runs() {
 }
 
 #[tokio::test]
-async fn a_dynamic_bot_is_claimed_by_its_first_dm() {
+async fn a_dynamic_bot_is_claimed_only_with_its_claim_code() {
     let mock = MockDiscord::start().await;
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Claimed.")]);
-    let (channel, _harness) = channel(&mock, provider, vec![], vec![]).await;
+    let (channel, harness) = channel(&mock, MockProvider::new(), vec![], vec![]).await;
+    // A stranger who finds the bot first gets nothing.
     channel
         .handle_event(direct_message(STRANGER, "hello"))
         .await;
-    mock.wait_for(|r| r.body["content"] == "Claimed.").await;
+    mock.wait_for(|r| {
+        r.body["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("This bot has no owner yet"))
+    })
+    .await;
+    assert!(!channel.is_authorized(STRANGER));
+    // The DM carrying the code shown where it was connected claims it, and
+    // the code itself never reaches the agent.
+    let code = channel.owner_claim().code();
+    channel
+        .handle_event(direct_message(STRANGER, &format!("/claim {code}")))
+        .await;
+    mock.wait_for(|r| {
+        r.body["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("now set as the owner"))
+    })
+    .await;
     assert!(channel.is_authorized(STRANGER));
+    assert_eq!(harness.provider.call_count().await, 0);
 }
 
 fn server_message(from: u64, text: &str, addressed: bool) -> ChannelEvent {
