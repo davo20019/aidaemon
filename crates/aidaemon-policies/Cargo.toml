@@ -28,6 +28,7 @@ tracing = "0.1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
 # `OtelSink`: export runs as OpenTelemetry spans.

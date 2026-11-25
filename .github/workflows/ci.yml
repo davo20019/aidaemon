@@ -1,10 +1,12 @@
 name: CI
 
+# release/* branches are the integration branch for the next release: feature
+# branches merge there and get the same checks before it merges to master.
 on:
   push:
-    branches: [master]
+    branches: [master, "release/**"]
   pull_request:
-    branches: [master]
+    branches: [master, "release/**"]
 
 # One run per pull request: a new push cancels the run in progress, so its
 # results come without waiting for the older commit's (a waiting run held
@@ -167,6 +169,25 @@ jobs:
 
       - name: Diff aidaemon-core public API against the snapshot
         run: scripts/check-core-api.sh
+
+  # workspace-hack/ (cargo-hakari) must match the dependency graph: after a
+  # dependency or feature change run `cargo hakari generate` and
+  # `cargo hakari manage-deps` and commit the result.
+  hakari:
+    name: workspace-hack up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-hakari@0.9.39
+      - name: Check workspace-hack
+        run: |
+          cargo hakari generate --diff
+          cargo hakari manage-deps --dry-run
+          cargo hakari verify
 
   # Docs must build without warnings for every SDK crate, one crate at a time
   # (a workspace-wide `cargo doc` unifies features and hides per-crate breakage).

@@ -17,6 +17,8 @@ import os
 import subprocess
 import sys
 
+HAKARI = "workspace-hack"
+
 
 def main() -> int:
     meta = json.loads(
@@ -49,6 +51,9 @@ def main() -> int:
                 d["name"]
                 for d in packages[n]["dependencies"]
                 if d.get("kind") != "dev" and d["name"] in packages
+                # cargo-hakari's crate stays local: a published crate gets the
+                # empty `workspace-hack 0.1` stub from crates.io in its place.
+                and d["name"] != HAKARI
             }
         )
         for n in publishable

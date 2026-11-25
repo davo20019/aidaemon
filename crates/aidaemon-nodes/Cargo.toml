@@ -48,6 +48,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }

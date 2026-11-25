@@ -97,6 +97,16 @@ if touches '\.rs$|Cargo\.(toml|lock)$'; then
         cargo clippy "${sdk_args[@]}" --all-targets --all-features -- -D warnings
 fi
 
+# workspace-hack/ must match the dependency graph (CI's `hakari` job).
+if touches 'Cargo\.(toml|lock)$|^\.config/hakari\.toml$'; then
+    if command -v cargo-hakari >/dev/null; then
+        run_whole "workspace-hack" 'Cargo\.(toml|lock)$|hakari' bash -c \
+            'cargo hakari generate --diff && cargo hakari manage-deps --dry-run'
+    else
+        echo "pre-push: workspace-hack skipped (cargo install --locked cargo-hakari)"
+    fi
+fi
+
 # Rustdoc -D warnings for each changed SDK crate (private intra-doc links).
 doc_args=()
 for c in "${sdk_crates[@]}"; do
@@ -147,6 +157,7 @@ if ((${#failed[@]})); then
     echo "pre-push: FAILED: ${failed[*]}"
     echo "  Goldens: UPDATE_TOOL_GOLDENS=1 cargo test --all-features --lib catalog_"
     echo "  Core API: scripts/check-core-api.sh --bless"
+    echo "  workspace-hack: cargo hakari generate && cargo hakari manage-deps"
     echo "  A failure in a file with someone else's uncommitted edits is theirs;"
     echo "  then push with AIDAEMON_SKIP_PREPUSH=1."
     exit 1
