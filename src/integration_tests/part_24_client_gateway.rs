@@ -122,10 +122,11 @@ mod client_gateway {
     }
 
     async fn connect(daemon: &Daemon, resume_from: Option<u64>) -> Socket {
-        let mut request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-            format!("ws://{}/client/v1/ws", daemon.url),
-        )
-        .unwrap();
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                format!("ws://{}/client/v1/ws", daemon.url),
+            )
+            .unwrap();
         request.headers_mut().insert(
             "authorization",
             format!("Bearer {}", daemon.token).parse().unwrap(),
@@ -308,7 +309,10 @@ mod client_gateway {
 
         // Back, from the last seq applied: the card is replayed.
         let mut socket = connect(&daemon, Some(applied.last())).await;
-        assert!(matches!(next(&mut socket).await, ServerFrame::Welcome { .. }));
+        assert!(matches!(
+            next(&mut socket).await,
+            ServerFrame::Welcome { .. }
+        ));
         let asked = until(&mut socket, &mut applied, |f| {
             is_event(f, "approval_requested")
         })
@@ -372,11 +376,14 @@ mod client_gateway {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let mut socket = connect(&daemon, Some(applied.last())).await;
-        assert!(matches!(next(&mut socket).await, ServerFrame::Welcome { .. }));
+        assert!(matches!(
+            next(&mut socket).await,
+            ServerFrame::Welcome { .. }
+        ));
         let finished = |applied: &Applied| {
-            applied.events.iter().any(|e| {
-                matches!(e, Event::TaskUpdated { task } if task.state == TaskState::Completed)
-            })
+            applied.events.iter().any(
+                |e| matches!(e, Event::TaskUpdated { task } if task.state == TaskState::Completed),
+            )
         };
         while !finished(&applied) {
             let frame = next(&mut socket).await;
@@ -493,9 +500,7 @@ mod client_gateway {
         }
     }
 
-    async fn http_json<T: serde::de::DeserializeOwned>(
-        response: reqwest::Response,
-    ) -> T {
+    async fn http_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> T {
         assert!(
             response.status().is_success(),
             "{} from {}",
@@ -649,9 +654,10 @@ mod client_gateway {
         // the log after the browser connected: the turn's card is the one
         // after the turn started.
         until(&mut socket, &mut applied, |f| is_event(f, "turn_started")).await;
-        applied.skip_before_last(|f| is_event(f, "turn_started"), |f| {
-            is_event(f, "approval_requested")
-        });
+        applied.skip_before_last(
+            |f| is_event(f, "turn_started"),
+            |f| is_event(f, "approval_requested"),
+        );
         let asked = until(&mut socket, &mut applied, |f| {
             is_event(f, "approval_requested")
         })
@@ -665,9 +671,12 @@ mod client_gateway {
         };
         assert_eq!(approval.session_id, TELEGRAM_SESSION);
         assert_eq!(approval.channel.as_deref(), Some("telegram"));
-        assert!(applied.events.iter().any(
-            |e| matches!(e, Event::TurnStarted { origin, .. } if origin == "telegram")
-        ));
+        assert!(
+            applied
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::TurnStarted { origin, .. } if origin == "telegram"))
+        );
         command(
             &mut socket,
             "approve-from-phone",
@@ -677,10 +686,7 @@ mod client_gateway {
             },
         )
         .await;
-        let completed = until(&mut socket, &mut applied, |f| {
-            is_event(f, "turn_completed")
-        })
-        .await;
+        let completed = until(&mut socket, &mut applied, |f| is_event(f, "turn_completed")).await;
         let ServerFrame::Event {
             event: Event::TurnCompleted { text, .. },
             ..
