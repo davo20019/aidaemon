@@ -58,6 +58,7 @@ mod mandate_bootstrap_isolation_tests {
                 ingress_timing: None,
                 internal_continuation: false,
                 parent_task_id: None,
+                stop_work: &agent.engine(),
             },
         )
         .await

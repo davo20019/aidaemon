@@ -64,36 +64,18 @@ pub trait TurnWorkspace: Send + Sync {
     fn project_roots(&self) -> &[String];
 }
 
-/// Where a turn's decision points go: the record of why the runtime chose
-/// what it did, kept with the turn's events when the host records them.
-#[async_trait::async_trait]
-pub trait DecisionRecorder: Send + Sync {
-    /// Record one decision point of `task_id` at loop `iteration`.
-    async fn record_decision_point(
-        &self,
-        emitter: &aidaemon_events::EventEmitter,
-        task_id: &str,
-        iteration: usize,
-        decision_type: aidaemon_events::DecisionType,
-        summary: String,
-        metadata: serde_json::Value,
-    );
-}
+pub use crate::decisions::DecisionRecorder;
 
 /// What the turn engine is handed with the agent.
 pub trait EngineContext: Send + Sync {
     /// The daemon's own paths (config, data, logs), which file policy and
     /// path classification read.
     fn daemon_paths(&self) -> &aidaemon_tools::path_class::DaemonPaths;
-    /// How turns run on the SDK kernel; shared by every agent in the tree.
-    fn engine_settings(&self) -> &std::sync::Arc<crate::engine::settings::SdkEngineSettings>;
     /// The durable kernel run store, when runs are recorded.
     fn run_store(&self) -> Option<&std::sync::Arc<aidaemon_store_sqlite::SqliteStore>>;
     /// The chat whose approval grants a child's turns share; `None` for a
     /// root agent (its own session's grants apply).
     fn approval_session_id(&self) -> Option<&str>;
-    /// The owner's approvals: pending cards and session grants.
-    fn owner_approvals(&self) -> &std::sync::Arc<crate::approvals::OwnerApprovals>;
     /// A spawned child's progress clock, read by its parent's watchdog.
     fn child_progress(&self) -> Option<&aidaemon_channels::owner_wait::ProgressClock>;
     /// Set once this agent's turn read untrusted content; its parent reads it.
@@ -140,7 +122,7 @@ pub trait TurnServices: Send + Sync {
     async fn mcp_tool_names(&self) -> Vec<String>;
     /// Where a turn's memory side effects go (extraction, summaries,
     /// learning).
-    fn transcript_writes(&self) -> std::sync::Arc<dyn crate::turn::memory_writer::MemoryWrites>;
+    fn transcript_writes(&self) -> std::sync::Arc<dyn crate::memory_port::MemoryWrites>;
     /// Cancels this agent's run (a child or a background task).
     fn cancel_token(&self) -> Option<&tokio_util::sync::CancellationToken>;
     /// The local model slot an interactive turn pins to keep its cache warm.
@@ -200,7 +182,7 @@ pub trait TurnHost:
     /// worker's prompt.
     fn bundled_specialist_kinds(&self) -> Vec<(String, String)>;
     /// The memory system serving the agent's turns.
-    fn memory_plugin(&self) -> &dyn crate::turn::memory::MemoryPlugin;
+    fn memory_plugin(&self) -> &dyn crate::memory_port::MemoryPlugin;
     /// Whether the memory system is the daemon's own.
     fn memory_is_daemons_own(&self) -> bool {
         self.memory_plugin().is_daemons_own()
@@ -268,15 +250,9 @@ pub trait TurnHost:
     /// A shared handle to the message store, for spawned work.
     fn message_log(&self) -> std::sync::Arc<dyn MessageStore>;
     /// A shared handle to what conversation compaction reads and writes.
-    fn compaction_store(&self) -> std::sync::Arc<dyn crate::turn::compaction::CompactionStore>;
+    fn compaction_store(&self) -> std::sync::Arc<dyn crate::memory_port::CompactionStore>;
     /// The skill library.
     fn skills(&self) -> &aidaemon_skills::SkillCache;
-    /// Build a child of this agent: a fresh agent sharing this one's model
-    /// runtime, stores, hub, approvals and sub-agent registry.
-    async fn create_child(
-        &self,
-        spec: crate::spawn::ChildSpec,
-    ) -> std::sync::Arc<dyn crate::spawn::ChildAgent>;
     /// The agent's tools (their task-end hooks run when a task ends).
     fn tools(&self) -> &[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>];
     /// The dispatch facts the registered tool `name` states; the defaults
@@ -292,8 +268,6 @@ pub trait TurnHost:
     /// executors get the working tools it lacks; `None` when the agent's own
     /// tools are the full list.
     fn root_tools(&self) -> Option<&[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>]>;
-    /// The specialist registry this agent's children are made from.
-    fn specialists(&self) -> &std::sync::Arc<crate::specialists::SpecialistRegistry>;
     /// The task board tool of a task lead for `goal_id`, bound to the goal
     /// run `goal_run_id` when there is one.
     fn goal_tasks_tool(
@@ -313,7 +287,7 @@ pub trait TurnHost:
     ) -> std::sync::Arc<dyn aidaemon_tools::OutcomeTool>;
     /// The execution budget pinned for this agent's turns, if any (tests
     /// pin one; the daemon never does).
-    fn execution_budget_override(&self) -> Option<crate::turn::execution_state::ExecutionBudget> {
+    fn execution_budget_override(&self) -> Option<crate::memory_port::ExecutionBudget> {
         None
     }
 }

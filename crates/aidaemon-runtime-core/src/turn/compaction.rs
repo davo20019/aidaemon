@@ -15,22 +15,9 @@ use serde_json::Value;
 
 use crate::llm::gateway::SideCallGateway;
 use crate::llm::side_calls::SideCall;
+pub use crate::memory_port::CompactionStore;
 use aidaemon_events::{EventStore, FetchedTurn};
 use aidaemon_tools::semantics::UserRole;
-
-/// What a compaction reads and writes besides the turns: the summary table,
-/// and the settings that record a summary's untrusted-content taint.
-pub trait CompactionStore:
-    aidaemon_events::stores::ConversationSummaryStore + aidaemon_tools::services::SettingsStore
-{
-}
-
-impl<T> CompactionStore for T where
-    T: aidaemon_events::stores::ConversationSummaryStore
-        + aidaemon_tools::services::SettingsStore
-        + ?Sized
-{
-}
 
 /// One pass per session and one queued behind it, across every compactor
 /// the daemon builds (the background pass after a reply and the emergency

@@ -473,6 +473,7 @@ impl TurnEngine<'_> {
                 ingress_timing: ingress_timing.as_ref(),
                 internal_continuation,
                 parent_task_id: continuation_parent_task_id,
+                stop_work: self,
             },
         )
         .await?;

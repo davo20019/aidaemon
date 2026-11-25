@@ -2366,11 +2366,18 @@ fn recent_actions(ctx: &sdk::HookContext<'_>) -> String {
         .join("\n")
 }
 
+/// The request's tree as the coordination hook reads it (the authority's
+/// `SpawnFamily`).
+pub trait CoordinatedTree: Send + Sync {
+    /// The tree's shared knowledge, once it has a member to coordinate with.
+    fn active_coordination(&self) -> Option<&Coordination>;
+}
+
 /// Judges every declared file write once the tree has a child: refuses a
 /// write made from a stale view of the file, and settles one that would
 /// change a sibling's lines by rule, by ruling, or by asking the coordinator.
 pub struct CoordinationHook {
-    pub family: crate::authority::SpawnFamily,
+    pub family: Arc<dyn CoordinatedTree>,
     pub member: String,
     pub tools: Arc<HashMap<String, Arc<dyn aidaemon_tools::OutcomeTool>>>,
     pub backend: SharedExecutionBackend,

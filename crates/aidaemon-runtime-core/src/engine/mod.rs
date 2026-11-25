@@ -13,6 +13,7 @@ pub mod calls;
 pub mod chat_work;
 pub mod deferral;
 pub mod dispatcher;
+pub mod engine_host;
 pub mod hooks;
 pub mod loaded_tools;
 pub mod mandate_run;
@@ -26,7 +27,7 @@ pub mod tool_calls;
 pub mod tool_exec;
 pub mod tool_gate;
 pub mod tool_result_fit;
-pub mod tool_roster;
+pub use crate::turn::tool_roster;
 pub mod turn_engine;
 pub mod work_scope;
 

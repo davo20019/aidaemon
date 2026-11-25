@@ -2,12 +2,9 @@
 //! the hooks and tools it adds ([`MemoryParts`]) through [`MemoryPlugin`],
 //! and how the daemon's own memory tools are offered beside it.
 
-use std::sync::Arc;
-
+pub use crate::memory_port::{MemoryParts, MemoryPlugin, MemoryTurn, MemoryWarmup};
 use aidaemon_channels::context::ChannelContext;
-use aidaemon_core as sdk;
 use aidaemon_tools::semantics::UserRole;
-use async_trait::async_trait;
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
 /// lists them in [`MemoryParts::owned_daemon_tools`].
@@ -83,54 +80,6 @@ pub fn check_goal_action(arguments: &serde_json::Value) -> Result<(), String> {
     }
 }
 
-/// What is known about a turn when its message arrives: enough to start
-/// recall, not yet its task or its memory policy.
-#[derive(Clone)]
-pub struct MemoryWarmup {
-    pub session_id: String,
-    pub user_text: String,
-    pub user_role: UserRole,
-    pub channel_ctx: ChannelContext,
-    pub depth: usize,
-    /// The project the conversation is placed in, when it may keep project
-    /// memory ([`memory_project`]).
-    pub project: Option<aidaemon_core::ProjectRef>,
-}
-
-/// Everything a plugin needs to scope memory for one turn.
-#[derive(Clone)]
-pub struct MemoryTurn {
-    pub session_id: String,
-    pub task_id: String,
-    /// The conversation turn this run answers. It is over when the run ends,
-    /// before its `task_end` is appended.
-    pub turn_id: String,
-    /// The turn's event emitter (decision points, memory telemetry).
-    pub emitter: aidaemon_events::EventEmitter,
-    /// The persisted user message for the turn.
-    pub user_text: String,
-    pub user_role: UserRole,
-    pub channel_ctx: ChannelContext,
-    /// The compiled policy allows reading memory.
-    pub memory_pipeline_allowed: bool,
-    /// The compiled policy allows writing memory.
-    pub memory_persistence_allowed: bool,
-    /// A mandate worker: no memory at all.
-    pub mandate: bool,
-    pub depth: usize,
-    pub model: String,
-    /// The run's learning context; the dispatcher adds its tool calls.
-    pub learning: Arc<std::sync::Mutex<crate::turn::post_task::LearningContext>>,
-    /// How the turn judges the run's final status.
-    pub verdict: Arc<crate::engine::outcome::TurnVerdict>,
-    /// Whether the turn may be learned from ("don't remember this"), shared
-    /// with whatever memory system serves the turn.
-    pub learning_consent: aidaemon_policies::TurnLearning,
-    /// The project the turn works in, when it may keep project memory
-    /// ([`memory_project`]); `None` otherwise.
-    pub project: Option<aidaemon_core::ProjectRef>,
-}
-
 /// The project whose memory a turn reads and writes: the turn's project,
 /// only on the owner's own turns in a private or internal channel, never
 /// under a mandate. Guests, groups and public channels keep today's memory.
@@ -158,39 +107,6 @@ impl MemoryTurn {
     /// Worker sessions keep summaries but never learn owner facts.
     pub fn memory_isolated(&self) -> bool {
         self.depth > 0 || aidaemon_events::is_memory_isolated_worker_session(&self.session_id)
-    }
-}
-
-/// What a plugin adds to one turn.
-#[derive(Default)]
-pub struct MemoryParts {
-    pub hooks: Vec<Arc<dyn sdk::Hook>>,
-    pub tools: Vec<Arc<dyn sdk::Tool>>,
-    /// Daemon tools this plugin owns; offered only while it is the active
-    /// plugin. Filled from [`MemoryPlugin::owned_daemon_tools`].
-    pub owned_daemon_tools: &'static [&'static str],
-}
-
-#[async_trait]
-pub trait MemoryPlugin: Send + Sync {
-    async fn turn(&self, turn: &MemoryTurn) -> MemoryParts;
-
-    /// Starts recall for a message as it arrives, before the turn's memory
-    /// policy is settled. It must write nothing and return at once, and what
-    /// it reads may reach the turn only through [`MemoryPlugin::turn`], when
-    /// that turn may read memory and recalls for the same inputs.
-    fn warm(&self, _warmup: &MemoryWarmup) {}
-
-    /// The daemon memory tools ([`DAEMON_MEMORY_TOOLS`]) this plugin owns.
-    fn owned_daemon_tools(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    /// This is the daemon's own memory, so the daemon's prompts about facts
-    /// and its learning from finished runs apply. Another memory system may
-    /// have neither.
-    fn is_daemons_own(&self) -> bool {
-        false
     }
 }
 

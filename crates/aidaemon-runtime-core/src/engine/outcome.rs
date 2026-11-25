@@ -5,6 +5,7 @@ use aidaemon_events::{TaskOutcome, TaskStatus};
 
 use super::budgets::{GOAL_BUDGET_EXHAUSTED, MANDATE_BUDGET_EXHAUSTED};
 use super::stop::finalize_reply;
+pub use crate::memory_port::TurnVerdict;
 
 /// How the kernel writes a used-up quota into `RunStatus::ProviderFailed`
 /// (the `Display` of `ProviderError::QuotaExhausted`).
@@ -177,45 +178,6 @@ fn reads_an_edited_file(receipt: &sdk::Receipt, edited: &[String]) -> bool {
 
 /// The coding-agent launcher's tool name, as its receipts carry it.
 const CLI_AGENT_TOOL: &str = "cli_agent";
-
-/// What a run settled, beyond its kernel status, that decides the turn's
-/// final status and outcome. Shared with run-end hooks (memory writers), so
-/// they judge a run exactly as the turn does.
-#[derive(Default)]
-pub struct TurnVerdict {
-    /// The reply and outcome a used-up goal or mandate budget closes the run
-    /// with; the run itself ends through the provider port.
-    pub budget_stop: std::sync::Mutex<Option<(String, TaskOutcome)>>,
-    /// Confirmation of the latest successful external change.
-    pub external_action_ack: std::sync::Mutex<Option<String>>,
-    /// Set when the run must end failed despite a final answer.
-    pub run_failure: std::sync::Mutex<Option<String>>,
-    /// The latest provider note (for example a safety finish reason).
-    pub response_note: std::sync::Mutex<Option<String>>,
-    /// The latest well-formed final answer a closeout demand sent back for
-    /// more work. If the model then replies with nothing, this ships instead
-    /// of a generic activity summary.
-    pub interrupted_answer: std::sync::Mutex<Option<String>>,
-    /// The handoff reply for a run that stopped while a job it launched was
-    /// still running: that job's notifier delivers the result, so the run
-    /// tells the user the work continues instead of shipping the model's own
-    /// verdict on unfinished work.
-    pub handoff_reply: std::sync::Mutex<Option<String>>,
-    /// The coding agents this turn started answered it themselves
-    /// ([`crate::run_state::RunStates::agents_answered`]). When the model
-    /// did nothing after them, the turn ships no reply of its own: each
-    /// agent's message, its report checked, is the answer, and the model's
-    /// closing words would only repeat it (live 2026-11-23: told not to, it
-    /// restated a clean result two runs of two).
-    pub answered_by_agents: std::sync::atomic::AtomicBool,
-    /// The files those agents' runs changed, by their records: reading them
-    /// back after the agents is no work of the turn's own.
-    pub agents_edited: std::sync::Mutex<Vec<String>>,
-    /// The turn of a conversation set to a coding agent: its reply is what
-    /// the agent's run returned, as it is (no reply checks, no activity
-    /// summary in its place).
-    pub direct_agent: std::sync::atomic::AtomicBool,
-}
 
 impl TurnVerdict {
     /// The run ends on a used-up budget: the next model call fails with the

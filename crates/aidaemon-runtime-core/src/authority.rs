@@ -257,6 +257,12 @@ struct SpawnFamilyState {
 #[derive(Debug, Clone)]
 pub struct SpawnFamily(std::sync::Arc<SpawnFamilyState>);
 
+impl crate::coordination::CoordinatedTree for SpawnFamily {
+    fn active_coordination(&self) -> Option<&crate::coordination::Coordination> {
+        SpawnFamily::active_coordination(self)
+    }
+}
+
 impl PartialEq for SpawnFamily {
     fn eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)

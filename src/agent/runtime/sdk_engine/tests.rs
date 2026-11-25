@@ -4,7 +4,7 @@ use super::outcome::*;
 use super::tool_calls::*;
 use super::*;
 use crate::events::TaskEndData;
-use aidaemon_runtime::host::{EngineContext as _, TurnHost as _};
+use aidaemon_runtime::host::TurnHost as _;
 
 fn vision(max_image_bytes: u64) -> VisionConfig {
     VisionConfig {
@@ -3695,7 +3695,10 @@ async fn path_aliases_are_not_trusted_roots() {
     harness
         .agent
         .set_test_project_roots(vec!["/tmp/aidaemon-test/projects".to_string()]);
-    let configured = harness.agent.engine_settings().trusted_roots.clone();
+    let configured =
+        aidaemon_runtime::engine::engine_host::EngineHost::engine_settings(&harness.agent)
+            .trusted_roots
+            .clone();
     let roots = super::turn_trust_roots(super::TrustRootSources {
         configured: &configured,
         ..Default::default()
@@ -3814,7 +3817,7 @@ async fn hook_order_is_pinned() {
             calls: calls.clone(),
         },
         coordination: crate::agent::coordination::CoordinationHook {
-            family: crate::agent::authority::SpawnFamily::new(Default::default()),
+            family: Arc::new(crate::agent::authority::SpawnFamily::new(Default::default())),
             member: "telegram:synthetic-user-1".to_string(),
             tools: Arc::default(),
             backend: crate::execution::active_execution_backend(),
@@ -4377,7 +4380,7 @@ fn no_name_keyed_dispatch_remains() {
         ("approvals.rs", include_str!("../approvals.rs")),
         (
             "tool_roster.rs",
-            include_str!("../../../../crates/aidaemon-runtime-core/src/engine/tool_roster.rs"),
+            include_str!("../../../../crates/aidaemon-runtime-core/src/turn/tool_roster.rs"),
         ),
     ];
     let names = [

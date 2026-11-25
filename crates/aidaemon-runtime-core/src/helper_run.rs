@@ -89,7 +89,7 @@ impl HelperSpec {
         if self.name().is_empty() {
             fallback.trim().to_string()
         } else {
-            crate::spawn::child_status_label(self.name())
+            child_status_label(self.name())
         }
     }
 
@@ -366,6 +366,76 @@ impl CliSandbox {
             self.describe()
         )
     }
+}
+
+/// A word of a title as the owner reads it: a path is the name of what it
+/// points at.
+pub fn plain_word(word: &str) -> String {
+    let looks_like_path = word.starts_with('/')
+        || word.starts_with('~')
+        || word.matches('/').count() > 1
+        || word.contains('\\');
+    if !looks_like_path {
+        return word.to_string();
+    }
+    let trail: String = word
+        .chars()
+        .rev()
+        .take_while(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | '"' | '\''))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let core = &word[..word.len() - trail.len()];
+    let name = core
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty() && *part != "~")
+        .unwrap_or(core);
+    format!("{name}{trail}")
+}
+
+/// A short name for a child on the parent's status card: its mission's first
+/// line, cut to a phone-width length.
+pub fn child_status_label(mission: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    // A path reads as the name of what it points at.
+    let line = mission
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(plain_word)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = if line.is_empty() {
+        "Sub-agent"
+    } else {
+        line.as_str()
+    };
+    let is_path = |word: &str| word.contains('/') || word.contains('\\') || word.starts_with('~');
+    if line.chars().count() <= MAX_CHARS && !line.split_whitespace().any(is_path) {
+        return line.to_string();
+    }
+    // Whole words up to the limit, stopping before a path: a label never
+    // ends mid-word or mid-path (live 2026-11-13: "… in exactly
+    // /Users/alice/projects/cla").
+    let mut label = String::new();
+    for word in line.split_whitespace() {
+        let longer = label.chars().count() + usize::from(!label.is_empty()) + word.chars().count();
+        if is_path(word) || longer > MAX_CHARS - 1 {
+            break;
+        }
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(word);
+    }
+    if label.is_empty() {
+        let cut: String = line.chars().take(MAX_CHARS - 1).collect();
+        return format!("{}…", cut.trim_end());
+    }
+    format!("{label}…")
 }
 
 #[cfg(test)]

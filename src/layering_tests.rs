@@ -3,8 +3,9 @@
 //! re-check all of them on any edit, and blocks splitting them into crates.
 //!
 //! These tests read `aidaemon-runtime-core`'s source (not test code) for
-//! `crate::<module>` paths and fail when the module graph has a cycle.
-//! `KNOWN_BACK_EDGES` lists the references still pointing up; it only shrinks.
+//! `crate::<module>` paths and fail when the module graph has a cycle or a
+//! layered module uses one above it. To share something between layers, move
+//! the shared item down, or define a trait below and implement it above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -34,23 +35,6 @@ const LAYERS: &[&str] = &[
     "eval",
     "prompt",
     "known_resources",
-];
-
-/// References from a lower module to a higher one, still to be removed.
-/// Remove a pair when its last reference goes; never add one.
-const KNOWN_BACK_EDGES: &[(&str, &str)] = &[
-    ("coordination", "authority"),
-    ("helper_run", "spawn"),
-    ("helper_run", "spawn_tool"),
-    ("helper_run", "turn"),
-    ("host", "approvals"),
-    ("host", "engine"),
-    ("host", "specialists"),
-    ("host", "turn"),
-    ("spawn", "host"),
-    ("turn", "engine"),
-    ("untrusted", "engine"),
-    ("untrusted", "host"),
 ];
 
 fn root() -> PathBuf {
@@ -420,17 +404,12 @@ fn find_cycle(edges: &BTreeSet<(String, String)>) -> Option<Vec<String>> {
     None
 }
 
-fn known(a: &str, b: &str) -> bool {
-    KNOWN_BACK_EDGES.contains(&(a, b))
-}
-
 #[test]
 fn layered_modules_only_use_lower_ones() {
     let graph = module_graph();
     let up: Vec<String> = graph
         .iter()
         .filter(|((a, b), _)| matches!((layer(a), layer(b)), (Some(la), Some(lb)) if la > lb))
-        .filter(|((a, b), _)| !known(a, b))
         .map(|((a, b), files)| format!("{a} -> {b} in {files:?}"))
         .collect();
     assert!(
@@ -443,11 +422,7 @@ fn layered_modules_only_use_lower_ones() {
 #[test]
 fn runtime_modules_have_no_cycles() {
     let graph = module_graph();
-    let edges: BTreeSet<(String, String)> = graph
-        .keys()
-        .filter(|(a, b)| !known(a, b))
-        .cloned()
-        .collect();
+    let edges: BTreeSet<(String, String)> = graph.keys().cloned().collect();
     if let Some(cycle) = find_cycle(&edges) {
         let detail: Vec<String> = cycle
             .windows(2)
@@ -464,26 +439,13 @@ fn runtime_modules_have_no_cycles() {
     }
 }
 
-#[test]
-fn known_back_edges_still_exist() {
-    let graph = module_graph();
-    let gone: Vec<_> = KNOWN_BACK_EDGES
-        .iter()
-        .filter(|(a, b)| !graph.contains_key(&(a.to_string(), b.to_string())))
-        .collect();
-    assert!(
-        gone.is_empty(),
-        "remove these from KNOWN_BACK_EDGES, they no longer exist: {gone:?}"
-    );
-}
-
 /// The scan reads real code: the engine's use of the turn module is seen.
 #[test]
 fn the_scan_sees_engine_using_turn() {
     assert!(module_graph().contains_key(&("engine".to_string(), "turn".to_string())));
 }
 
-/// Prints every reference that points up the layers, known or not:
+/// Prints every reference that points up the layers:
 /// `cargo test --lib layering_tests::print_back_edges -- --ignored --nocapture`.
 #[test]
 #[ignore = "a report, not a check"]

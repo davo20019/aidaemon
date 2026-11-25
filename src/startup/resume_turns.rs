@@ -667,6 +667,14 @@ mod tests {
         ) -> Option<aidaemon_runtime::spawn::SalvagedTaskOutcome> {
             None
         }
+        fn helper_runs(&self) -> Arc<aidaemon_runtime::run_state::RunStates> {
+            self.1.clone()
+        }
+        async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
+    }
+
+    #[async_trait]
+    impl aidaemon_runtime::helper_run::delivery::RunResultSink for Answers {
         async fn deliver_background_child_result(
             &self,
             _router: Option<&Weak<dyn OutboundRouter>>,
@@ -676,10 +684,7 @@ mod tests {
         ) -> anyhow::Result<bool> {
             Ok(false)
         }
-        fn helper_runs(&self) -> Arc<aidaemon_runtime::run_state::RunStates> {
-            self.1.clone()
-        }
-        async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
+
         async fn answer_after_runs(&self, answer: RunsAnswer) -> anyhow::Result<bool> {
             self.0.lock().unwrap().push(answer);
             Ok(true)

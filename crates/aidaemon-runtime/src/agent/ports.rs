@@ -130,6 +130,13 @@ impl ChildAgentRuntime for Agent {
             .await;
     }
 
+    fn helper_runs(&self) -> std::sync::Arc<crate::run_state::RunStates> {
+        self.running_children.runs()
+    }
+}
+
+#[async_trait]
+impl crate::helper_run::delivery::RunResultSink for Agent {
     async fn deliver_background_child_result(
         &self,
         router: Option<&std::sync::Weak<dyn aidaemon_channels::ports::OutboundRouter>>,
@@ -141,10 +148,6 @@ impl ChildAgentRuntime for Agent {
             .deliver_background_spawn_result(router, parent_session_id, text, trust)
             .await?
             .sent)
-    }
-
-    fn helper_runs(&self) -> std::sync::Arc<crate::run_state::RunStates> {
-        self.running_children.runs()
     }
 
     /// The runs one chat turn started all ended: the chat's request is

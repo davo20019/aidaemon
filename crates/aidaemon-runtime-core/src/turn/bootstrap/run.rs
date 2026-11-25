@@ -1,5 +1,5 @@
 use super::types::{BootstrapCtx, BootstrapData, BootstrapOutcome};
-use crate::engine::tool_roster::ToolRoster as _;
+use crate::turn::tool_roster::ToolRoster as _;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -797,6 +797,7 @@ pub async fn run_bootstrap(
 
     if let Some(reply) = super::shortcuts::maybe_handle_stop_command(
         agent,
+        ctx.stop_work,
         session_id,
         user_text,
         user_role,

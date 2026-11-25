@@ -104,20 +104,12 @@ impl EngineContext for Agent {
         &self.daemon_paths
     }
 
-    fn engine_settings(&self) -> &std::sync::Arc<crate::engine::settings::SdkEngineSettings> {
-        &self.sdk_engine
-    }
-
     fn run_store(&self) -> Option<&std::sync::Arc<aidaemon_store_sqlite::SqliteStore>> {
         self.run_store.as_ref()
     }
 
     fn approval_session_id(&self) -> Option<&str> {
         self.approval_session_id.as_deref()
-    }
-
-    fn owner_approvals(&self) -> &std::sync::Arc<crate::approvals::OwnerApprovals> {
-        &self.owner_approvals
     }
 
     fn child_progress(&self) -> Option<&aidaemon_channels::owner_wait::ProgressClock> {
@@ -365,19 +357,8 @@ impl TurnHost for Agent {
         &self.skill_cache
     }
 
-    async fn create_child(
-        &self,
-        spec: crate::spawn::ChildSpec,
-    ) -> std::sync::Arc<dyn crate::spawn::ChildAgent> {
-        self.create_child_agent(spec).await
-    }
-
     fn root_tools(&self) -> Option<&[std::sync::Arc<dyn aidaemon_tools::OutcomeTool>]> {
         self.root_tools.as_deref()
-    }
-
-    fn specialists(&self) -> &std::sync::Arc<crate::specialists::SpecialistRegistry> {
-        &self.specialists
     }
 
     fn goal_tasks_tool(
@@ -426,7 +407,26 @@ impl TurnHost for Agent {
 }
 
 #[async_trait::async_trait]
-impl crate::spawn::ChildAgent for Agent {
+impl crate::engine::engine_host::EngineHost for Agent {
+    fn engine_settings(&self) -> &std::sync::Arc<crate::engine::settings::SdkEngineSettings> {
+        &self.sdk_engine
+    }
+    fn owner_approvals(&self) -> &std::sync::Arc<crate::approvals::OwnerApprovals> {
+        &self.owner_approvals
+    }
+    fn specialists(&self) -> &std::sync::Arc<crate::specialists::SpecialistRegistry> {
+        &self.specialists
+    }
+    async fn create_child(
+        &self,
+        spec: crate::spawn::ChildSpec,
+    ) -> std::sync::Arc<dyn crate::engine::engine_host::ChildAgent> {
+        self.create_child_agent(spec).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::engine::engine_host::ChildAgent for Agent {
     async fn handle_message(
         &self,
         session_id: &str,

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use crate::memory_port::ExecutionBudget;
 use aidaemon_events::traits::{AgentRole, ToolCallEffect, ToolTargetHint};
 
 /// Structured record of a single tool call attempt outcome.
@@ -112,16 +113,6 @@ pub enum StepExecutionOutcome {
     RecoverableFailure,
     NonrecoverableFailure,
     BackgroundDetached,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExecutionBudget {
-    pub max_steps: usize,
-    pub max_tokens: usize,
-    pub max_llm_calls: usize,
-    pub max_tool_calls: usize,
-    pub max_validation_rounds: usize,
-    pub max_wall_clock_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

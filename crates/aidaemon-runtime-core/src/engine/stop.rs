@@ -1,8 +1,7 @@
 //! What the host's stop check reads: reply defects, the reply that ships,
 //! and when the ledger closeout may demand more work.
 
-/// Extra passes the ledger may demand in one run.
-pub const MAX_CLOSEOUT_DEMANDS: u32 = 2;
+pub use crate::turn::closeout::MAX_CLOSEOUT_DEMANDS;
 
 /// A final reply that must not ship as is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

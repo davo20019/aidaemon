@@ -229,42 +229,9 @@ impl SpawnAgentTool {
     }
 }
 
-/// Truncate a string to at most `max_bytes` bytes without splitting a
-/// multi-byte UTF-8 character. Returns the original string when it fits.
-pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the last char boundary at or before `max_bytes`.
-    let boundary = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= max_bytes)
-        .last()
-        .unwrap_or(0);
-    &s[..boundary]
-}
+pub use crate::text_cut::truncate_utf8;
 
-/// A child's reply cut to `max_len`, and what was left out if anything.
-pub fn bounded_child_response(
-    response: &str,
-    max_len: usize,
-) -> (&str, Option<aidaemon_tools::semantics::TruncationInfo>) {
-    if response.len() <= max_len {
-        return (response, None);
-    }
-    let shown = truncate_utf8(response, max_len);
-    let info = aidaemon_tools::semantics::TruncationInfo {
-        shown_chars: shown.chars().count(),
-        total_chars: response.chars().count(),
-        remediation_hint: Some(
-            "To see the rest, delegate again and ask the sub-agent to write the full \
-             result to a file and return its path, or to answer a narrower question."
-                .to_string(),
-        ),
-    };
-    (shown, Some(info))
-}
+pub use crate::text_cut::bounded_child_response;
 
 /// How much of a mission a background record keeps.
 pub const BACKGROUND_MISSION_CHARS: usize = 200;
@@ -2017,14 +1984,13 @@ mod group_tests {
             None
         }
         async fn mark_executor_task_timeout(&self, _task_id: &str, _timeout_secs: u64) {}
-        async fn answer_after_runs(&self, answer: RunsAnswer) -> anyhow::Result<bool> {
-            self.answers.lock().unwrap().push(answer);
-            let continuation = self.continuation.lock().unwrap().take();
-            if let Some(continuation) = continuation {
-                continuation().await;
-            }
-            Ok(true)
+        fn helper_runs(&self) -> Arc<RunStates> {
+            self.runs.clone()
         }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::helper_run::delivery::RunResultSink for Parent {
         async fn deliver_background_child_result(
             &self,
             _router: Option<&Weak<dyn OutboundRouter>>,
@@ -2034,8 +2000,14 @@ mod group_tests {
         ) -> anyhow::Result<bool> {
             Ok(false)
         }
-        fn helper_runs(&self) -> Arc<RunStates> {
-            self.runs.clone()
+
+        async fn answer_after_runs(&self, answer: RunsAnswer) -> anyhow::Result<bool> {
+            self.answers.lock().unwrap().push(answer);
+            let continuation = self.continuation.lock().unwrap().take();
+            if let Some(continuation) = continuation {
+                continuation().await;
+            }
+            Ok(true)
         }
     }
 

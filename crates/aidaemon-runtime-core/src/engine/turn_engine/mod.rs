@@ -77,7 +77,7 @@ const HEARTBEAT_TICK: Duration = Duration::from_secs(15);
 /// The turn engine over a host. See the module docs.
 #[derive(Clone, Copy)]
 pub struct TurnEngine<'h> {
-    host: &'h dyn TurnHost,
+    host: &'h dyn crate::engine::engine_host::EngineHost,
 }
 
 /// The owner's follow-up to a run, written in its thread (the typed
@@ -153,7 +153,7 @@ fn follow_up_script(
 }
 
 impl<'h> TurnEngine<'h> {
-    pub fn new(host: &'h dyn TurnHost) -> Self {
+    pub fn new(host: &'h dyn crate::engine::engine_host::EngineHost) -> Self {
         Self { host }
     }
 
@@ -164,7 +164,7 @@ impl<'h> TurnEngine<'h> {
 }
 
 impl<'h> std::ops::Deref for TurnEngine<'h> {
-    type Target = dyn TurnHost + 'h;
+    type Target = dyn crate::engine::engine_host::EngineHost + 'h;
 
     fn deref(&self) -> &Self::Target {
         self.host
@@ -1052,7 +1052,7 @@ impl TurnEngine<'_> {
         }
         let hooks = TurnHooks {
             coordination: crate::coordination::CoordinationHook {
-                family: spawn_family.clone(),
+                family: std::sync::Arc::new(spawn_family.clone()),
                 member: session_id.to_string(),
                 tools: turn_tools.clone(),
                 backend: self.execution_backend_handle().clone(),
@@ -1943,6 +1943,59 @@ impl PendingReplyText {
         {
             self.text.clear();
         }
+    }
+}
+
+/// A stop command cancels through the engine: the running coding agents (the
+/// `cli_agent` tool's `cancel_all`) and the session's finite work.
+#[async_trait]
+impl crate::turn::bootstrap::StopSessionWork for TurnEngine<'_> {
+    async fn cancel_cli_agents(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> Option<String> {
+        use crate::engine::dispatcher::ToolDispatch as _;
+        self.execute_tool_with_watchdog_outcome(
+            "cli_agent",
+            r#"{"action": "cancel_all"}"#,
+            &ToolExecCtx {
+                file_fence: None,
+                produced_files: None,
+                mcp_tool: None,
+                owner_approval_by_kernel: false,
+                session_id,
+                task_id: Some(task_id),
+                status_tx,
+                channel_visibility: channel_ctx.visibility,
+                channel_id: channel_ctx.channel_id.as_deref(),
+                project_scope: None,
+                project: None,
+                trusted: channel_ctx.trusted,
+                user_role,
+                workspace_grant: channel_ctx.active_workspace_grant(user_role),
+                mandate_authority: None,
+                tool_call_id: None,
+                mutation_forbidden: false,
+                scope_escalation: None,
+                turn_authority: None,
+                trust_roots: None,
+                lone_root_call: false,
+                nested: None,
+                detached_judge: None,
+            },
+        )
+        .await
+        .map(|outcome| outcome.output)
+        .ok()
+    }
+
+    async fn cancel_finite_work(&self, session_id: &str) -> Vec<String> {
+        use crate::engine::chat_work::ChatWorkControl as _;
+        self.cancel_active_finite_work_for_session(session_id).await
     }
 }
 

@@ -8,42 +8,7 @@ use super::post_task::LearningContext;
 use aidaemon_core as sdk;
 use aidaemon_events::TaskStatus;
 
-/// The daemon's memory side effects, behind a seam so the writer's decisions
-/// are testable without spawning extraction.
-pub trait MemoryWrites: Send + Sync {
-    /// Progressive fact extraction from the user text and the final reply.
-    /// Facts the agent stored itself since `run_started_at` are not
-    /// extracted a second time.
-    fn extract_facts(
-        &self,
-        turn: &MemoryTurn,
-        reply: &str,
-        run_started_at: chrono::DateTime<chrono::Utc>,
-    );
-    /// Incremental conversation summarization.
-    fn summarize(&self, turn: &MemoryTurn);
-    /// Post-task learning (procedures, expertise, failure patterns).
-    fn learn(&self, learning: LearningContext);
-    /// Durable knowledge from a completed delegated task's activity log,
-    /// extracted with `model`; a tainted run teaches nothing. What applies
-    /// only to `project` (the project the work belongs to) is kept as its
-    /// memory when the host keeps project memory.
-    fn learn_from_task(
-        &self,
-        task: aidaemon_work::traits::Task,
-        model: String,
-        taint: RunTaint,
-        project: Option<aidaemon_core::ProjectRef>,
-    );
-}
-
-/// Whether the run a task finished in read untrusted content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunTaint {
-    Clean,
-    Tainted,
-}
-
+pub use crate::memory_port::{MemoryWrites, RunTaint};
 /// Which writes a writer owns: the memory plugin owns fact extraction; the
 /// turn owns summarization and learning.
 pub use aidaemon_memory::full::writer::WriterSettings;

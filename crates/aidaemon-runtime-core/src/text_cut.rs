@@ -77,3 +77,54 @@ pub fn keep_head_and_tail_marked(
         &text[tail_start..]
     )
 }
+
+/// Truncate a string to at most `max_bytes` bytes without splitting a
+/// multi-byte UTF-8 character. Returns the original string when it fits.
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Find the last char boundary at or before `max_bytes`.
+    let boundary = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    &s[..boundary]
+}
+
+/// A child's reply cut to `max_len`, and what was left out if anything.
+pub fn bounded_child_response(
+    response: &str,
+    max_len: usize,
+) -> (&str, Option<aidaemon_tools::semantics::TruncationInfo>) {
+    if response.len() <= max_len {
+        return (response, None);
+    }
+    let shown = truncate_utf8(response, max_len);
+    let info = aidaemon_tools::semantics::TruncationInfo {
+        shown_chars: shown.chars().count(),
+        total_chars: response.chars().count(),
+        remediation_hint: Some(
+            "To see the rest, delegate again and ask the sub-agent to write the full \
+             result to a file and return its path, or to answer a narrower question."
+                .to_string(),
+        ),
+    };
+    (shown, Some(info))
+}
+
+/// Render the model-facing truncation notice from structured metadata.
+/// Exactly one call site in the agent loop renders this; tools must not
+/// embed it in their returned output.
+pub fn render_truncation_notice(info: &aidaemon_tools::semantics::TruncationInfo) -> String {
+    match info.remediation_hint.as_deref() {
+        Some(hint) => aidaemon_tools::text::truncation_notice_with_hint(
+            info.shown_chars,
+            info.total_chars,
+            hint,
+        ),
+        None => aidaemon_tools::text::truncation_notice(info.shown_chars, info.total_chars),
+    }
+}

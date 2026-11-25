@@ -14,8 +14,7 @@ use tracing::{info, warn};
 use super::card::settle_background_steps;
 use crate::run_state::RunPhase;
 use crate::run_state::timing::{background_timing, since_request_view};
-use crate::spawn::ChildAgentRuntime;
-use crate::spawn_tool::bounded_child_response;
+use crate::text_cut::bounded_child_response;
 
 /// A background helper's result for the chat, composed from its typed run
 /// record around the helper's report: the outcome line (its phase, and why
@@ -38,7 +37,7 @@ pub fn render_run_result(
         (shown, Some(info)) => {
             format!(
                 "{shown}\n\n{}",
-                crate::turn::helpers::render_truncation_notice(&info)
+                crate::text_cut::render_truncation_notice(&info)
             )
         }
         (shown, None) => shown.to_string(),
@@ -158,10 +157,49 @@ pub async fn enqueue_background_notification(
     }
 }
 
+/// Where a background run's results go: the agent that started it
+/// (a supertrait of `spawn::ChildAgentRuntime`).
+#[async_trait::async_trait]
+pub trait RunResultSink: Send + Sync {
+    async fn deliver_background_child_result(
+        &self,
+        router: Option<&Weak<dyn OutboundRouter>>,
+        parent_session_id: &str,
+        text: &str,
+        trust: SourceTrust,
+    ) -> anyhow::Result<bool>;
+
+    /// Every run one turn started has ended: continue that turn's request
+    /// once in its chat with the runs' typed results ([`RunsAnswer`]), and
+    /// send the reply there. `Ok(true)` once the reply reached the chat;
+    /// `Ok(false)` when no answer was written here (the caller then sends
+    /// each run's own result).
+    async fn answer_after_runs(&self, _answer: RunsAnswer) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+}
+
+/// The one continuation a turn's group of runs gets once its last run ended
+/// ([`RunResultSink::answer_after_runs`]).
+pub struct RunsAnswer {
+    pub hub: Option<Weak<dyn OutboundRouter>>,
+    /// The chat whose request started the runs.
+    pub chat: String,
+    /// That request's task: the continuation continues it.
+    pub parent_task_id: Option<String>,
+    /// The runs' results and measured times, from their records
+    /// ([`crate::helper_run::delivery::group_followup`]).
+    pub followup: String,
+    /// When the owner's request that started the runs came in, how many
+    /// ran and when the last ended: the answer's total is measured against
+    /// it.
+    pub clock: Option<crate::run_state::RequestClock>,
+}
+
 /// Where a background child's result goes: straight to the parent session
 /// through the hub, else the queue.
 pub struct BackgroundDelivery<'a> {
-    pub agent: &'a dyn ChildAgentRuntime,
+    pub agent: &'a dyn RunResultSink,
     pub hub: Option<&'a Weak<dyn OutboundRouter>>,
     pub state: Option<&'a Arc<dyn StateStore>>,
     pub session_id: &'a str,
@@ -226,7 +264,7 @@ impl BackgroundDelivery<'_> {
 /// Where a background run's result goes when the run ends, and what it
 /// settles there.
 pub struct ResultRoute {
-    pub agent: Arc<dyn ChildAgentRuntime>,
+    pub agent: Arc<dyn RunResultSink>,
     pub runs: Arc<crate::run_state::RunStates>,
     pub hub: Option<Weak<dyn OutboundRouter>>,
     pub state: Option<Arc<dyn StateStore>>,
@@ -372,7 +410,7 @@ async fn answer_group(
     let jobs: Vec<String> = ends.iter().map(|end| end.state.id.clone()).collect();
     let answered = route
         .agent
-        .answer_after_runs(crate::spawn::RunsAnswer {
+        .answer_after_runs(RunsAnswer {
             hub: route.hub.clone(),
             chat: chat.clone(),
             parent_task_id: route.parent_task_id.clone(),

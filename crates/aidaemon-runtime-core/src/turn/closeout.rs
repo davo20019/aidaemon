@@ -13,6 +13,9 @@ use aidaemon_events::RunObligation;
 use aidaemon_events::traits::ToolSemanticScope;
 use aidaemon_tools::semantics::ToolDispatchFacts;
 
+/// Extra passes the ledger may demand in one run.
+pub const MAX_CLOSEOUT_DEMANDS: u32 = 2;
+
 /// What closeout knows about a registered tool: whether it only reads, and
 /// the dispatch facts it states. A tool closeout does not know (an MCP or
 /// custom tool) has none.
@@ -268,7 +271,7 @@ impl StopDemand {
     pub fn budget(self) -> u32 {
         match self {
             Self::GuiClickVerification => 3,
-            Self::LedgerExpectations => crate::engine::stop::MAX_CLOSEOUT_DEMANDS,
+            Self::LedgerExpectations => MAX_CLOSEOUT_DEMANDS,
             Self::MandateDecisionCommit
             | Self::ReplyRepair
             | Self::CombinedVerification

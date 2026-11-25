@@ -3,13 +3,13 @@
 //! child had done, and the plain child's prompt. Building and running the
 //! child itself is the host's.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aidaemon_agents::specialist::SpecialistKind;
 use aidaemon_channels::context::ChannelContext;
-use aidaemon_channels::ports::{AgentResponseEnvelope, OutboundRouter};
+use aidaemon_channels::ports::AgentResponseEnvelope;
 use aidaemon_events::traits::AgentRole;
 use aidaemon_events::{EventType, TaskEndData, TaskOutcome};
 use aidaemon_tools::semantics::UserRole;
@@ -870,48 +870,7 @@ pub fn child_status_sender(
     Some(tx)
 }
 
-/// A short name for a child on the parent's status card: its mission's first
-/// line, cut to a phone-width length.
-pub fn child_status_label(mission: &str) -> String {
-    const MAX_CHARS: usize = 60;
-    // A path reads as the name of what it points at.
-    let line = mission
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .map(crate::background_run::plain_word)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let line = if line.is_empty() {
-        "Sub-agent"
-    } else {
-        line.as_str()
-    };
-    let is_path = |word: &str| word.contains('/') || word.contains('\\') || word.starts_with('~');
-    if line.chars().count() <= MAX_CHARS && !line.split_whitespace().any(is_path) {
-        return line.to_string();
-    }
-    // Whole words up to the limit, stopping before a path: a label never
-    // ends mid-word or mid-path (live 2026-11-13: "… in exactly
-    // /Users/alice/projects/cla").
-    let mut label = String::new();
-    for word in line.split_whitespace() {
-        let longer = label.chars().count() + usize::from(!label.is_empty()) + word.chars().count();
-        if is_path(word) || longer > MAX_CHARS - 1 {
-            break;
-        }
-        if !label.is_empty() {
-            label.push(' ');
-        }
-        label.push_str(word);
-    }
-    if label.is_empty() {
-        let cut: String = line.chars().take(MAX_CHARS - 1).collect();
-        return format!("{}…", cut.trim_end());
-    }
-    format!("{label}…")
-}
+pub use crate::helper_run::child_status_label;
 
 /// What a stopped child had done, from its typed tool records: every call to
 /// a tool not known to be read-only, finished or not. The child's session is
@@ -1346,7 +1305,7 @@ impl ChildAgentRequest {
 
 /// Child-delegation capability required by `spawn_agent`.
 #[async_trait]
-pub trait ChildAgentRuntime: Send + Sync {
+pub trait ChildAgentRuntime: crate::helper_run::delivery::RunResultSink {
     fn depth(&self) -> usize;
     fn max_depth(&self) -> usize;
     fn role(&self) -> AgentRole;
@@ -1398,43 +1357,11 @@ pub trait ChildAgentRuntime: Send + Sync {
 
     async fn mark_executor_task_timeout(&self, task_id: &str, timeout_secs: u64);
 
-    /// Every run one turn started has ended: continue that turn's request
-    /// once in its chat with the runs' typed results ([`RunsAnswer`]), and
-    /// send the reply there. `Ok(true)` once the reply reached the chat;
-    /// `Ok(false)` when no answer was written here (the caller then sends
-    /// each run's own result).
-    async fn answer_after_runs(&self, _answer: RunsAnswer) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    async fn deliver_background_child_result(
-        &self,
-        router: Option<&Weak<dyn OutboundRouter>>,
-        parent_session_id: &str,
-        text: &str,
-        trust: aidaemon_core::SourceTrust,
-    ) -> anyhow::Result<bool>;
-
     /// The run-state records of this agent tree's background helpers.
     fn helper_runs(&self) -> Arc<crate::run_state::RunStates>;
 }
 
-/// The one continuation a turn's group of runs gets once its last run ended
-/// ([`ChildAgentRuntime::answer_after_runs`]).
-pub struct RunsAnswer {
-    pub hub: Option<Weak<dyn OutboundRouter>>,
-    /// The chat whose request started the runs.
-    pub chat: String,
-    /// That request's task: the continuation continues it.
-    pub parent_task_id: Option<String>,
-    /// The runs' results and measured times, from their records
-    /// ([`crate::helper_run::delivery::group_followup`]).
-    pub followup: String,
-    /// When the owner's request that started the runs came in, how many
-    /// ran and when the last ended: the answer's total is measured against
-    /// it.
-    pub clock: Option<crate::run_state::RequestClock>,
-}
+pub use crate::helper_run::delivery::RunsAnswer;
 
 /// Owned input for re-entering an existing conversation.
 pub struct ConversationRequest {
@@ -1522,25 +1449,6 @@ pub struct ChildSpec {
     pub inherited_authority: crate::authority::InheritedAuthority,
     /// The child's progress clock: what keeps it from being stopped as idle.
     pub child_progress: Option<aidaemon_channels::owner_wait::ProgressClock>,
-}
-
-/// A child agent its host built: a turn host of its own that runs turns.
-#[async_trait]
-pub trait ChildAgent: crate::host::TurnHost {
-    /// Run one turn of the child.
-    async fn handle_message(
-        &self,
-        session_id: &str,
-        user_text: &str,
-        status_tx: Option<mpsc::Sender<StatusUpdate>>,
-        user_role: UserRole,
-        channel_ctx: ChannelContext,
-        heartbeat: Option<Arc<AtomicU64>>,
-    ) -> anyhow::Result<String>;
-
-    /// Set once any turn of the child read (or started with) untrusted
-    /// content, even when the taint could not be recorded.
-    fn read_untrusted(&self) -> Arc<std::sync::atomic::AtomicBool>;
 }
 
 #[cfg(test)]

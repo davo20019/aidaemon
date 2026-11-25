@@ -9,7 +9,6 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::engine::turn_engine::TurnEngine;
-use crate::host::TurnHost;
 use crate::turn::notes::TurnNotes;
 use aidaemon_work::scheduler::SchedulerStore;
 
@@ -327,7 +326,7 @@ pub async fn release_duplicate_dispatch_trigger(
 
 #[derive(Clone)]
 pub struct AutoDispatchContext {
-    agent: Arc<dyn TurnHost>,
+    agent: Arc<dyn crate::engine::engine_host::EngineHost>,
     state: Arc<dyn SchedulerStore>,
     mission: String,
     goal_id: String,
@@ -388,7 +387,7 @@ pub async fn execute_auto_dispatch_task(
 }
 
 pub async fn deliver_auto_dispatch_result(
-    agent: &Arc<dyn TurnHost>,
+    agent: &Arc<dyn crate::engine::engine_host::EngineHost>,
     state: &Arc<dyn SchedulerStore>,
     hub: Option<&Weak<dyn aidaemon_channels::ports::OutboundRouter>>,
     session_id: &str,
@@ -1126,7 +1125,7 @@ pub async fn emit_progress_surface(
 /// the goal and notifies the user when complete.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_background_task_lead(
-    agent: Arc<dyn TurnHost>,
+    agent: Arc<dyn crate::engine::engine_host::EngineHost>,
     goal: aidaemon_work::traits::Goal,
     user_text: String,
     session_id: String,

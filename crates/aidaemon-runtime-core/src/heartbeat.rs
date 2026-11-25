@@ -27,7 +27,6 @@ use aidaemon_work::scheduler::{
 };
 use aidaemon_work::traits::{Goal, Task};
 
-use crate::host::TurnHost;
 use crate::stores::StateStore;
 use crate::turn::notes::TurnNotes;
 
@@ -55,7 +54,7 @@ pub struct HeartbeatCoordinator {
     tick_interval: Duration,
     wake_rx: Option<mpsc::Receiver<()>>,
     hub: Option<Weak<dyn OutboundRouter>>,
-    agent: Option<Weak<dyn TurnHost>>,
+    agent: Option<Weak<dyn crate::engine::engine_host::EngineHost>>,
     goal_token_registry: Option<GoalTokenRegistry>,
     telemetry: Option<Arc<HeartbeatTelemetry>>,
 }
@@ -76,7 +75,7 @@ impl std::ops::DerefMut for HeartbeatCoordinator {
 
 /// The agent, as the goal cycle hands it task leads.
 struct AgentTaskLeads {
-    agent: Weak<dyn TurnHost>,
+    agent: Weak<dyn crate::engine::engine_host::EngineHost>,
     state: Arc<dyn StateStore>,
     hub: Option<Weak<dyn OutboundRouter>>,
     goal_token_registry: Option<GoalTokenRegistry>,
@@ -168,7 +167,7 @@ impl TaskLeadHost for AgentTaskLeads {
 }
 
 impl AgentTaskLeads {
-    fn live(&self) -> anyhow::Result<Arc<dyn TurnHost>> {
+    fn live(&self) -> anyhow::Result<Arc<dyn crate::engine::engine_host::EngineHost>> {
         self.agent
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("the agent runtime has stopped"))
@@ -179,7 +178,7 @@ impl AgentTaskLeads {
 /// history says when the owner last wrote in a chat.
 struct HubDelivery {
     hub: Weak<dyn OutboundRouter>,
-    agent: Option<Weak<dyn TurnHost>>,
+    agent: Option<Weak<dyn crate::engine::engine_host::EngineHost>>,
 }
 
 impl HubDelivery {
@@ -290,7 +289,7 @@ impl HeartbeatCoordinator {
 
     /// Set the agent reference (deferred, since agent is created before heartbeat starts).
     /// Used for dispatching orphaned pending tasks.
-    pub fn set_agent(&mut self, agent: Weak<dyn TurnHost>) {
+    pub fn set_agent(&mut self, agent: Weak<dyn crate::engine::engine_host::EngineHost>) {
         self.agent = Some(agent);
         self.wire_agent();
     }

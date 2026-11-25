@@ -7,44 +7,8 @@ use chrono::Utc;
 use regex::Regex;
 use std::sync::LazyLock;
 
-use aidaemon_events::TaskOutcome;
-
+pub use crate::memory_port::{LearnedCall, LearningContext};
 use crate::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
-
-#[derive(Clone)]
-pub struct LearningContext {
-    pub user_text: String,
-    /// False when the task's compiled capability policy suppresses all
-    /// automatic memory persistence. Canonical task/event telemetry is still
-    /// recorded; only learned procedures, expertise, and failure patterns are
-    /// skipped.
-    pub memory_persistence_allowed: bool,
-    pub intent_domains: Vec<String>,
-    pub tool_calls: Vec<LearnedCall>,
-    pub errors: Vec<(String, bool)>, // (error_text, was_recovered)
-    pub first_error: Option<String>,
-    pub recovery_actions: Vec<String>,
-    pub start_time: chrono::DateTime<Utc>,
-    pub completed_naturally: bool,
-    /// Semantic outcome emitted at task end; authoritative for learning when set.
-    pub task_outcome: Option<TaskOutcome>,
-}
-
-/// One call as post-task learning records it: its `tool_name(summary)`
-/// line (marked when it was rejected or failed, as memory reads it), and the
-/// typed facts the recap counts it by: the tool's `recap` kind and whether
-/// it ran to completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LearnedCall {
-    pub line: String,
-    /// What the call's arguments say, in a few words.
-    pub summary: String,
-    pub recap: aidaemon_tools::semantics::RecapKind,
-    /// Refused before it ran.
-    pub rejected: bool,
-    /// Ran and failed.
-    pub failed: bool,
-}
 
 impl LearnedCall {
     pub fn new(

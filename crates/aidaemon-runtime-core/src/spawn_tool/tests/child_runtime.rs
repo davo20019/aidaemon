@@ -139,6 +139,10 @@ impl ChildAgentRuntime for ScriptedChild {
             .unwrap()
             .push(task_id.to_string());
     }
+}
+
+#[async_trait]
+impl crate::helper_run::delivery::RunResultSink for ScriptedChild {
     async fn deliver_background_child_result(
         &self,
         _router: Option<&Weak<dyn OutboundRouter>>,

@@ -814,7 +814,7 @@ pub struct UntrustedVerifier<'a> {
     /// The side-call gateway the check goes through.
     pub gateway: &'a SideCallGateway,
     /// Where the check's decision point goes.
-    pub decisions: &'a dyn crate::host::DecisionRecorder,
+    pub decisions: &'a dyn crate::decisions::DecisionRecorder,
     pub emitter: &'a aidaemon_events::EventEmitter,
     pub task_id: &'a str,
     /// The request egress is judged against (a child inherits its root's
@@ -837,7 +837,7 @@ pub struct UntrustedVerifier<'a> {
     /// read when a call is judged, so "stop the counting job" sent mid-run
     /// is part of the request (live 2026-11-21: the `pkill` it asked for was
     /// held as "you asked to start a second counting job, not stop it").
-    pub steered: Option<&'a std::sync::Mutex<Vec<crate::engine::scope::AbsorbedSteering>>>,
+    pub steered: Option<&'a std::sync::Mutex<Vec<crate::steering::AbsorbedSteering>>>,
 }
 
 /// `request` followed by the messages the owner sent while the run worked,

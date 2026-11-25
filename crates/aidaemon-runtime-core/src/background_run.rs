@@ -159,32 +159,7 @@ pub fn plain_label(title: Option<&str>, fallback: &str) -> String {
     }
 }
 
-/// A word of a title as the owner reads it: a path is the name of what it
-/// points at.
-pub fn plain_word(word: &str) -> String {
-    let looks_like_path = word.starts_with('/')
-        || word.starts_with('~')
-        || word.matches('/').count() > 1
-        || word.contains('\\');
-    if !looks_like_path {
-        return word.to_string();
-    }
-    let trail: String = word
-        .chars()
-        .rev()
-        .take_while(|c| matches!(c, '.' | ',' | ';' | ':' | ')' | '"' | '\''))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let core = &word[..word.len() - trail.len()];
-    let name = core
-        .trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty() && *part != "~")
-        .unwrap_or(core);
-    format!("{name}{trail}")
-}
+pub use crate::helper_run::plain_word;
 
 /// Where a background run reports: the runtime's run records, the chat's
 /// hub and its checklists.

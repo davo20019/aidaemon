@@ -33,6 +33,8 @@ pub struct BootstrapCtx<'a> {
     /// Explicit parent for a runtime-generated continuation. Ordinary ingress
     /// and language-classified follow-ups leave this empty.
     pub parent_task_id: Option<&'a str>,
+    /// What a stop command cancels (the engine running the turn).
+    pub stop_work: &'a dyn super::shortcuts::StopSessionWork,
 }
 
 pub struct BootstrapData {

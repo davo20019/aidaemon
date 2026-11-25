@@ -38,6 +38,7 @@ pub mod task_planning;
 pub mod tool_dispatch;
 pub mod tool_facts;
 pub mod tool_result_notices;
+pub mod tool_roster;
 pub mod tool_summary;
 pub mod turn_context;
 pub mod turn_eviction;

@@ -4,6 +4,7 @@
 
 mod run;
 mod shortcuts;
+pub use shortcuts::StopSessionWork;
 mod types;
 
 pub use run::{GateFilterStage, run_bootstrap};
