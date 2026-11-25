@@ -352,12 +352,19 @@ jobs:
 
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks,cargo-hakari@0.9.39
 
       - name: Install Linux dependencies
         uses: ./.github/actions/apt-install
         with:
           packages: libdbus-1-dev pkg-config libssl-dev
+
+      # A published crate depends on the empty crates.io workspace-hack, so
+      # compare it as published: without the workspace's unified features
+      # (with them, tokio's extra features change auto traits such as
+      # UnwindSafe on types that hold its channels).
+      - name: Build as published (no feature unification)
+        run: cargo hakari disable
 
       - name: Check each public-contract crate
         run: |

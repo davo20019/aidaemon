@@ -47,7 +47,6 @@ hybrid-array = { version = "0.4", default-features = false, features = ["alloc",
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "service", "tokio"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher", "unlock_notify"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128"] }
@@ -104,7 +103,6 @@ axum-core = { version = "0.5", default-features = false, features = ["tracing"] 
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 bstr = { version = "1" }
-cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
 console = { version = "0.16" }
 crossbeam-utils = { version = "0.8" }
@@ -131,7 +129,6 @@ hybrid-array = { version = "0.4", default-features = false, features = ["alloc",
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "service", "tokio"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher", "unlock_notify"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128"] }

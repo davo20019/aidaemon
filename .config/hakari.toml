@@ -37,3 +37,12 @@ workspace-members = [
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
+
+# libsqlite3-sys is left to each build: the daemon's `encryption` feature
+# turns on SQLCipher (and OpenSSL with it) on purpose, and unifying it would
+# force SQLCipher into every build, including proc-macros such as
+# sqlx-macros, which then fail to link OpenSSL on Windows.
+[traversal-excludes]
+third-party = [
+    { name = "libsqlite3-sys" },
+]
