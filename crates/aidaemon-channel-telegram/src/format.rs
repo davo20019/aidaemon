@@ -171,7 +171,7 @@ fn render_table(table: &[&str], out: &mut String) {
     }
 }
 
-fn strip_heading(line: &str) -> Option<&str> {
+pub(crate) fn strip_heading(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     if !trimmed.starts_with('#') {
         return None;

@@ -10,7 +10,9 @@ pub fn markdown_to_plain_fallback(md: &str) -> String {
     let mut in_code_block = false;
 
     for line in md.lines() {
-        if line.starts_with("```") {
+        // The same line rules as the HTML converter: an indented fence, a
+        // heading of at most six `#`, and a bullet keeping its indent.
+        if line.trim_start().starts_with("```") {
             in_code_block = !in_code_block;
             continue;
         }
@@ -18,14 +20,16 @@ pub fn markdown_to_plain_fallback(md: &str) -> String {
         let processed = if in_code_block {
             line.to_string()
         } else {
-            let line = strip_heading(line).unwrap_or_else(|| line.to_string());
-            let line =
-                if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-                    format!("• {}", rest)
-                } else {
-                    line
-                };
-            convert_inline_formatting_to_plain(&line)
+            let line = crate::format::strip_heading(line).unwrap_or(line);
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            match trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                Some(rest) => format!("{indent}• {}", convert_inline_formatting_to_plain(rest)),
+                None => convert_inline_formatting_to_plain(line),
+            }
         };
 
         result.push_str(&processed);
@@ -36,18 +40,6 @@ pub fn markdown_to_plain_fallback(md: &str) -> String {
         result.pop();
     }
     result
-}
-
-/// Strip markdown heading prefix (e.g. "### Foo" → "Foo"). Returns None if not a heading.
-fn strip_heading(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        let after_hashes = trimmed.trim_start_matches('#');
-        if after_hashes.starts_with(' ') {
-            return Some(after_hashes.trim_start().to_string());
-        }
-    }
-    None
 }
 
 fn convert_inline_formatting_to_plain(s: &str) -> String {
@@ -193,6 +185,14 @@ pub fn split_text(text: &str, max_units: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::markdown_to_plain_fallback;
+
+    #[test]
+    fn line_rules_match_the_html_converter() {
+        assert_eq!(
+            markdown_to_plain_fallback("  ```\ncode\n  ```\n####### seven\n  - item"),
+            "code\n####### seven\n  • item"
+        );
+    }
 
     #[test]
     fn snake_case_keeps_its_underscores() {
