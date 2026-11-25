@@ -652,6 +652,15 @@ async fn app_file(
     serve_app_file(&gateway.config, &path, &headers).await
 }
 
+/// The served web app's policy, as the hosted copy's (`deploy/web/_headers`):
+/// no inline script (the build's only inline `<script>`s are JSON data,
+/// which never run), and nothing fetched over plain `ws:`/`http:` from
+/// another host. Its own origin, and over iroh the relays (`https:`/`wss:`).
+const APP_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+     connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline'; \
+     img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self'; \
+     manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
+
 pub(crate) async fn serve_app_file(
     config: &crate::ClientGatewayConfig,
     path: &str,
@@ -729,12 +738,7 @@ pub(crate) async fn serve_app_file(
         ));
     }
     if relative.ends_with(".html") {
-        headers.push((
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' ws: wss:; \
-             style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; \
-             frame-ancestors 'none'",
-        ));
+        headers.push((axum::http::header::CONTENT_SECURITY_POLICY, APP_CSP));
         // The app answers approvals: no other page may frame it.
         headers.push((axum::http::header::X_FRAME_OPTIONS, "DENY"));
         headers.push((axum::http::header::REFERRER_POLICY, "no-referrer"));
@@ -1217,6 +1221,25 @@ async fn replay(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_app_runs_no_inline_script_and_reaches_no_plain_ws_host() {
+        let csp = super::APP_CSP;
+        let script = csp
+            .split(';')
+            .find(|d| d.trim().starts_with("script-src"))
+            .unwrap();
+        assert!(!script.contains("unsafe-inline"), "{script}");
+        let connect = csp
+            .split(';')
+            .find(|d| d.trim().starts_with("connect-src"))
+            .unwrap();
+        assert!(
+            !connect.contains(" ws:") && !connect.contains(" http:"),
+            "{connect}"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
     #[test]
     fn app_paths_stay_inside_the_directory() {
         use super::app_path;
