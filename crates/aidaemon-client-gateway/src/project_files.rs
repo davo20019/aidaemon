@@ -15,7 +15,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command as Process;
 use std::time::UNIX_EPOCH;
 
 use aidaemon_client_protocol::{
@@ -352,7 +351,9 @@ impl GitState {
         Some(GitState {
             top,
             branch,
-            changes: parse_status(&status),
+            changes: crate::git::parse_status(status.as_bytes())
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -387,59 +388,9 @@ impl GitState {
     }
 }
 
-/// `git status --porcelain=v1 -z`'s records: path to how it changed. A
-/// rename's record is followed by its old path, skipped.
-fn parse_status(out: &str) -> BTreeMap<String, FileStatus> {
-    let mut changes = BTreeMap::new();
-    let mut records = out.split('\0');
-    while let Some(record) = records.next() {
-        if record.len() < 4 {
-            continue;
-        }
-        let (code, path) = record.split_at(3);
-        let mut code = code.chars();
-        let (x, y) = (code.next().unwrap_or(' '), code.next().unwrap_or(' '));
-        let status = match (x, y) {
-            ('?', _) => FileStatus::Untracked,
-            ('R', _) | (_, 'R') => {
-                records.next();
-                FileStatus::Renamed
-            }
-            ('A', _) => FileStatus::Added,
-            ('D', _) | (_, 'D') => FileStatus::Deleted,
-            _ => FileStatus::Modified,
-        };
-        changes.insert(path.to_owned(), status);
-    }
-    changes
-}
-
+/// A project folder's git output, as text.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    // A project folder's repository is not the daemon's: none of the
-    // programs its own configuration names runs here
-    // (`aidaemon_tools::git_guard`).
-    let listing = run_git(dir, &[], aidaemon_tools::git_guard::DRIVER_LISTING_ARGS)
-        .map(String::into_bytes)
-        .unwrap_or_default();
-    let guard = aidaemon_tools::git_guard::untrusted_repo_config_args(&listing).ok()?;
-    run_git(dir, &guard, args)
-}
-
-fn run_git(dir: &Path, guard: &[String], args: &[&str]) -> Option<String> {
-    let out = Process::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "core.quotepath=false"])
-        .args(guard)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::git::git(dir, args).map(|out| String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -595,7 +546,9 @@ mod tests {
     #[test]
     fn status_records_parse() {
         let out = " M src/a.rs\0?? notes.md\0R  new.rs\0old.rs\0D  gone.rs\0";
-        let changes = parse_status(out);
+        let changes: BTreeMap<String, FileStatus> = crate::git::parse_status(out.as_bytes())
+            .into_iter()
+            .collect();
         assert_eq!(changes["src/a.rs"], FileStatus::Modified);
         assert_eq!(changes["notes.md"], FileStatus::Untracked);
         assert_eq!(changes["new.rs"], FileStatus::Renamed);

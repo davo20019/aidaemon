@@ -52,6 +52,7 @@ pub mod client_feature;
 pub mod client_view;
 mod config;
 pub mod files;
+pub mod git;
 mod observer;
 mod pair_page;
 pub mod pairing;

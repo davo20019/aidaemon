@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use aidaemon_client_protocol::{CheckRun, FileChange, FileStatus, RepoChanges, SessionChanges};
 use serde_json::Value;
@@ -25,9 +24,6 @@ const MAX_FILES: usize = 500;
 const MAX_PATCH_BYTES: usize = 512 * 1024;
 /// An untracked file larger than this is listed but not shown in the patch.
 const MAX_UNTRACKED_BYTES: u64 = 256 * 1024;
-/// One git command may take this long.
-const GIT_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// The changes of session `session_id`.
 pub(crate) async fn session_changes(
     pool: &sqlx::SqlitePool,
@@ -388,32 +384,7 @@ async fn repo_changes(root: &Path, written: &BTreeSet<String>) -> Option<RepoCha
     })
 }
 
-/// `git status --porcelain=v1 -z` entries: path and status.
-pub(crate) fn parse_status(out: &[u8]) -> Vec<(String, FileStatus)> {
-    let mut entries = Vec::new();
-    let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
-    while let Some(entry) = fields.next() {
-        if entry.len() < 4 {
-            continue;
-        }
-        let (x, y) = (entry[0], entry[1]);
-        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
-        let status = match (x, y) {
-            (b'?', b'?') => FileStatus::Untracked,
-            (b'!', b'!') => continue,
-            (b'R', _) | (_, b'R') | (b'C', _) => {
-                // The old path follows as its own field.
-                fields.next();
-                FileStatus::Renamed
-            }
-            (b'D', _) | (_, b'D') => FileStatus::Deleted,
-            (b'A', _) => FileStatus::Added,
-            _ => FileStatus::Modified,
-        };
-        entries.push((path, status));
-    }
-    entries
-}
+pub(crate) use aidaemon_client_gateway::git::parse_status;
 
 /// `git diff --numstat -z` lines: path to (added, removed). A rename is
 /// keyed by its new path; a binary file counts 0 and 0.
@@ -548,33 +519,18 @@ pub(crate) async fn revert_file(
         .map_err(|e| format!("Undone, but the changes could not be read again: {e}"))
 }
 
+/// A guarded git command in an agent-written repository
+/// (`aidaemon_client_gateway::git::git`), off the async threads.
 async fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    // Agents wrote to this repository: none of the programs its own
-    // configuration names runs here (`aidaemon_tools::git_guard`).
-    let listing = run_git(dir, &[], aidaemon_tools::git_guard::DRIVER_LISTING_ARGS)
-        .await
-        .unwrap_or_default();
-    let guard = aidaemon_tools::git_guard::untrusted_repo_config_args(&listing).ok()?;
-    run_git(dir, &guard, args).await
-}
-
-async fn run_git(dir: &Path, guard: &[String], args: &[&str]) -> Option<Vec<u8>> {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "core.quotepath=false"])
-        .args(guard)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(GIT_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    out.status.success().then_some(out.stdout)
+    let dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        aidaemon_client_gateway::git::git(&dir, &args)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
