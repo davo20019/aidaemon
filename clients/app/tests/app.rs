@@ -784,6 +784,14 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     )]);
     app.wait_for("text:Codex: Write /w/synthetic/reviews/codex.md")?;
     let before = sent("resolve_approval");
+    // A click the moment the line appears answers nothing: it may have
+    // been aimed at what was there before.
+    app.press("Allow")?;
+    settle(&mut app)?;
+    if sent("resolve_approval") != before {
+        return Err("an approval answered the moment it appeared".into());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
     app.press("Allow")?;
     wait_sent_new("resolve_approval", before)?;
     feed([frame(

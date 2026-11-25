@@ -180,6 +180,7 @@ pub fn card(store: Store, approval: Approval) -> View {
         store.approvals_taught();
     }
     let id = approval.id.clone();
+    store.card_shown(&id);
     ui::surface()
         .border_color(risk_tone.color())
         // The card a view move brought up stands out until answered.
@@ -274,7 +275,7 @@ pub fn card(store: Store, approval: Approval) -> View {
                 // What an answer covers, in words and for screen readers.
                 let resolve_id = id.clone();
                 let button = btn(label, variant, Size::Sm, move || {
-                    store.resolve(&resolve_id, d)
+                    store.resolve_clicked(&resolve_id, d)
                 })
                 .accessibility_label(scope(d));
                 // The terminal answers the card its keys reach with one key

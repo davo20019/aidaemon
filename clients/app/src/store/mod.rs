@@ -564,6 +564,9 @@ pub struct Store {
     /// The terminal's approval keys: when the card they answer came into
     /// view, and a first press of the key that allows for the session.
     key_arming: Stored<KeyArming>,
+    /// The approval buttons' arming: when each card was first drawn and
+    /// when the view last moved (see [`Store::resolve_clicked`]).
+    click_arming: Stored<ClickArming>,
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
@@ -654,6 +657,7 @@ impl Store {
             live_typed: signal(None),
             live_room_sent: stored(None),
             key_arming: stored(KeyArming::default()),
+            click_arming: stored(ClickArming::default()),
             media: stored(None),
             media_epoch: stored(0),
             shell: stored(None),
@@ -2551,6 +2555,11 @@ impl Store {
     }
 
     fn move_view(&self, request: ViewRequest) {
+        // A card the move brings up, or shifts, is not under a pointer the
+        // owner aimed at it: its buttons arm again.
+        let mut arming = self.click_arming.get();
+        arming.view_moved_at = now_ms();
+        self.click_arming.replace(arming);
         let what = self.describe(&request.action);
         let note = match request.action {
             ViewAction::OpenSession { session_id } => {
@@ -3555,6 +3564,38 @@ impl Store {
         self.act(|c| c.resolve(approval, decision));
     }
 
+    /// An approval card (or its sidebar line) is being drawn: its buttons
+    /// arm [`KEYS_ARM_AFTER_MS`] after the first time.
+    pub fn card_shown(&self, approval: &str) {
+        let waiting: BTreeSet<String> = self
+            .client
+            .with_untracked(|c| c.state.approvals.keys().cloned().collect());
+        let mut arming = self.click_arming.get();
+        arming.cards.retain(|id, _| waiting.contains(id));
+        arming
+            .cards
+            .entry(approval.to_owned())
+            .or_insert_with(now_ms);
+        self.click_arming.replace(arming);
+    }
+
+    /// Answer an approval from a button. Allowing waits until the card has
+    /// been drawn, and the view still, for [`KEYS_ARM_AFTER_MS`]: a card
+    /// that appears, or that an agent's view move shifts, under a click
+    /// aimed at something else answers nothing. Denying is never held.
+    pub fn resolve_clicked(&self, approval: &str, decision: ApprovalDecision) {
+        if decision != ApprovalDecision::Deny {
+            let mut arming = self.click_arming.get();
+            let armed = click_armed(&mut arming, approval, now_ms());
+            self.click_arming.replace(arming);
+            if !armed {
+                self.say("The approval just appeared: read it, then click again to answer it");
+                return;
+            }
+        }
+        self.resolve(approval, decision);
+    }
+
     /// The approval of the conversation on screen that single keys answer
     /// now (its oldest, while the composer is empty): its id.
     pub fn key_approval(&self) -> Option<String> {
@@ -3691,6 +3732,22 @@ struct KeyArming {
     session_key: Option<(String, u64)>,
 }
 
+/// See [`Store::card_shown`] and [`Store::resolve_clicked`].
+#[derive(Clone, Default)]
+struct ClickArming {
+    /// Each waiting approval's card: when it was first drawn.
+    cards: BTreeMap<String, u64>,
+    /// When the agent last moved the view.
+    view_moved_at: u64,
+}
+
+/// Whether a click on an allowing button of `approval` answers it at `now`.
+/// A card not seen drawn yet is being drawn now.
+fn click_armed(arming: &mut ClickArming, approval: &str, now: u64) -> bool {
+    let shown = *arming.cards.entry(approval.to_owned()).or_insert(now);
+    now.saturating_sub(shown.max(arming.view_moved_at)) >= KEYS_ARM_AFTER_MS
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum KeyPress {
     TooSoon,
@@ -3794,6 +3851,28 @@ mod key_press_tests {
             key_press(&mut arming, "app:s1", "a3", ApproveSession, 9_000),
             KeyPress::Again
         );
+    }
+}
+
+#[cfg(test)]
+mod click_arming_tests {
+    use super::{ClickArming, click_armed};
+
+    #[test]
+    fn approval_buttons_wait_for_the_card_and_the_view_to_settle() {
+        let mut arming = ClickArming::default();
+        arming.cards.insert("a1".into(), 10_000);
+        // A click the moment the card is drawn answers nothing.
+        assert!(!click_armed(&mut arming, "a1", 10_400));
+        assert!(click_armed(&mut arming, "a1", 11_000));
+        // The agent moves the view: the card may now sit under the
+        // pointer, so its buttons wait again.
+        arming.view_moved_at = 20_000;
+        assert!(!click_armed(&mut arming, "a1", 20_300));
+        assert!(click_armed(&mut arming, "a1", 21_000));
+        // A card never seen drawn is being drawn now.
+        assert!(!click_armed(&mut arming, "a2", 30_000));
+        assert!(click_armed(&mut arming, "a2", 31_000));
     }
 }
 
