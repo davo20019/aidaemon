@@ -90,6 +90,8 @@ install() {
         err "No sha256sum or shasum found: the download cannot be verified. Install one and run this again."
     fi
 
+    verify_signature "${_tmpdir}/${TARBALL}" "${URL}.sig"
+
     info "Extracting..."
     tar -xzf "${_tmpdir}/${TARBALL}" -C "$_tmpdir"
 
@@ -213,11 +215,39 @@ run_post_install_migration() {
     fi
 
     # Common config locations for upgrades
-    try_migrate_config "$PWD/config.toml" && return 0
     try_migrate_config "${HOME}/.aidaemon/config.toml" && return 0
     try_migrate_config "${HOME}/.config/aidaemon/config.toml" && return 0
 
     info "No existing config.toml found; migration will run automatically on first launch"
+}
+
+# The project's release signing key (ed25519); the same key is pinned in
+# src/updater.rs and kept in scripts/release-signing-key.pub.pem.
+RELEASE_SIGNING_PUBLIC_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAmZc8XNy3woKHk/HyaySZoCnnxLjTofoAS2CD74kfDjE=
+-----END PUBLIC KEY-----'
+
+# Check the archive's detached signature (<archive>.sig) with the release
+# key. A release older than signing has none: the checksum above is then
+# all there is, and this says so. With no OpenSSL that verifies ed25519
+# (3.0 or newer) the check is skipped with a warning.
+verify_signature() {
+    archive="$1"
+    sig_url="$2"
+    if ! curl --proto '=https' --tlsv1.2 -sSfL "$sig_url" -o "${archive}.sig" 2>/dev/null; then
+        warn "This release has no signature; it was checked against its checksum only"
+        return 0
+    fi
+    if ! command -v openssl >/dev/null 2>&1 \
+        || ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+        warn "No OpenSSL 3 found to check the release signature; checked against its checksum only"
+        return 0
+    fi
+    printf '%s\n' "$RELEASE_SIGNING_PUBLIC_KEY" > "${archive}.pub.pem"
+    info "Verifying signature..."
+    openssl pkeyutl -verify -pubin -inkey "${archive}.pub.pem" -rawin \
+        -in "$archive" -sigfile "${archive}.sig" >/dev/null 2>&1 \
+        || err "Signature verification failed: this archive was not signed with the AIDaemon release key."
 }
 
 post_install() {

@@ -97,6 +97,8 @@ Everything that runs on its own is an automation, of two kinds. **Scheduled** au
 ### Security
 Terminal command allowlists, inline approval flow (Allow / Allow until restart or Always allow / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
 
+The database key is kept in the OS keychain (config.toml says `encryption_key = "keychain"`); an older install's key in `.env` moves there on the next start that opens the database. On a machine with no usable keychain (a headless Linux server) it stays in `.env`, owner-only, beside the database: a backup or synced copy of the daemon's folder then carries both, so keep such copies as private as the data itself. Release downloads carry an ed25519 signature (`<file>.sig`, key in `scripts/release-signing-key.pub.pem`); the daemon's self-update installs only a signed release, and `install.sh` checks the signature where OpenSSL 3 is available.
+
 ## Running as a Service
 
 ```bash

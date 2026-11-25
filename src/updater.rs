@@ -21,6 +21,73 @@ const REPO_NAME: &str = "aidaemon";
 const BIN_NAME: &str = "aidaemon";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The project's release signing key (ed25519, raw 32 bytes). release.yml
+/// signs every archive with its private half (the `RELEASE_SIGNING_KEY`
+/// secret); scripts/release-signing-key.pub.pem and install.sh carry the
+/// same key.
+pub(crate) const RELEASE_SIGNING_PUBLIC_KEY: [u8; 32] = [
+    0x99, 0x97, 0x3c, 0x5c, 0xdc, 0xb7, 0xc2, 0x82, 0x87, 0x93, 0xf1, 0xf2, 0x6b, 0x24, 0x99, 0xa0,
+    0x29, 0xe7, 0xc4, 0xb8, 0xd3, 0xa1, 0xfa, 0x00, 0x4b, 0x60, 0x83, 0xef, 0x89, 0x1f, 0x0e, 0x31,
+];
+
+/// A release archive is a few tens of MB; anything far past that is not one.
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Check `signature` (raw 64 bytes, or that base64-encoded on one line) over
+/// `archive` with `key`.
+pub(crate) fn verify_release_signature(
+    archive: &[u8],
+    signature: &[u8],
+    key: &[u8; 32],
+) -> Result<(), &'static str> {
+    use base64::Engine as _;
+    let raw: Vec<u8> = if signature.len() == 64 {
+        signature.to_vec()
+    } else {
+        let text = std::str::from_utf8(signature).map_err(|_| "the signature is malformed")?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .map_err(|_| "the signature is malformed")?
+    };
+    let signature =
+        ed25519_dalek::Signature::from_slice(&raw).map_err(|_| "the signature is malformed")?;
+    let key =
+        ed25519_dalek::VerifyingKey::from_bytes(key).map_err(|_| "the release key is invalid")?;
+    key.verify_strict(archive, &signature)
+        .map_err(|_| "the signature does not match the release key")
+}
+
+/// A daemon running as root would replace a binary that runs every later
+/// start as root; updates there go through the package manager or a
+/// reinstall instead.
+fn refuse_as_root() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            anyhow::bail!(
+                "AIDaemon is running as root: it does not update itself there. \
+                 Reinstall it, or run it as your own user (`aidaemon service install`)."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn download_asset(url: &str, dest: &std::path::Path, max_bytes: u64) -> anyhow::Result<()> {
+    let file = std::fs::File::create(dest)?;
+    self_update::Download::from_url(url)
+        .show_download_progress(false)
+        .max_download_size(max_bytes)
+        .timeout(Duration::from_secs(300))
+        .request_header(
+            self_update::http::header::ACCEPT,
+            "application/octet-stream",
+        )
+        .download_to(file)?;
+    Ok(())
+}
+
 pub struct Updater {
     config: UpdateConfig,
     hub: Arc<ChannelHub>,
@@ -89,14 +156,15 @@ impl Updater {
             .map_err(|e| anyhow::anyhow!("Update check task panicked: {}", e))?
     }
 
-    /// Download the latest release and replace the current binary.
+    /// Download the latest release, check its signature and replace the
+    /// current binary.
     ///
-    /// SECURITY NOTE: The download relies on HTTPS transport security only.
-    /// No cryptographic signature or checksum verification of the binary is
-    /// performed. If the GitHub repository or release assets are compromised,
-    /// a malicious binary could be distributed. For maximum security, use
-    /// `UpdateMode::CheckOnly` to require manual approval before applying
-    /// updates, or `UpdateMode::Disable` to manage updates out-of-band.
+    /// The archive is replaced only when its detached signature
+    /// (`<archive>.sig`, ed25519 over the archive's bytes, made by
+    /// release.yml with the project's release key) verifies against
+    /// [`RELEASE_SIGNING_PUBLIC_KEY`]: a compromised release asset, mirror or
+    /// repository token alone cannot push a binary. A release without a
+    /// signature is refused, not installed.
     fn perform_update() -> anyhow::Result<String> {
         if crate::daemon::in_signed_app() {
             anyhow::bail!(
@@ -104,25 +172,73 @@ impl Updater {
                  (its .dmg) to update both."
             );
         }
-        warn!(
-            "Applying update with HTTPS transport security only — \
-             no binary signature verification is available"
-        );
+        refuse_as_root()?;
         let identifier = Self::platform_asset_identifier()?;
         let target_asset = format!("{}-{}.tar.gz", BIN_NAME, identifier);
 
-        let status = self_update::backends::github::Update::configure()
+        let releases = self_update::backends::github::ReleaseList::configure()
             .repo_owner(REPO_OWNER)
             .repo_name(REPO_NAME)
-            .bin_name(BIN_NAME)
-            .asset_identifier(&target_asset)
-            .current_version(CURRENT_VERSION)
-            .no_confirm(true)
-            .show_download_progress(false)
             .build()?
-            .update()?;
+            .fetch()?;
+        let latest = releases
+            .latest()
+            .ok_or_else(|| anyhow::anyhow!("No release found"))?;
+        let version = latest.version().trim_start_matches('v').to_string();
+        let is_newer = matches!(
+            (semver::Version::parse(CURRENT_VERSION), semver::Version::parse(&version)),
+            (Ok(current), Ok(latest)) if latest > current
+        );
+        if !is_newer {
+            anyhow::bail!("v{version} is not newer than v{CURRENT_VERSION}");
+        }
+        let asset_url = |name: &str| {
+            latest
+                .assets()
+                .iter()
+                .find(|asset| asset.name() == name)
+                .map(|asset| asset.download_url().to_string())
+        };
+        let archive_url = asset_url(&target_asset)
+            .ok_or_else(|| anyhow::anyhow!("v{version} has no {target_asset}"))?;
+        let signature_url = asset_url(&format!("{target_asset}.sig")).ok_or_else(|| {
+            anyhow::anyhow!(
+                "v{version} is not signed ({target_asset}.sig is missing): not installing it"
+            )
+        })?;
 
-        Ok(status.version().to_string())
+        let work = tempfile::tempdir()?;
+        let archive_path = work.path().join(&target_asset);
+        download_asset(&archive_url, &archive_path, MAX_ARCHIVE_BYTES)?;
+        let signature_path = work.path().join("archive.sig");
+        download_asset(&signature_url, &signature_path, 1024)?;
+        let archive = std::fs::read(&archive_path)?;
+        let signature = std::fs::read(&signature_path)?;
+        verify_release_signature(&archive, &signature, &RELEASE_SIGNING_PUBLIC_KEY)
+            .map_err(|why| anyhow::anyhow!("v{version}: {why}: not installing it"))?;
+        info!(version = %version, "Release signature verified");
+
+        let unpacked = work.path().join("unpacked");
+        std::fs::create_dir(&unpacked)?;
+        self_update::Extract::from_source(&archive_path)
+            .archive(self_update::ArchiveKind::Tar(Some(
+                self_update::Compression::Gz,
+            )))
+            .extract_into(&unpacked)?;
+        let new_binary = unpacked.join(BIN_NAME);
+        let metadata = std::fs::symlink_metadata(&new_binary)
+            .map_err(|_| anyhow::anyhow!("v{version}'s archive has no {BIN_NAME}"))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "v{version}'s {BIN_NAME} is not a regular file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&new_binary, std::fs::Permissions::from_mode(0o755))?;
+        }
+        self_replace::self_replace(&new_binary)?;
+        Ok(version)
     }
 
     /// Async wrapper for the blocking update operation.
@@ -352,5 +468,53 @@ impl Updater {
             today_target_utc + chrono::Duration::days(1)
         };
         (target - now).to_std().unwrap_or(Duration::from_secs(3600))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+
+    #[test]
+    fn only_an_archive_signed_with_the_key_passes() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key = signing.verifying_key().to_bytes();
+        let archive = b"synthetic release archive";
+        let signature = signing.sign(archive).to_bytes();
+        assert!(verify_release_signature(archive, &signature, &key).is_ok());
+        let as_text = base64::engine::general_purpose::STANDARD.encode(signature);
+        assert!(verify_release_signature(archive, as_text.as_bytes(), &key).is_ok());
+        assert!(verify_release_signature(b"tampered archive", &signature, &key).is_err());
+        assert!(
+            verify_release_signature(archive, &signature, &RELEASE_SIGNING_PUBLIC_KEY).is_err()
+        );
+        assert!(verify_release_signature(archive, b"", &key).is_err());
+    }
+
+    #[test]
+    fn an_openssl_signature_from_the_release_key_verifies() {
+        // Made with the release key the way release.yml signs an archive:
+        // `openssl pkeyutl -sign -inkey <key> -rawin -in msg -out msg.sig`.
+        let message = b"aidaemon release signing check\n";
+        let signature = "vN7BTePMI2L67uZ11044+XevdrjkBa3ervwoL7HioewN5z6ZN1UCa3j5fj26Bml3XbCZBOFJNm8ogyex94yaBg==";
+        assert!(
+            verify_release_signature(message, signature.as_bytes(), &RELEASE_SIGNING_PUBLIC_KEY)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_pinned_key_is_the_one_in_the_repository() {
+        let pem = include_str!("../scripts/release-signing-key.pub.pem");
+        let body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        assert_eq!(der[der.len() - 32..], RELEASE_SIGNING_PUBLIC_KEY);
     }
 }
