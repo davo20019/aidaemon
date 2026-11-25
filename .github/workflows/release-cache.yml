@@ -1,0 +1,121 @@
+name: Release cache
+
+# Keeps release.yml's dependency builds warm. A tag's own caches are not
+# shared with later tags, so release builds restore what this workflow saved
+# on master (same `shared-key` per target) and recompile only the workspace
+# crates. Dependencies change only with Cargo.lock or the toolchain, so it
+# runs then, weekly (GitHub evicts caches unused for 7 days) and on demand.
+on:
+  push:
+    branches: [master]
+    paths:
+      - Cargo.lock
+      - clients/app/Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/release-cache.yml
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+
+# Must match release.yml: rust-cache's key hashes CARGO*/RUST* variables.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "8388608"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: Warm ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, name: linux-x86_64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, name: linux-aarch64 }
+          - { target: x86_64-apple-darwin, os: macos-15, name: macos-x86_64 }
+          - { target: aarch64-apple-darwin, os: macos-15, name: macos-aarch64 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, name: windows-x86_64 }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libdbus-1-dev pkg-config libssl-dev libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev clang
+
+      - name: ONNX Runtime (Intel Mac)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: scripts/onnxruntime-intel-mac.sh "$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: runner.os == 'Windows'
+        id: openssl
+        with:
+          path: C:\vcpkg\installed\x64-windows-static-md
+          key: vcpkg-openssl-x64-windows-static-md-v1
+
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows' && steps.openssl.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: vcpkg install openssl:x64-windows-static-md
+
+      - name: Point the build at OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # The ARM runner runs out of memory linking the release build without it.
+      - name: Add swap (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile >/dev/null
+          sudo swapon /mnt/swapfile
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-${{ matrix.name }}
+          workspaces: |
+            . -> target
+            clients/app -> clients/app/target
+
+      # The same commands as release.yml, so the dependency units match.
+      - name: Build daemon
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = Windows ]; then
+            cargo build --release --locked --features "browser" --bin aidaemon
+          else
+            cargo build --release --target ${{ matrix.target }} --features "browser" --bin aidaemon
+          fi
+
+      - name: Build app
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = Windows ]; then
+            cargo build --release --locked --manifest-path clients/app/Cargo.toml
+          else
+            cargo build --release --locked --target ${{ matrix.target }} --manifest-path clients/app/Cargo.toml
+          fi

@@ -217,9 +217,23 @@ jobs:
           free -h
           df -h / /mnt
 
+      # Dependencies from release-cache.yml's master build (a tag's own cache
+      # would never be read again, so nothing is saved here).
+      - name: Restore release dependency cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-${{ matrix.name }}
+          save-if: false
+          workspaces: |
+            . -> target
+            clients/app -> clients/app/target
+
+      # Only the shipped binary: the dev tools (db_probe, node_simulator,
+      # k10_provision) would each get their own thin-LTO link competing for
+      # the runner's cores (163 s -> 88 s for a rebuild on a 14-core Mac).
       - name: Build (native)
         if: '!matrix.cross'
-        run: cargo build --release --target ${{ matrix.target }} --features "browser"
+        run: cargo build --release --target ${{ matrix.target }} --features "browser" --bin aidaemon
 
       - name: Build (cross)
         if: matrix.cross
@@ -320,8 +334,19 @@ jobs:
         run: |
           "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # Dependencies from release-cache.yml's master build (a tag's own cache
+      # would never be read again, so nothing is saved here).
+      - name: Restore release dependency cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-windows-x86_64
+          save-if: false
+          workspaces: |
+            . -> target
+            clients/app -> clients/app/target
+
       - name: Build daemon
-        run: cargo build --release --locked --features "browser"
+        run: cargo build --release --locked --features "browser" --bin aidaemon
 
       - name: Build app
         run: cargo build --release --locked --manifest-path clients/app/Cargo.toml
