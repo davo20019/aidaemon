@@ -1631,3 +1631,142 @@ pub fn labeled(caption: &'static str, control: impl IntoElement) -> View {
         )
         .child(control)
 }
+
+/// Whether a document's image loads without being asked for: one that comes
+/// from no host (a relative path on the daemon, `data:`, `blob:` or an app
+/// asset). A URL scheme with a host would let whatever wrote the document (a
+/// model, a page it read) make this device fetch an address of its choosing,
+/// and put data in that address, just by showing it.
+pub fn image_loads_unasked(src: &str) -> bool {
+    let src = src.trim();
+    // Machine format: a URL's scheme. A protocol-relative `//host/...` names
+    // a host too.
+    if src.starts_with("//") || src.starts_with("\\\\") {
+        return false;
+    }
+    match src.split_once(':') {
+        None => true,
+        Some((scheme, _)) => {
+            let is_scheme = scheme.len() > 1
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+            // `C:\x` and other one-letter "schemes" are paths; anything
+            // with a scheme loads only when it names no host.
+            if !is_scheme {
+                return !src.contains('\\');
+            }
+            matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "data" | "blob" | "asset"
+            )
+        }
+    }
+}
+
+/// The host a document's image would be fetched from, for its placeholder.
+fn image_host(src: &str) -> String {
+    let rest = src
+        .trim()
+        .split_once("//")
+        .map(|(_, rest)| rest)
+        .unwrap_or(src);
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if host.is_empty() {
+        "another site".to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
+/// An image in a reply's Markdown (`render_image`). One from another site
+/// shows as a placeholder naming that site until the owner loads it; a
+/// terminal shows its words.
+pub fn markdown_image(shown: &nsh_base::text_view::Image) -> View {
+    let src = shown.src.clone();
+    let alt = if shown.alt.trim().is_empty() {
+        "Image".to_owned()
+    } else {
+        shown.alt.clone()
+    };
+    let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
+    if terminal {
+        return view().child(
+            text(format!("[{alt}]"))
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+        );
+    }
+    let picture = {
+        let (src, alt) = (src.clone(), alt.clone());
+        move || {
+            image(src.clone())
+                .max_w(percentage(1.0))
+                .object_fit(ResizeMode::Contain)
+                .label(SharedString::from(alt.clone()))
+        }
+    };
+    if image_loads_unasked(&src) {
+        return view().child(picture());
+    }
+    let loaded = signal(false);
+    let host = image_host(&src);
+    view().child(dynamic(move || {
+        if loaded.get() {
+            return Some(view().child(picture()));
+        }
+        let (alt, host) = (alt.clone(), host.clone());
+        Some(untracked(move || {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded(px(radius::SMALL))
+                .bg(colors::INSET)
+                .child(
+                    text(format!("{alt} · from {host}"))
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::MUTED),
+                )
+                .child(btn("Load image", Variant::Ghost, Size::Sm, move || {
+                    loaded.set(true)
+                }))
+        }))
+    }))
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::image_loads_unasked;
+
+    #[test]
+    fn only_images_from_no_host_load_unasked() {
+        for src in [
+            "/client/v1/files/abc",
+            "files/abc.png",
+            "data:image/png;base64,AAAA",
+            "blob:https://app.example.invalid/1",
+            "asset:logo.png",
+        ] {
+            assert!(image_loads_unasked(src), "{src}");
+        }
+        for src in [
+            "https://attacker.example.invalid/p?d=secret",
+            "http://127.0.0.1:8080/x",
+            "//attacker.example.invalid/x",
+            "\\\\attacker.example.invalid\\share\\x.png",
+            "ftp://host.example.invalid/x",
+            "file:///etc/passwd",
+        ] {
+            assert!(!image_loads_unasked(src), "{src}");
+        }
+    }
+}

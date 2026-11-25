@@ -3130,9 +3130,12 @@ impl Store {
             .replace(base.trim_end_matches('/').to_owned());
     }
 
-    /// Where to fetch `file`.
+    /// Where to fetch `file`: on the gateway, under its own path. The
+    /// daemon's `url` is appended to the gateway's address, so anything but
+    /// a path there (`@other.host/…`, `.other.host/…`, `//…`) could name
+    /// another host; such a link is no file of this daemon's.
     pub fn file_url(&self, file: &AttachmentRef) -> Option<String> {
-        let url = file.url.as_deref()?;
+        let url = gateway_file_path(file.url.as_deref()?)?;
         Some(format!("{}{url}", self.gateway_base.with(|b| b.clone())))
     }
 
@@ -3623,4 +3626,39 @@ fn stored_lines(key: &str) -> Vec<String> {
 fn store_lines<'a>(key: &str, ids: impl Iterator<Item = &'a String>) {
     let text = ids.cloned().collect::<Vec<_>>().join("\n");
     let _ = nsh_core::storage::Storage::set_item(key, text);
+}
+
+/// A file's link as the gateway serves it: a path under `/client/v1/`
+/// without `..`, a backslash or a second `//` (machine format: a URL path).
+fn gateway_file_path(url: &str) -> Option<&str> {
+    let path = url.strip_prefix("/client/v1/")?;
+    let clean = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains("//")
+        && !path.contains('\\')
+        && !path.split(['/', '?']).any(|part| part == "..")
+        && !url.chars().any(|c| c.is_control() || c == '@');
+    clean.then_some(url)
+}
+
+#[cfg(test)]
+mod file_link_tests {
+    use super::gateway_file_path;
+
+    #[test]
+    fn a_file_link_stays_on_the_gateway() {
+        assert!(gateway_file_path("/client/v1/files/f_1?sig=ab12").is_some());
+        for url in [
+            "@evil.example.invalid/x",
+            ".evil.example.invalid/x",
+            "//evil.example.invalid/x",
+            "/client/v1//evil.example.invalid/x",
+            "/client/v1/../../x",
+            "/client/v1/files/a@evil.example.invalid",
+            "https://evil.example.invalid/client/v1/files/x",
+            "/client/v1/",
+        ] {
+            assert!(gateway_file_path(url).is_none(), "{url}");
+        }
+    }
 }

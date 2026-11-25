@@ -4,7 +4,13 @@
 //! live view" does), and only then takes the part out of its address, so a
 //! reload before it connects still opens it and one after does not. The
 //! same link given to the open page (typed, or the browser's back and
-//! forward) does the same.
+//! forward) does the same. The link opens the view to watch: taking control
+//! of it is the owner's choice, asked for, since a link (from a page or a
+//! message) is not the owner's word.
+//!
+//! Links out of the app ([`open_outside`]): what a reply, a page the agent
+//! read or a daemon's answer links to opens only as a web or mail link, and
+//! only `https:` without a question.
 
 use nsh_core::prelude::*;
 
@@ -36,8 +42,15 @@ pub fn surface_links(store: Store) {
         }
         untracked(|| {
             wanted.set(None);
-            store.watch_surface(&id, true);
+            store.watch_surface(&id, false);
             let _ = set_app_url(without_surface(&at));
+            let id = id.clone();
+            crate::ui::confirm(
+                "Take control of this live view?",
+                "A link opened this live view to watch. Take control only if you opened the link yourself.",
+                "Take control",
+                move || store.watch_surface(&id, true),
+            );
         });
     });
 }
@@ -72,9 +85,96 @@ fn without_surface(url: &str) -> String {
     }
 }
 
+/// What a press on a link out of the app may do, by the URL's scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outside {
+    /// `https:`: opens.
+    Open,
+    /// `http:` or `mailto:`: opens once the owner has seen where it goes.
+    Ask,
+    /// Anything else (another app's scheme, `file:`, a pairing link, a
+    /// relative path): never opened from content.
+    Refuse,
+}
+
+/// The scheme of `url` (machine format: the RFC 3986 scheme before `:`).
+fn scheme(url: &str) -> Option<String> {
+    let (scheme, _) = url.trim().split_once(':')?;
+    let valid = scheme.len() > 1
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then(|| scheme.to_ascii_lowercase())
+}
+
+pub fn outside(url: &str) -> Outside {
+    match scheme(url).as_deref() {
+        Some("https") => Outside::Open,
+        Some("http" | "mailto") => Outside::Ask,
+        _ => Outside::Refuse,
+    }
+}
+
+/// Open `url` outside the app as [`outside`] allows; a refused one is
+/// logged. Every link from content or from the daemon goes through here.
+pub fn open_outside(url: String) {
+    match outside(&url) {
+        Outside::Open => drop(open_url(url)),
+        Outside::Ask => crate::ui::confirm(
+            "Open this link?",
+            format!("It is not a secure web link: {url}"),
+            "Open",
+            move || drop(open_url(url)),
+        ),
+        Outside::Refuse => log::warn!("refused to open a link outside the app: {url}"),
+    }
+}
+
+/// Open a URL the daemon sent (a sign-in page, where to get a key, a bot's
+/// help page) outside the app: `https:` only. A daemon is not the owner, and
+/// one this device was steered to can name any app's scheme.
+pub fn open_https(url: String) {
+    if outside(&url) == Outside::Open {
+        drop(open_url(url));
+    } else {
+        log::warn!("refused to open a daemon's link that is not https: {url}");
+    }
+}
+
+/// A press on a link in a document: anchors stay in it, the rest goes out
+/// through [`open_outside`].
+pub fn open_document_link(url: &str) {
+    if !url.starts_with('#') {
+        open_outside(url.to_owned());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_web_and_mail_links_leave_the_app() {
+        assert_eq!(outside("https://docs.example.invalid/a"), Outside::Open);
+        assert_eq!(outside(" HTTPS://docs.example.invalid"), Outside::Open);
+        assert_eq!(outside("http://docs.example.invalid"), Outside::Ask);
+        assert_eq!(outside("mailto:alice@example.invalid"), Outside::Ask);
+        for url in [
+            "aidaemon-pair:?gateway=https://evil.example.invalid",
+            "vscode://file/etc/passwd",
+            "ssh://host.example.invalid",
+            "smb://host.example.invalid/share",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "tel:5550100",
+            "C:\\Windows\\x.exe",
+            "/client/v1/files/x",
+            "no scheme here",
+        ] {
+            assert_eq!(outside(url), Outside::Refuse, "{url}");
+        }
+    }
 
     #[test]
     fn a_handoff_link_names_its_live_view_and_leaves_the_rest() {

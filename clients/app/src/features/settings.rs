@@ -1555,7 +1555,7 @@ fn sign_in_card(
                     Variant::Primary,
                     Size::Sm,
                     move || {
-                        drop(open_url(url.clone()));
+                        crate::features::links::open_https(url.clone());
                     },
                 ))
                 .child(ui::btn("Cancel", Variant::Ghost, Size::Sm, move || {
@@ -1798,7 +1798,7 @@ fn provider_form(
         if !option.key_url.is_empty() {
             let url = option.key_url.clone();
             key_row = key_row.child(ui::btn("Get a key", Variant::Ghost, Size::Sm, move || {
-                drop(open_url(url.clone()));
+                crate::features::links::open_https(url.clone());
             }));
         }
         body = body

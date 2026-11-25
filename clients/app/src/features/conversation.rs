@@ -7,7 +7,8 @@ use aidaemon_client_protocol::{
     AttachmentRef, MidRun, RunPhase, RunSummary, ServedBy, ToolCallInfo,
 };
 use nsh_base::{
-    MarkdownOptions, TextViewLinks, TextViewPart, TextViewParts, button, input, text_view,
+    MarkdownOptions, TextViewLinkPressEvent, TextViewLinks, TextViewPart, TextViewParts, button,
+    input, text_view,
 };
 use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
@@ -2660,7 +2661,11 @@ pub(crate) fn markdown(
             html: false,
             ..MarkdownOptions::default()
         })
-        .links(TextViewLinks::Open)
+        .links(TextViewLinks::Report)
+        .on_link_press(|press: &TextViewLinkPressEvent| {
+            crate::features::links::open_document_link(&press.url)
+        })
+        .render_image(ui::markdown_image)
         .selectable(true)
         .gap_3()
         .text_size(px(ui::fit::read()))
@@ -2687,7 +2692,11 @@ pub(crate) fn compact_markdown(
             html: false,
             ..MarkdownOptions::default()
         })
-        .links(TextViewLinks::Open)
+        .links(TextViewLinks::Report)
+        .on_link_press(|press: &TextViewLinkPressEvent| {
+            crate::features::links::open_document_link(&press.url)
+        })
+        .render_image(ui::markdown_image)
         .selectable(true)
         .gap_2()
         .text_size(px(ui::fit::body()))

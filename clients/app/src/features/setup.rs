@@ -556,7 +556,7 @@ fn choices(
                         Variant::Primary,
                         Size::Sm,
                         move || {
-                            drop(open_url(url.clone()));
+                            crate::features::links::open_https(url.clone());
                         },
                     ))
                     .child(ui::code(sign_in.url.clone()).number_of_lines(2));
@@ -673,7 +673,7 @@ fn choices(
                                         Variant::Ghost,
                                         Size::Sm,
                                         move || {
-                                            drop(open_url(url.clone()));
+                                            crate::features::links::open_https(url.clone());
                                         },
                                     ));
                                 }
@@ -989,7 +989,7 @@ fn channel_step(store: Store) -> View {
                                         Variant::Ghost,
                                         Size::Sm,
                                         move || {
-                                            drop(open_url(help.clone()));
+                                            crate::features::links::open_https(help.clone());
                                         },
                                     ))
                                     .child(labeled(
