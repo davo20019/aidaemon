@@ -80,8 +80,9 @@ impl ConfigFile {
 
     /// Writes a text already checked, owner-only.
     pub async fn write_checked(&self, content: &str) -> anyhow::Result<()> {
-        tokio::fs::write(&self.path, content).await?;
-        set_owner_only_permissions(&self.path);
+        let path = self.path.clone();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || write_owner_only(&path, &content)).await??;
         Ok(())
     }
 
@@ -115,6 +116,40 @@ fn backup_paths(path: &Path) -> [PathBuf; 3] {
         path.with_extension("toml.bak.1"),
         path.with_extension("toml.bak.2"),
     ]
+}
+
+/// Write `content` to `path`, owner-only (0600) from the first byte: it
+/// goes to a fresh sibling file created 0600 and is renamed over `path`, so
+/// a config holding keys or bot tokens is never readable by others, not
+/// even for the moment between a write and a chmod.
+pub fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    let tmp = parent
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Owner-only read/write (0600) on Unix, best effort.
@@ -154,6 +189,25 @@ pub async fn rotate_backups(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_owner_only_write_replaces_the_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "old = 1\n").unwrap();
+        write_owner_only(&path, "token = \"synthetic\"\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "token = \"synthetic\"\n"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[tokio::test]
     async fn save_refuses_what_the_check_refuses_and_keeps_backups() {
