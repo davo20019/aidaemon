@@ -5964,3 +5964,84 @@ async fn render_pdf_binds_its_approval_to_the_source_content() {
             .any(|call| matches!(call, MockCall::RenderPdf))
     );
 }
+
+/// Chromium loads a private copy of the exact bytes the gate judged, not
+/// the source file, so a swap between the check and Chromium's read cannot
+/// change what renders; the copy keeps the source folder for relative links
+/// and is gone once dropped.
+#[test]
+fn render_pdf_renders_a_private_copy_of_the_judged_bytes() {
+    use sha2::Digest as _;
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("brief.html");
+    let page = "<!doctype html><html><HEAD><title>Synthetic</title></HEAD><body><img src=\"logo.png\"></body></html>";
+    std::fs::write(&source, page).unwrap();
+    let judged = hex::encode(sha2::Sha256::digest(page.as_bytes()));
+
+    // Other content than the judged one is refused.
+    std::fs::write(&source, "<h1>Swapped</h1>").unwrap();
+    assert_eq!(
+        super::PrivateRenderCopy::of(&source, &judged)
+            .err()
+            .as_deref(),
+        Some(super::RENDER_SOURCE_CHANGED)
+    );
+    std::fs::write(&source, page).unwrap();
+
+    let copy = super::PrivateRenderCopy::of(&source, &judged).unwrap();
+    assert!(
+        !copy.file.starts_with(temp.path()),
+        "the copy is not beside the source"
+    );
+    let rendered = std::fs::read_to_string(&copy.file).unwrap();
+    let folder =
+        reqwest::Url::from_directory_path(dunce::canonicalize(temp.path()).unwrap()).unwrap();
+    let base = format!("<base href=\"{}\">", folder.as_str().replace('&', "&amp;"));
+    let canonical_base = rendered.contains(&base);
+    let plain_base = rendered.contains(&format!(
+        "<base href=\"{}\">",
+        reqwest::Url::from_directory_path(temp.path()).unwrap()
+    ));
+    assert!(canonical_base || plain_base, "{rendered}");
+    assert!(
+        rendered.starts_with("<!doctype html><html><HEAD><base "),
+        "{rendered}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&copy.dir), 0o700);
+        assert_eq!(mode(&copy.file), 0o600);
+    }
+    // Changing the source now does not reach the copy.
+    std::fs::write(&source, "<h1>Swapped</h1>").unwrap();
+    assert_eq!(std::fs::read_to_string(&copy.file).unwrap(), rendered);
+    let dir = copy.dir.clone();
+    drop(copy);
+    assert!(!dir.exists());
+}
+
+#[test]
+fn the_base_element_goes_first_in_the_head() {
+    let folder = "file:///work/a&b/";
+    let base = "<base href=\"file:///work/a&amp;b/\">";
+    assert_eq!(
+        String::from_utf8(super::with_base_href(
+            b"<head lang=x><base href=\"evil/\">",
+            folder
+        ))
+        .unwrap(),
+        format!("<head lang=x>{base}<base href=\"evil/\">")
+    );
+    // `<header>` is not `<head>`.
+    assert_eq!(
+        String::from_utf8(super::with_base_href(b"<html><header>x</header>", folder)).unwrap(),
+        format!("<html>{base}<header>x</header>")
+    );
+    assert_eq!(
+        String::from_utf8(super::with_base_href(b"<p>bare</p>", folder)).unwrap(),
+        format!("{base}<p>bare</p>")
+    );
+}

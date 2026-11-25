@@ -420,6 +420,105 @@ fn render_source_digest(
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
+/// A private copy of a `render_pdf` source for Chromium to load: the exact
+/// bytes whose digest the gate judged, in a fresh owner-only directory under
+/// the system temp folder (confined runs cannot write there: bubblewrap gives
+/// them their own `/tmp`, seatbelt allows writes only in their roots). A
+/// `<base>` element points relative links at the source's own folder, so the
+/// page's images and styles resolve as before. Removed on drop.
+struct PrivateRenderCopy {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+impl PrivateRenderCopy {
+    fn of(source: &std::path::Path, judged: &str) -> Result<Self, String> {
+        let bytes = std::fs::read(source).map_err(|_| RENDER_SOURCE_CHANGED.to_string())?;
+        if hex::encode(Sha256::digest(&bytes)) != judged {
+            return Err(RENDER_SOURCE_CHANGED.to_string());
+        }
+        let folder = source
+            .parent()
+            .and_then(|parent| reqwest::Url::from_directory_path(parent).ok())
+            .ok_or_else(|| "Could not convert source_path to a local file URL".to_string())?;
+        let page = with_base_href(&bytes, folder.as_str());
+        let dir = std::env::temp_dir().join(format!("aidaemon-render-{}", uuid::Uuid::new_v4()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .map_err(|e| format!("Could not prepare the page for rendering: {e}"))?;
+        let copy = Self {
+            file: dir.join(source.file_name().unwrap_or_else(|| "page.html".as_ref())),
+            dir,
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let written = options.open(&copy.file).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(&page)?;
+            file.sync_all()
+        });
+        written.map_err(|e| format!("Could not prepare the page for rendering: {e}"))?;
+        // The copy must hold exactly what was written.
+        let back = std::fs::read(&copy.file).map_err(|_| RENDER_SOURCE_CHANGED.to_string())?;
+        if Sha256::digest(&back) != Sha256::digest(&page) {
+            return Err(RENDER_SOURCE_CHANGED.to_string());
+        }
+        Ok(copy)
+    }
+}
+
+impl Drop for PrivateRenderCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `page` with a `<base href>` naming `folder`, placed right after the
+/// opening `<head>` tag (else `<html>`, else the doctype, else first), so
+/// it is the document's first base element. Tag names are matched as the
+/// HTML machine format they are (ASCII case-insensitive), not as prose.
+fn with_base_href(page: &[u8], folder: &str) -> Vec<u8> {
+    let href = folder
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let base = format!("<base href=\"{href}\">");
+    let lower = page.to_ascii_lowercase();
+    let after_tag = |tag: &[u8]| {
+        let mut from = 0;
+        while let Some(at) = lower[from..]
+            .windows(tag.len())
+            .position(|window| window == tag)
+            .map(|at| from + at)
+        {
+            let next = lower.get(at + tag.len()).copied();
+            if matches!(next, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')) {
+                return lower[at..]
+                    .iter()
+                    .position(|&b| b == b'>')
+                    .map(|end| at + end + 1);
+            }
+            from = at + tag.len();
+        }
+        None
+    };
+    let at = after_tag(b"<head")
+        .or_else(|| after_tag(b"<html"))
+        .or_else(|| after_tag(b"<!doctype"))
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(page.len() + base.len());
+    out.extend_from_slice(&page[..at]);
+    out.extend_from_slice(base.as_bytes());
+    out.extend_from_slice(&page[at..]);
+    out
+}
+
 /// What a `render_pdf` source page reaches beyond its own folder's files,
 /// in words for the card, or `None` when it reaches nothing else: no
 /// script or inline handler, no frame/object/embed, no remote or `file:`
@@ -1941,19 +2040,16 @@ impl BrowserTool {
             .trim();
         validate_pdf_filename(output_filename)?;
 
-        let source_url = reqwest::Url::from_file_path(&source)
-            .map_err(|_| "Could not convert source_path to a local file URL".to_string())?;
-        // Only the content the gate judged renders: the file read now, and
-        // again once Chromium has loaded it, must be that content.
-        let content_now = || {
-            std::fs::read(&source)
-                .ok()
-                .map(|bytes| hex::encode(Sha256::digest(&bytes)))
-        };
-        let judged = clearance.render_source.as_deref();
-        if judged.is_none() || content_now().as_deref() != judged {
+        // Only the content the gate judged renders: the file is read once,
+        // checked against that digest, and Chromium loads a private copy of
+        // those exact bytes, so nothing can swap the file between the check
+        // and Chromium's read. The copy is removed when it goes out of scope.
+        let Some(judged) = clearance.render_source.as_deref() else {
             return Err(ActionError::Failed(RENDER_SOURCE_CHANGED.to_string()));
-        }
+        };
+        let copy = PrivateRenderCopy::of(&source, judged)?;
+        let source_url = reqwest::Url::from_file_path(&copy.file)
+            .map_err(|_| "Could not convert source_path to a local file URL".to_string())?;
 
         // Use a disposable page/context so rendering never navigates away from
         // the session's active tab or destroys in-progress browser state.
@@ -1970,12 +2066,6 @@ impl BrowserTool {
         .await;
 
         let pdf_bytes = match render {
-            Ok(Ok(_)) if content_now().as_deref() != judged => {
-                self.backend
-                    .dispose_session(std::slice::from_ref(&target_id), &context_ids)
-                    .await;
-                return Err(ActionError::Failed(RENDER_SOURCE_CHANGED.to_string()));
-            }
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
                 self.backend
