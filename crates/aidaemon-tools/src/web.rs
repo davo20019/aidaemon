@@ -1224,13 +1224,7 @@ impl crate::semantics::ToolSemantics for WebFetch {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::READ_ONLY_EXTERNAL
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {

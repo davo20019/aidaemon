@@ -231,13 +231,7 @@ impl crate::tools::traits::ToolSemantics for PolicyMetricsTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::READ_ONLY
     }
 }
 

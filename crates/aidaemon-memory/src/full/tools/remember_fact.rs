@@ -587,13 +587,7 @@ impl aidaemon_tools::semantics::ToolSemantics for RememberFactTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::IDEMPOTENT_LOCAL_WRITE
     }
 
     /// Only the agent's own memory store changes, so a decline earlier in

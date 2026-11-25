@@ -626,13 +626,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ReadChannelHistoryTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::READ_ONLY_EXTERNAL
     }
 
     /// The channel API host (Slack's Web API) the history is read from.

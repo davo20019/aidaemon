@@ -224,13 +224,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ManageMemoriesTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
+        ToolCapabilities::APPROVED_HIGH_IMPACT_LOCAL
     }
 
     /// `set_privacy` asks the owner when it widens who may see a fact.

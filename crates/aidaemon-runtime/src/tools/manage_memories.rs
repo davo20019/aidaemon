@@ -275,13 +275,7 @@ impl crate::tools::traits::ToolSemantics for ManageMemoriesTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
+        ToolCapabilities::APPROVED_HIGH_IMPACT_LOCAL
     }
 
     /// Reads, `repair` and `forget` touch only the agent's own memory store,

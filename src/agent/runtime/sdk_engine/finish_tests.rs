@@ -594,13 +594,7 @@ struct FlakySend {
 
 impl crate::traits::ToolSemantics for FlakySend {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::EXTERNAL_WRITE
     }
 
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {

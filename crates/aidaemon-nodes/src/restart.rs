@@ -569,13 +569,7 @@ impl ToolSemantics for NodeRestartTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
+        ToolCapabilities::EXTERNAL_HIGH_IMPACT
     }
 
     /// Every request the Node could act on asks the owner. A request that

@@ -445,13 +445,7 @@ impl crate::traits::ToolSemantics for ManageGoalTasksTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        ToolCapabilities::LOCAL_WRITE
     }
 
     /// `list_tasks`, `claim_task` and an `update_task` that does not put a

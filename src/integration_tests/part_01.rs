@@ -476,13 +476,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for IdempotencyProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::LOCAL_WRITE
     }
 
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
@@ -537,13 +531,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 #[async_trait::async_trait]
 impl crate::traits::ToolSemantics for ReconciledIdempotencyProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::LOCAL_WRITE
     }
 
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
@@ -1051,13 +1039,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for SpawnAgentMock {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::LOCAL_WRITE
     }
 }
 
@@ -1723,13 +1705,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for SlowReadTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY
     }
 }
 
@@ -1775,13 +1751,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for FlakyProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY
     }
 }
 

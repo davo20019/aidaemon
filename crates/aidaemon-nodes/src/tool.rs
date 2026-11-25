@@ -335,13 +335,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ReadNodeSensorsTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::READ_ONLY
     }
 
     /// The request travels to an enrolled Node over the network, whose
@@ -453,13 +447,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ReadNodeHealthTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::READ_ONLY
     }
 
     /// The request travels to an enrolled Node over the network, whose
@@ -534,13 +522,7 @@ impl aidaemon_tools::semantics::ToolSemantics for SendNodeAudioTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        ToolCapabilities::EXTERNAL_WRITE
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
@@ -690,13 +672,7 @@ impl ManageNodeMonitorsTool {
 
 impl aidaemon_tools::semantics::ToolSemantics for ManageNodeMonitorsTool {
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        ToolCapabilities::EXTERNAL_WRITE
     }
 
     fn tool_role(&self) -> ToolRole {

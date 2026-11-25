@@ -898,13 +898,7 @@ impl crate::traits::Tool for ShellProbe {
 
 impl crate::traits::ToolSemantics for ShellProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::IDEMPOTENT_LOCAL_WRITE
     }
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
         let args = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
@@ -2576,13 +2570,7 @@ impl crate::traits::Tool for PageProbe {
 
 impl crate::traits::ToolSemantics for PageProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY_EXTERNAL
     }
 }
 
@@ -2623,13 +2611,7 @@ impl crate::traits::Tool for SendProbe {
 
 impl crate::traits::ToolSemantics for SendProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::EXTERNAL_WRITE
     }
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
         crate::traits::ToolCallSemantics::mutation_with(
@@ -3119,13 +3101,7 @@ impl crate::traits::Tool for TaintRecordProbe {
 
 impl crate::traits::ToolSemantics for TaintRecordProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY
     }
 }
 
@@ -5148,13 +5124,7 @@ impl crate::traits::Tool for SiteReportProbe {
 
 impl crate::traits::ToolSemantics for SiteReportProbe {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY_EXTERNAL
     }
 }
 

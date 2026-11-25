@@ -2608,13 +2608,7 @@ impl aidaemon_tools::semantics::ToolSemantics for ConfigManagerTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
+        ToolCapabilities::APPROVED_HIGH_IMPACT_LOCAL
     }
 }
 

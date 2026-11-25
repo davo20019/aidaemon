@@ -437,13 +437,7 @@ impl crate::tools::traits::ToolSemantics for ManageCliAgentsTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
+        ToolCapabilities::EXTERNAL_HIGH_IMPACT
     }
 }
 

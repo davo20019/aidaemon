@@ -46,13 +46,7 @@ impl crate::traits::Tool for StructuredPatchTool {
 
 impl crate::traits::ToolSemantics for StructuredPatchTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::IDEMPOTENT_LOCAL_WRITE
     }
 
     fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
@@ -104,13 +98,7 @@ impl crate::traits::Tool for HighImpactCliAgentMock {
 
 impl crate::traits::ToolSemantics for HighImpactCliAgentMock {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
+        crate::traits::ToolCapabilities::EXTERNAL_HIGH_IMPACT
     }
 }
 

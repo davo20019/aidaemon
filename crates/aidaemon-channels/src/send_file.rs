@@ -579,13 +579,7 @@ impl aidaemon_tools::semantics::ToolSemantics for SendFileTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        ToolCapabilities::EXTERNAL_WRITE
     }
 
     fn stable_observation_subjects(

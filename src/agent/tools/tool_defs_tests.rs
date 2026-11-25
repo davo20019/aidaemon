@@ -427,95 +427,20 @@ async fn task_lead_policy_filter_keeps_delegation_tools_exposed() {
         named_tool_def("spawn_agent"),
     ];
     let capabilities: HashMap<String, ToolCapabilities> = HashMap::from([
-        (
-            "system_info".to_string(),
-            ToolCapabilities {
-                read_only: true,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: true,
-                high_impact_write: false,
-            },
-        ),
-        (
-            "remember_fact".to_string(),
-            ToolCapabilities {
-                read_only: false,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: false,
-                high_impact_write: false,
-            },
-        ),
-        (
-            "policy_metrics".to_string(),
-            ToolCapabilities {
-                read_only: true,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: true,
-                high_impact_write: false,
-            },
-        ),
-        (
-            "search_files".to_string(),
-            ToolCapabilities {
-                read_only: true,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: true,
-                high_impact_write: false,
-            },
-        ),
-        (
-            "read_file".to_string(),
-            ToolCapabilities {
-                read_only: true,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: true,
-                high_impact_write: false,
-            },
-        ),
-        (
-            "check_environment".to_string(),
-            ToolCapabilities {
-                read_only: true,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: true,
-                high_impact_write: false,
-            },
-        ),
-        (
-            "goal_trace".to_string(),
-            ToolCapabilities {
-                read_only: true,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: true,
-                high_impact_write: false,
-            },
-        ),
+        ("system_info".to_string(), ToolCapabilities::READ_ONLY),
+        ("remember_fact".to_string(), ToolCapabilities::LOCAL_WRITE),
+        ("policy_metrics".to_string(), ToolCapabilities::READ_ONLY),
+        ("search_files".to_string(), ToolCapabilities::READ_ONLY),
+        ("read_file".to_string(), ToolCapabilities::READ_ONLY),
+        ("check_environment".to_string(), ToolCapabilities::READ_ONLY),
+        ("goal_trace".to_string(), ToolCapabilities::READ_ONLY),
         (
             "manage_goal_tasks".to_string(),
-            ToolCapabilities {
-                read_only: false,
-                external_side_effect: false,
-                needs_approval: false,
-                idempotent: false,
-                high_impact_write: false,
-            },
+            ToolCapabilities::LOCAL_WRITE,
         ),
         (
             "cli_agent".to_string(),
-            ToolCapabilities {
-                read_only: false,
-                external_side_effect: true,
-                needs_approval: true,
-                idempotent: false,
-                high_impact_write: true,
-            },
+            ToolCapabilities::EXTERNAL_HIGH_IMPACT,
         ),
         (
             "spawn_agent".to_string(),

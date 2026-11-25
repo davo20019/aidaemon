@@ -1927,6 +1927,73 @@ impl ToolCallOutcome {
     }
 }
 
+impl ToolCapabilities {
+    /// Reads only the daemon's own state or the local machine: no approval, safe to repeat.
+    pub const READ_ONLY: Self = Self {
+        read_only: true,
+        external_side_effect: false,
+        needs_approval: false,
+        idempotent: true,
+        high_impact_write: false,
+    };
+    /// Changes something outside the daemon in a way that matters: the owner approves it, and it is not safe to repeat.
+    pub const EXTERNAL_HIGH_IMPACT: Self = Self {
+        read_only: false,
+        external_side_effect: true,
+        needs_approval: true,
+        idempotent: false,
+        high_impact_write: true,
+    };
+    /// Changes only the daemon's own state (a reminder, a note), without approval.
+    pub const LOCAL_WRITE: Self = Self {
+        read_only: false,
+        external_side_effect: false,
+        needs_approval: false,
+        idempotent: false,
+        high_impact_write: false,
+    };
+    /// Reaches outside the daemon (sends, posts) without approval; not safe to repeat.
+    pub const EXTERNAL_WRITE: Self = Self {
+        read_only: false,
+        external_side_effect: true,
+        needs_approval: false,
+        idempotent: false,
+        high_impact_write: false,
+    };
+    /// Changes only the daemon's own state, the same way however often it runs.
+    pub const IDEMPOTENT_LOCAL_WRITE: Self = Self {
+        read_only: false,
+        external_side_effect: false,
+        needs_approval: false,
+        idempotent: true,
+        high_impact_write: false,
+    };
+    /// Reads from outside the daemon (the web, a service): no approval, safe to repeat, its output untrusted.
+    pub const READ_ONLY_EXTERNAL: Self = Self {
+        read_only: true,
+        external_side_effect: true,
+        needs_approval: false,
+        idempotent: true,
+        high_impact_write: false,
+    };
+    /// Changes the daemon's own configuration or authority: the owner approves it.
+    pub const APPROVED_HIGH_IMPACT_LOCAL: Self = Self {
+        read_only: false,
+        external_side_effect: false,
+        needs_approval: true,
+        idempotent: false,
+        high_impact_write: true,
+    };
+    /// Reaches outside the daemon without approval, the same way however often it runs.
+    pub const IDEMPOTENT_EXTERNAL_WRITE: Self = Self {
+        read_only: false,
+        external_side_effect: true,
+        needs_approval: false,
+        idempotent: true,
+        high_impact_write: false,
+    };
+}
+
 impl Default for ToolCapabilities {
     fn default() -> Self {
         Self {

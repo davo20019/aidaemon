@@ -86,26 +86,14 @@ impl RegisteredMcpTool {
 /// hook's read-only level, the profile's tool pruning, the untrusted-content
 /// verifier) reads them.
 pub fn mcp_tool_capabilities() -> ToolCapabilities {
-    ToolCapabilities {
-        read_only: false,
-        external_side_effect: true,
-        needs_approval: true,
-        idempotent: false,
-        high_impact_write: true,
-    }
+    ToolCapabilities::EXTERNAL_HIGH_IMPACT
 }
 
 /// The capabilities of a tool the owner's config lists read-only: a read
 /// that still reaches a process outside the daemon (like `web_search`), so
 /// its output stays untrusted.
 pub fn owner_read_only_capabilities() -> ToolCapabilities {
-    ToolCapabilities {
-        read_only: true,
-        external_side_effect: true,
-        needs_approval: false,
-        idempotent: true,
-        high_impact_write: false,
-    }
+    ToolCapabilities::READ_ONLY_EXTERNAL
 }
 
 #[async_trait]

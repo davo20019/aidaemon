@@ -764,13 +764,7 @@ impl Tool for GenerateImageTool {
 
 impl aidaemon_tools::semantics::ToolSemantics for GenerateImageTool {
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        ToolCapabilities::EXTERNAL_WRITE
     }
 
     fn output_trust(

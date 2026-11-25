@@ -1996,13 +1996,7 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        ToolCapabilities::LOCAL_WRITE
     }
 }
 

@@ -541,13 +541,7 @@ impl Tool for MockInspectFolderTool {
 
 impl crate::traits::ToolSemantics for MockInspectFolderTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY
     }
 }
 
@@ -619,13 +613,7 @@ impl Tool for PlayedNodeAudioTool {
 
 impl crate::traits::ToolSemantics for PlayedNodeAudioTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::EXTERNAL_WRITE
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
@@ -864,13 +852,7 @@ impl Tool for CountingLocalWriteTool {
 
 impl crate::traits::ToolSemantics for CountingLocalWriteTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::LOCAL_WRITE
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {

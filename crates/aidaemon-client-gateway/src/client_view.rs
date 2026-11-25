@@ -181,13 +181,7 @@ impl ToolSemantics for ClientViewTool {
     }
 
     fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        ToolCapabilities::IDEMPOTENT_LOCAL_WRITE
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {

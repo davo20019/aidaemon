@@ -382,13 +382,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for ExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::IDEMPOTENT_EXTERNAL_WRITE
     }
 }
 
@@ -428,13 +422,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for PreWrappedExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::IDEMPOTENT_EXTERNAL_WRITE
     }
 }
 
@@ -489,13 +477,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for StructuredExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::IDEMPOTENT_EXTERNAL_WRITE
     }
 }
 
@@ -593,13 +575,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for UrlProbeTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: true,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::READ_ONLY
     }
 }
 
@@ -848,13 +824,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
         }
 
         fn capabilities(&self) -> crate::traits::ToolCapabilities {
-            crate::traits::ToolCapabilities {
-                read_only: false,
-                external_side_effect: true,
-                needs_approval: false,
-                idempotent: false,
-                high_impact_write: false,
-            }
+            crate::traits::ToolCapabilities::EXTERNAL_WRITE
         }
 
         fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
@@ -998,13 +968,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
         }
 
         fn capabilities(&self) -> crate::traits::ToolCapabilities {
-            crate::traits::ToolCapabilities {
-                read_only: false,
-                external_side_effect: true,
-                needs_approval: false,
-                idempotent: false,
-                high_impact_write: false,
-            }
+            crate::traits::ToolCapabilities::EXTERNAL_WRITE
         }
 
         fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
@@ -1331,13 +1295,7 @@ output.map(crate::traits::ToolCallOutcome::from_output)
 
 impl crate::traits::ToolSemantics for FailingExternalActionTool {
     fn capabilities(&self) -> crate::traits::ToolCapabilities {
-        crate::traits::ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: false,
-            idempotent: true,
-            high_impact_write: false,
-        }
+        crate::traits::ToolCapabilities::IDEMPOTENT_EXTERNAL_WRITE
     }
     fn call_semantics(&self, _arguments: &str) -> crate::traits::ToolCallSemantics {
         crate::traits::ToolCallSemantics::mutation()
