@@ -89,5 +89,5 @@ pub use google::{
     TEXT_ONLY_RESPONSE_MARKER,
 };
 pub use openai::{OPENAI_DEFAULT_BASE_URL, OpenAiCompatible, OpenAiCompatibleBuilder};
-pub use transport::{ConfigError, TransportFailure};
+pub use transport::{ConfigError, TransportFailure, base_url_refusal};
 pub use xai::{XAI_DEFAULT_BASE_URL, Xai, XaiBuilder};

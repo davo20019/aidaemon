@@ -166,13 +166,8 @@ pub(crate) fn build_provider(
                      longer supported and are ignored"
                 );
             }
-            if !config.api_key.is_empty() && sends_key_in_clear(&config.base_url) {
-                warn!(
-                    "The provider's API key goes over plain HTTP to {}: anyone on the network \
-                     path can read it. Use https, or leave the key empty for a local server.",
-                    config.base_url
-                );
-            }
+            // The builder refuses plain http to a public host
+            // (`aidaemon_providers::base_url_refusal`).
             let mut builder = backends::OpenAiCompatible::builder()
                 .base_url(&config.base_url)
                 .api_key(&config.api_key)
@@ -432,39 +427,5 @@ mod keyless_fallback_tests {
             "#,
         );
         assert!(catalog_models(&proxy.provider).is_empty());
-    }
-}
-
-/// Plain HTTP to a host other than this machine: an API key in the request
-/// header would cross the network unencrypted.
-fn sends_key_in_clear(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url) else {
-        return false;
-    };
-    if url.scheme() != "http" {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => !ip.is_loopback(),
-        Err(_) => !host.eq_ignore_ascii_case("localhost"),
-    }
-}
-
-#[cfg(test)]
-mod clear_key_tests {
-    use super::sends_key_in_clear;
-
-    #[test]
-    fn plain_http_off_this_machine_sends_the_key_in_clear() {
-        assert!(sends_key_in_clear("http://203.0.113.10:8000/v1"));
-        assert!(sends_key_in_clear("http://inference.example.com/v1"));
-        assert!(!sends_key_in_clear("https://inference.example.com/v1"));
-        assert!(!sends_key_in_clear("http://localhost:11434/v1"));
-        assert!(!sends_key_in_clear("http://127.0.0.1:8080/v1"));
-        assert!(!sends_key_in_clear("http://[::1]:8080/v1"));
     }
 }

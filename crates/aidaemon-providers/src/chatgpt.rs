@@ -250,12 +250,7 @@ pub fn chatgpt_base_url_refusal(base_url: &str) -> Option<&'static str> {
         return refuse("credentials in the URL");
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let loopback = host == "localhost"
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
+    let loopback = crate::transport::is_loopback_host(&host);
     if loopback && matches!(url.scheme(), "http" | "https") {
         return None;
     }

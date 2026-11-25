@@ -186,6 +186,7 @@ impl GoogleGenaiBuilder {
     }
 
     pub fn build(self) -> Result<GoogleGenai, ConfigError> {
+        crate::transport::check_base_url(&self.base_url)?;
         let api_key = self
             .api_key
             .filter(|k| !k.0.is_empty())

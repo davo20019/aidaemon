@@ -36,6 +36,80 @@ pub enum ConfigError {
     BaseUrl(String, &'static str),
 }
 
+/// Why a provider's API key and the conversation may not be sent to
+/// `base_url`, or `None` when they may: `https` anywhere, plain `http` only
+/// to a host that cannot be on the public internet (loopback; a private,
+/// link-local or unique-local address; a single-label name; a name under
+/// `.local`, `.lan`, `.home.arpa`, `.internal` or `.localhost`), never
+/// credentials in the URL, and no other scheme. A model server on the LAN
+/// keeps working; a public host over plain http would carry the key and
+/// every prompt in cleartext.
+pub fn base_url_refusal(base_url: &str) -> Option<&'static str> {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return Some("not a URL");
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some("credentials in the URL");
+    }
+    match url.scheme() {
+        "https" => None,
+        "http" if url.host_str().is_some_and(is_local_host) => None,
+        "http" => Some("plain http only to this machine or the local network; use https"),
+        _ => Some("only http(s)"),
+    }
+}
+
+/// A URL host (`host_str`, IPv6 in brackets) that is this machine.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    match parse_host(host) {
+        Host::Ip(ip) => ip.is_loopback(),
+        Host::Name(name) => name == "localhost" || name.ends_with(".localhost"),
+    }
+}
+
+enum Host {
+    Ip(std::net::IpAddr),
+    Name(String),
+}
+
+fn parse_host(host: &str) -> Host {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => Host::Ip(ip),
+        Err(_) => Host::Name(bare.trim_end_matches('.').to_ascii_lowercase()),
+    }
+}
+
+/// A host that cannot be reached from the public internet: this machine,
+/// a private / link-local / unique-local address, or a local-only name.
+fn is_local_host(host: &str) -> bool {
+    if is_loopback_host(host) {
+        return true;
+    }
+    match parse_host(host) {
+        // A machine name (DNS name format, not prose).
+        Host::Name(name) => {
+            !name.contains('.')
+                || [".local", ".lan", ".home.arpa", ".internal"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }
+        Host::Ip(std::net::IpAddr::V4(ip)) => ip.is_private() || ip.is_link_local(),
+        Host::Ip(std::net::IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            // fc00::/7 unique-local, fe80::/10 link-local.
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// [`base_url_refusal`] as a builder error.
+pub(crate) fn check_base_url(base_url: &str) -> Result<(), ConfigError> {
+    base_url_refusal(base_url).map_or(Ok(()), |why| {
+        Err(ConfigError::BaseUrl(base_url.to_string(), why))
+    })
+}
+
 pub(crate) fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, ConfigError> {
     // No redirects: a provider endpoint that answers 3xx would otherwise
     // carry the request body and custom key headers (`x-api-key`,
@@ -387,5 +461,41 @@ mod tests {
         assert_eq!(broken, json!({"_raw": r#"{"a":"#}));
         assert_eq!(raw_arguments(&broken), Some(r#"{"a":"#));
         assert_eq!(raw_arguments(&json!({"a": 1})), None);
+    }
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::base_url_refusal;
+
+    #[test]
+    fn https_anywhere_plain_http_only_off_the_public_internet() {
+        for ok in [
+            "https://api.example.com/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://192.168.1.20:1234/v1",
+            "http://10.0.0.5",
+            "http://172.16.0.9",
+            "http://169.254.1.1",
+            "http://[fd00::1]:8000",
+            "http://gpu-box:8000/v1",
+            "http://studio.local:1234",
+            "http://models.home.arpa",
+            "http://llm.internal",
+        ] {
+            assert_eq!(base_url_refusal(ok), None, "{ok}");
+        }
+        for refused in [
+            "http://api.example.com/v1",
+            "http://8.8.8.8",
+            "http://172.32.0.1",
+            "https://user:pass@api.example.com",
+            "ftp://api.example.com",
+            "not a url",
+        ] {
+            assert!(base_url_refusal(refused).is_some(), "{refused}");
+        }
     }
 }

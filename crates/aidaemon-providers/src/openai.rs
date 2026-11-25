@@ -132,6 +132,7 @@ impl OpenAiCompatibleBuilder {
     }
 
     pub fn build(self) -> Result<OpenAiCompatible, ConfigError> {
+        crate::transport::check_base_url(&self.base_url)?;
         Ok(OpenAiCompatible {
             name: self.name,
             client: build_client(self.connect_timeout)?,

@@ -173,11 +173,7 @@ impl XaiBuilder {
             .api_key
             .filter(|k| !k.0.is_empty())
             .ok_or(ConfigError::MissingApiKey)?;
-        if !base_url_is_safe(&self.base_url) {
-            return Err(ConfigError::Missing(
-                "an https base_url (plain http is allowed only for localhost)",
-            ));
-        }
+        crate::transport::check_base_url(&self.base_url)?;
         let mut headers =
             header_map(&[("authorization".to_string(), format!("Bearer {}", api_key.0))])?;
         headers.extend(header_map(&self.headers)?);
@@ -199,22 +195,6 @@ impl XaiBuilder {
             max_tokens: self.max_tokens,
             json_fallback: fallback.build()?,
         })
-    }
-}
-
-/// HTTPS anywhere, plain HTTP only on localhost: the API key travels in a
-/// header.
-fn base_url_is_safe(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url) else {
-        return false;
-    };
-    match url.scheme() {
-        "https" => true,
-        "http" => matches!(
-            url.host_str().unwrap_or_default(),
-            "localhost" | "127.0.0.1" | "[::1]" | "::1"
-        ),
-        _ => false,
     }
 }
 
@@ -549,7 +529,7 @@ mod tests {
             .api_key("k")
             .base_url("http://xai.example.com/v1")
             .build();
-        assert!(matches!(remote_http, Err(ConfigError::Missing(_))));
+        assert!(matches!(remote_http, Err(ConfigError::BaseUrl(..))));
         for local in ["http://localhost:8080/v1", "http://127.0.0.1:9/v1/"] {
             let built = Xai::builder().api_key("k").base_url(local).build().unwrap();
             assert!(
