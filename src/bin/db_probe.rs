@@ -1816,6 +1816,19 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // With the daemon stopped: drop the client event log's superseded run
+    // updates (as the gateway's upkeep does), then VACUUM to give the file
+    // its space back.
+    if args.iter().any(|a| a == "--compact-client-events") {
+        let log = aidaemon_store_sqlite::SqliteClientEventLog::open(pool.clone()).await?;
+        let removed = log
+            .drop_superseded(aidaemon_client_gateway::OWNER, "run_updated")
+            .await?;
+        println!("Dropped {removed} superseded run updates; vacuuming…");
+        sqlx::query("VACUUM").execute(&pool).await?;
+        println!("Done.");
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--fact-dup-audit") {
         fact_dup_audit(&pool).await?;
         return Ok(());

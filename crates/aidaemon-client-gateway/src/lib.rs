@@ -741,6 +741,16 @@ impl ClientGateway {
             Ok(removed) => info!(removed, "Trimmed the client event log"),
             Err(error) => warn!(%error, "Could not trim the client event log"),
         }
+        // A run's update carries the whole run, so only its newest is worth
+        // replaying (one long run's thousands of updates filled 12 GB).
+        match self.bus.log().drop_superseded(OWNER, "run_updated").await {
+            Ok(0) => {}
+            Ok(removed) => info!(
+                removed,
+                "Dropped superseded run updates from the client event log"
+            ),
+            Err(error) => warn!(%error, "Could not drop superseded run updates"),
+        }
         let forget = now.saturating_sub(u64::try_from(REPLY_MEMORY.as_millis()).unwrap_or(0));
         if let Err(error) = self.bus.log().forget_replies_before(forget).await {
             warn!(%error, "Could not forget old client replies");

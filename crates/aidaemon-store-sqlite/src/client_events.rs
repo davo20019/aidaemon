@@ -335,6 +335,27 @@ impl SqliteClientEventLog {
         Ok(rows.iter().map(row).collect())
     }
 
+    /// Remove the events of `kind` that a newer one of the same kind and
+    /// `ref_id` replaces: each carries the whole thing it tracks (a run's
+    /// update, the run as it is now), so a client replaying the newest
+    /// alone ends where it would after all of them. Replay sends whatever
+    /// is after a client's last seq, so the holes left are harmless.
+    /// Returns how many were removed.
+    pub async fn drop_superseded(&self, owner: &str, kind: &str) -> Result<u64, Error> {
+        let done = sqlx::query(
+            "DELETE FROM client_events
+             WHERE owner = ?1 AND kind = ?2 AND ref_id IS NOT NULL
+               AND seq < (SELECT MAX(n.seq) FROM client_events n
+                          WHERE n.owner = ?1 AND n.kind = ?2
+                            AND n.ref_id = client_events.ref_id)",
+        )
+        .bind(owner)
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Remove events older than `before_ms`, and beyond the newest
     /// `keep_newest`, but never the owner's newest event. Returns how many
     /// were removed.
