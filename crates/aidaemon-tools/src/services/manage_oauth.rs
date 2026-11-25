@@ -66,6 +66,12 @@ struct RegisterPlan {
     scopes: Vec<String>,
 }
 
+fn validate_service_name(raw: &str) -> anyhow::Result<String> {
+    crate::services::validate_identifier(raw, "Service")
+}
+
+use crate::services::normalize_domains;
+
 pub struct ManageOAuthTool {
     gateway: OAuthGateway,
     state_store: Arc<dyn OAuthStore>,
@@ -98,42 +104,6 @@ impl ManageOAuthTool {
             Self::OAUTH_CONNECTION_COLLECTION_ID,
         )
         .expect("oauth connection collection ID is nonempty")
-    }
-
-    fn validate_service_name(raw: &str) -> anyhow::Result<String> {
-        let trimmed = raw.trim();
-        anyhow::ensure!(!trimmed.is_empty(), "Service name must not be empty");
-        anyhow::ensure!(
-            trimmed
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')),
-            "Service name '{}' is invalid. Use only letters, numbers, '_' or '-'.",
-            trimmed
-        );
-        Ok(trimmed.to_ascii_lowercase())
-    }
-
-    fn normalize_domains(domains: &[String]) -> anyhow::Result<Vec<String>> {
-        let normalized: Vec<String> = domains
-            .iter()
-            .map(|domain| domain.trim().trim_start_matches('.').to_ascii_lowercase())
-            .filter(|domain| !domain.is_empty())
-            .map(|domain| {
-                anyhow::ensure!(
-                    !domain.contains("://")
-                        && !domain.contains('/')
-                        && !domain.contains(char::is_whitespace),
-                    "Allowed domain '{}' must be a bare host/domain, not a URL or path.",
-                    domain
-                );
-                Ok(domain)
-            })
-            .collect::<anyhow::Result<_>>()?;
-        anyhow::ensure!(
-            !normalized.is_empty(),
-            "`allowed_domains` must contain at least one hostname."
-        );
-        Ok(normalized)
     }
 
     fn validate_https_url(raw: &str, label: &str) -> anyhow::Result<String> {
@@ -315,7 +285,7 @@ impl ManageOAuthTool {
         let Some(service) = args
             .service
             .as_deref()
-            .and_then(|service| Self::validate_service_name(service).ok())
+            .and_then(|service| validate_service_name(service).ok())
         else {
             return OwnerApprovalNeed::NotNeeded;
         };
@@ -473,7 +443,7 @@ impl ManageOAuthTool {
                 if let Some(service) = args
                     .service
                     .as_deref()
-                    .and_then(|service| Self::validate_service_name(service).ok())
+                    .and_then(|service| validate_service_name(service).ok())
                 {
                     effects
                         .keys
@@ -555,7 +525,7 @@ impl ManageOAuthTool {
             "token_url",
         )?;
         let allowed_domains =
-            Self::normalize_domains(args.allowed_domains.as_deref().ok_or_else(|| {
+            normalize_domains(args.allowed_domains.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("'register_provider' requires 'allowed_domains'")
             })?)?;
         let scopes = Self::normalize_scopes(args.scopes.as_deref().unwrap_or(&[]));
@@ -1401,14 +1371,14 @@ impl ManageOAuthTool {
             "providers" => self.handle_providers().await,
             "describe_provider" => {
                 let service =
-                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
+                    validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'describe_provider' requires 'service'")
                     })?)?;
                 self.handle_describe_provider(&service).await
             }
             "list" => self.handle_list().await,
             "bind_account" => {
-                let service = Self::validate_service_name(
+                let service = validate_service_name(
                     args.service
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'bind_account' requires 'service'"))?,
@@ -1430,7 +1400,7 @@ impl ManageOAuthTool {
             }
             "connect" => {
                 let service =
-                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
+                    validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'connect' requires 'service' parameter")
                     })?)?;
                 let session_id = if args.call_session.is_empty() {
@@ -1442,7 +1412,7 @@ impl ManageOAuthTool {
             }
             "remove" => {
                 let service =
-                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
+                    validate_service_name(args.service.as_deref().ok_or_else(|| {
                         anyhow::anyhow!("'remove' requires 'service' parameter")
                     })?)?;
                 self.handle_remove(
@@ -1453,25 +1423,22 @@ impl ManageOAuthTool {
                 .await
             }
             "register_provider" => {
-                let service =
-                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'register_provider' requires 'service' parameter")
-                    })?)?;
+                let service = validate_service_name(args.service.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'register_provider' requires 'service' parameter")
+                })?)?;
                 self.handle_register_provider(&service, &args, kernel_approved)
                     .await
             }
             "remove_provider" => {
-                let service =
-                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'remove_provider' requires 'service' parameter")
-                    })?)?;
+                let service = validate_service_name(args.service.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'remove_provider' requires 'service' parameter")
+                })?)?;
                 self.handle_remove_provider(&service, kernel_approved).await
             }
             "set_credentials" => {
-                let service =
-                    Self::validate_service_name(args.service.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("'set_credentials' requires 'service' parameter")
-                    })?)?;
+                let service = validate_service_name(args.service.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("'set_credentials' requires 'service' parameter")
+                })?)?;
                 self.handle_set_credentials(
                     &service,
                     args.client_id.as_deref(),
@@ -1480,7 +1447,7 @@ impl ManageOAuthTool {
                 .await
             }
             "refresh" => {
-                let service = Self::validate_service_name(
+                let service = validate_service_name(
                     args.service
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("'refresh' requires 'service'"))?,
@@ -1530,7 +1497,7 @@ impl crate::semantics::ToolSemantics for ManageOAuthTool {
                 );
             }
             if let Some(service) = args.service.as_deref()
-                && let Ok(service) = Self::validate_service_name(service)
+                && let Ok(service) = validate_service_name(service)
             {
                 semantics = semantics.with_target_hint(
                     ToolTargetHintKind::ResourceId,

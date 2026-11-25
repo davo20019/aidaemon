@@ -66,6 +66,10 @@ struct ManageApiArgs {
     call_session: String,
 }
 
+fn validate_service_name(raw: &str) -> anyhow::Result<String> {
+    aidaemon_tools::services::validate_identifier(raw, "Service")
+}
+
 pub struct ManageApiTool {
     manage_http_auth: ManageHttpAuthTool,
     manage_oauth: ManageOAuthTool,
@@ -106,19 +110,6 @@ impl ManageApiTool {
             http_request: HttpRequestTool::new(profiles).with_oauth_gateway(oauth_gateway),
             search_backend,
         }
-    }
-
-    fn validate_service_name(raw: &str) -> anyhow::Result<String> {
-        let trimmed = raw.trim();
-        anyhow::ensure!(!trimmed.is_empty(), "Service name must not be empty");
-        anyhow::ensure!(
-            trimmed
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')),
-            "Service name '{}' is invalid. Use only letters, numbers, '_' or '-'.",
-            trimmed
-        );
-        Ok(trimmed.to_ascii_lowercase())
     }
 
     fn parse_auth_mode(raw: Option<&str>) -> anyhow::Result<ApiAuthMode> {
@@ -815,7 +806,7 @@ impl ManageApiTool {
         if args.action != "onboard" {
             return None;
         }
-        let service = Self::validate_service_name(args.service.as_deref()?).ok()?;
+        let service = validate_service_name(args.service.as_deref()?).ok()?;
         let auth_mode = Self::parse_auth_mode(args.auth_mode.as_deref()).ok()?;
         let need = match auth_mode {
             ApiAuthMode::Existing => return None,
@@ -918,7 +909,7 @@ impl ManageApiTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<String> {
-        let service = Self::validate_service_name(
+        let service = validate_service_name(
             args.service
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("action='onboard' requires 'service'"))?,

@@ -17,6 +17,45 @@ pub mod manage_oauth;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 
+/// A service or profile name (`label`: "Service", "Profile"): letters,
+/// digits, `_` and `-`, kept lowercase.
+pub fn validate_identifier(raw: &str, label: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    anyhow::ensure!(!trimmed.is_empty(), "{label} name must not be empty");
+    anyhow::ensure!(
+        trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')),
+        "{label} name '{trimmed}' is invalid. Use only letters, numbers, '_' or '-'."
+    );
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// The hosts a credential may be sent to: bare, lowercase, without a
+/// leading dot, at least one.
+pub fn normalize_domains(domains: &[String]) -> anyhow::Result<Vec<String>> {
+    let normalized: Vec<String> = domains
+        .iter()
+        .map(|domain| domain.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .map(|domain| {
+            anyhow::ensure!(
+                !domain.contains("://")
+                    && !domain.contains('/')
+                    && !domain.contains(char::is_whitespace),
+                "Allowed domain '{}' must be a bare host/domain, not a URL or path.",
+                domain
+            );
+            Ok(domain)
+        })
+        .collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(
+        !normalized.is_empty(),
+        "`allowed_domains` must contain at least one hostname."
+    );
+    Ok(normalized)
+}
+
 /// The conversation's audience, shared across the SDK.
 pub use aidaemon_core::ChannelVisibility;
 

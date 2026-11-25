@@ -41,6 +41,7 @@
 //! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18; the
 //! report, 2026-11-23).
 
+use crate::jsonrpc::{error_line as error_reply_line, reply_line, request_line};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -342,30 +343,6 @@ pub fn initialize_line() -> String {
         "initialize",
         json!({"clientInfo": {"name": "aidaemon", "version": env!("CARGO_PKG_VERSION")}}),
     )
-}
-
-fn request_line(id: u64, method: &str, params: Value) -> String {
-    let mut line =
-        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    line.push('\n');
-    line
-}
-
-fn reply_line(id: &Value, result: Value) -> String {
-    let mut line = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
-    line.push('\n');
-    line
-}
-
-fn error_reply_line(id: &Value, message: &str) -> String {
-    let mut line = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": -32601, "message": message},
-    })
-    .to_string();
-    line.push('\n');
-    line
 }
 
 /// The action a command approval asks for: a network host to reach, or a

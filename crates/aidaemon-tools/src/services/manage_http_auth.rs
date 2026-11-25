@@ -71,6 +71,12 @@ impl ManualProfileResolution {
     }
 }
 
+fn validate_profile_name(raw: &str) -> anyhow::Result<String> {
+    crate::services::validate_identifier(raw, "Profile")
+}
+
+use crate::services::normalize_domains;
+
 pub struct ManageHttpAuthTool {
     config: ConfigFile,
     profiles: SharedHttpProfiles,
@@ -108,19 +114,6 @@ impl ManageHttpAuthTool {
             state_store,
             secrets,
         }
-    }
-
-    fn validate_profile_name(raw: &str) -> anyhow::Result<String> {
-        let trimmed = raw.trim();
-        anyhow::ensure!(!trimmed.is_empty(), "Profile name must not be empty");
-        anyhow::ensure!(
-            trimmed
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')),
-            "Profile name '{}' is invalid. Use only letters, numbers, '_' or '-'.",
-            trimmed
-        );
-        Ok(trimmed.to_ascii_lowercase())
     }
 
     fn parse_auth_type(raw: &str) -> anyhow::Result<HttpAuthType> {
@@ -181,29 +174,6 @@ impl ManageHttpAuthTool {
 
     fn keychain_field_name(profile: &str, field: &str) -> String {
         aidaemon_secrets::names::http_auth(profile, field)
-    }
-
-    fn normalize_domains(domains: &[String]) -> anyhow::Result<Vec<String>> {
-        let normalized: Vec<String> = domains
-            .iter()
-            .map(|domain| domain.trim().trim_start_matches('.').to_ascii_lowercase())
-            .filter(|domain| !domain.is_empty())
-            .map(|domain| {
-                anyhow::ensure!(
-                    !domain.contains("://")
-                        && !domain.contains('/')
-                        && !domain.contains(char::is_whitespace),
-                    "Allowed domain '{}' must be a bare host/domain, not a URL or path.",
-                    domain
-                );
-                Ok(domain)
-            })
-            .collect::<anyhow::Result<_>>()?;
-        anyhow::ensure!(
-            !normalized.is_empty(),
-            "`allowed_domains` must contain at least one hostname."
-        );
-        Ok(normalized)
     }
 
     async fn load_config_doc(&self) -> anyhow::Result<toml::Table> {
@@ -429,7 +399,7 @@ impl ManageHttpAuthTool {
         let Some(profile) = args
             .profile
             .as_deref()
-            .and_then(|profile| Self::validate_profile_name(profile).ok())
+            .and_then(|profile| validate_profile_name(profile).ok())
         else {
             return OwnerApprovalNeed::NotNeeded;
         };
@@ -517,7 +487,7 @@ impl ManageHttpAuthTool {
                 if let Some(profile) = args
                     .profile
                     .as_deref()
-                    .and_then(|profile| Self::validate_profile_name(profile).ok())
+                    .and_then(|profile| validate_profile_name(profile).ok())
                 {
                     effects
                         .keys
@@ -573,7 +543,7 @@ impl ManageHttpAuthTool {
             .map(Self::read_allowed_domains)
             .unwrap_or_default();
         let allowed_domains = if let Some(ref domains) = args.allowed_domains {
-            Self::normalize_domains(domains)?
+            normalize_domains(domains)?
         } else if !existing_allowed_domains.is_empty() {
             existing_allowed_domains
         } else {
@@ -959,7 +929,7 @@ impl ManageHttpAuthTool {
 
     /// `verify` for `profile_name` with no probe, with its typed readiness.
     pub async fn verify_profile(&self, profile_name: &str) -> anyhow::Result<ProfileVerification> {
-        let profile = Self::validate_profile_name(profile_name)?;
+        let profile = validate_profile_name(profile_name)?;
         self.handle_verify(&profile, None, None, None).await
     }
 
@@ -1210,7 +1180,7 @@ impl Tool for ManageHttpAuthTool {
             ));
         } else if matches!(args.action.as_str(), "describe" | "verify")
             && let Some(profile) = args.profile.as_deref()
-            && let Ok(profile) = Self::validate_profile_name(profile)
+            && let Ok(profile) = validate_profile_name(profile)
             && let Some(subject) = ToolTargetHint::new(
                 ToolTargetHintKind::ResourceId,
                 HttpRequestTool::auth_profile_resource_id(&profile),
@@ -1242,7 +1212,7 @@ impl ManageHttpAuthTool {
         match args.action.as_str() {
             "list" => self.handle_list().await,
             "describe" => {
-                let profile = Self::validate_profile_name(
+                let profile = validate_profile_name(
                     args.profile
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='describe' requires 'profile'"))?,
@@ -1250,7 +1220,7 @@ impl ManageHttpAuthTool {
                 self.handle_describe(&profile).await
             }
             "upsert" => {
-                let profile = Self::validate_profile_name(
+                let profile = validate_profile_name(
                     args.profile
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='upsert' requires 'profile'"))?,
@@ -1258,7 +1228,7 @@ impl ManageHttpAuthTool {
                 self.handle_upsert(&profile, &args, kernel_approved).await
             }
             "remove" => {
-                let profile = Self::validate_profile_name(
+                let profile = validate_profile_name(
                     args.profile
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='remove' requires 'profile'"))?,
@@ -1266,7 +1236,7 @@ impl ManageHttpAuthTool {
                 self.handle_remove(&profile, kernel_approved).await
             }
             "verify" => {
-                let profile = Self::validate_profile_name(
+                let profile = validate_profile_name(
                     args.profile
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("action='verify' requires 'profile'"))?,
@@ -1331,7 +1301,7 @@ impl crate::semantics::ToolSemantics for ManageHttpAuthTool {
                 );
             }
             if let Some(profile) = args.profile.as_deref()
-                && let Ok(profile) = Self::validate_profile_name(profile)
+                && let Ok(profile) = validate_profile_name(profile)
             {
                 semantics = semantics.with_target_hint(
                     ToolTargetHintKind::ResourceId,

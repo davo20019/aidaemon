@@ -319,12 +319,7 @@ impl OutcomeTool for EditFile {
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
 
-        // Parameter aliasing: models often use slightly different names
-        let path_str = args["path"]
-            .as_str()
-            .or_else(|| args["file_path"].as_str())
-            .or_else(|| args["file"].as_str())
-            .or_else(|| args["filename"].as_str())
+        let path_str = super::path_arg(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
         let request = EditRequest::parse(&args).map_err(|why| anyhow::anyhow!(why))?;
 
@@ -569,16 +564,7 @@ impl crate::semantics::ToolSemantics for EditFile {
         _roots: &crate::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
         let semantics = self.call_semantics(arguments);
-        let mut annotations =
-            crate::semantics::default_call_annotations(self.capabilities(), &semantics);
-        // A write that can plant git configuration changes what later
-        // "read-only" git commands execute: treat it as a configuration change.
-        let plants_git_config = semantics
-            .target_hints
-            .iter()
-            .any(|hint| self.policy.plants_configuration(&hint.value));
-        annotations.egress |= plants_git_config;
-        annotations
+        super::write_call_annotations(self.capabilities(), &semantics, &*self.policy)
     }
 }
 

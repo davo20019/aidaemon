@@ -337,6 +337,30 @@ pub(crate) fn path_arg(arguments: &Value) -> Option<&str> {
         .find_map(|key| arguments.get(*key).and_then(Value::as_str))
 }
 
+/// The content argument of `write_file`, under the names models commonly
+/// use.
+pub(crate) fn content_arg(arguments: &Value) -> Option<&str> {
+    ["content", "data", "text"]
+        .iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+}
+
+/// A file write's annotations: the defaults, plus egress when a target can
+/// plant git configuration (which changes what later "read-only" git
+/// commands execute).
+pub(crate) fn write_call_annotations(
+    capabilities: crate::semantics::ToolCapabilities,
+    semantics: &crate::semantics::ToolCallSemantics,
+    policy: &dyn FilePolicy,
+) -> aidaemon_core::ToolAnnotations {
+    let mut annotations = crate::semantics::default_call_annotations(capabilities, semantics);
+    annotations.egress |= semantics
+        .target_hints
+        .iter()
+        .any(|hint| policy.plants_configuration(&hint.value));
+    annotations
+}
+
 /// Format file content with line numbers.
 pub fn format_with_line_numbers(content: &str, start_line: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();

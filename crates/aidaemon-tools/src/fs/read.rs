@@ -195,12 +195,7 @@ impl ReadFile {
         fence: Option<&Arc<dyn crate::semantics::FileFence>>,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
-        // Parameter aliasing: models often use "file_path" or "file" instead of "path"
-        let path_str = args["path"]
-            .as_str()
-            .or_else(|| args["file_path"].as_str())
-            .or_else(|| args["file"].as_str())
-            .or_else(|| args["filename"].as_str())
+        let path_str = super::path_arg(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
 
         let has_start = args.get("start_line").is_some_and(|value| !value.is_null());

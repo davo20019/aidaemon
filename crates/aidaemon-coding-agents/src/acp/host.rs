@@ -30,6 +30,7 @@
 //! The host advertises no file system or terminal of its own: the agent
 //! acts with its own tools, after asking.
 
+use crate::jsonrpc::{error_line, reply_line, request_line};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -44,30 +45,6 @@ const SESSION_NEW_ID: u64 = 2;
 const PROMPT_ID: u64 = 3;
 const SET_MODEL_ID: u64 = 4;
 const SESSION_LOAD_ID: u64 = 5;
-
-fn request_line(id: u64, method: &str, params: Value) -> String {
-    let mut line =
-        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    line.push('\n');
-    line
-}
-
-fn reply_line(id: &Value, result: Value) -> String {
-    let mut line = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
-    line.push('\n');
-    line
-}
-
-fn error_line(id: &Value, message: &str) -> String {
-    let mut line = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": -32601, "message": message},
-    })
-    .to_string();
-    line.push('\n');
-    line
-}
 
 /// The paths a tool call names (`locations[].path`).
 fn locations(update: &Value) -> Vec<Value> {

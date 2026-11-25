@@ -459,21 +459,10 @@ pub async fn latest_child_task_end(
     event_store: &aidaemon_events::EventStore,
     child_session: &str,
 ) -> anyhow::Result<Option<TaskEndData>> {
-    const MAX_BUSY_RETRIES: usize = 3;
-    let mut busy_retries = 0_usize;
-    let events = loop {
-        match event_store
-            .query_recent_task_ends(child_session, false, 1)
-            .await
-        {
-            Ok(events) => break events,
-            Err(error) if busy_retries < MAX_BUSY_RETRIES && is_sqlite_busy(&error) => {
-                tokio::time::sleep(Duration::from_millis(25_u64 << busy_retries)).await;
-                busy_retries += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let events = aidaemon_work::scheduler::retry_on_busy("reading a child's end record", 3, || {
+        event_store.query_recent_task_ends(child_session, false, 1)
+    })
+    .await?;
     // A record that is there but cannot be parsed is unreadable, never a
     // missing (and so never a successful) end.
     events

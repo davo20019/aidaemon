@@ -97,17 +97,9 @@ impl OutcomeTool for WriteFile {
         facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
         let args: Value = serde_json::from_str(arguments)?;
-        // Parameter aliasing: models often use "file_path" or "file" instead of "path"
-        let path_str = args["path"]
-            .as_str()
-            .or_else(|| args["file_path"].as_str())
-            .or_else(|| args["file"].as_str())
-            .or_else(|| args["filename"].as_str())
+        let path_str = super::path_arg(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
-        let content = args["content"]
-            .as_str()
-            .or_else(|| args["data"].as_str())
-            .or_else(|| args["text"].as_str())
+        let content = super::content_arg(&args)
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: content"))?;
         let create_dirs = args["create_dirs"].as_bool().unwrap_or(true);
 
@@ -322,9 +314,7 @@ impl crate::semantics::ToolSemantics for WriteFile {
         current: Option<&[u8]>,
     ) -> Option<Result<Vec<u8>, String>> {
         let args: Value = serde_json::from_str(arguments).ok()?;
-        let content = ["content", "data", "text"]
-            .iter()
-            .find_map(|key| args.get(*key).and_then(Value::as_str))?;
+        let content = super::content_arg(&args)?;
         let mut result = match args["mode"].as_str() {
             Some("append") => current.unwrap_or_default().to_vec(),
             Some("overwrite") | None => Vec::new(),
@@ -364,16 +354,7 @@ impl crate::semantics::ToolSemantics for WriteFile {
         _roots: &crate::semantics::TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
         let semantics = self.call_semantics(arguments);
-        let mut annotations =
-            crate::semantics::default_call_annotations(self.capabilities(), &semantics);
-        // A write that can plant git configuration changes what later
-        // "read-only" git commands execute: treat it as a configuration change.
-        let plants_git_config = semantics
-            .target_hints
-            .iter()
-            .any(|hint| self.policy.plants_configuration(&hint.value));
-        annotations.egress |= plants_git_config;
-        annotations
+        super::write_call_annotations(self.capabilities(), &semantics, &*self.policy)
     }
 
     async fn durable_replay_decision(&self, arguments: &str) -> DurableReplayDecision {
@@ -385,19 +366,10 @@ impl crate::semantics::ToolSemantics for WriteFile {
         if args["mode"].as_str().unwrap_or("overwrite") != "overwrite" {
             return DurableReplayDecision::Replay;
         }
-        let Some(path_str) = args["path"]
-            .as_str()
-            .or_else(|| args["file_path"].as_str())
-            .or_else(|| args["file"].as_str())
-            .or_else(|| args["filename"].as_str())
-        else {
+        let Some(path_str) = super::path_arg(&args) else {
             return DurableReplayDecision::Replay;
         };
-        let Some(content) = args["content"]
-            .as_str()
-            .or_else(|| args["data"].as_str())
-            .or_else(|| args["text"].as_str())
-        else {
+        let Some(content) = super::content_arg(&args) else {
             return DurableReplayDecision::Replay;
         };
 

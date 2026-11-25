@@ -29,6 +29,7 @@ mod agent;
 pub mod claude;
 pub mod codex;
 mod events;
+mod jsonrpc;
 mod mode;
 mod models;
 pub mod peer;

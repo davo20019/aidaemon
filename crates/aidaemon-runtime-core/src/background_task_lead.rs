@@ -278,33 +278,20 @@ pub async fn release_duplicate_dispatch_trigger(
             ),
             ..Default::default()
         };
-        let mut busy_retry = 0_usize;
-        loop {
-            match state
-                .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
-                .await
-            {
-                Ok(true) => break,
-                Ok(false) => return,
-                Err(error) if busy_retry < 5 && is_sqlite_busy_error(&error) => {
-                    let delay_ms = 25_u64 << busy_retry;
-                    busy_retry += 1;
-                    warn!(
-                        attempt_id = %attempt.id,
-                        retry = busy_retry,
-                        delay_ms,
-                        "SQLite busy while releasing task-lead trigger; retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(error) => {
-                    warn!(
-                        attempt_id = %attempt.id,
-                        %error,
-                        "Failed to release task-lead trigger attempt"
-                    );
-                    return;
-                }
+        match aidaemon_work::scheduler::retry_on_busy("releasing a task-lead trigger", 5, || {
+            state.patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
+        })
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                warn!(
+                    attempt_id = %attempt.id,
+                    %error,
+                    "Failed to release task-lead trigger attempt"
+                );
+                return;
             }
         }
     }
@@ -321,30 +308,18 @@ pub async fn release_duplicate_dispatch_trigger(
             task.blocker = None;
             task.started_at = None;
             task.completed_at = None;
-            let mut busy_retry = 0_usize;
-            loop {
-                match state.update_task(&task).await {
-                    Ok(()) => break,
-                    Err(error) if busy_retry < 5 && is_sqlite_busy_error(&error) => {
-                        let delay_ms = 25_u64 << busy_retry;
-                        busy_retry += 1;
-                        warn!(
-                            task_id = %task_id,
-                            retry = busy_retry,
-                            delay_ms,
-                            "SQLite busy while re-queueing task-lead trigger; retrying"
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    }
-                    Err(error) => {
-                        warn!(
-                            task_id = %task_id,
-                            %error,
-                            "Failed to re-queue task-lead trigger"
-                        );
-                        break;
-                    }
-                }
+            if let Err(error) = aidaemon_work::scheduler::retry_on_busy(
+                "re-queueing a task-lead trigger",
+                5,
+                || state.update_task(&task),
+            )
+            .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    %error,
+                    "Failed to re-queue task-lead trigger"
+                );
             }
         }
     }

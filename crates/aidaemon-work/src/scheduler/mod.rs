@@ -195,6 +195,33 @@ pub fn mandate_transient_retry_at(mandate: &Mandate, now: chrono::DateTime<Utc>)
     retry_at.to_rfc3339()
 }
 
+/// Run `op` until it succeeds, retrying up to `max_retries` times after
+/// SQLite contention ([`is_sqlite_busy_error`]) with a doubling wait from
+/// 25 ms. Any other error, or contention past the last retry, is returned.
+/// `what` names the operation in the retry log.
+pub async fn retry_on_busy<T, F, Fut>(
+    what: &str,
+    max_retries: usize,
+    mut op: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut retry = 0_usize;
+    loop {
+        match op().await {
+            Err(error) if retry < max_retries && is_sqlite_busy_error(&error) => {
+                let delay_ms = 25_u64 << retry;
+                retry += 1;
+                tracing::warn!(what, retry, delay_ms, %error, "SQLite busy; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Whether an error is SQLite contention (`SQLITE_BUSY` or `SQLITE_LOCKED`,
 /// including their extended codes), read from the driver's typed database
 /// error anywhere in the chain. The message is never read: an error that was

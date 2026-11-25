@@ -64,35 +64,15 @@ impl TurnEngine<'_> {
         worker_instance_id: &str,
         worker_profile_id: Option<&str>,
     ) -> anyhow::Result<bool> {
-        const MAX_BUSY_RETRIES: usize = 4;
-        let mut busy_retries = 0_usize;
-        loop {
-            match self
-                .work()
-                .bind_task_attempt_worker(
-                    attempt_id,
-                    lease_token,
-                    worker_instance_id,
-                    worker_profile_id,
-                )
-                .await
-            {
-                Ok(bound) => return Ok(bound),
-                Err(error) if busy_retries < MAX_BUSY_RETRIES && is_sqlite_busy(&error) => {
-                    let delay_ms = 25_u64 << busy_retries;
-                    busy_retries += 1;
-                    warn!(
-                        attempt_id,
-                        busy_retries,
-                        delay_ms,
-                        error = %error,
-                        "Retrying task worker binding after SQLite contention"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        aidaemon_work::scheduler::retry_on_busy("binding a task worker", 4, || {
+            self.work().bind_task_attempt_worker(
+                attempt_id,
+                lease_token,
+                worker_instance_id,
+                worker_profile_id,
+            )
+        })
+        .await
     }
 
     async fn sync_worker_profile(
@@ -523,37 +503,16 @@ impl TurnEngine<'_> {
         error: Option<&str>,
         child_session: &str,
     ) -> anyhow::Result<()> {
-        const MAX_BUSY_RETRIES: usize = 3;
-        let mut busy_retry = 0_usize;
-        loop {
-            match self
-                .finalize_executor_task_outcome_once(
-                    task_id,
-                    attempt,
-                    response,
-                    error,
-                    child_session,
-                )
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(finalize_error)
-                    if busy_retry < MAX_BUSY_RETRIES && is_sqlite_busy(&finalize_error) =>
-                {
-                    let delay_ms = 25_u64 << busy_retry;
-                    busy_retry += 1;
-                    warn!(
-                        task_id,
-                        busy_retry,
-                        delay_ms,
-                        error = %finalize_error,
-                        "Retrying durable executor finalization after SQLite contention"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(finalize_error) => return Err(finalize_error),
-            }
-        }
+        aidaemon_work::scheduler::retry_on_busy("finalizing an executor task", 3, || {
+            self.finalize_executor_task_outcome_once(
+                task_id,
+                attempt,
+                response,
+                error,
+                child_session,
+            )
+        })
+        .await
     }
 
     async fn finalize_executor_task_outcome_once(
