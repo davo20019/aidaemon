@@ -221,6 +221,7 @@ fn work_line(store: Store, id: String) -> View {
             let label = format!("{words}, open its agents");
             view().child(
                 nsh_base::button()
+                    .w_full()
                     .accessibility_label(label)
                     .rounded(px(ui::radius::CONTROL))
                     .hover(|s| s.bg(colors::HOVER))
@@ -228,12 +229,14 @@ fn work_line(store: Store, id: String) -> View {
                     .on_press(move || store.open_agents(open_id.clone()))
                     .child(
                         view()
+                            .w_full()
+                            .min_h(px(ui::Size::Sm.height()))
                             .flex_row()
                             .items_center()
                             .gap_2()
                             .pl(px(WORK_INDENT))
                             .pr_2()
-                            .pb_1()
+                            .py_1()
                             .child(
                                 text(words)
                                     .flex_1()
@@ -428,9 +431,10 @@ fn rename_field(store: Store, id: String) -> View {
 }
 
 /// More about a conversation than its row says: its title, where it is,
-/// when it last moved, and its last message.
+/// who answers it, when it last moved, and its last message.
 fn session_preview(store: Store, id: String) -> View {
-    let (title, place, when, last) = (id.clone(), id.clone(), id.clone(), id);
+    let (title, place, agent, when, last) =
+        (id.clone(), id.clone(), id.clone(), id.clone(), id);
     view()
         .gap_1()
         .child(
@@ -443,6 +447,9 @@ fn session_preview(store: Store, id: String) -> View {
         .child(
             text(move || {
                 let mut parts = vec![store.place(&place)];
+                if let Some(agent) = store.session_agent(&agent) {
+                    parts.push(agent);
+                }
                 if let Some(at) = store.last_activity(&when) {
                     parts.push(ui::time::ago(at, crate::store::now_ms()));
                 }
@@ -1436,10 +1443,15 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             store.leave_drawer(move || store.select(Some(b)))
         },
     )
-    // Read as one item: its name, where it lives and whether it is working.
+    // Two lines need air between rows; a phone's taller rows have it.
+    .py(px(if ui::touch() { 0.0 } else { 4.0 }))
+    // Read as one item: its name, where it lives, who answers and whether it is working.
     .accessibility_label(move || {
         let id = &label_id;
         let mut parts = vec![store.title(id), store.place(id)];
+        if let Some(agent) = store.session_agent(id) {
+            parts.push(agent);
+        }
         if store.is_pinned(id) {
             parts.push("pinned".into());
         }
@@ -1503,11 +1515,10 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
 }
 
 /// A conversation row's name and where it is from: its project's name
-/// (outside that project's page), or the chat it came from when not the
-/// app (Telegram, Discord and Slack by their icons, a group adding people;
-/// any other by name). A window keeps them on one line, faint after the
-/// name; a phone, whose name has little room, puts them on a second line
-/// under it, and a row with nothing to say stays one line.
+/// (outside that project's page), its coding agent when set to one, or the
+/// chat it came from when not the app (Telegram, Discord and Slack by their
+/// icons, a group adding people; any other by name). Shown on a second line
+/// under the title, and a row with nothing to say stays one line.
 fn row_names(store: Store, id: String, d: String, f: String, g: String, h: String) -> View {
     let title = text(move || store.title(&d))
         .flex_1()
@@ -1525,8 +1536,11 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
         .text_size(px(type_scale::XS))
         .text_color(colors::FAINT);
     let (tag_id, mark_id, any_id) = (g, id.clone(), id);
+    let tag_shown_id = tag_id.clone();
     let agent_id = tag_id.clone();
+    let agent_shown_id = tag_id.clone();
     let tag = move || row_tag(store, &tag_id);
+    let has_tag = move || !row_tag(store, &tag_shown_id).is_empty();
     let tag_text = move || {
         let tag = tag.clone();
         text(tag)
@@ -1536,6 +1550,7 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
     };
     // The coding agent the conversation is set to (messages there go
     // straight to it), kept whole: a long project name gives way first.
+    let has_agent = move || store.session_agent(&agent_shown_id).is_some();
     let agent_text = move || {
         let id = agent_id.clone();
         text(move || row_agent(store, &id))
@@ -1585,16 +1600,22 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
                 .child(star),
         )
         .child(when(said, move || {
+            let has_tag = has_tag.clone();
+            let tag_text = tag_text.clone();
+            let has_agent = has_agent.clone();
+            let agent_text = agent_text.clone();
             // The line shrinks with the row, and the project's name gives
-            // way (one line, ending in "…") before the source icons: a long
-            // name ran past the time and off a phone's screen.
+            // way (one line, ending in "…") before the agent and source icons:
+            // empty slots stay unmounted so they add no leading flex gap.
             view()
                 .flex_row()
                 .items_center()
                 .min_w(px(0.0))
                 .gap_1()
-                .child(tag_text().min_w(px(0.0)).flex_shrink(1.0))
-                .child(agent_text())
+                .child(when(has_tag, move || {
+                    tag_text().min_w(px(0.0)).flex_shrink(1.0)
+                }))
+                .child(when(has_agent, agent_text))
                 .child(mark())
         }))
 }
