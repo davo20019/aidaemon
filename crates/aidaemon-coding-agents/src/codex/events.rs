@@ -152,6 +152,7 @@ mod tests {
                 tool: StepTool::Run {
                     program: Some("npm".into()),
                     subcommand: Some("test".into()),
+                    also: Vec::new(),
                 }
             })]
         );

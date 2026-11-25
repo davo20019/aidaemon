@@ -114,6 +114,23 @@ pub trait CodingAgent: Send + Sync {
     }
 }
 
+/// A host-owned stdio MCP server explicitly injected into a coding agent run
+/// (for example, a scoped peer-coordination server).
+///
+/// Unlike user-configured MCP servers—which confined modes strip—endpoints
+/// carried here are authorized and managed by the embedding host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpEndpoint {
+    /// Server identifier as seen by the coding agent (e.g. `aidaemon_peers`).
+    pub name: String,
+    /// Executable path or name launched by the coding agent over stdio.
+    pub command: String,
+    /// Arguments passed to `command`.
+    pub args: Vec<String>,
+    /// Environment variables passed exclusively to this MCP server process.
+    pub env: Vec<(String, String)>,
+}
+
 /// One run, as the embedding agent asks for it.
 #[derive(Debug, Clone, Copy)]
 pub struct RunRequest<'a> {
@@ -146,6 +163,8 @@ pub struct RunRequest<'a> {
     /// what it learned there; `None`: a new session. Only an agent that
     /// [`CodingAgent::resumes`] takes it.
     pub resume: Option<&'a str>,
+    /// Host-owned MCP servers injected for this run (e.g. peer coordination).
+    pub mcp_servers: &'a [McpEndpoint],
 }
 
 /// `Err`, in words for the owner, when `request` asks `agent` to continue

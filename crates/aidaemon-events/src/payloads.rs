@@ -426,7 +426,8 @@ pub struct ToolReceiptV1 {
     /// `checklist_items`), copied from its metadata.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist_items: Vec<usize>,
-    /// How many runs the call left working, from its metadata.
+    /// How many runs the call launched (still working or ended within it),
+    /// from its metadata.
     #[serde(default, skip_serializing_if = "is_zero_runs")]
     pub launched_runs: usize,
 }

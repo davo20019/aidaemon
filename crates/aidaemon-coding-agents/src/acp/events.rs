@@ -143,7 +143,7 @@ mod tests {
         );
         assert!(
             matches!(&read_events(r#"{"type":"tool_call","id":"c2","kind":"execute","command":"pytest -q"}"#)[0],
-                AgentEvent::Step(step) if step.tool == StepTool::Run { program: Some("pytest".into()), subcommand: None })
+                AgentEvent::Step(step) if step.tool == StepTool::Run { program: Some("pytest".into()), subcommand: None, also: Vec::new() })
         );
         assert!(read_events(r#"{"type":"tool_call","id":"c3","kind":"think"}"#).is_empty());
         assert_eq!(

@@ -231,6 +231,10 @@ pub fn interrupt_line() -> String {
 /// Starts a [`ClaudeHost`] for a run in `working_dir`.
 pub struct ClaudeHostStarter {
     pub working_dir: Option<String>,
+    /// Host-injected MCP server names whose tools (`mcp__<server>__*`) are
+    /// authorized directly by the host (the host's MCP server enforces its own
+    /// authority and approval checks).
+    pub trusted_mcp_servers: Vec<String>,
 }
 
 #[async_trait]
@@ -242,10 +246,23 @@ impl HostStarter for ClaudeHostStarter {
         judge: Arc<dyn ActionJudge>,
         prompt: &str,
     ) -> Arc<dyn AgentHost> {
-        let host = ClaudeHost::new(stdin, judge, self.working_dir);
+        let host = ClaudeHost::new(stdin, judge, self.working_dir)
+            .with_trusted_mcp_servers(self.trusted_mcp_servers);
         host.stdin.write(&prompt_line(prompt)).await;
         Arc::new(host)
     }
+}
+
+/// Whether `tool_name` is an MCP tool (`mcp__<server>__<tool>`, Claude Code's
+/// protocol naming) belonging to a host-injected server in `trusted`.
+pub fn is_trusted_mcp_tool(tool_name: &str, trusted: &[String]) -> bool {
+    let Some(rest) = tool_name.strip_prefix("mcp__") else {
+        return false;
+    };
+    let Some((server, tool)) = rest.split_once("__") else {
+        return false;
+    };
+    !tool.is_empty() && trusted.iter().any(|allowed| allowed == server)
 }
 
 /// Answers one Claude Code process's prompts.
@@ -254,6 +271,7 @@ pub struct ClaudeHost {
     stdin: Stdin,
     judge: Arc<dyn ActionJudge>,
     working_dir: Option<String>,
+    trusted_mcp_servers: Arc<[String]>,
     answers: Arc<Mutex<HostAnswers>>,
 }
 
@@ -267,14 +285,26 @@ impl ClaudeHost {
             stdin: Stdin::new(stdin),
             judge,
             working_dir,
+            trusted_mcp_servers: Arc::from(Vec::<String>::new()),
             answers: Arc::default(),
         }
     }
 
+    /// Authorize MCP tool prompts belonging to host-injected servers.
+    pub fn with_trusted_mcp_servers(mut self, servers: Vec<String>) -> Self {
+        self.trusted_mcp_servers = Arc::from(servers);
+        self
+    }
+
     async fn answer(&self, prompt: PermissionPrompt) {
-        let (label, verdict) = match action(&prompt, self.working_dir.as_deref()) {
-            Ok(action) => (action.label(), self.judge.judge(action).await),
-            Err(reason) => (prompt.tool_name.clone(), Verdict::Deny { reason }),
+        let (label, verdict) = if is_trusted_mcp_tool(&prompt.tool_name, &self.trusted_mcp_servers)
+        {
+            (prompt.tool_name.clone(), Verdict::Allow)
+        } else {
+            match action(&prompt, self.working_dir.as_deref()) {
+                Ok(action) => (action.label(), self.judge.judge(action).await),
+                Err(reason) => (prompt.tool_name.clone(), Verdict::Deny { reason }),
+            }
         };
         // Claude Code reports what it was refused itself
         // (`permission_denials`); a decline is kept here.

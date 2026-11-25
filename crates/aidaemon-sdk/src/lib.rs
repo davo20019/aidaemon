@@ -12,8 +12,9 @@
 //! | [`policies`] | `policies` (default) | Approvals, scope and egress guards, streak guard, redaction, instructions, context window, conversation compaction, memory, tracing |
 //! | [`secrets`] | `secrets` (default; `keychain` for the OS store) | Secret stores whose values come out as `Secret` and are redacted from every run |
 //! | [`agents`] | `agents` (default) | Agents as tools, child budgets |
+//! | [`coding_agents`] | `coding-agents` (+ `mcp`) | Coding agents (Claude Code, Codex, ACP), permission hosts, and MCP peer-CLI coordination (`coding_agents::peer`) |
 //! | [`store`] | `sqlite` (default) | Durable runs on SQLite, crash recovery queries, upkeep (`store::maintenance`: planner statistics, live snapshots) |
-//! | [`mcp`] | `mcp` | MCP servers as tools |
+//! | [`mcp`] | `mcp` | MCP client (`McpServer`) and reusable MCP server + stdio bridge (`LocalMcpServer`, `serve_stdio`, `run_stdio_bridge`) |
 //! | [`eval`] | `eval` | YAML scenarios, N-of-M pass rates, baseline comparison |
 //! | [`memory`] | `memory` (+ `fastembed`) | Long-term memory: facts, episodes, hybrid recall; every part swappable |
 //! | [`events`] | `events` | The immutable event store, its payloads and the run aggregate |

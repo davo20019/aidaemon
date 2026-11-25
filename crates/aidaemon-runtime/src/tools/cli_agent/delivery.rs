@@ -92,6 +92,13 @@ pub(super) async fn deliver_end(
     };
     handles.claims_changed.notify_waiters();
 
+    // Child peer runs spawned via the MCP coordination server settle their run
+    // card above and hand their output back to their spawning peer via
+    // `PeerTree`, never posting standalone replies into the owner's chat.
+    if call.is_peer_run {
+        return;
+    }
+
     let direct = !notify_session_id.trim().is_empty()
         && crate::session_model::get(handles.state.as_ref(), &notify_session_id)
             .await

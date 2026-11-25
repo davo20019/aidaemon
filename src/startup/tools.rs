@@ -153,6 +153,19 @@ pub async fn setup_tools(
     .await?;
     if let Some(cli) = &cli_agent_tool {
         cli.set_permissions(permissions);
+        let sweeper = cli.clone();
+        tokio::spawn(async move { sweeper.release_orphaned_peer_worktrees().await });
+        if let Ok(exe) = std::env::current_exe()
+            && let Err(error) = cli
+                .enable_peer_coordination(
+                    exe.to_string_lossy().into_owned(),
+                    vec!["mcp-bridge".to_string()],
+                )
+                .await
+        {
+            tracing::warn!(%error, "Could not start MCP peer-coordination server for CLI agents");
+        }
+        cli.enable_peer_file_delivery(inbox_dir.clone());
     }
 
     let mcp_registry = crate::startup::mcp::setup_mcp_registry(

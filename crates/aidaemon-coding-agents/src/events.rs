@@ -79,6 +79,10 @@ pub enum StepTool {
     Run {
         program: Option<String>,
         subcommand: Option<String>,
+        /// The commands after the first in the same command line
+        /// (`git status && python3 -m unittest`), each as
+        /// [`command_key`] reads one.
+        also: Vec<(String, Option<String>)>,
     },
     Fetch {
         host: Option<String>,
@@ -201,12 +205,23 @@ fn tool_record(tool: &StepTool) -> Value {
         StepTool::Run {
             program,
             subcommand,
-        } => match subcommand {
-            Some(subcommand) => {
-                json!({"kind": "run", "program": program, "subcommand": subcommand})
+            also,
+        } => {
+            let mut record = json!({"kind": "run", "program": program});
+            if let Some(subcommand) = subcommand {
+                record["subcommand"] = json!(subcommand);
             }
-            None => json!({"kind": "run", "program": program}),
-        },
+            if !also.is_empty() {
+                record["also"] = also
+                    .iter()
+                    .map(|(program, subcommand)| match subcommand {
+                        Some(subcommand) => json!({"program": program, "subcommand": subcommand}),
+                        None => json!({"program": program}),
+                    })
+                    .collect();
+            }
+            record
+        }
         StepTool::Fetch { host } => json!({"kind": "fetch", "host": host}),
         StepTool::Delegate { what } => json!({"kind": "delegate", "what": what}),
         StepTool::Plan => json!({"kind": "plan"}),
@@ -259,6 +274,24 @@ fn is_safe_subcommand(word: &str) -> bool {
 /// `("pytest", None)`). Machine format (a shell command line), tokenized;
 /// flags, paths, URLs, assignments, and arbitrary arguments are never kept.
 pub fn command_key(command: &str) -> (Option<String>, Option<String>) {
+    let (keys, setup) = scan_command(command, false);
+    match keys.into_iter().next() {
+        Some((program, subcommand)) => (Some(program), subcommand),
+        // Only setup commands: say the first.
+        None => (setup, None),
+    }
+}
+
+/// Every command a command line runs, in order, each as [`command_key`]
+/// reads one (`git status && python3 -m unittest` runs `git status` and
+/// `python3`). Setup builtins (`cd`, `export`) are left out.
+pub fn command_keys(command: &str) -> Vec<(String, Option<String>)> {
+    scan_command(command, true).0
+}
+
+/// The commands `command` runs (only the first unless `all`), and the first
+/// setup builtin it names.
+fn scan_command(command: &str, all: bool) -> (Vec<(String, Option<String>)>, Option<String>) {
     // Shell builtins that set up the next command rather than do the work
     // (a machine format: command words).
     const SETUP: &[&str] = &[
@@ -278,9 +311,9 @@ pub fn command_key(command: &str) -> (Option<String>, Option<String>) {
         && flags.starts_with('-')
         && flags.contains('c')
     {
-        let inner_key = command_key(inner);
-        if inner_key.0.is_some() {
-            return inner_key;
+        let (inner_keys, inner_setup) = scan_command(inner, all);
+        if !inner_keys.is_empty() {
+            return (inner_keys, inner_setup);
         }
     }
     // Shell grammar words (a machine format): a compound command's header
@@ -290,6 +323,7 @@ pub fn command_key(command: &str) -> (Option<String>, Option<String>) {
     const HEADERS: &[&str] = &["for", "while", "until", "if", "elif", "case", "select"];
     const LEADS: &[&str] = &["do", "then", "else", "{", "(", "!", "time"];
     let mut first: Option<String> = None;
+    let mut keys: Vec<(String, Option<String>)> = Vec::new();
     let mut at_start = true;
     let mut in_header = false;
     for (idx, raw_word) in words.iter().enumerate() {
@@ -338,17 +372,20 @@ pub fn command_key(command: &str) -> (Option<String>, Option<String>) {
                     } else {
                         extract_subcommand(&name, &words[idx + 1..])
                     };
-                    return (Some(name), subcommand);
+                    keys.push((name, subcommand));
+                    if !all {
+                        return (keys, first);
+                    }
+                } else {
+                    first.get_or_insert(name);
                 }
-                first.get_or_insert(name);
             }
         }
         if ends {
             at_start = true;
         }
     }
-    // Only setup commands: say the first.
-    (first.filter(|name| !name.is_empty()), None)
+    (keys, first.filter(|name| !name.is_empty()))
 }
 
 /// Extract a safe subcommand word from the tokens following `program`, stopping
@@ -378,9 +415,14 @@ impl StepTool {
     /// program and optional subcommand word.
     pub fn run(command: Option<&str>) -> Self {
         let (program, subcommand) = command.map(command_key).unwrap_or((None, None));
+        let also = match (command, &program) {
+            (Some(command), Some(_)) => command_keys(command).into_iter().skip(1).collect(),
+            _ => Vec::new(),
+        };
         Self::Run {
             program,
             subcommand,
+            also,
         }
     }
 }

@@ -28,7 +28,9 @@ pub mod codex;
 mod events;
 mod mode;
 mod models;
+pub mod peer;
 pub mod plain;
+pub mod private_files;
 mod readiness;
 mod registry;
 pub mod report;
@@ -36,11 +38,12 @@ mod stdin;
 
 pub use action::{ActionJudge, AgentAction, AllowAll, TextEdit, Verdict};
 pub use agent::{
-    AgentHost, CodingAgent, Discovery, HostAnswers, HostStarter, Launch, LaunchArguments, Plan,
-    PromptPlacement, RunRequest, read_through,
+    AgentHost, CodingAgent, Discovery, HostAnswers, HostStarter, Launch, LaunchArguments,
+    McpEndpoint, Plan, PromptPlacement, RunRequest, read_through,
 };
 pub use events::{
-    AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, command_key, host_of, program_of,
+    AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, command_key, command_keys, host_of,
+    program_of,
 };
 pub use mode::{PermissionMode, mode_within, modes_within};
 pub use models::{ModelListing, list_models};

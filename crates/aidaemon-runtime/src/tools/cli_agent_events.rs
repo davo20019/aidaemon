@@ -22,7 +22,32 @@ pub(super) struct RecordedRun {
     pub(super) id: Option<String>,
     pub(super) program: Option<String>,
     pub(super) subcommand: Option<String>,
+    /// The commands after the first in the same command line.
+    pub(super) also: Vec<(String, Option<String>)>,
     pub(super) failed: Option<bool>,
+}
+
+impl RecordedRun {
+    /// Whether this command line ran `program` (with `subcommand`, when a
+    /// check names one).
+    fn ran(&self, program: &str, subcommand: Option<&str>) -> bool {
+        let first = self
+            .program
+            .as_deref()
+            .map(|first| (first, self.subcommand.as_deref()));
+        let rest = self
+            .also
+            .iter()
+            .map(|(program, subcommand)| (program.as_str(), subcommand.as_deref()));
+        first.into_iter().chain(rest).any(|(ran, ran_sub)| {
+            ran == program
+                && match (subcommand, ran_sub) {
+                    (Some(claimed), Some(actual)) => claimed == actual,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                }
+        })
+    }
 }
 
 pub(super) struct AgentEventRecorder {
@@ -99,10 +124,11 @@ impl AgentEventRecorder {
     pub(super) fn result(
         &self,
         edited: &[String],
+        watched: &[String],
         fallback: &str,
     ) -> aidaemon_channels::turns::RunResult {
         let fallback = if self.structured() { "" } else { fallback };
-        run_result(self.reported.as_ref(), fallback, edited, &self.ran)
+        run_result(self.reported.as_ref(), fallback, edited, watched, &self.ran)
     }
 
     /// What its agent ended with, as its adapter read it: a report's text
@@ -141,11 +167,13 @@ impl AgentEventRecorder {
                     aidaemon_coding_agents::StepTool::Run {
                         program,
                         subcommand,
+                        also,
                     } => {
                         self.ran.push(RecordedRun {
                             id: step.id.clone(),
                             program: program.clone(),
                             subcommand: subcommand.clone(),
+                            also: also.clone(),
                             failed: None,
                         });
                     }
@@ -200,13 +228,16 @@ const REPLY_CHARS: usize = 50_000;
 /// A run's result: the agent's reply (its report's summary when it reported
 /// in fields), its claims, and each claim its recorded actions don't bear
 /// out. Files are compared as paths (a claim may be relative to the folder
-/// it worked in); a check by its program and optional safe subcommand
+/// it worked in); a claimed change is judged only where the record could
+/// have seen it: relative, or under one of the `watched` folders (a shell
+/// write elsewhere, such as `/tmp`, leaves no record either way); a check by its program and optional safe subcommand
 /// ([`aidaemon_coding_agents::command_key`], a machine format), judged by
 /// the latest matching invocation.
 pub(super) fn run_result(
     reported: Option<&(String, Option<aidaemon_coding_agents::Report>)>,
     fallback: &str,
     edited: &[String],
+    watched: &[String],
     ran: &[RecordedRun],
 ) -> aidaemon_channels::turns::RunResult {
     use aidaemon_channels::turns::{RunClaims, RunMismatch, RunResult};
@@ -231,13 +262,42 @@ pub(super) fn run_result(
     };
     // A path names the same file when one is the other, or ends with the
     // other as a relative path.
+    // A path names the same file through a link too (macOS's `/tmp` is
+    // `/private/tmp`): each side is compared as written and, when it
+    // exists, as resolved.
+    let forms = |path: &str| -> Vec<String> {
+        let path = path.trim_start_matches("./").to_string();
+        let mut forms = vec![path.clone()];
+        if let Ok(resolved) = std::fs::canonicalize(&path) {
+            let resolved = resolved.to_string_lossy().into_owned();
+            if resolved != path {
+                forms.push(resolved);
+            }
+        }
+        forms
+    };
     let same = |a: &str, b: &str| {
-        let (a, b) = (a.trim_start_matches("./"), b.trim_start_matches("./"));
-        a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+        forms(a).iter().any(|a| {
+            forms(b)
+                .iter()
+                .any(|b| a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}")))
+        })
+    };
+    // Paths are a machine format: a claim is in view when it is relative or
+    // one of its forms lies under one of a watched folder's forms.
+    let in_view = |path: &str| {
+        !std::path::Path::new(path).is_absolute()
+            || forms(path).iter().any(|path| {
+                watched.iter().any(|root| {
+                    forms(root).iter().any(|root| {
+                        std::path::Path::new(path).starts_with(std::path::Path::new(root))
+                    })
+                })
+            })
     };
     let mut mismatches = Vec::new();
     for path in &report.changed_files {
-        if !edited.iter().any(|seen| same(seen, path)) {
+        if !edited.iter().any(|seen| same(seen, path)) && in_view(path) {
             mismatches.push(RunMismatch::ChangeNotSeen { path: path.clone() });
         }
     }
@@ -252,19 +312,14 @@ pub(super) fn run_result(
     }
     for check in report.checks.iter().filter(|check| check.passed) {
         let (program, subcommand) = aidaemon_coding_agents::command_key(&check.command);
-        let runs: Vec<Option<bool>> = ran
-            .iter()
-            .filter(|run| {
-                run.program.is_some()
-                    && run.program == program
-                    && match (&subcommand, &run.subcommand) {
-                        (Some(claimed), Some(actual)) => claimed == actual,
-                        (Some(_), None) => false,
-                        (None, _) => true,
-                    }
-            })
-            .map(|run| run.failed)
-            .collect();
+        let runs: Vec<Option<bool>> = match program.as_deref() {
+            Some(program) => ran
+                .iter()
+                .filter(|run| run.ran(program, subcommand.as_deref()))
+                .map(|run| run.failed)
+                .collect(),
+            None => Vec::new(),
+        };
         if runs.is_empty() {
             mismatches.push(RunMismatch::CheckNotRun {
                 command: check.command.clone(),
@@ -388,12 +443,14 @@ mod tests {
                 id: Some("1".into()),
                 program: Some("pytest".into()),
                 subcommand: None,
+                also: Vec::new(),
                 failed: Some(false),
             },
             RecordedRun {
                 id: Some("2".into()),
                 program: Some("cargo".into()),
                 subcommand: Some("test".into()),
+                also: Vec::new(),
                 failed: Some(true),
             },
         ];
@@ -409,6 +466,7 @@ mod tests {
             Some(&("{...}".to_string(), Some(claimed))),
             "",
             &edited,
+            &[],
             &ran,
         );
         assert_eq!(
@@ -445,18 +503,21 @@ mod tests {
                 id: Some("1".into()),
                 program: Some("cargo".into()),
                 subcommand: Some("fmt".into()),
+                also: Vec::new(),
                 failed: Some(false),
             },
             RecordedRun {
                 id: Some("2".into()),
                 program: Some("cargo".into()),
                 subcommand: Some("check".into()),
+                also: Vec::new(),
                 failed: Some(false),
             },
             RecordedRun {
                 id: Some("3".into()),
                 program: Some("cargo".into()),
                 subcommand: Some("check".into()),
+                also: Vec::new(),
                 failed: Some(true),
             },
         ];
@@ -468,7 +529,13 @@ mod tests {
                 ("cargo fmt", true),
             ],
         );
-        let result = run_result(Some(&("{...}".to_string(), Some(claimed))), "", &[], &ran);
+        let result = run_result(
+            Some(&("{...}".to_string(), Some(claimed))),
+            "",
+            &[],
+            &[],
+            &ran,
+        );
         assert_eq!(
             result.mismatches,
             vec![
@@ -487,10 +554,97 @@ mod tests {
     #[test]
     fn a_reply_without_a_report_has_no_claims() {
         let said = ("It has 4 lines.".to_string(), None);
-        let result = run_result(Some(&said), "", &[], &[]);
+        let result = run_result(Some(&said), "", &[], &[], &[]);
         assert_eq!(result.text, "It has 4 lines.");
         assert!(result.claims.is_none() && result.mismatches.is_empty());
-        let plain = run_result(None, "  printed output ", &[], &[]);
+        let plain = run_result(None, "  printed output ", &[], &[], &[]);
         assert_eq!(plain.text, "printed output");
+    }
+
+    /// A check run inside a compound command line (`git status && python3
+    /// -m unittest -v; echo $?`) counts as run.
+    #[test]
+    fn a_check_run_later_in_a_compound_command_counts_as_run() {
+        let step = aidaemon_coding_agents::StepTool::run(Some(
+            "git status --short && git diff --stat && python3 -m unittest -v 2>&1; echo EXIT=$?",
+        ));
+        let aidaemon_coding_agents::StepTool::Run {
+            program,
+            subcommand,
+            also,
+        } = step
+        else {
+            panic!("a command line is a run step");
+        };
+        assert_eq!(program.as_deref(), Some("git"));
+        let ran = vec![RecordedRun {
+            id: Some("1".into()),
+            program,
+            subcommand,
+            also,
+            failed: Some(false),
+        }];
+        let claimed = report(&[], &[("python3 -m unittest -v", true)]);
+        let result = run_result(
+            Some(&("{...}".to_string(), Some(claimed))),
+            "",
+            &[],
+            &[],
+            &ran,
+        );
+        assert!(result.mismatches.is_empty(), "{:?}", result.mismatches);
+    }
+
+    /// A file named through a link (macOS's `/tmp`) is the file the record
+    /// saw under its resolved path.
+    #[test]
+    fn a_change_named_through_a_link_matches_the_recorded_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("note.md"), "synthetic").unwrap();
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let recorded = std::fs::canonicalize(real.join("note.md"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let claimed_path = link.join("note.md").to_string_lossy().into_owned();
+        let claimed = report(&[claimed_path.as_str()], &[]);
+        let result = run_result(
+            Some(&("{...}".to_string(), Some(claimed))),
+            "",
+            &[recorded],
+            &[],
+            &[],
+        );
+        assert!(result.mismatches.is_empty(), "{:?}", result.mismatches);
+    }
+
+    /// A claimed change outside every watched folder (a shell write to
+    /// `/tmp`) is beyond the record, so it is not called unseen; one inside
+    /// a watched folder still is.
+    #[test]
+    fn a_claimed_change_outside_the_watched_folders_is_not_judged() {
+        let claimed = report(
+            &["/elsewhere/synthetic/out.md", "/w/synthetic/missing.md"],
+            &[],
+        );
+        let result = run_result(
+            Some(&("{...}".to_string(), Some(claimed))),
+            "",
+            &[],
+            &["/w/synthetic".to_string()],
+            &[],
+        );
+        assert_eq!(
+            result.mismatches,
+            vec![RunMismatch::ChangeNotSeen {
+                path: "/w/synthetic/missing.md".into()
+            }]
+        );
     }
 }

@@ -127,22 +127,26 @@ impl Tool for CliAgentTool {
 }
 
 /// An earlier run a follow-up goes on from ([`CliAgentArgs::continue_run`]).
-struct EarlierRun {
+pub(super) struct EarlierRun {
     /// Its agent's configured name.
-    agent: String,
-    working_dir: Option<String>,
-    continues: crate::helper_run::Continues,
+    pub(super) agent: String,
+    pub(super) working_dir: Option<String>,
+    pub(super) continues: crate::helper_run::Continues,
     /// For a run that ended before it finished (a restart stopped it, it
     /// failed part way): what it had done, by the events kept as it ran,
     /// for the follow-up's agent ([`super::RunProgress::note`]).
-    progress: Option<String>,
+    pub(super) progress: Option<String>,
 }
 
 impl CliAgentTool {
     /// Run `run` of conversation `session_id`, when a follow-up can go on
     /// from it: it ended, and its agent kept its session. `Err`: why not,
     /// in plain words.
-    async fn earlier_run(&self, run: &str, session_id: &str) -> Result<EarlierRun, String> {
+    pub(super) async fn earlier_run(
+        &self,
+        run: &str,
+        session_id: &str,
+    ) -> Result<EarlierRun, String> {
         let found = self
             .state
             .cli_agent_run(run)
@@ -463,11 +467,14 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
                 read_targets.push(target);
             }
         }
-        let mut write_targets = parsed
-            .as_ref()
-            .and_then(|value| value.get("write_paths"))
-            .and_then(Value::as_array)
+        // Everything the run may be handed as a write root: the named
+        // write paths, and the declared scope and new folders, which
+        // `helper_write_paths` turns into write roots too. The scope check
+        // judges this list, so none of them may be left out of it.
+        let mut write_targets = ["write_paths", "scope", "new_folders"]
             .into_iter()
+            .filter_map(|key| parsed.as_ref().and_then(|value| value.get(key)))
+            .filter_map(Value::as_array)
             .flatten()
             .filter_map(Value::as_str)
             .map(|path| {
@@ -478,7 +485,12 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
                     .unwrap_or_else(|| path.to_string())
             })
             .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
-            .collect::<Vec<_>>();
+            .fold(Vec::new(), |mut targets, target| {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+                targets
+            });
         if workspace_mode == "read_only" {
             write_targets.clear();
         }
@@ -604,45 +616,61 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let (output, left_in_background, settled, changed, run_label, never_started, refusal) =
-            REFUSED_BEFORE_LAUNCH
-                .scope(
-                    std::cell::Cell::new(None),
-                    NEVER_STARTED.scope(
-                        std::cell::Cell::new(false),
-                        BACKGROUND_RUN_LABEL.scope(
-                            std::cell::RefCell::new(None),
-                            RUN_CHANGED_LOCALLY.scope(
-                                std::cell::Cell::new(false),
-                                BACKGROUND_SETTLED.scope(
+        let (
+            (output, left_in_background, settled, changed, run_label, never_started, refusal),
+            acted,
+        ) = RUN_ACTED_THROUGH_PEERS
+            .scope(std::cell::Cell::new(false), async {
+                let call = REFUSED_BEFORE_LAUNCH
+                    .scope(
+                        std::cell::Cell::new(None),
+                        NEVER_STARTED.scope(
+                            std::cell::Cell::new(false),
+                            BACKGROUND_RUN_LABEL.scope(
+                                std::cell::RefCell::new(None),
+                                RUN_CHANGED_LOCALLY.scope(
                                     std::cell::Cell::new(false),
-                                    LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
-                                        let output = self
-                                            .call_with_status_under_contract(
-                                                arguments,
-                                                status_tx,
-                                                read_only_run,
-                                                enforce_native_access,
-                                                facts,
-                                            )
-                                            .await?;
-                                        anyhow::Ok((
-                                            output,
-                                            LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
-                                            BACKGROUND_SETTLED.with(std::cell::Cell::get),
-                                            RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
-                                            BACKGROUND_RUN_LABEL
-                                                .with(|slot| slot.borrow_mut().take()),
-                                            NEVER_STARTED.with(std::cell::Cell::get),
-                                            REFUSED_BEFORE_LAUNCH.with(std::cell::Cell::get),
-                                        ))
-                                    }),
+                                    BACKGROUND_SETTLED.scope(
+                                        std::cell::Cell::new(false),
+                                        LEFT_IN_BACKGROUND.scope(
+                                            std::cell::Cell::new(false),
+                                            async {
+                                                let output = self
+                                                    .call_with_status_under_contract(
+                                                        arguments,
+                                                        status_tx,
+                                                        read_only_run,
+                                                        enforce_native_access,
+                                                        facts,
+                                                    )
+                                                    .await?;
+                                                anyhow::Ok((
+                                                    output,
+                                                    LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                                                    BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                                                    RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
+                                                    BACKGROUND_RUN_LABEL
+                                                        .with(|slot| slot.borrow_mut().take()),
+                                                    NEVER_STARTED.with(std::cell::Cell::get),
+                                                    REFUSED_BEFORE_LAUNCH
+                                                        .with(std::cell::Cell::get),
+                                                ))
+                                            },
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
-                    ),
-                )
-                .await?;
+                    )
+                    .await?;
+                anyhow::Ok((call, RUN_ACTED_THROUGH_PEERS.with(std::cell::Cell::get)))
+            })
+            .await?;
+        // A read-only run that acted through its peer tree (a board post, a
+        // launched peer, a sent file) took work on too: only a pure look is
+        // no attempt.
+        let launched_a_run =
+            action == "run" && !never_started && refusal.is_none() && (!read_only_run || acted);
         let mut outcome = cli_agent_outcome_with_refusal(
             &action,
             output,
@@ -672,6 +700,19 @@ impl CliAgentTool {
                 if outcome.metadata.checklist_items.is_empty() {
                     outcome.metadata.checklist_items = claimed;
                 }
+            }
+        }
+        // A run it launched with room to change things took the work on,
+        // still working or ended within this call: an attempt the closeout
+        // counts (a read-only run that only looked is a look, and a look
+        // never is). The items it was named for are the ones it took on.
+        if launched_a_run {
+            outcome.metadata.launched_runs = outcome.metadata.launched_runs.max(1);
+            if outcome.metadata.checklist_items.is_empty() {
+                outcome.metadata.checklist_items = parsed
+                    .as_ref()
+                    .map(|args| args.checklist_items.clone())
+                    .unwrap_or_default();
             }
         }
         outcome.metadata.background_settled = settled && !left_in_background;
@@ -986,6 +1027,11 @@ impl CliAgentTool {
                                 .cloned(),
                             detached_judge.clone(),
                             spawn_family.clone(),
+                            // Its peers may send files only to the owner's
+                            // own private conversation.
+                            facts.user_role == Some(aidaemon_tools::semantics::UserRole::Owner)
+                                && facts.channel_visibility
+                                    == Some(aidaemon_core::ChannelVisibility::Private),
                         )
                         .await
                     {

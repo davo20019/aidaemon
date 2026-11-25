@@ -122,6 +122,8 @@ pub(super) struct PreparedRun {
     pub(super) keeps_session: bool,
     /// The earlier run it continues.
     pub(super) continues: Option<crate::helper_run::Continues>,
+    /// Host-injected MCP servers for this run (kept for queued re-prepares).
+    pub(super) mcp_servers: Vec<aidaemon_coding_agents::McpEndpoint>,
     /// The prompt with its mission rules, before any enrichment.
     pub(super) prompt: String,
     /// What it was asked, without the daemon's mission rules.
@@ -183,6 +185,10 @@ pub(super) struct RunCall {
     pub(super) owner_follow_up: bool,
     /// Conversation pinned directly to a coding agent (no model reads the tool output).
     pub(super) direct_agent: bool,
+    /// Run spawned by another CLI via the peer-coordination MCP server.
+    pub(super) is_peer_run: bool,
+    /// Tree binding for permit parking, completion updates, and cascading cancel.
+    pub(super) peer_binding: Option<peers::ActivePeerBinding>,
 }
 
 /// What a run shares with its entry in the tool's task table.
@@ -518,6 +524,7 @@ impl CliAgentTool {
         nested: Option<aidaemon_core::NestedCalls>,
         detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
         spawn_family: Option<crate::authority::SpawnFamily>,
+        may_send_files: bool,
     ) -> anyhow::Result<String> {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         // A background launch in a conversation set to a coding agent is
@@ -529,11 +536,85 @@ impl CliAgentTool {
                 .agent
                 .is_some();
         let waits_for_folder = async_mode && direct_agent;
+
+        // When peer coordination is enabled on a local backend, mint a tree and
+        // scoped MCP server endpoint for this root CLI run so it can delegate to
+        // and coordinate with sibling CLIs (including in direct-agent mode).
+        let (root_mcp, root_keep_alive, effective_prompt, root_peer_binding) = if let Some(coord) =
+            self.peer_coord.get()
+            && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local
+        {
+            let available: Vec<String> = self
+                .tool_names
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            // The lead's own mode: no peer it starts runs above it.
+            let lead_mode = self
+                .tools
+                .read()
+                .ok()
+                .and_then(|tools| tools.get(tool_name).map(|entry| self.entry_agent(entry)))
+                .and_then(|agent| self.permissions().agent_mode(tool_name, &*agent))
+                .or((!enforce_native_access)
+                    .then_some(aidaemon_coding_agents::PermissionMode::Checked));
+            let root_ctx = peers::PeerRootContext {
+                lead_mode,
+                session_id: session_id.to_string(),
+                grant_session: grant_session.to_string(),
+                working_dir: working_dir.map(str::to_string),
+                read_paths: read_paths.to_vec(),
+                write_paths: write_paths.to_vec(),
+                enforce_native_access,
+                project: project.cloned(),
+                detached_judge: detached_judge.clone(),
+                spawn_family: spawn_family.clone(),
+                status_tx: status_tx.clone(),
+                may_send_files,
+            };
+            let root_session = coord.start_root_tree(
+                tool_name,
+                &spec.label(&format!("{tool_name} coding agent")),
+                root_ctx,
+                &available,
+            );
+            root_session
+                .tree
+                .set_peer_run_id("peer-root", cli_run_id(&task_id));
+            let binding = peers::ActivePeerBinding {
+                tree: root_session.tree,
+                peer_id: "peer-root".to_string(),
+                permit_slots: root_session.permit_slots,
+                is_root: true,
+                launcher: Some(root_session.launcher),
+                branch: None,
+            };
+            let has_known_agent = self
+                .tools
+                .read()
+                .ok()
+                .and_then(|tools| tools.get(tool_name).map(|entry| self.entry_agent(entry)))
+                .is_some_and(|agent| agent.launch_arguments().is_some());
+            let augmented = if has_known_agent {
+                format!("{}\n\n{}", prompt.trim_end(), root_session.prompt_hint)
+            } else {
+                prompt.to_string()
+            };
+            (
+                vec![root_session.endpoint],
+                Some(Box::new(root_session.scoped) as Box<dyn std::any::Any + Send>),
+                augmented,
+                Some(binding),
+            )
+        } else {
+            (Vec::new(), None, prompt.to_string(), None)
+        };
+
         let mut prep = match self
             .prepare_run(
                 tool_name,
                 &task_id,
-                prompt,
+                &effective_prompt,
                 task_prompt,
                 working_dir,
                 session_id,
@@ -550,12 +631,21 @@ impl CliAgentTool {
                 spawn_family,
                 waits_for_folder,
                 direct_agent,
+                &root_mcp,
+                &[],
+                None,
             )
             .await?
         {
             Ok(prep) => prep,
             Err(message) => return Ok(message),
         };
+        if let Some(scoped_guard) = root_keep_alive {
+            prep.keep_alive = Some(match prep.keep_alive.take() {
+                Some(kept) => Box::new((kept, scoped_guard)),
+                None => scoped_guard,
+            });
+        }
         let call = RunCall {
             tool_name: tool_name.to_string(),
             task_id: task_id.clone(),
@@ -571,6 +661,8 @@ impl CliAgentTool {
             began: chrono::Utc::now(),
             owner_follow_up: spec.owner_follow_up,
             direct_agent,
+            is_peer_run: false,
+            peer_binding: root_peer_binding,
         };
 
         if prep.folder_wait.is_some() {
@@ -689,6 +781,12 @@ impl CliAgentTool {
 
         let background_timeout = handles.background_timeout.max(timeout);
         let idle_timeout = handles.idle_timeout;
+        let permit_slot = peers::PermitSlot::new(
+            slot_permit,
+            self.concurrency_limiter.clone(),
+            shared.finished.clone(),
+            shared.in_flight_approvals.clone(),
+        );
         tokio::spawn(watch_run(
             handles,
             call.clone(),
@@ -699,7 +797,7 @@ impl CliAgentTool {
             background_timeout,
             idle_timeout,
             prep.keep_alive.take(),
-            slot_permit,
+            permit_slot,
             completion_tx,
         ));
 
@@ -838,7 +936,24 @@ impl CliAgentTool {
                     stdout_preview = %truncate_str(&stdout_output, 200),
                     "CLI agent stdout captured"
                 );
-                let result_text = extract_meaningful_output(&stdout_output, max_output);
+                let mut result_text = extract_meaningful_output(&stdout_output, max_output);
+                // A lead run's tree record: what the caller can quote of its
+                // peers and board, which its own report only summarizes.
+                if let Some(record) = call
+                    .peer_binding
+                    .as_ref()
+                    .and_then(peers::ActivePeerBinding::lead_record)
+                {
+                    result_text.push_str("\n\n");
+                    result_text.push_str(&record);
+                }
+                if call
+                    .peer_binding
+                    .as_ref()
+                    .is_some_and(peers::ActivePeerBinding::acted)
+                {
+                    super::mark_run_acted_through_peers();
+                }
                 info!(
                     tool = %tool_name,
                     result_len = result_text.len(),
@@ -969,6 +1084,219 @@ impl CliAgentTool {
                 ))
             }
         }
+    }
+
+    /// Launch a child CLI peer requested through the peer-coordination MCP
+    /// server. Child peers inherit narrowed authority and owner approval cards,
+    /// show up in `RunStates`, and report completion back to their [`PeerTree`]
+    /// rather than posting standalone replies to the owner's chat.
+    pub(super) async fn launch_peer_run(
+        &self,
+        spec: peers::PeerLaunchSpec,
+    ) -> Result<peers::PeerLaunched, String> {
+        let task_id = Uuid::new_v4().to_string()[..8].to_string();
+        let run_id = cli_run_id(&task_id);
+        let mut prep = self
+            .prepare_run(
+                &spec.tool_name,
+                &task_id,
+                &spec.prompt,
+                &spec.task_prompt,
+                spec.working_dir.as_deref(),
+                &spec.session_id,
+                None,
+                None,
+                spec.workspace_mode,
+                &spec.read_paths,
+                &spec.write_paths,
+                spec.enforce_native_access,
+                &spec.spec,
+                spec.project.as_ref(),
+                None,
+                spec.detached_judge,
+                spec.spawn_family,
+                false,
+                false,
+                &spec.mcp_endpoints,
+                &spec.nests_in,
+                spec.mode_cap,
+            )
+            .await
+            .map_err(|error| error.to_string())??;
+
+        if let Some(mcp_guard) = spec.mcp_keep_alive {
+            prep.keep_alive = Some(match prep.keep_alive.take() {
+                Some(kept) => Box::new((kept, mcp_guard)),
+                None => mcp_guard,
+            });
+        }
+
+        let slot_permit = tokio::select! {
+            _ = spec.cancel.cancelled() => {
+                return Err("peer launch cancelled while waiting for a concurrency slot".to_string());
+            }
+            acquired = self.concurrency_limiter.clone().acquire_owned() => {
+                acquired.map_err(|_| "concurrency pool closed".to_string())?
+            }
+        };
+
+        let call = RunCall {
+            tool_name: spec.tool_name.clone(),
+            task_id: task_id.clone(),
+            session_id: spec.session_id.clone(),
+            goal_id: None,
+            delegated_task_id: None,
+            label: spec.spec.label(&format!("{} peer agent", spec.tool_name)),
+            short_summary: spec.task_prompt.chars().take(50).collect(),
+            async_mode: true,
+            status_tx: spec.status_tx.clone(),
+            grant_session: spec.grant_session,
+            new_folders: Vec::new(),
+            began: chrono::Utc::now(),
+            owner_follow_up: false,
+            direct_agent: false,
+            is_peer_run: true,
+            peer_binding: Some(spec.peer_binding),
+        };
+
+        let handles = self.run_handles();
+        let shared = RunShared::default();
+        shared.starts_in_background();
+
+        let started = handles
+            .start_process(&call, &mut prep, &shared)
+            .await
+            .map_err(|error| error.to_string())?;
+        shared
+            .process
+            .start(started.handle.clone(), started.host.clone());
+        let started_at_instant = started.started_at;
+        let max_output = prep.max_output;
+        let keeps_session = prep.keeps_session;
+        let background_timeout = handles.background_timeout.max(prep.timeout);
+        let idle_timeout = handles.idle_timeout;
+
+        self.start_background_run(
+            &shared.run_slot,
+            &task_id,
+            &call.session_id,
+            &call.label,
+            None,
+            call.status_tx.clone(),
+            call.began,
+        )
+        .await;
+        handles.runs.set_agent(&run_id, prep.coding_agent.name());
+        handles.runs.asked(&run_id, run_ask(&prep, &call));
+        if let Some(earlier) = &prep.continues {
+            handles
+                .runs
+                .continues(&run_id, &earlier.run, &earlier.thread);
+        }
+        handles.runs.keeps_session(&run_id, keeps_session);
+
+        // Wire cascading tree cancellation to stop this peer process cleanly.
+        let cancel_process = shared.process.clone();
+        let cancel_backend = self.backend.clone();
+        let cancel_finished = shared.finished.clone();
+        let cancel_token = spec.cancel.clone();
+        tokio::spawn(async move {
+            cancel_token.cancelled().await;
+            if !cancel_finished.load(Ordering::Acquire) {
+                cancel_process.stop(&cancel_backend).await;
+            }
+        });
+
+        let (completion_tx, _completion_rx) =
+            tokio::sync::oneshot::channel::<(Option<i32>, bool, Option<usize>)>();
+        let permit_slot = peers::PermitSlot::new(
+            slot_permit,
+            self.concurrency_limiter.clone(),
+            shared.finished.clone(),
+            shared.in_flight_approvals.clone(),
+        );
+        tokio::spawn(watch_run(
+            handles,
+            call.clone(),
+            shared.clone(),
+            started,
+            prep.coding_agent.clone(),
+            max_output,
+            background_timeout,
+            idle_timeout,
+            prep.keep_alive.take(),
+            permit_slot,
+            completion_tx,
+        ));
+
+        let agent = tracked(
+            &call,
+            &shared,
+            started_at_instant,
+            prep.claim_dir.clone(),
+            prep.write_scope.clone(),
+            prep.max_output,
+        );
+        self.running.lock().await.insert(task_id.clone(), agent);
+        if let Some(guard) = prep.claim.as_mut() {
+            guard.disarm();
+        }
+
+        if !spec.wait {
+            return Ok(peers::PeerLaunched {
+                run_id,
+                finished: false,
+                success: None,
+                output: None,
+                resumable: keeps_session,
+            });
+        }
+
+        let wait_deadline = tokio::time::Instant::now() + background_timeout;
+        loop {
+            let notified = shared.done_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if shared.finished.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = spec.cancel.cancelled() => {
+                    let _ = self.handle_cancel(&task_id).await;
+                    return Err("peer run cancelled while waiting".to_string());
+                }
+                res = tokio::time::timeout_at(wait_deadline, notified) => {
+                    if res.is_err() {
+                        return Ok(peers::PeerLaunched {
+                            run_id,
+                            finished: false,
+                            success: None,
+                            output: Some("Peer is still running; use check_peer to inspect later.".to_string()),
+                            resumable: keeps_session,
+                        });
+                    }
+                }
+            }
+        }
+
+        let verdict = shared.verdict.get().cloned();
+        let success = verdict.as_ref().map(|v| v.success).unwrap_or(false);
+        let output = verdict.map(|v| v.text);
+        let resumable = self
+            .state
+            .cli_agent_run(&run_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.keeps_session && r.agent_session.is_some());
+
+        Ok(peers::PeerLaunched {
+            run_id,
+            finished: true,
+            success: Some(success),
+            output,
+            resumable,
+        })
     }
 }
 

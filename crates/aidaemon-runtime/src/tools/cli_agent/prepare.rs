@@ -34,6 +34,11 @@ impl CliAgentTool {
         spawn_family: Option<crate::authority::SpawnFamily>,
         waits_for_folder: bool,
         direct_agent: bool,
+        mcp_servers: &[aidaemon_coding_agents::McpEndpoint],
+        nests_in: &[String],
+        // A peer run: the most its lead may do. A peer never runs in a mode
+        // above the agent that started it.
+        mode_cap: Option<aidaemon_coding_agents::PermissionMode>,
     ) -> anyhow::Result<Result<PreparedRun, String>> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic, coding_agent) = {
@@ -59,8 +64,9 @@ impl CliAgentTool {
             .takes_model()
             .then(|| self.permissions().model_of(tool_name))
             .flatten();
-        let Some(mode) = mode.or((!enforce_native_access).then_some(PermissionMode::Checked))
-        else {
+        let mode = mode.or((!enforce_native_access).then_some(PermissionMode::Checked));
+        let mode = capped_mode(&*coding_agent, mode, mode_cap);
+        let Some(mode) = mode else {
             let level = self.permissions().level();
             let program = coding_agent.name();
             mark_refused_before_launch(PrelaunchRefusal::Policy);
@@ -233,6 +239,7 @@ impl CliAgentTool {
                     .as_ref()
                     .map(|earlier| earlier.agent_session.as_str()),
                 report: !direct_agent,
+                mcp_servers,
             },
             &mut launch,
         ) {
@@ -278,6 +285,7 @@ impl CliAgentTool {
                 let mut claims = lock_claims(&self.working_dir_claims);
                 let gone = |id: &str| {
                     id == task_id
+                        || nests_in.iter().any(|ancestor| ancestor == id)
                         || running
                             .get(id)
                             .is_some_and(|agent| agent.finished.load(Ordering::Acquire))
@@ -386,11 +394,52 @@ impl CliAgentTool {
             keep_alive,
             keeps_session,
             continues: spec.continues.clone(),
+            mcp_servers: mcp_servers.to_vec(),
             prompt: prompt.to_string(),
             task,
             final_prompt,
             claim: claim_guard,
             folder_wait,
         }))
+    }
+}
+
+/// `mode` held to `cap`: above it, the most `agent` offers within it
+/// (`None` when it offers nothing that low, so it does not run).
+pub(super) fn capped_mode(
+    agent: &dyn aidaemon_coding_agents::CodingAgent,
+    mode: Option<aidaemon_coding_agents::PermissionMode>,
+    cap: Option<aidaemon_coding_agents::PermissionMode>,
+) -> Option<aidaemon_coding_agents::PermissionMode> {
+    match (mode, cap) {
+        (Some(mode), Some(cap)) if mode > cap => {
+            aidaemon_coding_agents::mode_within(agent, Some(mode), false, cap)
+        }
+        (mode, _) => mode,
+    }
+}
+
+#[cfg(test)]
+mod mode_cap_tests {
+    use super::capped_mode;
+    use aidaemon_coding_agents::PermissionMode::{Checked, EveryCommand, FullAccess};
+
+    #[test]
+    fn a_peer_never_runs_above_its_lead() {
+        let claude = aidaemon_coding_agents::claude::ClaudeCode;
+        assert_eq!(
+            capped_mode(&claude, Some(FullAccess), Some(Checked)),
+            Some(Checked)
+        );
+        assert_eq!(
+            capped_mode(&claude, Some(FullAccess), None),
+            Some(FullAccess)
+        );
+        assert_eq!(
+            capped_mode(&claude, Some(EveryCommand), Some(FullAccess)),
+            Some(EveryCommand)
+        );
+        let lowest = capped_mode(&claude, Some(Checked), Some(EveryCommand));
+        assert!(lowest.is_none_or(|mode| mode <= EveryCommand));
     }
 }

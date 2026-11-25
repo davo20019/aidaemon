@@ -313,6 +313,7 @@ impl CliAgentTool {
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents,
             permissions: Arc::new(OnceLock::new()),
+            peer_coord: OnceLock::new(),
         };
 
         // Load dynamic agents from DB
@@ -414,6 +415,63 @@ impl CliAgentTool {
         let _ = self.plan_store.set(plan_store);
     }
 
+    /// Enable daemon-hosted MCP peer coordination so CLI agents can delegate
+    /// to and communicate with sibling CLIs (including in direct-agent mode).
+    ///
+    /// `bridge_exe` and `bridge_args` name the stdio MCP bridge command (for
+    /// example, the `aidaemon` binary with `["mcp-bridge"]`).
+    pub async fn enable_peer_coordination(
+        self: &Arc<Self>,
+        bridge_exe: impl Into<String>,
+        bridge_args: Vec<String>,
+    ) -> std::io::Result<()> {
+        self.enable_peer_coordination_with_limits(
+            bridge_exe,
+            bridge_args,
+            aidaemon_coding_agents::peer::PeerLimits::default(),
+        )
+        .await
+    }
+
+    /// Let coordinated CLI runs send files to their owner's private
+    /// conversation (`send_file`), staging temp files through `inbox_dir`.
+    /// Call after [`Self::enable_peer_coordination`].
+    pub fn enable_peer_file_delivery(&self, inbox_dir: impl Into<std::path::PathBuf>) {
+        if let Some(coord) = self.peer_coord.get() {
+            let _ = coord.file_inbox.set(inbox_dir.into());
+        }
+    }
+
+    /// Release the peer worktrees an earlier daemon left behind: no tree
+    /// outlives the daemon that ran it. Their work is committed to their
+    /// branches, which are kept. Call once at daemon startup.
+    pub async fn release_orphaned_peer_worktrees(&self) {
+        if self.backend.kind() == aidaemon_tools::backend::BackendKind::Local {
+            peers::sweep_orphaned_peer_worktrees(self.backend.as_ref()).await;
+        }
+    }
+
+    /// Same as [`Self::enable_peer_coordination`] with explicit tree guardrails.
+    pub async fn enable_peer_coordination_with_limits(
+        self: &Arc<Self>,
+        bridge_exe: impl Into<String>,
+        bridge_args: Vec<String>,
+        limits: aidaemon_coding_agents::peer::PeerLimits,
+    ) -> std::io::Result<()> {
+        if self.peer_coord.get().is_some() {
+            return Ok(());
+        }
+        let coord = peers::PeerCoordinator::start(
+            Arc::downgrade(self),
+            bridge_exe.into(),
+            bridge_args,
+            limits,
+        )
+        .await?;
+        let _ = self.peer_coord.set(coord);
+        Ok(())
+    }
+
     pub(super) fn get_hub(&self) -> Option<Arc<dyn OutboundRouter>> {
         self.hub.get().and_then(|w| w.upgrade())
     }
@@ -433,6 +491,16 @@ impl CliAgentTool {
             Ok(agents) => {
                 for agent in agents {
                     if !agent.enabled {
+                        continue;
+                    }
+                    // A stored agent never replaces a built-in one of the
+                    // same name: it would run under the built-in's name, and
+                    // with the permission mode the owner chose for that one.
+                    if self.is_builtin_name(&agent.name) {
+                        warn!(
+                            name = %agent.name,
+                            "A stored CLI agent has a built-in agent's name; keeping the built-in"
+                        );
                         continue;
                     }
                     let args: Vec<String> =
@@ -477,6 +545,15 @@ impl CliAgentTool {
         }
     }
 
+    /// Whether `name` is a configured (not stored) agent's.
+    pub(super) fn is_builtin_name(&self, name: &str) -> bool {
+        self.tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .is_some_and(|entry| !entry.is_dynamic)
+    }
+
     pub fn has_tools(&self) -> bool {
         !self.tools.read().unwrap().is_empty()
     }
@@ -491,6 +568,11 @@ impl CliAgentTool {
         timeout_secs: Option<u64>,
         max_output_chars: Option<usize>,
     ) -> anyhow::Result<String> {
+        if self.is_builtin_name(name) {
+            return Ok(format!(
+                "CLI agent '{name}' is a built-in agent's name; choose another name."
+            ));
+        }
         let (resolved_command, resolved_args) =
             match resolve_agent_launch(&self.backend, command, &args).await {
                 Ok(launch) => launch,
@@ -559,6 +641,11 @@ impl CliAgentTool {
             agent.enabled = enabled;
             self.state.update_dynamic_cli_agent(&agent).await?;
 
+            if enabled && self.is_builtin_name(name) {
+                return Ok(format!(
+                    "CLI agent '{name}' is a built-in agent's name; the built-in stays."
+                ));
+            }
             if enabled {
                 let args: Vec<String> = serde_json::from_str(&agent.args_json).unwrap_or_default();
                 // Re-add to runtime map only after validating both a wrapper

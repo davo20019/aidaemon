@@ -191,6 +191,7 @@ mod tests {
                     tool: StepTool::Run {
                         program: Some("cargo".into()),
                         subcommand: Some("test".into()),
+                        also: Vec::new(),
                     },
                 }),
                 AgentEvent::Step(AgentStep {

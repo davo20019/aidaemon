@@ -47,6 +47,7 @@ mod claims;
 mod delivery;
 mod launch;
 mod output;
+mod peers;
 mod prepare;
 mod progress;
 mod prompt;
@@ -245,6 +246,10 @@ tokio::task_local! {
     /// shows it changed its write roots: its outcome carries those typed
     /// effects, so the dispatcher treats what it set up like any call's.
     static RUN_CHANGED_LOCALLY: std::cell::Cell<bool>;
+    /// Set by a run that finished in the call after acting through its peer
+    /// tree (launched a peer, posted to the board, sent a file): even a
+    /// read-only run then took work on, not only looked.
+    static RUN_ACTED_THROUGH_PEERS: std::cell::Cell<bool>;
     /// The name of the run this call left in the background, when it
     /// started or moved one there.
     static BACKGROUND_RUN_LABEL: std::cell::RefCell<Option<String>>;
@@ -276,6 +281,11 @@ fn mark_background_run(label: &str) {
 /// Record that this call's finished run changed its write roots.
 fn mark_run_changed_locally() {
     let _ = RUN_CHANGED_LOCALLY.try_with(|flag| flag.set(true));
+}
+
+/// Record that this call's finished run acted through its peer tree.
+fn mark_run_acted_through_peers() {
+    let _ = RUN_ACTED_THROUGH_PEERS.try_with(|flag| flag.set(true));
 }
 
 /// Record that this call left its work running in the background.
@@ -330,4 +340,7 @@ pub struct CliAgentTool {
     /// The owner's choice per agent and AIdaemon's level, which caps it:
     /// the daemon's shared value once [`Self::set_permissions`] wires it.
     permissions: Arc<OnceLock<crate::permissions::Permissions>>,
+    /// Daemon-hosted MCP peer coordinator so CLI agents can delegate to and
+    /// communicate with sibling CLIs (including in direct-agent mode).
+    peer_coord: OnceLock<Arc<peers::PeerCoordinator>>,
 }

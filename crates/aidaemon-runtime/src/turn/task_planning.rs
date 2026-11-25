@@ -407,6 +407,24 @@ pub fn parse_owner_units(text: &str) -> Option<Vec<aidaemon_events::traits::Requ
     if parsed.schema_version != 1 {
         return None;
     }
+    // A unit that names no result is a broken reply, and the whole compile
+    // goes with it: the turn then has no owner units, as when the compiler
+    // gives no answer (live 2026-11-24: "x" as a unit's text, and JSON
+    // leaked into one, each read back to the owner as "I didn't start this
+    // part: x").
+    // (A blank unit is only dropped, below.)
+    if let Some(broken) = parsed
+        .units
+        .iter()
+        .find(|unit| !unit.what.trim().is_empty() && !names_a_result(&unit.what))
+    {
+        warn!(
+            unit = %truncate_str(&broken.what, 200),
+            reply = %truncate_str(text, 1000),
+            "Request compiler returned a unit that names no result; ignoring its units"
+        );
+        return None;
+    }
     Some(
         parsed
             .units
@@ -421,6 +439,13 @@ pub fn parse_owner_units(text: &str) -> Option<Vec<aidaemon_events::traits::Requ
             .take(MAX_OWNER_UNITS)
             .collect(),
     )
+}
+
+/// Whether a unit's text can name a result: at least two letters or digits,
+/// and none of this compiler's own JSON in it (its `asks_change` key: a
+/// machine format, the schema's field name, leaked into the text).
+fn names_a_result(what: &str) -> bool {
+    what.chars().filter(|c| c.is_alphanumeric()).count() >= 2 && !what.contains("asks_change")
 }
 
 /// What the run reads of the owner's units: numbered, so its checklist can
@@ -759,6 +784,22 @@ mod tests {
         assert!(units[0].asks_change);
         assert!(!units[1].asks_change);
         assert!(parse_owner_units("not json").is_none());
+        // A unit that names no result breaks the whole reply.
+        assert!(
+            parse_owner_units(r#"{"schema_version":1,"units":[{"what":"x","asks_change":true}]}"#)
+                .is_none()
+        );
+        assert!(
+            parse_owner_units(
+                r#"{"schema_version":1,"units":[{"what":"Say what Codex did.','asks_change':false}]}","asks_change":false}]}"#
+            )
+            .is_none()
+        );
+        let fixed = parse_owner_units(
+            r#"{"schema_version":1,"units":[{"what":"Fix sub() in calc.py","asks_change":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(fixed[0].what, "Fix sub() in calc.py");
         assert!(parse_owner_units(r#"{"schema_version":2,"units":[]}"#).is_none());
         let note = owner_units_note(&units).unwrap();
         assert!(note.contains("0. Install Drupal (new work"), "{note}");

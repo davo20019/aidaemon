@@ -188,7 +188,7 @@ impl CliAgentTool {
                     refresh_direct_session(&handles, &running, &call, &mut prep).await;
                 }
             }
-            let mut slot = slot.unwrap_or_else(|| Box::pin(limiter.acquire_owned()));
+            let mut slot = slot.unwrap_or_else(|| Box::pin(limiter.clone().acquire_owned()));
             let waited = match futures::poll!(slot.as_mut()) {
                 std::task::Poll::Ready(permit) => Some(permit),
                 std::task::Poll::Pending => {
@@ -281,6 +281,12 @@ impl CliAgentTool {
             let max_output = prep.max_output;
             let background_timeout = handles.background_timeout.max(prep.timeout);
             let idle_timeout = handles.idle_timeout;
+            let permit_slot = peers::PermitSlot::new(
+                permit,
+                limiter.clone(),
+                shared.finished.clone(),
+                shared.in_flight_approvals.clone(),
+            );
             drop(prep);
             watch_run(
                 handles,
@@ -292,7 +298,7 @@ impl CliAgentTool {
                 background_timeout,
                 idle_timeout,
                 keep_alive,
-                permit,
+                permit_slot,
                 completion_tx,
             )
             .await;
@@ -392,6 +398,7 @@ pub(super) async fn refresh_direct_session(
             model: prep.model.as_deref(),
             resume: Some(agent_session.as_str()),
             report: !call.direct_agent,
+            mcp_servers: &prep.mcp_servers,
         },
         &mut launch,
     ) {

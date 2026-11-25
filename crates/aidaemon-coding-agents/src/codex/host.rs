@@ -258,8 +258,9 @@ impl CodexHome {
         // Codex makes it on its first stored thread; a link needs it now.
         let sessions = source.join("sessions");
         std::fs::create_dir_all(&sessions).map_err(|error| error.to_string())?;
-        let path = std::env::temp_dir().join(format!("aidaemon-codex-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+        // Owner-only: its config.toml can carry the peer server's token.
+        let path = crate::private_files::new_private_dir("codex-home")
+            .map_err(|error| error.to_string())?;
         let home = Self { path };
         link_file(&auth, &home.path.join("auth.json")).map_err(|error| error.to_string())?;
         link_dir(&sessions, &home.path.join("sessions")).map_err(|error| error.to_string())?;
@@ -268,6 +269,41 @@ impl CodexHome {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Write a run-local `config.toml` declaring host-injected MCP servers
+    /// (`[mcp_servers.<name>]`) with owner-only file permissions so tokens stay
+    /// out of process arguments.
+    pub fn write_mcp_servers(&self, servers: &[crate::McpEndpoint]) -> Result<(), String> {
+        if servers.is_empty() {
+            return Ok(());
+        }
+        let mut toml = String::new();
+        for server in servers {
+            let quoted_name = serde_json::to_string(&server.name).map_err(|e| e.to_string())?;
+            let quoted_cmd = serde_json::to_string(&server.command).map_err(|e| e.to_string())?;
+            let quoted_args = serde_json::to_string(&server.args).map_err(|e| e.to_string())?;
+            toml.push_str(&format!("[mcp_servers.{quoted_name}]\n"));
+            toml.push_str(&format!("command = {quoted_cmd}\n"));
+            toml.push_str(&format!("args = {quoted_args}\n"));
+            if !server.env.is_empty() {
+                let pairs: Result<Vec<String>, String> = server
+                    .env
+                    .iter()
+                    .map(|(k, v)| {
+                        let qk = serde_json::to_string(k).map_err(|e| e.to_string())?;
+                        let qv = serde_json::to_string(v).map_err(|e| e.to_string())?;
+                        Ok(format!("{qk} = {qv}"))
+                    })
+                    .collect();
+                toml.push_str(&format!("env = {{ {} }}\n", pairs?.join(", ")));
+            }
+            toml.push('\n');
+        }
+        let path = self.path.join("config.toml");
+        crate::private_files::write_new_private_file(&path, toml.as_bytes())
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 }
 

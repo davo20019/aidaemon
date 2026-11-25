@@ -152,6 +152,50 @@ fn every_command(args: &mut Vec<String>, start: usize, read_only: bool) {
     );
 }
 
+/// Ephemeral `--mcp-config` file written for host-injected MCP servers and
+/// removed when the run finishes (kept in [`Plan::keep_alive`]).
+#[derive(Debug)]
+struct McpConfigFile {
+    path: std::path::PathBuf,
+}
+
+impl McpConfigFile {
+    fn write(servers: &[crate::McpEndpoint]) -> Result<Self, String> {
+        let mut map = serde_json::Map::new();
+        for server in servers {
+            let env: serde_json::Map<String, Value> = server
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect();
+            map.insert(
+                server.name.clone(),
+                json!({
+                    "type": "stdio",
+                    "command": server.command,
+                    "args": server.args,
+                    "env": env,
+                }),
+            );
+        }
+        let body = json!({ "mcpServers": map }).to_string();
+        // It carries the peer server's token: owner-only from its creation,
+        // in the user's own run directory, never the shared temp directory.
+        let dir = crate::private_files::run_dir()
+            .map_err(|e| format!("failed to make the run directory: {e}"))?;
+        let path = dir.join(format!("claude-mcp-{}.json", uuid::Uuid::new_v4()));
+        crate::private_files::write_new_private_file(&path, body.as_bytes())
+            .map_err(|e| format!("failed to write MCP config: {e}"))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for McpConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// The task on stdin and every prompt to the host.
 fn hosted(args: &mut Vec<String>, request: &RunRequest<'_>) -> Plan {
     for pair in host::HOST_FLAGS.chunks(2) {
@@ -163,6 +207,11 @@ fn hosted(args: &mut Vec<String>, request: &RunRequest<'_>) -> Plan {
         prompt: PromptPlacement::Host,
         host: Some(Box::new(host::ClaudeHostStarter {
             working_dir: request.working_dir.map(str::to_string),
+            trusted_mcp_servers: request
+                .mcp_servers
+                .iter()
+                .map(|server| server.name.clone())
+                .collect(),
         })),
         ..plan()
     }
@@ -174,6 +223,30 @@ fn plan() -> Plan {
         env_remove: vec!["CLAUDECODE".to_string()],
         ..Plan::plain()
     }
+}
+
+fn attach_mcp_config(
+    args: &mut Vec<String>,
+    plan: &mut Plan,
+    servers: &[crate::McpEndpoint],
+) -> Result<(), String> {
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let file = McpConfigFile::write(servers)?;
+    let path = file.path.to_string_lossy().into_owned();
+    // One `--opt=value` token: `--mcp-config` is variadic, so a separate value
+    // would also swallow a prompt passed as the last argument.
+    args.push(format!("--mcp-config={path}"));
+    // The injected servers are a few small tools: load them up front rather
+    // than behind ToolSearch, which costs a model round trip per run.
+    plan.env
+        .push(("ENABLE_TOOL_SEARCH".to_string(), "false".to_string()));
+    plan.keep_alive = Some(match plan.keep_alive.take() {
+        Some(kept) => Box::new((kept, file)),
+        None => Box::new(file),
+    });
+    Ok(())
 }
 
 /// `launch` in `request`'s mode, and how the run goes.
@@ -196,35 +269,40 @@ fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> 
     }
     let args = &mut launch.args;
     basics(args);
-    if !request.enforce {
+    let mut plan = if !request.enforce {
         // Outside the embedding agent's checks: its prompts still go to
         // the host when one can answer them.
-        return Ok(if request.can_host {
+        if request.can_host {
             hosted(args, request)
         } else {
             plan()
-        });
-    }
-    match request.mode {
-        PermissionMode::FullAccess => {
-            drop_permission_flags(args, launch.start);
-            push(args, &["--permission-mode", "bypassPermissions"]);
-            Ok(plan())
         }
-        _ if !request.can_host => Err(
-            "Claude Code's prompts can't be answered here (its run needs a local process \
-             inside a checked turn)"
-                .to_string(),
-        ),
-        PermissionMode::Checked => {
-            confine(args, launch.start, request)?;
-            Ok(hosted(args, request))
+    } else {
+        match request.mode {
+            PermissionMode::FullAccess => {
+                drop_permission_flags(args, launch.start);
+                push(args, &["--permission-mode", "bypassPermissions"]);
+                plan()
+            }
+            _ if !request.can_host => {
+                return Err(
+                    "Claude Code's prompts can't be answered here (its run needs a local process \
+                     inside a checked turn)"
+                        .to_string(),
+                );
+            }
+            PermissionMode::Checked => {
+                confine(args, launch.start, request)?;
+                hosted(args, request)
+            }
+            PermissionMode::EveryCommand => {
+                every_command(args, launch.start, request.read_only);
+                hosted(args, request)
+            }
         }
-        PermissionMode::EveryCommand => {
-            every_command(args, launch.start, request.read_only);
-            Ok(hosted(args, request))
-        }
-    }
+    };
+    attach_mcp_config(args, &mut plan, request.mcp_servers)?;
+    Ok(plan)
 }
 
 impl CodingAgent for ClaudeCode {
@@ -402,6 +480,7 @@ mod tests {
             model: None,
             resume: None,
             report: false,
+            mcp_servers: &[],
         }
     }
 
@@ -620,5 +699,59 @@ mod tests {
             ClaudeCode.prepare(&asked, &mut launch).unwrap();
             assert_eq!(schema_of(&launch), None);
         }
+    }
+
+    #[test]
+    fn injected_mcp_servers_write_ephemeral_config_and_auto_allow_trusted_prefix() {
+        let endpoints = vec![crate::McpEndpoint {
+            name: "aidaemon_peers".into(),
+            command: "/usr/local/bin/aidaemon".into(),
+            args: vec![
+                "mcp-bridge".into(),
+                "--addr".into(),
+                "127.0.0.1:4242".into(),
+            ],
+            env: vec![("AIDAEMON_MCP_TOKEN".into(), "synthetic-token".into())],
+        }];
+        let mut asked = request(PermissionMode::Checked, false, true);
+        asked.mcp_servers = &endpoints;
+        let mut launch = Launch {
+            args: strings(&["-p"]),
+            start: 0,
+        };
+        let plan = ClaudeCode.prepare(&asked, &mut launch).unwrap();
+        assert!(launch.args.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(!launch.args.iter().any(|a| a == "--mcp-config"));
+        assert!(
+            plan.env
+                .iter()
+                .any(|(k, v)| k == "ENABLE_TOOL_SEARCH" && v == "false")
+        );
+        let cfg_path = launch
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("--mcp-config="))
+            .map(std::path::PathBuf::from)
+            .expect("missing --mcp-config=<path>");
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            body["mcpServers"]["aidaemon_peers"]["command"],
+            "/usr/local/bin/aidaemon"
+        );
+        assert_eq!(
+            body["mcpServers"]["aidaemon_peers"]["env"]["AIDAEMON_MCP_TOKEN"],
+            "synthetic-token"
+        );
+        // Host helper recognizes only host-injected MCP servers, never arbitrary ones.
+        let trusted = vec!["aidaemon_peers".to_string()];
+        assert!(host::is_trusted_mcp_tool(
+            "mcp__aidaemon_peers__delegate_cli",
+            &trusted
+        ));
+        assert!(!host::is_trusted_mcp_tool("mcp__untrusted__send", &trusted));
+        // Dropping the plan cleans up the ephemeral config file.
+        drop(plan);
+        assert!(!cfg_path.exists());
     }
 }

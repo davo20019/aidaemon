@@ -1722,9 +1722,11 @@ pub struct ToolCallMetadata {
     /// attribution of work to declared items, never read from text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist_items: Vec<usize>,
-    /// How many runs this call left working (a batch launch starts one per
-    /// child). Each run takes on its own work: a launch of two helpers that
-    /// names no items is two attempts, never one.
+    /// How many runs this call launched, still working when it returned or
+    /// run to their end within it (a batch launch starts one per child).
+    /// Each run takes on its own work: a launch of two helpers that names no
+    /// items is two attempts, never one. One run that names no items and
+    /// ends within the call took on the whole request.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub launched_runs: usize,
     /// The call changed something its semantics could not type (a write

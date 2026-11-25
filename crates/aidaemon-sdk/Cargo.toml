@@ -31,7 +31,7 @@ agents = ["dep:aidaemon-agents"]
 # Coding agents (Claude Code, Codex, ...) to hand work to, in permission modes.
 coding-agents = ["dep:aidaemon-coding-agents"]
 sqlite = ["dep:aidaemon-store-sqlite"]
-mcp = ["dep:aidaemon-mcp"]
+mcp = ["dep:aidaemon-mcp", "aidaemon-coding-agents?/mcp"]
 eval = ["dep:aidaemon-eval"]
 memory = ["dep:aidaemon-memory", "dep:tokio"]
 events = ["dep:aidaemon-events"]
@@ -159,6 +159,10 @@ required-features = ["macros", "testing"]
 [[example]]
 name = "otel_traces"
 required-features = ["macros", "testing", "otel"]
+
+[[example]]
+name = "peer_cli_coordination"
+required-features = ["coding-agents", "mcp"]
 
 [[test]]
 name = "behavior"

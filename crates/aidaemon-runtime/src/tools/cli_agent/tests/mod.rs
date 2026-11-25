@@ -18,6 +18,7 @@ mod basics;
 mod claims;
 mod launch;
 mod output;
+mod peers;
 mod prompt;
 mod queue;
 
@@ -312,6 +313,7 @@ async fn setup_echo_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
         reengagements: Arc::new(Mutex::new(HashMap::new())),
         coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
         permissions: Arc::new(OnceLock::new()),
+        peer_coord: OnceLock::new(),
     };
 
     (tool, db_file)
@@ -359,6 +361,7 @@ async fn setup_bash_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
         reengagements: Arc::new(Mutex::new(HashMap::new())),
         coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
         permissions: Arc::new(OnceLock::new()),
+        peer_coord: OnceLock::new(),
     };
 
     (tool, db_file)
@@ -367,3 +370,59 @@ async fn setup_bash_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
 // -----------------------------------------------------------------------
 // Basic run tests
 // -----------------------------------------------------------------------
+
+/// The scope and new folders a call declares become write roots of its run
+/// (`helper_write_paths`), so the scope check must see them as write targets.
+#[cfg(unix)]
+#[tokio::test]
+async fn declared_scope_and_new_folders_are_write_targets() {
+    let (tool, _db) = setup_echo_tool().await;
+    let manifest = tool.call_access_manifest(
+        &serde_json::json!({
+            "tool": "echo-agent",
+            "prompt": "synthetic task",
+            "working_dir": "/work/project",
+            "write_paths": ["src"],
+            "scope": ["/work"],
+            "new_folders": ["/work/new-folder"],
+        })
+        .to_string(),
+    );
+    let writes: Vec<&str> = manifest
+        .write_targets
+        .iter()
+        .map(|target| target.value.as_str())
+        .collect();
+    for expected in ["/work/project/src", "/work", "/work/new-folder"] {
+        assert!(
+            writes.contains(&expected),
+            "{expected} missing from {writes:?}"
+        );
+    }
+}
+
+/// A stored agent with a built-in agent's name does not replace it at
+/// startup (it would inherit the built-in's permission mode).
+#[tokio::test]
+async fn a_stored_agent_never_replaces_a_built_in_of_its_name() {
+    let (tool, _db) = setup_echo_tool().await;
+    tool.state
+        .save_dynamic_cli_agent(&DynamicCliAgent {
+            id: 0,
+            name: "echo".to_string(),
+            command: "sh".to_string(),
+            args_json: "[]".to_string(),
+            description: "shadow".to_string(),
+            timeout_secs: None,
+            max_output_chars: None,
+            enabled: true,
+            created_at: String::new(),
+        })
+        .await
+        .unwrap();
+    tool.load_dynamic_agents().await;
+    let tools = tool.tools.read().unwrap();
+    let entry = tools.get("echo").unwrap();
+    assert!(!entry.is_dynamic);
+    assert_eq!(entry.command, "echo");
+}

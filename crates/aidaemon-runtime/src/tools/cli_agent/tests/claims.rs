@@ -769,3 +769,69 @@ async fn single_pass_snapshot_skips_unmarked_dirs_consistently() {
         vec![dir.path().join("lib.rs").to_string_lossy().to_string()]
     );
 }
+
+#[tokio::test]
+async fn a_narrowed_peer_nests_inside_only_its_ancestors_folder_claim() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    // The lead run holds the whole folder.
+    lock_claims(&tool.working_dir_claims).insert(
+        dir_path.clone(),
+        vec![WorkingDirClaim {
+            task_id: "lead1234".to_string(),
+            tool_name: "bash-agent".to_string(),
+            prompt_summary: "build the cache".to_string(),
+            writes: WriteScope::Whole,
+            state: ClaimState::Active,
+        }],
+    );
+    let write_paths = vec![format!("{dir_path}/cache.py")];
+    let prepare = |task_id: &'static str, nests_in: Vec<String>| {
+        let tool = &tool;
+        let dir_path = dir_path.clone();
+        let write_paths = write_paths.clone();
+        async move {
+            tool.prepare_run(
+                "bash-agent",
+                task_id,
+                "echo fix",
+                "echo fix",
+                Some(&dir_path),
+                "synthetic-session",
+                None,
+                None,
+                CliWorkspaceMode::ReadWrite,
+                &[],
+                &write_paths,
+                false,
+                &crate::helper_run::HelperSpec::default(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                &[],
+                &nests_in,
+                None,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Not the lead's descendant: blocked by its claim.
+    let blocked = prepare("other123", Vec::new()).await;
+    let Err(message) = blocked else {
+        panic!("a stranger's run must not start inside the lead's claim");
+    };
+    assert!(message.contains("is already working in"), "{message}");
+
+    // The lead's own subpath child: starts.
+    let nested = prepare("child123", vec!["lead1234".to_string()]).await;
+    assert!(nested.is_ok(), "{:?}", nested.err());
+}

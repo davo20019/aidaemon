@@ -35,10 +35,16 @@
 
 mod client;
 pub mod registry;
+pub mod server;
 mod tool;
 
 pub use client::{
     MAX_STDERR_LINE_BYTES, McpError, McpOptions, McpServer, McpServerSpec, PROTOCOL_VERSION,
     SAFE_ENV_KEYS, SUPPORTED_PROTOCOL_VERSIONS, ServerInfo, StderrCallback,
+};
+pub use server::{
+    BRIDGE_TOKEN_ENV, CoreToolsHandler, LocalMcpServer, McpBridgeLaunch, McpToolHandler,
+    ScopedEndpoint, ServerMeta, ServerToolDef, ServerToolResult, run_io_bridge, run_stdio_bridge,
+    run_stdio_bridge_from_args, serve_io, serve_stdio,
 };
 pub use tool::{McpTool, map_annotations, normalize_schema, render_result, tool_name};

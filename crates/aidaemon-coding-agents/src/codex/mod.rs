@@ -179,6 +179,7 @@ fn hosted(
 ) -> Result<Plan, String> {
     let args = host::app_server_args(&launch.args, launch.start, asks)?;
     let home = home()?;
+    home.write_mcp_servers(request.mcp_servers)?;
     let thread = match request.resume {
         Some(id) => host::ThreadRequest::Resume {
             id: id.to_string(),
@@ -319,6 +320,39 @@ fn prepare(
         return Ok(plan);
     }
     // `exec`: options first.
+    if !request.mcp_servers.is_empty() {
+        for server in request.mcp_servers {
+            // Codex splits a `-c` key on `.` and keeps quotes, so a quoted
+            // segment would name the server `"x"`: the key must be bare.
+            let qname = server.name.as_str();
+            if qname.is_empty()
+                || !qname
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err(format!(
+                    "MCP server name `{qname}` is not a bare config key"
+                ));
+            }
+            let qcmd = serde_json::to_string(&server.command).unwrap_or_else(|_| "\"\"".into());
+            let qargs = serde_json::to_string(&server.args).unwrap_or_else(|_| "[]".into());
+            launch.args.extend([
+                "-c".to_string(),
+                format!("mcp_servers.{qname}.command={qcmd}"),
+                "-c".to_string(),
+                format!("mcp_servers.{qname}.args={qargs}"),
+            ]);
+            if !server.env.is_empty() {
+                let env_names: Vec<&str> = server.env.iter().map(|(k, _)| k.as_str()).collect();
+                let qvars = serde_json::to_string(&env_names).unwrap_or_else(|_| "[]".into());
+                launch.args.extend([
+                    "-c".to_string(),
+                    format!("mcp_servers.{qname}.env_vars={qvars}"),
+                ]);
+                plan.env.extend(server.env.iter().cloned());
+            }
+        }
+    }
     if request.report && request.stdin_open {
         match SchemaFile::write() {
             Ok(file) => {
@@ -467,6 +501,7 @@ mod tests {
             model: None,
             resume: None,
             report: false,
+            mcp_servers: &[],
         }
     }
 
@@ -912,5 +947,73 @@ mod tests {
         host.close().await;
         let _ = child.wait().await;
         std::fs::remove_dir_all(&owner).unwrap();
+    }
+
+    #[test]
+    fn injected_mcp_servers_write_codex_home_config_and_exec_env_vars() {
+        let endpoints = vec![crate::McpEndpoint {
+            name: "aidaemon_peers".into(),
+            command: "/usr/local/bin/aidaemon".into(),
+            args: vec![
+                "mcp-bridge".into(),
+                "--addr".into(),
+                "127.0.0.1:4242".into(),
+            ],
+            env: vec![("AIDAEMON_MCP_TOKEN".into(), "synthetic-token".into())],
+        }];
+
+        // Hosted path: writes config.toml inside ephemeral CODEX_HOME (not in argv).
+        let owner =
+            std::env::temp_dir().join(format!("aidaemon-codex-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join("auth.json"), "{}").unwrap();
+        let home = || host::CodexHome::linked_to(&owner);
+        let mut asked = request(PermissionMode::EveryCommand, false, &[]);
+        asked.can_host = true;
+        asked.mcp_servers = &endpoints;
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = prepare(&asked, &mut launch, &home).unwrap();
+        let codex_home = plan
+            .env
+            .iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .expect("CODEX_HOME env");
+        let cfg = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        assert!(cfg.contains("[mcp_servers.\"aidaemon_peers\"]"), "{cfg}");
+        assert!(cfg.contains("AIDAEMON_MCP_TOKEN"), "{cfg}");
+        drop(plan);
+        std::fs::remove_dir_all(&owner).unwrap();
+
+        // Exec path: keeps token in Plan::env and uses env_vars in -c args.
+        let mut exec_req = request(PermissionMode::FullAccess, false, &[]);
+        exec_req.mcp_servers = &endpoints;
+        let mut exec_launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let exec_plan = prepare(&exec_req, &mut exec_launch, &host::CodexHome::prepare).unwrap();
+        let joined = exec_launch.args.join(" ");
+        assert!(
+            joined.contains("mcp_servers.aidaemon_peers.command="),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("env_vars=[\"AIDAEMON_MCP_TOKEN\"]"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("synthetic-token"),
+            "token must never appear in argv"
+        );
+        assert!(
+            exec_plan
+                .env
+                .iter()
+                .any(|(k, v)| k == "AIDAEMON_MCP_TOKEN" && v == "synthetic-token")
+        );
     }
 }

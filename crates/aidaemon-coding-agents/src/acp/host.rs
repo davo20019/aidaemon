@@ -306,6 +306,8 @@ pub struct AcpHostStarter {
     pub model: Option<String>,
     /// The earlier session to continue (`None`: a new one).
     pub resume: Option<String>,
+    /// Host-injected MCP servers passed in `session/new` / `session/load`.
+    pub mcp_servers: Vec<crate::McpEndpoint>,
 }
 
 #[async_trait]
@@ -320,9 +322,97 @@ impl HostStarter for AcpHostStarter {
         host.agent = Arc::from(self.agent);
         host.model = self.model.map(Arc::from);
         host.resume = self.resume.map(Arc::from);
+        host.mcp_servers = Arc::from(self.mcp_servers);
         host.stdin.write(&initialize_line()).await;
         Arc::new(host)
     }
+}
+
+/// Serialize host-injected MCP servers into ACP's `mcpServers` schema.
+pub fn acp_mcp_servers_json(servers: &[crate::McpEndpoint]) -> Value {
+    let items: Vec<Value> = servers
+        .iter()
+        .map(|server| {
+            let env: Vec<Value> = server
+                .env
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect();
+            json!({
+                "name": server.name,
+                "command": server.command,
+                "args": server.args,
+                "env": env,
+            })
+        })
+        .collect();
+    Value::Array(items)
+}
+
+/// Whether an ACP `session/request_permission` `toolCall` targets one of the
+/// host-injected MCP servers in `servers`.
+fn is_trusted_mcp_tool_call(tool_call: &Value, servers: &[crate::McpEndpoint]) -> bool {
+    if servers.is_empty() {
+        return false;
+    }
+    let kind = tool_call
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("other");
+    if kind != "other" {
+        return false;
+    }
+    let title = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let server_field = tool_call
+        .get("rawInput")
+        .and_then(|input| input.get("server"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Antigravity names an MCP tool `mcp_<server>_<tool>` in the call's
+    // `name` (machine format, probed live).
+    let call_name = tool_call
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let raw_tool = tool_call
+        .get("rawInput")
+        .and_then(|input| input.get("tool").or_else(|| input.get("name")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Machine format (the agent's tool-call fields, probed live): the tool
+    // part after the server's prefix, up to the first space or bracket.
+    let tool_after = |text: &str, prefix: &str| -> Option<String> {
+        text.strip_prefix(prefix).map(|rest| {
+            rest.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+    };
+    servers.iter().any(|server| {
+        let name = server.name.as_str();
+        let mut tools: Vec<String> = Vec::new();
+        if server_field == name {
+            tools.push(raw_tool.to_string());
+        }
+        tools.extend(tool_after(call_name, &format!("mcp_{name}_")));
+        for prefix in [
+            format!("mcp__{name}__"),
+            format!("{name}__"),
+            format!("{name}/"),
+            format!("{name}:"),
+        ] {
+            tools.extend(tool_after(title, &prefix));
+        }
+        // Only a tool the daemon's own coordination server defines: the
+        // agent names the call, the daemon decides what passes unasked.
+        tools
+            .iter()
+            .any(|tool| crate::peer::COORD_TOOL_NAMES.contains(&tool.trim()))
+    })
 }
 
 /// Hosts one agent's session for its run.
@@ -338,6 +428,8 @@ pub struct AcpHost {
     model: Option<Arc<str>>,
     /// The earlier session the run continues (`session/load`).
     resume: Option<Arc<str>>,
+    /// Host-injected MCP servers passed to `session/new` / `session/load`.
+    mcp_servers: Arc<[crate::McpEndpoint]>,
     state: Arc<Mutex<HostState>>,
 }
 
@@ -356,8 +448,15 @@ impl AcpHost {
             prompt: Arc::from(prompt),
             model: None,
             resume: None,
+            mcp_servers: Arc::from(Vec::<crate::McpEndpoint>::new()),
             state: Arc::default(),
         }
+    }
+
+    /// Attach host-injected MCP servers for `session/new` / `session/load`.
+    pub fn with_mcp_servers(mut self, servers: Vec<crate::McpEndpoint>) -> Self {
+        self.mcp_servers = Arc::from(servers);
+        self
     }
 
     async fn send_prompt(&self, session: &str) {
@@ -453,7 +552,7 @@ impl AcpHost {
                     .pointer("/agentCapabilities/loadSession")
                     .and_then(Value::as_bool)
                     == Some(true);
-                let mut params = json!({"mcpServers": []});
+                let mut params = json!({"mcpServers": acp_mcp_servers_json(&self.mcp_servers)});
                 if let Some(dir) = self.working_dir.as_deref() {
                     params["cwd"] = json!(dir);
                 }
@@ -609,30 +708,41 @@ impl AcpHost {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let (label, verdict) = match actions(tool_call, self.working_dir.as_deref()) {
-            Ok(actions) => {
-                let label = actions
-                    .iter()
-                    .map(AgentAction::label)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let mut verdict = Verdict::Allow;
-                for action in actions {
-                    verdict = self.judge.judge(action).await;
-                    if !verdict.is_allowed() {
-                        break;
-                    }
-                }
-                (label, verdict)
-            }
-            Err(reason) => (
+        let (label, verdict) = if is_trusted_mcp_tool_call(tool_call, &self.mcp_servers) {
+            (
                 tool_call
                     .get("title")
                     .and_then(Value::as_str)
-                    .unwrap_or("an action")
+                    .unwrap_or("mcp tool")
                     .to_string(),
-                Verdict::Deny { reason },
-            ),
+                Verdict::Allow,
+            )
+        } else {
+            match actions(tool_call, self.working_dir.as_deref()) {
+                Ok(actions) => {
+                    let label = actions
+                        .iter()
+                        .map(AgentAction::label)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let mut verdict = Verdict::Allow;
+                    for action in actions {
+                        verdict = self.judge.judge(action).await;
+                        if !verdict.is_allowed() {
+                            break;
+                        }
+                    }
+                    (label, verdict)
+                }
+                Err(reason) => (
+                    tool_call
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("an action")
+                        .to_string(),
+                    Verdict::Deny { reason },
+                ),
+            }
         };
         if let Ok(mut state) = self.state.lock() {
             match verdict {
@@ -718,6 +828,55 @@ impl AgentHost for AcpHost {
 mod tests {
     use super::*;
 
+    #[test]
+    fn antigravity_mcp_tool_names_are_trusted_only_for_injected_servers() {
+        let servers = vec![crate::McpEndpoint {
+            name: "aidaemon_peers".into(),
+            command: "/usr/local/bin/aidaemon".into(),
+            args: vec!["mcp-bridge".into()],
+            env: Vec::new(),
+        }];
+        // The shape `agy acp` sent for an MCP tool in the live probe (2026-11-24).
+        let call = |name: &str, kind: &str| {
+            json!({
+                "sessionUpdate": "tool_call", "toolCallId": "call_1", "name": name,
+                "status": "pending", "kind": kind, "title": format!("Run {name}"),
+                "rawInput": {"topic": "heron-review", "toolSummary": "Post findings"}
+            })
+        };
+        assert!(is_trusted_mcp_tool_call(
+            &call("mcp_aidaemon_peers_post_board", "other"),
+            &servers
+        ));
+        assert!(!is_trusted_mcp_tool_call(
+            &call("mcp_other_post_board", "other"),
+            &servers
+        ));
+        assert!(!is_trusted_mcp_tool_call(
+            &call("mcp_aidaemon_peers_", "other"),
+            &servers
+        ));
+        // A tool the coordination server does not serve is not let through,
+        // whatever server the agent says it belongs to.
+        assert!(!is_trusted_mcp_tool_call(
+            &call("mcp_aidaemon_peers_run_shell", "other"),
+            &servers
+        ));
+        let claimed = json!({
+            "kind": "other", "title": "aidaemon_peers: rm -rf build",
+            "rawInput": {"server": "aidaemon_peers", "command": "rm -rf build"}
+        });
+        assert!(!is_trusted_mcp_tool_call(&claimed, &servers));
+        assert!(!is_trusted_mcp_tool_call(
+            &call("mcp_aidaemon_peers_post_board", "edit"),
+            &servers
+        ));
+        assert!(!is_trusted_mcp_tool_call(
+            &call("mcp_aidaemon_peers_post_board", "other"),
+            &[]
+        ));
+    }
+
     /// The requests `agy acp` 1.5.10 sent in the live probe (2026-11-18).
     fn write_request() -> Value {
         json!({
@@ -798,7 +957,7 @@ mod tests {
         }));
         let events = super::super::events::read_events(&line);
         assert!(matches!(&events[0], crate::AgentEvent::Step(step)
-            if step.tool == crate::StepTool::Run { program: Some("python3".into()), subcommand: None }));
+            if step.tool == crate::StepTool::Run { program: Some("python3".into()), subcommand: None, also: Vec::new() }));
     }
 
     #[test]
@@ -1163,5 +1322,69 @@ mod tests {
         assert_eq!(cancel["method"], "session/cancel");
         assert_eq!(cancel["params"]["sessionId"], "synthetic-acp-1");
         host.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_passes_injected_mcp_servers_and_allows_trusted_mcp_calls() {
+        let endpoint = crate::McpEndpoint {
+            name: "aidaemon_peers".into(),
+            command: "/usr/local/bin/aidaemon".into(),
+            args: vec![
+                "mcp-bridge".into(),
+                "--addr".into(),
+                "127.0.0.1:4242".into(),
+            ],
+            env: vec![("AIDAEMON_MCP_TOKEN".into(), "synthetic-token".into())],
+        };
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let host = AcpHost::new(
+            stdin,
+            Arc::new(crate::AllowAll),
+            Some("/w/project".into()),
+            "coordinate",
+        )
+        .with_mcp_servers(vec![endpoint]);
+        use tokio::io::AsyncBufReadExt;
+        let mut sent = tokio::io::BufReader::new(stdout).lines();
+
+        host.on_line(LOADS).await;
+        let new: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(new["method"], "session/new");
+        assert_eq!(new["params"]["mcpServers"][0]["name"], "aidaemon_peers");
+        assert_eq!(
+            new["params"]["mcpServers"][0]["env"][0],
+            json!({ "name": "AIDAEMON_MCP_TOKEN", "value": "synthetic-token" })
+        );
+
+        // Trusted MCP tool call permission request is allowed cleanly.
+        let perm = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {
+                    "kind": "other",
+                    "title": "mcp__aidaemon_peers__delegate_cli"
+                },
+                "options": [
+                    { "kind": "allow_once", "optionId": "allow-1" },
+                    { "kind": "reject_once", "optionId": "reject-1" }
+                ]
+            }
+        })
+        .to_string();
+        host.on_line(&perm).await;
+        let reply: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(reply["id"], 99);
+        assert_eq!(reply["result"]["outcome"]["optionId"], "allow-1");
+        host.close().await;
+        let _ = child.wait().await;
     }
 }

@@ -196,6 +196,7 @@ impl CodingAgent for AcpAgent {
                 working_dir: request.working_dir.map(str::to_string),
                 model: request.model.map(str::to_string),
                 resume: request.resume.map(str::to_string),
+                mcp_servers: request.mcp_servers.to_vec(),
             })),
             // Whether its session can be continued is the agent's word once
             // it runs (its session event's `resumable`).
@@ -221,6 +222,7 @@ mod tests {
             model: None,
             resume: None,
             report: false,
+            mcp_servers: &[],
         }
     }
 

@@ -19,10 +19,12 @@ pub(super) async fn watch_run(
     background_timeout: Duration,
     idle_timeout: Duration,
     keep_alive: Option<Box<dyn std::any::Any + Send>>,
-    slot_permit: tokio::sync::OwnedSemaphorePermit,
+    permit_slot: peers::PermitSlot,
     completion_tx: tokio::sync::oneshot::Sender<(Option<i32>, bool, Option<usize>)>,
 ) {
-    let _slot_permit = slot_permit;
+    if let Some(binding) = call.peer_binding.as_ref() {
+        binding.register_permit(permit_slot.clone());
+    }
     // What the agent's launch needs until the run is over.
     let _keep_alive = keep_alive;
     let StartedRun {
@@ -358,9 +360,10 @@ pub(super) async fn watch_run(
             .map(|state| state.edited)
             .unwrap_or_default();
         let fallback = extract_meaningful_output(&stdout_buf_writer.lock().await, 4_000);
-        handles
-            .runs
-            .result(&run_id, agent_events.result(&edited, &fallback));
+        handles.runs.result(
+            &run_id,
+            agent_events.result(&edited, &watched_for_task, &fallback),
+        );
     }
     let auth_failed = cli_auth_failed(
         &stdout_buf_writer.lock().await,
@@ -475,10 +478,20 @@ pub(super) async fn watch_run(
             );
         }
         let agent_report = completion.persisted_output;
-        let persisted_output = match left.result_section() {
+        let mut persisted_output = match left.result_section() {
             Some(section) => format!("{agent_report}\n\n{section}"),
             None => agent_report.clone(),
         };
+        // A lead CLI's own report summarizes its peers; the tree's record
+        // (every peer and board post) is what the caller can quote.
+        if let Some(record) = call
+            .peer_binding
+            .as_ref()
+            .and_then(peers::ActivePeerBinding::lead_record)
+        {
+            persisted_output.push_str("\n\n");
+            persisted_output.push_str(&record);
+        }
         let (structured_response, structured_error) = if success {
             (completion.response, completion.error)
         } else {
@@ -526,6 +539,36 @@ pub(super) async fn watch_run(
         // Durable state is authoritative for completion. Publish the
         // finished flag and wake waiters before optional chat delivery.
         finished_for_task.store(true, Ordering::Release);
+        if let Some(binding) = call.peer_binding.as_ref() {
+            binding.unregister_permit();
+            let peer_state = if success {
+                aidaemon_coding_agents::peer::PeerState::Completed
+            } else {
+                aidaemon_coding_agents::peer::PeerState::Failed
+            };
+            let resumable = state_for_completion
+                .cli_agent_run(&cli_run_id(&call.task_id))
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.keeps_session && r.agent_session.is_some());
+            binding.tree.update_peer(
+                &binding.peer_id,
+                aidaemon_coding_agents::peer::PeerUpdate {
+                    state: peer_state,
+                    run_id: Some(cli_run_id(&call.task_id)),
+                    working_dir: None,
+                    branch: binding.branch.clone(),
+                    output: Some(match &structured_error {
+                        Some(error) => error.clone(),
+                        None => persisted_output.clone(),
+                    }),
+                    resumable: Some(resumable),
+                },
+            );
+            binding.cleanup_children().await;
+        }
+        permit_slot.release();
         shared.done_notify.notify_waiters();
         handles.claims_changed.notify_waiters();
 
@@ -547,7 +590,7 @@ pub(super) async fn watch_run(
                     left: &left,
                     diff_dir: notify_working_dir.as_ref(),
                     max_output: max_output_for_log,
-                    answer_alone: true,
+                    answer_alone: !call.is_peer_run,
                 },
             )
             .await;

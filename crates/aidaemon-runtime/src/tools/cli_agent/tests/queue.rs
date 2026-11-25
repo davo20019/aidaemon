@@ -522,6 +522,8 @@ async fn folder_waiter_blocks_subfolder_waiter_but_allows_disjoint_write_paths()
         began: chrono::Utc::now(),
         owner_follow_up: false,
         direct_agent: true,
+        is_peer_run: false,
+        peer_binding: None,
     };
     let earlier_at = Instant::now() - Duration::from_secs(5);
     let later_shared = RunShared::default();
@@ -726,6 +728,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         keep_alive: None,
         keeps_session: true,
         continues: None,
+        mcp_servers: Vec::new(),
         prompt: "second turn".to_string(),
         task: "second turn".to_string(),
         final_prompt: "second turn".to_string(),
@@ -747,6 +750,8 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         began: chrono::Utc::now(),
         owner_follow_up: false,
         direct_agent: true,
+        is_peer_run: false,
+        peer_binding: None,
     };
 
     super::super::queue::refresh_direct_session(

@@ -391,11 +391,14 @@ name = "aidaemon-coding-agents"
 version = "0.22.2"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-mcp",
  "async-trait",
  "dirs 7.0.0",
+ "serde",
  "serde_json",
  "shell-words",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -514,6 +517,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2463,7 +2467,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]

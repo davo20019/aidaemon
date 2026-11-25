@@ -34,7 +34,7 @@ aidaemon-agents = { version = "0.22.2", path = "../aidaemon-agents" }
 aidaemon-channels = { version = "0.22.2", path = "../aidaemon-channels" }
 aidaemon-client-gateway = { version = "0.22.2", path = "../aidaemon-client-gateway" }
 aidaemon-core = { version = "0.22.2", path = "../aidaemon-core" }
-aidaemon-coding-agents = { version = "0.22.2", path = "../aidaemon-coding-agents" }
+aidaemon-coding-agents = { version = "0.22.2", path = "../aidaemon-coding-agents", features = ["mcp"] }
 aidaemon-decisions = { version = "0.22.2", path = "../aidaemon-decisions", features = ["gemini", "typesafe"] }
 aidaemon-events = { version = "0.22.2", path = "../aidaemon-events" }
 aidaemon-exposure = { version = "0.22.2", path = "../aidaemon-exposure" }

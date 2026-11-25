@@ -138,6 +138,7 @@ async fn test_run_logs_invocation() {
         reengagements: Arc::new(Mutex::new(HashMap::new())),
         coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
         permissions: Arc::new(OnceLock::new()),
+        peer_coord: OnceLock::new(),
     };
 
     // Run a command
@@ -206,6 +207,7 @@ async fn test_timeout_run_still_logs_completion() {
         reengagements: Arc::new(Mutex::new(HashMap::new())),
         coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
         permissions: Arc::new(OnceLock::new()),
+        peer_coord: OnceLock::new(),
     };
 
     // Run a command that will exceed the short timeout and be moved to background,
@@ -367,6 +369,7 @@ async fn test_background_cli_check_returns_result_after_reap() {
         reengagements: Arc::new(Mutex::new(HashMap::new())),
         coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
         permissions: Arc::new(OnceLock::new()),
+        peer_coord: OnceLock::new(),
     };
 
     let resp = tool

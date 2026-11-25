@@ -89,7 +89,70 @@ pub(crate) use aidaemon_tools::check_environment::{
 };
 
 fn runtime_working_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = dirs::home_dir().map(|home| home.join(".aidaemon"));
+    choose_working_dir(
+        std::env::var_os("AIDAEMON_HOME").map(PathBuf::from),
+        cwd,
+        home,
+    )
+}
+
+/// The daemon's folder (config.toml, .env, the database): `AIDAEMON_HOME`
+/// when set; otherwise the current directory, except that an install in
+/// `~/.aidaemon` wins over a `config.toml` in whatever directory a command
+/// was typed in. The daemon loads that folder's `.env` into its environment
+/// and obeys its config (MCP servers it starts, who owns its bots), so a
+/// cloned repository or a downloads folder carrying those files must not
+/// become the daemon's home just because a command ran there.
+fn choose_working_dir(explicit: Option<PathBuf>, cwd: PathBuf, home: Option<PathBuf>) -> PathBuf {
+    if let Some(explicit) = explicit.filter(|path| !path.as_os_str().is_empty()) {
+        return absolutize_path(&explicit, &cwd);
+    }
+    match home {
+        Some(home) if home != cwd && home.join("config.toml").is_file() => {
+            if cwd.join("config.toml").is_file() {
+                eprintln!(
+                    "Using {} (its config.toml); the one in {} is ignored. \
+                     Set AIDAEMON_HOME to choose another folder.",
+                    home.display(),
+                    cwd.display()
+                );
+            }
+            home
+        }
+        _ => cwd,
+    }
+}
+
+#[cfg(test)]
+mod working_dir_tests {
+    use super::choose_working_dir;
+
+    #[test]
+    fn a_home_install_wins_over_a_config_in_the_current_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home/.aidaemon");
+        let repo = root.path().join("cloned-repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("config.toml"), "").unwrap();
+        // No home install: the current directory, as before.
+        assert_eq!(
+            choose_working_dir(None, repo.clone(), Some(home.clone())),
+            repo
+        );
+        std::fs::write(home.join("config.toml"), "").unwrap();
+        assert_eq!(
+            choose_working_dir(None, repo.clone(), Some(home.clone())),
+            home
+        );
+        let chosen = root.path().join("chosen");
+        assert_eq!(
+            choose_working_dir(Some(chosen.clone()), repo.clone(), Some(home)),
+            chosen
+        );
+    }
 }
 
 fn absolutize_path(path: &Path, base_dir: &Path) -> PathBuf {
@@ -178,6 +241,16 @@ fn load_startup_env_file(env_file_path: &Path) {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    // Handle `aidaemon mcp-bridge` before initializing logging or reading `.env`
+    // so stdout carries exclusively MCP JSON-RPC 2.0 frames.
+    let early_args: Vec<String> = std::env::args().collect();
+    if early_args.get(1).map(String::as_str) == Some("mcp-bridge") {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(aidaemon_mcp::run_stdio_bridge_from_args(&early_args[2..]));
+    }
+
     let working_dir = runtime_working_dir();
     let config_path = working_dir.join("config.toml");
     let env_file_path = resolve_runtime_env_file_path(&working_dir);
@@ -555,7 +628,8 @@ fn handle_memory_export_command(args: &[String], default_config_path: &Path) -> 
     let Some(directory) = directory else {
         anyhow::bail!("Usage: aidaemon memory-export DIR [--config PATH]");
     };
-    let _ = dotenvy::dotenv();
+    // The daemon folder's env file was loaded at startup; no search of
+    // the current directory and its parents for another one.
     let config = config::AppConfig::load(&config_path)?;
     let written = tokio::runtime::Builder::new_current_thread()
         .enable_all()

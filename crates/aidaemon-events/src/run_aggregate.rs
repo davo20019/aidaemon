@@ -1418,6 +1418,9 @@ impl RunAggregate {
                 operation.mutating
                     || operation.policy_denied
                     || operation.owner_declined
+                    // A launched run that ended within its call took the
+                    // work on as surely as one still working.
+                    || (operation.launched_runs > 0 && operation.has_terminal_receipt())
                     || (operation.is_background_in_flight()
                         && (operation.checklist_items.is_empty()
                             || operation
@@ -1427,6 +1430,19 @@ impl RunAggregate {
             })
             .map(RunOperation::attempts)
             .sum();
+        // A single run that could change things, named no steps and ended
+        // within its call was handed the request's work as a whole: it attempted every
+        // unit, however many it counts as (bench 2026-11-24: one run for a
+        // three-unit request read as two units never started, and cost an
+        // extra round). Whether it did all of it is its own report's and
+        // receipts' to show, not this count's.
+        let handed_off = self.operations.values().any(|operation| {
+            operation.launched_runs > 0
+                    && operation.has_terminal_receipt()
+                    // A launch named its own steps took only those.
+                    && operation.checklist_items.is_empty()
+        });
+        let attempts = if handed_off { usize::MAX } else { attempts };
         if self.checklist_owner_units.is_empty() {
             return change_units.into_iter().skip(attempts).collect();
         }
@@ -7788,6 +7804,73 @@ mod tests {
                 status,
             )
         }
+    }
+
+    /// A delegated run that ended within its call took the owner's change
+    /// on, though it changed nothing the ledger can type (live 2026-11-24:
+    /// a coding agent ran the whole request and the closeout still sent the
+    /// turn back once for "unattempted" work). One run, one unit.
+    #[test]
+    fn a_launched_run_that_ended_within_its_call_took_on_the_whole_request() {
+        let mut ended = result(
+            "delegate",
+            "cli_agent",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::default(),
+        );
+        ended.data["receipt"]["launched_runs"] = serde_json::json!(1);
+        let mut events = vec![
+            owner_contract(&[("Post the plan", true), ("Post the review", true)]),
+            call("delegate", "cli_agent"),
+            ended,
+        ];
+        renumber(&mut events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).uncovered_owner_units(),
+            Vec::<usize>::new(),
+            "a run handed the whole request took on every unit"
+        );
+
+        // A launch that named its steps took only those.
+        let mut named = result(
+            "delegate",
+            "cli_agent",
+            ToolOutcomeStatus::Succeeded,
+            0,
+            ToolCallSemantics::default(),
+        );
+        named.data["receipt"]["launched_runs"] = serde_json::json!(1);
+        named.data["receipt"]["checklist_items"] = serde_json::json!([0]);
+        let mut events = vec![
+            owner_contract(&[("Post the plan", true), ("Post the review", true)]),
+            call("delegate", "cli_agent"),
+            named,
+        ];
+        renumber(&mut events);
+        assert_eq!(
+            RunAggregate::replay("task-1", &events).uncovered_owner_units(),
+            vec![1]
+        );
+
+        // Without a launched run (a plain call that changed nothing), it is
+        // no attempt.
+        let mut plain = vec![
+            owner_contract(&[("Post the plan", true)]),
+            call("look", "cli_agent"),
+            result(
+                "look",
+                "cli_agent",
+                ToolOutcomeStatus::Succeeded,
+                0,
+                ToolCallSemantics::default(),
+            ),
+        ];
+        renumber(&mut plain);
+        assert_eq!(
+            RunAggregate::replay("task-1", &plain).uncovered_owner_units(),
+            vec![0]
+        );
     }
 
     fn batch_launch(items: serde_json::Value, runs: usize) -> Vec<Event> {
