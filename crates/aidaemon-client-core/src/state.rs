@@ -777,10 +777,7 @@ impl State {
         let summary = self.sessions.get(id).and_then(|v| v.summary.as_ref());
         match summary {
             Some(SessionSummary {
-                archived: false,
-                agent: None,
-                title: Some(title),
-                ..
+                title: Some(title), ..
             }) => title.clone(),
             Some(summary) => format!("{} ({})", short(id), summary.channel),
             None => short(id),

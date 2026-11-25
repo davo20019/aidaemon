@@ -2234,13 +2234,27 @@ impl Client {
     }
 
     /// Whether conversation `id` matches every word of `query` (its title,
-    /// place, id or any loaded message).
+    /// place, coding agent, id or any loaded message).
     pub fn matches(&self, id: &str, query: &str) -> bool {
         let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         if words.is_empty() {
             return true;
         }
         let mut hay = format!("{} {} {id}", self.title(id), self.place(id)).to_lowercase();
+        if let Some(agent) = self.session_agent(id) {
+            hay.push(' ');
+            hay.push_str(&agent.to_lowercase());
+        }
+        if let Some(agent_id) = self
+            .state
+            .sessions
+            .get(id)
+            .and_then(|v| v.summary.as_ref())
+            .and_then(|s| s.agent.as_deref())
+        {
+            hay.push(' ');
+            hay.push_str(&agent_id.to_lowercase());
+        }
         if let Some(view) = self.state.sessions.get(id) {
             for line in &view.lines {
                 if let Line::User { text, .. } | Line::Assistant { text, .. } = line {
@@ -4603,15 +4617,18 @@ mod tests {
         let mut client = Client::new();
         client.update(
             frame(
-                r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:a","event":{"type":"session_updated","session":{"id":"app:a","channel":"app","writable":true,"agent":"synthetic-cli"}}}"#,
+                r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:a","event":{"type":"session_updated","session":{"id":"app:a","channel":"app","title":"Fix sidebar","writable":true,"agent":"synthetic-cli"}}}"#,
             ),
             &cx(None),
         );
+        // State::title keeps the title even when pinned to a coding agent.
+        assert_eq!(client.state.title("app:a"), "Fix sidebar");
         // The id until the agents are read, and they are asked for.
         assert_eq!(
             client.session_agent("app:a").as_deref(),
             Some("synthetic-cli")
         );
+        assert!(client.matches("app:a", "synthetic-cli"));
         let (id, command) = client.take_outgoing().pop().unwrap();
         assert_eq!(command, Command::ListModels);
         client.update(
@@ -4624,14 +4641,19 @@ mod tests {
             client.session_agent("app:a").as_deref(),
             Some("Synthetic CLI")
         );
+        // Sidebar search finds the conversation by display name or raw agent id.
+        assert!(client.matches("app:a", "synthetic cli"));
+        assert!(client.matches("app:a", "synthetic-cli"));
         // Back to AIDaemon: no agent, and the agents are not read again.
         client.update(
             frame(
-                r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:a","event":{"type":"session_updated","session":{"id":"app:a","channel":"app","writable":true}}}"#,
+                r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:a","event":{"type":"session_updated","session":{"id":"app:a","channel":"app","title":"Fix sidebar","archived":true,"writable":true}}}"#,
             ),
             &cx(None),
         );
+        assert_eq!(client.state.title("app:a"), "Fix sidebar");
         assert_eq!(client.session_agent("app:a"), None);
+        assert!(!client.matches("app:a", "synthetic cli"));
         assert!(client.take_outgoing().is_empty());
     }
 
