@@ -363,6 +363,21 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
         }
     }
 
+    /// A coding agent's report is never the owner's words, wherever it ran:
+    /// the agent follows the project instructions it finds (its own
+    /// discovery from the working directory, and the snapshot in the
+    /// enriched prompt, which may come from a repository outside the trusted
+    /// roots), and reads files, pages and command output of its own. Its
+    /// result taints the lead run, as the project-instruction rule taints a
+    /// direct run that loads guidance from outside the trusted roots.
+    fn output_trust(
+        &self,
+        _arguments: &str,
+        _roots: &aidaemon_tools::semantics::TrustRoots<'_>,
+    ) -> aidaemon_core::SourceTrust {
+        aidaemon_core::SourceTrust::Untrusted
+    }
+
     /// A delegated agent may do anything its own tools allow.
     fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
         aidaemon_core::CallEffects::unknown()

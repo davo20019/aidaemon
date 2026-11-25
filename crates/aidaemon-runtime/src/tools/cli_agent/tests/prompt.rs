@@ -254,3 +254,29 @@ async fn a_commit_from_before_the_run_is_not_reported_as_its_change() {
     assert!(diff.contains("new.txt"), "{diff}");
     assert!(!diff.contains("old.txt"), "{diff}");
 }
+
+/// A coding agent's result is untrusted even when it ran inside the owner's
+/// trusted roots: the project instructions it followed and everything it
+/// read are its own, so the lead run is tainted.
+#[tokio::test]
+async fn a_coding_agents_result_is_untrusted_inside_trusted_roots_too() {
+    use crate::tools::traits::ToolSemantics;
+    let (tool, _db) = setup_echo_tool().await;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_string_lossy().to_string();
+    let roots = vec![root.clone()];
+    let roots = aidaemon_tools::semantics::TrustRoots::new(&roots);
+    for working_dir in [root.as_str(), "/elsewhere/cloned-repo"] {
+        let args = json!({
+            "action": "run",
+            "tool": "echo",
+            "prompt": "fix the build",
+            "working_dir": working_dir,
+        });
+        assert_eq!(
+            tool.output_trust(&args.to_string(), &roots),
+            aidaemon_core::SourceTrust::Untrusted,
+            "{working_dir}"
+        );
+    }
+}
