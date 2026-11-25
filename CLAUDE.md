@@ -18,6 +18,13 @@ Debug-profile agent futures are large. If `cargo test` aborts with
 daemon uses an 8 MiB worker stack in `src/lib.rs`) rather than shrinking a
 frame by hand.
 
+`workspace-hack/` (cargo-hakari) unifies third-party features so `-p` and
+feature-flag builds reuse one build of each dependency. After adding,
+removing or re-featuring a dependency run `cargo hakari generate` and
+`cargo hakari manage-deps` (CI's `hakari` job checks it). Target dirs only
+grow; `scripts/dev/target-gc.sh` prunes every checkout's to a budget
+(`scripts/dev/install-target-gc.sh` runs it daily).
+
 Integration tests drive the real `Agent::handle_message` path with
 `MockProvider`, `TestChannel` and temp stores; helpers are in `src/testing.rs`.
 The first embedding-backed run downloads the fastembed model into
@@ -68,6 +75,11 @@ specific lines or files you changed. Prefer `git diff`, `git status --short`,
 and targeted patches. When unrelated files are modified, leave them alone.
 
 ## Releases
+
+The next release has an integration branch, `release/X.Y.Z` (now
+`release/0.24.1`): feature branches start from it and their pull requests
+target it (CI runs on `release/**`), and it merges to `master` when the
+release is ready. Do not push feature work straight to `master`.
 
 Bump `Cargo.toml`, add a Keep a Changelog entry to `CHANGELOG.md`, run the
 pre-commit checklist, commit everything including `Cargo.lock` and push to
