@@ -21,6 +21,8 @@ stability promise.
 - `aidaemon-channels`: `claim`, one-time claim codes for unowned bots, and `write_private_file`.
 
 ### Changed
+- **Breaking:** `aidaemon-core`: `ApprovalCard` gained `run` (the helper run asking, so a client can show which coding agent waits on the owner); build it with `ApprovalCard::new` and struct update syntax. Every SDK crate moves to 0.23.0.
+- **Breaking:** `aidaemon-channels`: `ChatRun` gained `started_at`, `ended_at`, `activity`, `agent`, `group`, `edited`, `continues`, `thread`, `keeps_session`, `result` and `asked`, and `ChannelContext` gained `in_run` and `agents`.
 - `aidaemon-client-gateway`: device callers cannot run device-management slash commands (`ClientHost::owner_only_command`); the challenge sign-in accepts the unbound v1 message only from this computer; signed file links cover the file's size and change time; the pairing page and the daemon fingerprint (random per install, `Pairing::new` takes it) name only their own daemon.
 - `aidaemon-client-core`: `DeviceKey::sign_challenge` takes the audience and endpoint; `Http::audience`; pairing and sign-in refuse plain http to another computer unless `AIDAEMON_ALLOW_PLAINTEXT_GATEWAY` is set.
 - `aidaemon-providers`: no redirects, bounded SSE, the ChatGPT backend only to https chatgpt.com.
