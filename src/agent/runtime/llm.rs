@@ -1,8 +1,8 @@
 //! A turn's model calls with the daemon's recovery live in `aidaemon-runtime`
-//! ([`aidaemon_runtime::llm::turn_calls`]).
+//! ([`aidaemon_runtime::turn::llm_calls`]).
 
 #[cfg(test)]
-pub(in crate::agent) use aidaemon_runtime::llm::turn_calls::*;
+pub(in crate::agent) use aidaemon_runtime::turn::llm_calls::*;
 #[cfg(test)]
 mod tests {
     use aidaemon_runtime::host::TurnHost as _;

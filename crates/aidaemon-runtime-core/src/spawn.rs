@@ -1061,7 +1061,7 @@ pub fn plain_child_prompt(
          **Mission:** {mission}\n\n\
          Focus exclusively on this mission. Be concise. Return your findings/results \
          directly — they will be consumed by the parent agent. {own_duration}{depth_note}",
-        own_duration = crate::specialists::compose::OWN_DURATION_RULE,
+        own_duration = crate::prompt::rules::OWN_DURATION_RULE,
     );
     if let Some(specialist_prompt) = specialist_prompt {
         prompt.push_str("\n\n## Specialist Profile\n");
@@ -2500,7 +2500,7 @@ mod tests {
     /// the run record's measured times, under its result.
     #[test]
     fn a_helper_is_told_its_run_time_is_the_daemons() {
-        let rule = crate::specialists::compose::OWN_DURATION_RULE;
+        let rule = crate::prompt::rules::OWN_DURATION_RULE;
         assert!(plain_child_prompt("P", 1, 3, "Count", None, false).contains(rule));
         assert!(plain_child_prompt("P", 1, 3, "Coordinate", Some("profile"), true).contains(rule));
     }

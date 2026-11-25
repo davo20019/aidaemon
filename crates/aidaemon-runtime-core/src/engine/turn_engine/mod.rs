@@ -1758,7 +1758,7 @@ impl TurnEngine<'_> {
                     .lock()
                     .ok()
                     .and_then(|slot| slot.clone())
-                    && crate::llm::turn_calls::quota_note_due(scope.session_id, &fallback, now)
+                    && crate::turn::llm_calls::quota_note_due(scope.session_id, &fallback, now)
                 {
                     reply = format!("{}\n\n⚠️ {}", reply.trim_end(), fallback.note(now));
                 }

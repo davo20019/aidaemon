@@ -336,7 +336,7 @@ impl TurnEngine<'_> {
         // already chose one for this call.
         if options.reasoning_effort_override.is_none() {
             options.reasoning_effort_override =
-                crate::llm::turn_calls::session_effort(self.host, scope.session_id, &call_model)
+                crate::turn::llm_calls::session_effort(self.host, scope.session_id, &call_model)
                     .await;
         }
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
@@ -355,7 +355,7 @@ impl TurnEngine<'_> {
         let raw_input_tokens = fitted.estimated_tokens;
         let est_input_tokens =
             crate::context_budget::calibrated_tokens(&call_model, raw_input_tokens);
-        let mut telemetry = crate::llm::turn_calls::LlmCallTelemetry::default();
+        let mut telemetry = crate::turn::llm_calls::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
         // and its executors: reserve before the call, settle after it.
         let lease = match self
@@ -386,7 +386,7 @@ impl TurnEngine<'_> {
         };
         let started = Instant::now();
         let idle_timeout = self.sdk_model_call_timeout();
-        let call = crate::llm::turn_calls::call_llm_with_recovery(
+        let call = crate::turn::llm_calls::call_llm_with_recovery(
             self.host,
             snapshot.provider(),
             snapshot.router(),

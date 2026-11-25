@@ -55,6 +55,8 @@ pub mod approvals;
 pub mod authority;
 pub mod background_run;
 pub mod background_task_lead;
+pub mod budget_policy;
+pub mod call_args;
 pub mod chat_bridge;
 pub mod consolidation;
 pub mod context_budget;

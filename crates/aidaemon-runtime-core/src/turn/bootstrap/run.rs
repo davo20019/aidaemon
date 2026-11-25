@@ -372,7 +372,7 @@ async fn build_isolated_mandate_bootstrap(
         continuation_task_context_tail,
         active_skill_names,
         project_instruction_tracker,
-    ) = crate::prompt::system::build_system_prompt_for_message(
+    ) = crate::turn::system_prompt::build_system_prompt_for_message(
         agent,
         &emitter,
         &task_id,
@@ -973,7 +973,7 @@ pub async fn run_bootstrap(
     // Model selection: autonomous primary models interpret the request directly.
     // Lexical policy scoring remains available for guided/local-model support,
     // but must not silently swap a capable primary model based on user wording.
-    let (selected_model, routed) = crate::llm::turn_calls::select_turn_model(
+    let (selected_model, routed) = crate::turn::llm_calls::select_turn_model(
         agent,
         &llm_runtime_snapshot,
         llm_router.as_ref(),
@@ -1308,7 +1308,7 @@ pub async fn run_bootstrap(
                 && relationship_fallback.as_ref().is_none_or(|shape| {
                     shape.request_relationship.as_deref() == Some("new_request")
                 })
-                && !crate::llm::turn_calls::model_override_active(agent, session_id).await =>
+                && !crate::turn::llm_calls::model_override_active(agent, session_id).await =>
         {
             match outcome
                 .acted(crate::llm::decisions::digest_keys::TIER)
@@ -1524,7 +1524,7 @@ pub async fn run_bootstrap(
         continuation_task_context_tail,
         active_skill_names,
         project_instruction_tracker,
-    ) = crate::prompt::system::build_system_prompt_for_message(
+    ) = crate::turn::system_prompt::build_system_prompt_for_message(
         agent,
         &emitter,
         &task_id,

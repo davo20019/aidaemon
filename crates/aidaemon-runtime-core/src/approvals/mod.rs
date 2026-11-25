@@ -196,7 +196,7 @@ impl TerminalScope {
     }
 }
 
-pub use crate::engine::tool_calls::CanonicalCall;
+pub use crate::call_args::CanonicalCall;
 
 /// A terminal call as the kernel judged it.
 #[derive(Debug, Clone, PartialEq)]

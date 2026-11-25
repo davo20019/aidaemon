@@ -60,7 +60,7 @@ pub struct TurnScope<'a> {
     pub not_attempted: std::sync::Mutex<Vec<(Option<usize>, String)>>,
     /// The plan's usage limit stopped the chosen model and another answered:
     /// the reply says so, once per limit in a conversation.
-    pub answered_past_quota: std::sync::Mutex<Option<crate::llm::turn_calls::QuotaFallback>>,
+    pub answered_past_quota: std::sync::Mutex<Option<crate::turn::llm_calls::QuotaFallback>>,
     /// The model that wrote the latest successful answer (a failover's
     /// when one answered): the reply is recorded under it, so a client can
     /// show which model wrote it.

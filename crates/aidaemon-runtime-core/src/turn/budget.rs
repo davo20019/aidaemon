@@ -579,9 +579,9 @@ pub async fn enforce_goal_daily_budget_control(
                     current: old_gbudget,
                     proposed: new_gbudget,
                     why: if *ctx.budget_extensions_count >= ctx.max_budget_extensions {
-                        crate::engine::budgets::AskWhy::ExtensionsUsed(*ctx.budget_extensions_count)
+                        crate::budget_policy::AskWhy::ExtensionsUsed(*ctx.budget_extensions_count)
                     } else {
-                        crate::engine::budgets::AskWhy::NoProgress
+                        crate::budget_policy::AskWhy::NoProgress
                     }
                     .words(),
                 },

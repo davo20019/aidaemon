@@ -239,7 +239,7 @@ struct SpawnFamilyState {
     /// Delegated CLI agent runs registered in this family's coordination
     /// ledger (never counted against sub-agent spawn limits).
     cli_members: std::sync::atomic::AtomicUsize,
-    budget: std::sync::Arc<crate::engine::budgets::TreeBudget>,
+    budget: std::sync::Arc<crate::budget_policy::TreeBudget>,
     coordination: crate::coordination::Coordination,
     /// The folders the runtime made fresh for this request's work (every
     /// spawn's claimed `new_folders`): the work's own, for every run of
@@ -384,8 +384,8 @@ impl SpawnFamily {
     }
 
     /// The tree's one task budget: its tokens, limit, extensions and
-    /// progress ([`crate::engine::budgets::TreeBudget`]).
-    pub fn budget(&self) -> &crate::engine::budgets::TreeBudget {
+    /// progress ([`crate::budget_policy::TreeBudget`]).
+    pub fn budget(&self) -> &crate::budget_policy::TreeBudget {
         &self.0.budget
     }
 

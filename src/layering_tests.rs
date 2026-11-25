@@ -28,8 +28,8 @@ const LAYERS: &[&str] = &[
     "authority",
     "coordination",
     "untrusted",
-    "llm",
     "session_model",
+    "llm",
     "media",
     "eval",
     "prompt",
@@ -39,24 +39,15 @@ const LAYERS: &[&str] = &[
 /// References from a lower module to a higher one, still to be removed.
 /// Remove a pair when its last reference goes; never add one.
 const KNOWN_BACK_EDGES: &[(&str, &str)] = &[
-    ("approvals", "engine"),
-    ("authority", "engine"),
     ("coordination", "authority"),
     ("helper_run", "spawn"),
     ("helper_run", "spawn_tool"),
-    ("helper_run", "specialists"),
     ("helper_run", "turn"),
     ("host", "approvals"),
     ("host", "engine"),
     ("host", "specialists"),
     ("host", "turn"),
-    ("llm", "host"),
-    ("prompt", "engine"),
-    ("prompt", "host"),
-    ("prompt", "turn"),
-    ("session_model", "llm"),
     ("spawn", "host"),
-    ("spawn", "specialists"),
     ("turn", "engine"),
     ("untrusted", "engine"),
     ("untrusted", "host"),
@@ -281,7 +272,7 @@ fn referenced_modules(code: &str, top_level_file: bool) -> BTreeSet<String> {
                 continue;
             }
             if code[from..].starts_with('{') {
-                let end = from + item_end(code[from..].as_bytes(), 0);
+                let end = from + item_end(&code.as_bytes()[from..], 0);
                 let group = &code[from + 1..end - 1];
                 let mut depth = 0;
                 let mut start = true;
@@ -420,10 +411,10 @@ fn find_cycle(edges: &BTreeSet<(String, String)>) -> Option<Vec<String>> {
     }
     let nodes: Vec<&str> = next.keys().copied().collect();
     for node in nodes {
-        if state.get(node).copied().unwrap_or(0) == 0 {
-            if let Some(c) = visit(node, &next, &mut state, &mut Vec::new()) {
-                return Some(c);
-            }
+        if state.get(node).copied().unwrap_or(0) == 0
+            && let Some(c) = visit(node, &next, &mut state, &mut Vec::new())
+        {
+            return Some(c);
         }
     }
     None

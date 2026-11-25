@@ -1,8 +1,8 @@
 //! The system prompt lives in `aidaemon-runtime`
-//! ([`aidaemon_runtime::prompt::system`]).
+//! ([`aidaemon_runtime::turn::system_prompt`]).
 
 #[allow(unused_imports)]
-pub(in crate::agent) use aidaemon_runtime::prompt::system::*;
+pub(in crate::agent) use aidaemon_runtime::turn::system_prompt::*;
 
 pub(in crate::agent) use aidaemon_runtime::prompt::rules::infer_assistant_name_from_prompt;
 
@@ -273,7 +273,7 @@ mod tests {
             "new-task-session".to_string(),
         );
         let (_, tail, continuation_tail, _, _) =
-            aidaemon_runtime::prompt::system::build_system_prompt_for_message(
+            aidaemon_runtime::turn::system_prompt::build_system_prompt_for_message(
                 &harness.agent,
                 &emitter,
                 "new-task",
@@ -442,7 +442,7 @@ mod tests {
             "mandate-session".to_string(),
         );
         let (core, tail, continuation_tail, active_skills, project_tracker) =
-            aidaemon_runtime::prompt::system::build_system_prompt_for_message(
+            aidaemon_runtime::turn::system_prompt::build_system_prompt_for_message(
                 &harness.agent,
                 &emitter,
                 "prompt-task",
@@ -574,7 +574,7 @@ mod tests {
             executor_continuation_tail,
             executor_skills,
             executor_tracker,
-        ) = aidaemon_runtime::prompt::system::build_system_prompt_for_message(
+        ) = aidaemon_runtime::turn::system_prompt::build_system_prompt_for_message(
             &harness.agent,
             &emitter,
             "executor-prompt-task",
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn context_tail_carries_all_volatile_sections_and_marker() {
-        let tail = aidaemon_runtime::prompt::system::build_context_tail(
+        let tail = aidaemon_runtime::turn::system_prompt::build_context_tail(
             None,
             "",
             None,
@@ -662,7 +662,7 @@ mod tests {
 
         let checkpoint_section =
             "## Resume Checkpoint\nThe user explicitly asked to continue prior in-progress work.";
-        let tail = aidaemon_runtime::prompt::system::build_context_tail(
+        let tail = aidaemon_runtime::turn::system_prompt::build_context_tail(
             None,
             "",
             None,
@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn context_tail_includes_scoped_project_instructions() {
         let instructions = "[Project Instructions — scoped workspace guidance]\nUse cargo fmt.";
-        let tail = aidaemon_runtime::prompt::system::build_context_tail(
+        let tail = aidaemon_runtime::turn::system_prompt::build_context_tail(
             Some(instructions),
             "",
             None,

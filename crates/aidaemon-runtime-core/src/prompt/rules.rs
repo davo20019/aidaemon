@@ -9,6 +9,21 @@ use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::backend::BackendKind;
 use aidaemon_tools::semantics::UserRole;
 
+/// Every helper's contract: its report is about the work, and the daemon
+/// adds everything about time (and what reached the owner) from its own
+/// record. Put as the principle it is, so a helper neither states a time
+/// nor comments on one, whatever its task asks (live 2026-11-13: told not to
+/// state its run's time, a helper wrote "I don't have a measured elapsed
+/// time" right above the measured "Took 3m 16s", and wrote "I sent a
+/// screenshot" for one that never arrived).
+pub const OWN_DURATION_RULE: &str = "Your report is about the work: what you did, what you \
+     found, and what resulted. The daemon adds everything about time under your report, from \
+     its own measurement, so time is not yours to state or comment on in any form, not how long \
+     anything took, not when it happened, and not whether a time was or could be measured, even \
+     when your task asks for timings: the measured times your task wants appear beside your \
+     report. Likewise, what reached the owner is listed under your report from the daemon's \
+     record of its deliveries: say what you captured or produced, not whether it was sent.";
+
 /// What the channel rules read from the agent besides the turn's role and
 /// channel.
 #[derive(Debug, Clone, Copy)]

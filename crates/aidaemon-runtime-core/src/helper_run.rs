@@ -291,12 +291,12 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
 
 /// What every helper's mission carries besides its task, whichever program
 /// runs it: the folders made for it, and that its own duration is the
-/// daemon's to state ([`crate::specialists::compose::OWN_DURATION_RULE`]).
+/// daemon's to state ([`crate::prompt::rules::OWN_DURATION_RULE`]).
 pub fn mission_rules(new_folders: &[String]) -> String {
     format!(
         "{}\n\n{}",
         crate::helper_run::folders::new_folders_note(new_folders),
-        crate::specialists::compose::OWN_DURATION_RULE
+        crate::prompt::rules::OWN_DURATION_RULE
     )
 }
 
