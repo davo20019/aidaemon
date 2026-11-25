@@ -89,10 +89,130 @@ async fn enforce_database_encryption_impl(
         DbMode::EncryptedOrUnknown => {
             verify_encrypted_database(&db_path, &encryption_key, None).await?;
             info!(db_path = %db_path.display(), "Encrypted database verified");
+            remove_plaintext_migration_backups(&db_path);
+            move_env_key_to_keychain(config_path, &encryption_key).await;
         }
     }
 
     Ok(())
+}
+
+/// Move a database key kept in the env file into the OS keychain, once it
+/// has opened the database. In the env file the key sits beside the
+/// database, so a copy of the daemon's folder (a backup, a synced
+/// directory) carries both. Done only when the keychain takes the key and
+/// gives the same key back; config.toml then reads it from there
+/// (`[state] encryption_key = "keychain"`) and the env file line goes.
+/// Machines with no usable keychain keep the env file, owner-only.
+#[cfg(feature = "encryption")]
+async fn move_env_key_to_keychain(config_path: &Path, key: &str) {
+    let store = crate::config::secret_store();
+    if store.keychain_disabled() || store.fallback_notice().is_some() {
+        return;
+    }
+    let env_path = resolve_env_file_path(config_path);
+    let key_prefix = format!("{DB_ENCRYPTION_ENV_KEY}=");
+    let Ok(env_text) = std::fs::read_to_string(&env_path) else {
+        return;
+    };
+    if !env_text
+        .lines()
+        .any(|line| line.trim_start().starts_with(&key_prefix))
+    {
+        return;
+    }
+    let file = crate::config::config_file(config_path);
+    let Ok(config_text) = file.read().await else {
+        return;
+    };
+    let Ok(mut doc) = config_text.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let configured = doc
+        .get("state")
+        .and_then(|state| state.get("encryption_key"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    if configured {
+        return;
+    }
+    if crate::config::store_in_keychain("encryption_key", key).is_err()
+        || store.fallback_notice().is_some()
+        || !crate::config::resolve_from_keychain("encryption_key").is_ok_and(|back| back == key)
+    {
+        info!("The keychain did not take the database key; it stays in the env file");
+        return;
+    }
+    if !doc.contains_key("state") {
+        doc["state"] = toml_edit::table();
+    }
+    doc["state"]["encryption_key"] = toml_edit::value("keychain");
+    if let Err(err) = file.save(&doc.to_string()).await {
+        warn!(error = %err, "Could not point config.toml at the keychain database key");
+        return;
+    }
+    let kept: Vec<&str> = env_text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(&key_prefix))
+        .collect();
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    match write_secret_file(&env_path, &body) {
+        Ok(()) => info!(
+            env_path = %env_path.display(),
+            "Moved the database encryption key from the env file to the OS keychain"
+        ),
+        Err(err) => warn!(error = %err, "Could not remove the database key from the env file"),
+    }
+}
+
+/// The plaintext copies (`<db>.bak.<timestamp>`) an earlier start kept when
+/// it encrypted the database. Once a later start has opened and verified the
+/// encrypted database they have served their purpose, and each one is the
+/// whole history unencrypted, so they are deleted.
+#[cfg(feature = "encryption")]
+fn remove_plaintext_migration_backups(db_path: &Path) {
+    let (Some(dir), Some(name)) = (db_path.parent(), db_path.file_name()) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{}.bak.", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        // Machine format: the name backup_path() writes, a 14-digit stamp.
+        let Some(stamp) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if stamp.len() != 14 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_file())
+            || !matches!(detect_db_mode(&path), Ok(DbMode::Plaintext))
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                backup = %path.display(),
+                "Deleted the plaintext database copy kept from the encryption migration"
+            ),
+            Err(err) => warn!(
+                backup = %path.display(),
+                error = %err,
+                "Could not delete the plaintext database copy kept from the encryption migration"
+            ),
+        }
+    }
 }
 
 #[cfg(feature = "encryption")]
@@ -568,6 +688,43 @@ fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use sqlx::sqlite::SqliteConnectOptions;
+
+    #[tokio::test]
+    async fn the_env_file_key_stays_when_the_keychain_is_off() {
+        let _isolation = crate::testing::KeychainIsolation::acquire();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[state]\ndb_path = \"aidaemon.db\"\n").unwrap();
+        let env_path = resolve_env_file_path(&config_path);
+        std::fs::write(&env_path, "AIDAEMON_ENCRYPTION_KEY=synthetic-key\n").unwrap();
+        move_env_key_to_keychain(&config_path, "synthetic-key").await;
+        assert!(
+            std::fs::read_to_string(&env_path)
+                .unwrap()
+                .contains("AIDAEMON_ENCRYPTION_KEY=synthetic-key")
+        );
+        assert!(
+            !std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("keychain")
+        );
+    }
+
+    #[test]
+    fn plaintext_migration_copies_go_once_the_encrypted_db_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("aidaemon.db");
+        std::fs::write(&db, b"encrypted-bytes-synthetic").unwrap();
+        let plain = dir.path().join("aidaemon.db.bak.20261124120000");
+        std::fs::write(&plain, b"SQLite format 3\0rows").unwrap();
+        let other = dir.path().join("aidaemon.db.bak.notes");
+        std::fs::write(&other, b"SQLite format 3\0rows").unwrap();
+        let not_plain = dir.path().join("aidaemon.db.bak.20261124120001");
+        std::fs::write(&not_plain, b"ciphertext-synthetic-bytes").unwrap();
+        remove_plaintext_migration_backups(&db);
+        assert!(!plain.exists());
+        assert!(other.exists() && not_plain.exists() && db.exists());
+    }
 
     #[test]
     fn detect_db_mode_plaintext_header() {

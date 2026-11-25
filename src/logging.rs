@@ -260,9 +260,27 @@ impl<S: tracing::Subscriber> Layer<S> for SqlCipherKeyRedaction {
 
 struct KeyPragmaVisitor(bool);
 
+/// Machine format (SQL text sqlx logs): whether a statement carries a
+/// SQLCipher key: `PRAGMA [schema.]key|rekey = …`, or an `ATTACH DATABASE …
+/// KEY '…'` (the plaintext-to-encrypted migration attaches that way).
 fn mentions_key_pragma(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("pragma key") || lower.contains("pragma rekey")
+    let lower = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words: Vec<&str> = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let is_key = |word: &str| {
+        let name = word.rsplit('.').next().unwrap_or(word);
+        name == "key" || name == "rekey"
+    };
+    words
+        .windows(2)
+        .any(|pair| pair[0] == "pragma" && is_key(pair[1]))
+        || (lower.contains("attach") && words.iter().any(|word| *word == "key"))
 }
 
 impl tracing::field::Visit for KeyPragmaVisitor {
@@ -326,6 +344,16 @@ mod tests {
             tracing::warn!(
                 target: "sqlx::query",
                 statement = "PRAGMA rekey = 'synthetic-secret'",
+                "slow statement"
+            );
+            tracing::warn!(
+                target: "sqlx::query",
+                statement = "ATTACH DATABASE '/tmp/x.db' AS encrypted KEY 'synthetic-secret'",
+                "slow statement"
+            );
+            tracing::warn!(
+                target: "sqlx::query",
+                statement = "PRAGMA encrypted.key = 'synthetic-secret'",
                 "slow statement"
             );
             tracing::warn!(target: "sqlx::query", summary = "INSERT INTO events …", "slow statement");

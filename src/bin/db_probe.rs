@@ -1644,8 +1644,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let db_path = std::env::var("AIDAEMON_DB_PATH").unwrap_or_else(|_| "aidaemon.db".to_string());
+    // The daemon moves the key from .env into the OS keychain (config.toml
+    // then says `encryption_key = "keychain"`), so look there too.
     let key = std::env::var("AIDAEMON_ENCRYPTION_KEY")
-        .context("AIDAEMON_ENCRYPTION_KEY is not set in environment/.env")?;
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            let store = aidaemon_secrets::KeychainSecretStore::new(
+                aidaemon_secrets::KeychainSettings::new("aidaemon"),
+            );
+            aidaemon_secrets::SecretStore::get(&store, "encryption_key")
+                .ok()
+                .map(aidaemon_secrets::Secret::into_exposed)
+        })
+        .context("AIDAEMON_ENCRYPTION_KEY is not set in environment/.env or the keychain")?;
     if key.trim().is_empty() {
         anyhow::bail!("AIDAEMON_ENCRYPTION_KEY is empty");
     }
