@@ -105,6 +105,35 @@ mod tests {
             history
         );
     }
+
+    /// A goal's or executor's result is text autonomous work wrote after
+    /// reading what it read: the owner's history keeps it under a turn
+    /// recorded tainted, so the owner's next turn does not start clean.
+    #[tokio::test]
+    async fn an_autonomous_runs_result_lands_in_a_tainted_turn() {
+        use super::super::parent_delivery::ParentDeliveryKind;
+        use crate::testing::{MockProvider, setup_test_agent};
+
+        let harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup harness");
+        let session_id = "telegram:test_bot:555000112";
+        for kind in [
+            ParentDeliveryKind::GoalNotification,
+            ParentDeliveryKind::ExecutorResult,
+        ] {
+            harness
+                .agent
+                .deliver_parent_text_result(None, session_id, "Run finished: synthetic", kind)
+                .await
+                .expect("parent delivery result");
+        }
+        let tainted =
+            aidaemon_runtime::untrusted::tainted_turns(harness.state.as_ref(), session_id)
+                .await
+                .expect("read taint");
+        assert!(!tainted.is_empty(), "the result's turn is recorded tainted");
+    }
     /// A notification delivered while no turn is running (a scheduled goal at
     /// night) must still be in the conversation the owner's next message
     /// sees. The history fetch is turn-anchored, so a note stamped with no

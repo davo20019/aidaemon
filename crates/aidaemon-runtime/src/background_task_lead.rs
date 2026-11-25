@@ -2648,12 +2648,15 @@ pub fn spawn_background_task_lead(
                                 true,
                                 scheduled_run_progress(task_lead_outcome),
                             );
+                        // A run's result: text it wrote after reading what
+                        // it read, so the owner's history keeps it tainted.
                         let entry = aidaemon_work::traits::NotificationEntry::new(
                             &goal_id,
                             &session_id,
                             notification_type,
                             &msg,
-                        );
+                        )
+                        .with_untrusted(true);
                         let notification_id = entry.id.clone();
                         let queued = match state.enqueue_notification(&entry).await {
                             Ok(()) => true,
@@ -3167,12 +3170,15 @@ pub fn spawn_background_task_lead(
             } else {
                 aidaemon_channels::presentation::present_notification(notification_type, &msg)
             };
+            // A run's result: text it wrote after reading what it read, so
+            // the owner's history keeps it tainted.
             let entry = aidaemon_work::traits::NotificationEntry::new(
                 &goal_id,
                 &session_id,
                 notification_type,
                 &msg,
-            );
+            )
+            .with_untrusted(true);
             let notification_id = entry.id.clone();
             let enqueue_result = if continuous_controller {
                 state.enqueue_notification(&entry).await.map(|()| true)

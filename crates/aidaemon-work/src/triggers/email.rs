@@ -113,7 +113,7 @@ async fn imap_idle_loop(
 
                     let event = TriggerEvent {
                         source: "email".to_string(),
-                        session_id: "email_trigger".to_string(),
+                        session_id: super::trigger_session_id("email"),
                         content: format!("New email from {}: {}", from, subject),
                         trusted: false,
                         mandate_signal: None,

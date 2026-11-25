@@ -43,6 +43,14 @@ impl ParentDeliveryKind {
 }
 
 impl ParentDeliveryKind {
+    /// What autonomous work produced: an executor's or a goal's run, which
+    /// can read pages, files and tool output and records no taint of its
+    /// own. Its text lands in the owner's history under a turn recorded
+    /// tainted, so the owner's next turn does not start clean beside it.
+    pub fn from_autonomous_run(self) -> bool {
+        matches!(self, Self::ExecutorResult | Self::GoalNotification)
+    }
+
     const ALL: [Self; 4] = [
         Self::ExecutorResult,
         Self::GoalNotification,
@@ -282,10 +290,14 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
                 .await
             {
                 Ok(true) => {
-                    self.record_parent_visible_result_note(
+                    let turn_id = self
+                        .result_note_turn(parent_session_id, trimmed, kind)
+                        .await?;
+                    self.record_parent_visible_result_note_in_turn(
                         parent_session_id,
                         kind.note_prefix(),
                         trimmed,
+                        turn_id.as_deref(),
                     )
                     .await?;
                     return Ok(ParentDeliveryOutcome {
@@ -358,8 +370,30 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
         text: &str,
         kind: ParentDeliveryKind,
     ) -> anyhow::Result<ParentDeliveryOutcome> {
-        self.deliver_parent_text_result_in_turn(hub, parent_session_id, text, kind, None)
-            .await
+        let turn_id = self.result_note_turn(parent_session_id, text, kind).await?;
+        self.deliver_parent_text_result_in_turn(
+            hub,
+            parent_session_id,
+            text,
+            kind,
+            turn_id.as_deref(),
+        )
+        .await
+    }
+
+    /// The turn a result note joins: one recorded tainted for a result of
+    /// autonomous work (see [`ParentDeliveryKind::from_autonomous_run`]),
+    /// else the session's current turn.
+    async fn result_note_turn(
+        &self,
+        session_id: &str,
+        text: &str,
+        kind: ParentDeliveryKind,
+    ) -> anyhow::Result<Option<String>> {
+        if !kind.from_autonomous_run() || text.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.tainted_note_turn(session_id).await?))
     }
 
     /// `turn_id` stamps the recorded note; `None` joins the session's

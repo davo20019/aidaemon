@@ -149,12 +149,16 @@ impl GoalCycle {
                 _ => continue,
             };
 
+            // The message carries the goal's task results: text its runs
+            // wrote after reading whatever they read. It reaches the owner's
+            // history as untrusted, so the next turn there starts tainted.
             let entry = crate::traits::NotificationEntry::new(
                 &goal.id,
                 &goal.session_id,
                 notification_type,
                 &msg,
-            );
+            )
+            .with_untrusted(true);
 
             if let Err(e) = self.state.enqueue_goal_notification(&entry).await {
                 error!(goal_id = %goal.id, error = %e, "Failed to atomically enqueue notification");

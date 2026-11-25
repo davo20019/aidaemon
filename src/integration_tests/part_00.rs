@@ -1399,7 +1399,7 @@ fn simulate_telegram_auth(
     };
 
     match auth {
-        AuthResult::Unauthorized => None,
+        AuthResult::Unauthorized | AuthResult::ClaimNeeded => None,
         AuthResult::Authorized | AuthResult::AutoClaimed => {
             Some(determine_role(owner_user_ids, user_id))
         }

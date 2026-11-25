@@ -47,6 +47,16 @@ impl fmt::Debug for EmailTriggerSettings {
     }
 }
 
+/// The prefix of every session an automated trigger's turn runs in. A
+/// trigger's turn is an untrusted source by this typed id the daemon itself
+/// writes, never by what the source is called.
+pub const TRIGGER_SESSION_PREFIX: &str = "trigger:";
+
+/// The session a trigger from `source` runs its turns in.
+pub fn trigger_session_id(source: &str) -> String {
+    format!("{TRIGGER_SESSION_PREFIX}{source}")
+}
+
 /// An event emitted by triggers or channels (not the event-sourcing store).
 #[derive(Debug, Clone)]
 pub struct TriggerEvent {
