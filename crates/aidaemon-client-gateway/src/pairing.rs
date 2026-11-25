@@ -450,6 +450,12 @@ impl Pairing {
             url.filter(|u| !u.trim().is_empty());
     }
 
+    /// This daemon's peer-to-peer key (64 lowercase hex digits), once
+    /// remote access is up.
+    pub(crate) fn own_remote_key(&self) -> Option<String> {
+        self.remote_url().and_then(|url| own_key(&url))
+    }
+
     fn remote_url(&self) -> Option<String> {
         self.remote_url
             .lock()

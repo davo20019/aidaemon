@@ -578,7 +578,13 @@ code { font-family: ui-monospace, monospace; font-size: 0.9em; background: #f0f1
 /// hands the offer in its fragment to the phone app, or pairs this browser
 /// through the web app. Static: the offer never reaches the server.
 async fn pair_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
-    let page = PAIR_PAGE.replace("__WEB_APP__", gateway.web_app_path());
+    let mut origins = gateway.endpoints.current();
+    origins.push(gateway.config.public_url());
+    let page = crate::pair_page::pair_page(
+        gateway.web_app_path(),
+        &origins,
+        gateway.pairing.own_remote_key().as_deref(),
+    );
     (
         [
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -594,8 +600,6 @@ async fn pair_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
     )
         .into_response()
 }
-
-use crate::pair_page::PAIR_PAGE;
 
 #[cfg(test)]
 #[test]

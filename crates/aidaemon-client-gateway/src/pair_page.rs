@@ -47,6 +47,11 @@ p{color:var(--muted);font-size:15px;margin-bottom:14px}
     <a class="open web" href="#">Use AIDaemon in this browser</a>
   </section>
 
+  <section id="foreign" hidden>
+    <h1>This pairing link names another daemon</h1>
+    <p>It came from this AIDaemon's address but points your phone somewhere else. Don't use it: send <span class="code">/pair_device</span> to your agent again and open the new link it replies with.</p>
+  </section>
+
   <section id="broken" hidden>
     <h1>This pairing link is incomplete</h1>
     <p>Send <span class="code">/pair_device</span> to your agent again and open the new link it replies with.</p>
@@ -71,6 +76,17 @@ p{color:var(--muted);font-size:15px;margin-bottom:14px}
     token.test(offer) && token.test(code) && (fp === '' || token.test(fp)) &&
     (remote === '' || peer.test(remote));
   if (!valid) { document.getElementById('broken').hidden = false; return; }
+  // Filled in when served: the addresses and the peer-to-peer key of the
+  // daemon serving this page. A link here may only pair with that daemon,
+  // so a link edited to name another one is refused, not handed on.
+  var ownOrigins = __OWN_ORIGINS__;
+  var ownKey = __OWN_KEY__;
+  var ours = url.origin === location.origin || ownOrigins.indexOf(url.origin) >= 0;
+  var remoteKey = remote ? remote.slice('iroh://'.length, 'iroh://'.length + 64) : '';
+  if (!ours || (remote && remoteKey !== ownKey)) {
+    document.getElementById('foreign').hidden = false;
+    return;
+  }
 
   // Rebuilt from the checked values only, so nothing else reaches the app.
   var query = 'gateway=' + encodeURIComponent(gateway) + '&offer=' + offer + '&code=' + code +
@@ -100,9 +116,54 @@ p{color:var(--muted);font-size:15px;margin-bottom:14px}
 </body>
 </html>"##;
 
+/// [`PAIR_PAGE`] as `daemon` serves it: its web app's path, the origins it
+/// is reached at (`origins`) and its peer-to-peer key (`key`, 64 lowercase
+/// hex digits) filled in as script literals.
+pub(crate) fn pair_page(web_app: &str, origins: &[String], key: Option<&str>) -> String {
+    // JSON is a script literal; `<` escaped so no value can close the tag.
+    let literal = |value: serde_json::Value| value.to_string().replace('<', "\\u003c");
+    let origins: Vec<String> = origins
+        .iter()
+        .filter_map(|origin| aidaemon_client_protocol::sign_in_audience(origin))
+        .filter(|origin| origin.starts_with("http"))
+        .collect();
+    PAIR_PAGE
+        .replace("__WEB_APP__", web_app)
+        .replace("__OWN_ORIGINS__", &literal(serde_json::json!(origins)))
+        .replace(
+            "__OWN_KEY__",
+            &literal(serde_json::json!(key.unwrap_or(""))),
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PAIR_PAGE;
+    use super::{PAIR_PAGE, pair_page};
+
+    /// A link on the daemon's page pairs only with that daemon: its
+    /// addresses and key are on the page, and the check is made before the
+    /// link reaches the app.
+    #[test]
+    fn the_page_knows_its_daemon_and_refuses_another() {
+        let page = pair_page(
+            "/client/v1/next/",
+            &[
+                "https://app.example.com/".into(),
+                "http://127.0.0.1:8788".into(),
+            ],
+            Some(&"ab".repeat(32)),
+        );
+        assert!(
+            page.contains(
+                r#"var ownOrigins = ["https://app.example.com","http://127.0.0.1:8788"];"#
+            )
+        );
+        assert!(page.contains(&format!("var ownKey = \"{}\";", "ab".repeat(32))));
+        assert!(page.contains("if (!ours || (remote && remoteKey !== ownKey))"));
+        assert!(!page.contains("__OWN_"));
+        let odd = pair_page("/", &["https://x.example.com/</script>".into()], None);
+        assert!(!odd.contains("</script>\""), "{odd}");
+    }
 
     /// The page rebuilds the app's link from checked values: the daemon's
     /// iroh address must be one of them, or the app pairs over the tunnel.
