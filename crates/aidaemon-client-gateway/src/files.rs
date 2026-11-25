@@ -1,9 +1,10 @@
 //! Files with messages, as clients see them: pictures and documents the
 //! owner uploads to send, and those the agent sends. Each is registered by
 //! the path it lives at (an upload is saved to the daemon's inbox first) and
-//! served at a signed path, `/client/v1/files/{id}/{sig}/{name}`, so an image
-//! element loads it with no token. The signing key is kept beside the
-//! records, so links in the event log keep working across restarts.
+//! served at a signed path, `/client/v1/files/{id}/{expires}-{sig}/{name}`,
+//! so an image element loads it with no token. The signing key is kept
+//! beside the records, so a link keeps working across restarts until it
+//! expires ([`LINK_LIFETIME`]); a conversation read again gets new links.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,20 @@ pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Pictures served inline. Anything else (SVG and HTML included, which can
 /// run script on the gateway's origin) is served as a download.
 const INLINE_IMAGES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// How long a file's link works. A link is a bearer capability (no token,
+/// no device), so it must not outlive the device or the leak that carries
+/// it for long; reading a conversation's history signs its files again, so
+/// only a view held open for more than a day meets an expired link, and
+/// reading it again mends that.
+pub const LINK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// One registered file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,19 +224,23 @@ impl FileStore {
         })
     }
 
-    fn signature(&self, id: &str, stamp: Option<&str>) -> String {
-        let signed = match stamp {
-            Some(stamp) => format!("{id}\n{stamp}"),
-            None => id.to_string(),
-        };
+    /// The signature of file `id`'s link, as registered with `stamp`,
+    /// working until `expires` (seconds since the epoch).
+    fn signature(&self, id: &str, stamp: Option<&str>, expires: u64) -> String {
+        let signed = format!("{id}\n{}\n{expires}", stamp.unwrap_or_default());
         hex::encode(&hmac(&self.key, signed.as_bytes())[..16])
     }
 
-    /// Where a client fetches file `id`, as registered with `stamp`.
+    /// Where a client fetches file `id`, as registered with `stamp`, for
+    /// the next [`LINK_LIFETIME`].
     fn url(&self, id: &str, stamp: Option<&str>, name: &str) -> String {
+        self.url_until(id, stamp, name, now_secs() + LINK_LIFETIME.as_secs())
+    }
+
+    fn url_until(&self, id: &str, stamp: Option<&str>, name: &str, expires: u64) -> String {
         format!(
-            "/client/v1/files/{id}/{}/{}",
-            self.signature(id, stamp),
+            "/client/v1/files/{id}/{expires}-{}/{}",
+            self.signature(id, stamp, expires),
             percent_encode(name)
         )
     }
@@ -339,14 +358,25 @@ impl FileStore {
         serde_json::from_slice(&text).ok()
     }
 
-    /// The record of file `id` when `signature` is its link's and the file
-    /// is still what it was registered as.
+    /// The record of file `id` when `signature` (`{expires}-{sig}`, the
+    /// link's segment) is its link's, the link has not expired, and the
+    /// file is still what it was registered as.
     pub fn signed(&self, id: &str, signature: &str) -> Option<FileRecord> {
+        self.signed_at(id, signature, now_secs())
+    }
+
+    fn signed_at(&self, id: &str, signature: &str, now: u64) -> Option<FileRecord> {
+        let (expires, signature) = signature.split_once('-')?;
+        let expires: u64 = expires.parse().ok()?;
+        // A link signed for longer than links last was not signed here.
+        if now >= expires || expires > now + LINK_LIFETIME.as_secs() + 300 {
+            return None;
+        }
         let record = self.get(id)?;
         if record.stamp.is_some() && stamp_of(&record.path) != record.stamp {
             return None;
         }
-        let expected = self.signature(id, record.stamp.as_deref());
+        let expected = self.signature(id, record.stamp.as_deref(), expires);
         // Constant time over equal lengths.
         if expected.len() != signature.len()
             || expected
@@ -412,6 +442,12 @@ mod tests {
         assert!(record.path.starts_with(dir.path().join("inbox")));
         assert_eq!(std::fs::read(&record.path).unwrap(), PNG);
         assert!(store.signed(parts[0], "0".repeat(32).as_str()).is_none());
+        let expires = parts[1].split_once('-').unwrap().0;
+        assert!(
+            store
+                .signed(parts[0], &format!("{expires}-{}", "0".repeat(32)))
+                .is_none()
+        );
         assert!(store.get("../secret").is_none());
         // Links survive a restart: the key is kept.
         let again = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
@@ -475,6 +511,34 @@ mod tests {
     }
 
     #[test]
+    fn a_link_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
+        let saved = store.save("shot.png", None, PNG).unwrap();
+        let url = saved.url.unwrap();
+        let mut it = url.trim_start_matches("/client/v1/files/").split('/');
+        let (id, segment) = (it.next().unwrap(), it.next().unwrap());
+        let expires: u64 = segment.split_once('-').unwrap().0.parse().unwrap();
+        assert!(store.signed_at(id, segment, expires - 1).is_some());
+        assert!(store.signed_at(id, segment, expires).is_none());
+        // A later expiry under the same signature is refused.
+        let sig = segment.split_once('-').unwrap().1;
+        assert!(
+            store
+                .signed(id, &format!("{}-{sig}", expires + 60))
+                .is_none()
+        );
+        // Nor can a link be signed far into the future.
+        let record = store.get(id).unwrap();
+        let far = now_secs() + 30 * LINK_LIFETIME.as_secs();
+        let far_url = store.url_until(id, record.stamp.as_deref(), "shot.png", far);
+        let far_segment = far_url.split('/').nth(5).unwrap();
+        assert!(store.signed(id, far_segment).is_none());
+        // An old, unexpiring link is refused.
+        assert!(store.signed(id, sig).is_none());
+    }
+
+    #[test]
     fn the_same_path_is_the_same_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
@@ -486,6 +550,8 @@ mod tests {
         let b = store
             .register(&path, "report.pdf", "application/pdf", 4)
             .unwrap();
-        assert_eq!(a, b);
+        // The same id (links differ only once a second has passed).
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.name, b.name);
     }
 }
