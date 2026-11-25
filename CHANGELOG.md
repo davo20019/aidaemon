@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-25
+
+### Security
+
+- **Project instructions from outside your trusted folders taint the run.** An `AGENTS.md` or `CLAUDE.md` loaded from a folder the owner did not configure (a repository cloned into a temp folder, a download) marks the run as having read untrusted text, so its sends are checked; the owner's own `~/.aidaemon/AGENTS.md` and configured project roots stay trusted.
+- **A quiet automation's run that is handed its previous report starts tainted.**
+- **In a group chat only the requester's own messages vouch for an address.** A URL another participant typed no longer passes the exact-outbound check on the owner's turn.
+- **Git run by the daemon executes nothing a repository's own config names.** Hooks, fsmonitor and signing are off, and filter, diff and merge drivers from the repository's local config are replaced, for peer worktrees, coding-agent diffs, the app's code view and the project file list.
+- **Linux confined runs keep `.git/hooks`, `.git/config` and `.husky` read-only** inside their write folders, as macOS already did.
+- **`render_pdf` approval covers the file's content,** not only its path: a file changed after approval is refused.
+- **File links expire after 24 hours;** the app fetches fresh ones when a picture's link has expired.
+- **The node gateway's sign-in rate limit is kept per source address,** so one machine inventing ids cannot lock out others.
+- **The app's Allow buttons arm one second after a card appears or the agent moves the view,** so a click aimed elsewhere cannot approve a card that just slid under it.
+
 ## [0.23.1] - 2026-11-25
 
 ### Fixed

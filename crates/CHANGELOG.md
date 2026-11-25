@@ -12,8 +12,14 @@ stability promise.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-25
+
 ### Changed
-- **Breaking:** `aidaemon-core`: `Message` gained `sender` (who typed a user message, when the application tells participants apart; `Message::with_sender`). `UntrustedHook` counts an `Outbound::Exact` string as the user's only when it appears in a message from the sender of the run's latest request; when that request carries a sender, a message without one does not count.
+- **Breaking:** `aidaemon-core`: `Message` gained `sender` (who typed a user message, when the application tells participants apart; `Message::with_sender`). `UntrustedHook` counts an `Outbound::Exact` string as the user's only when it appears in a message from the sender of the run's latest request; when that request carries a sender, a message without one does not count. Every SDK crate moves to 0.24.0.
+- `aidaemon-tools`: `git_guard`, which runs git without the programs a repository's own config names.
+- `aidaemon-client-gateway`: signed file links carry an expiry (24 h).
+- `aidaemon-nodes`: unauthenticated rate limits are kept per source address (`LanPeer`).
+- `aidaemon-client-core`: `Client::resign_files` reads a conversation's history again to refresh expired file links.
 
 ## [0.23.1] - 2026-11-25
 

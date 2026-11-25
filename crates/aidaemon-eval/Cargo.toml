@@ -22,7 +22,7 @@ exclude = ["tests/", "benches/", "examples/"]
 examples = []
 
 [dependencies]
-aidaemon-core = { version = "0.23.1", path = "../aidaemon-core", features = ["testing"] }
+aidaemon-core = { version = "0.24.0", path = "../aidaemon-core", features = ["testing"] }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
