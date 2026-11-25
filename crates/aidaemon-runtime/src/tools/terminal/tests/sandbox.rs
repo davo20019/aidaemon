@@ -417,7 +417,10 @@ fn macos_policy_grants_network_only_when_capability_granted() {
         &[],
         &[],
         false,
-        ConfinedCapabilities { network: true },
+        ConfinedCapabilities {
+            network: true,
+            ..ConfinedCapabilities::default()
+        },
     )
     .expect("policy");
     assert!(networked.contains("(allow network-outbound)\n"));
@@ -977,7 +980,10 @@ fn bubblewrap_fallback_gets_the_codex_manifest() {
         "/work/repo",
         &["/work/repo".to_string()],
         &["/work/repo/out".to_string()],
-        ConfinedCapabilities { network: false },
+        ConfinedCapabilities {
+            network: false,
+            ..ConfinedCapabilities::default()
+        },
         &confined,
     );
     let joined = args.join(" ");
@@ -995,7 +1001,10 @@ fn bubblewrap_fallback_gets_the_codex_manifest() {
         "/",
         &[],
         &[],
-        ConfinedCapabilities { network: true },
+        ConfinedCapabilities {
+            network: true,
+            ..ConfinedCapabilities::default()
+        },
         &confined,
     );
     assert!(!networked.contains(&"--unshare-net".to_string()));
@@ -1491,4 +1500,48 @@ fn a_command_that_writes_remotely_is_a_remote_mutation() {
             .mutation_effects
             .contains(ToolMutationEffects::REMOTE_MUTATION)
     );
+}
+
+/// An unattended confined run may write its folder but not the places in it
+/// whose content runs later (git hooks and configuration, husky hooks).
+#[cfg(target_os = "macos")]
+#[test]
+fn unattended_confined_writes_exclude_persistence_subpaths() {
+    let root = "/Users/alice/projects/site".to_string();
+    let attended = macos_manifest_sandbox_policy(
+        Some(&root),
+        &[],
+        std::slice::from_ref(&root),
+        &[],
+        false,
+        ConfinedCapabilities::default(),
+    )
+    .expect("policy");
+    assert!(!attended.contains("(deny file-write*"));
+    let unattended = macos_manifest_sandbox_policy(
+        Some(&root),
+        &[],
+        std::slice::from_ref(&root),
+        &[],
+        false,
+        ConfinedCapabilities {
+            protect_persistence: true,
+            ..ConfinedCapabilities::default()
+        },
+    )
+    .expect("policy");
+    let deny = unattended.rfind("(deny file-write*").expect("deny rule");
+    let allow = unattended
+        .rfind("file-write*\n  (literal \"/Users/alice/projects/site\")")
+        .expect("write grant");
+    assert!(
+        deny > allow,
+        "the deny must come after the grant it narrows"
+    );
+    for sub in [".git/hooks", ".git/config", ".husky"] {
+        assert!(
+            unattended[deny..].contains(&format!("(subpath \"{root}/{sub}\")")),
+            "{sub}"
+        );
+    }
 }

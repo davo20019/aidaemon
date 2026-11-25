@@ -87,7 +87,10 @@ impl TerminalTool {
             });
         }
 
-        let capabilities = ConfinedCapabilities { network };
+        let capabilities = ConfinedCapabilities {
+            network,
+            ..ConfinedCapabilities::default()
+        };
         let execution_request = if !confined {
             host_terminal_execution_request(&self.backend, command, script_via_stdin, working_dir)
                 .await?

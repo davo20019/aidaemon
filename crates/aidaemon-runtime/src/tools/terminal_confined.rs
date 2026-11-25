@@ -216,6 +216,46 @@ const GIT_PROBE_TIMEOUT_SECS: u64 = 60;
 #[cfg(target_os = "macos")]
 static MACOS_GIT: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
+/// Whether a confined-tier run may use `dir` as its folder without the
+/// owner: never the home folder or an ancestor of it, a hidden folder or
+/// `Library`/`AppData` directly under home, a system root, or a folder
+/// holding secrets or persistence (`.ssh`, `.git`, `LaunchAgents`). A
+/// write-tier build there could write the owner's shell start-up files or
+/// login items; a read-tier one could print keys.
+pub(crate) fn confined_dir_ok(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    if !dir.is_absolute()
+        || dir.parent().is_none()
+        || aidaemon_tools::fs_utils::is_protected_host_data_path(dir)
+    {
+        return false;
+    }
+    let classifier = aidaemon_tools::path_class::PathClassifier::empty();
+    if classifier.is_sensitive(dir) || aidaemon_tools::path_class::is_persistence_path(dir, &[]) {
+        return false;
+    }
+    let Some(home) = home else {
+        return true;
+    };
+    if home.starts_with(dir) {
+        return false;
+    }
+    match dir.strip_prefix(home) {
+        Ok(rest) => rest.components().next().is_some_and(|first| {
+            let first = first.as_os_str().to_string_lossy();
+            !first.starts_with('.')
+                && !first.eq_ignore_ascii_case("Library")
+                && !first.eq_ignore_ascii_case("AppData")
+        }),
+        Err(_) => true,
+    }
+}
+
+/// Whether reading `path` in a confined-tier run would read a secret
+/// (keys, credentials, env files): such a read is never auto-approved.
+pub(crate) fn confined_read_is_secret(path: &std::path::Path) -> bool {
+    aidaemon_tools::path_class::PathClassifier::empty().is_secret(path)
+}
+
 /// A confined-tier process that ran: its output, the directory it ran in,
 /// and the paths it read beyond that (Git's metadata).
 pub(crate) struct ConfinedRun {
@@ -367,6 +407,46 @@ pub(crate) async fn run_confined(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The confined tier never runs in the home folder, a hidden folder or
+    /// `Library` under it, a system root, or a secret/persistence folder.
+    #[test]
+    fn the_confined_tier_refuses_home_hidden_and_secret_folders() {
+        let home = std::path::Path::new("/Users/synthetic");
+        for refused in [
+            "/Users/synthetic",
+            "/Users",
+            "/",
+            "/Users/synthetic/.ssh",
+            "/Users/synthetic/.config/app",
+            "/Users/synthetic/Library/LaunchAgents",
+            "/Users/synthetic/projects/app/.git",
+            "/Users/synthetic/projects/app/.git/hooks",
+            "/etc",
+            "/usr/local/bin",
+        ] {
+            assert!(
+                !confined_dir_ok(std::path::Path::new(refused), Some(home)),
+                "{refused}"
+            );
+        }
+        for allowed in [
+            "/Users/synthetic/projects/app",
+            "/srv/app",
+            "/tmp/build-synthetic",
+        ] {
+            assert!(
+                confined_dir_ok(std::path::Path::new(allowed), Some(home)),
+                "{allowed}"
+            );
+        }
+        assert!(confined_read_is_secret(std::path::Path::new(
+            "/Users/synthetic/.ssh/id_ed25519"
+        )));
+        assert!(!confined_read_is_secret(std::path::Path::new(
+            "/Users/synthetic/projects/app/src/main.rs"
+        )));
+    }
 
     /// The allowlist as a table: test runners (whose job is running repo
     /// code), installs, scripts and environment dumps are out; `git

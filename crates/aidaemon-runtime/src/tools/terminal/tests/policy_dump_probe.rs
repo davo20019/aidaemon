@@ -30,6 +30,7 @@ async fn dump_policy_for_project_build() {
     }
     let capabilities = ConfinedCapabilities {
         network: std::env::var("AIDAEMON_POLICY_PROBE_NETWORK").is_ok_and(|v| v == "1"),
+        ..ConfinedCapabilities::default()
     };
     let request = confined_terminal_execution_request_inner(
         &backend,

@@ -7,7 +7,16 @@ use super::*;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ConfinedCapabilities {
     pub(crate) network: bool,
+    /// The run was not shown to the owner (the confined auto-approve tier):
+    /// inside its write roots, the places whose content runs later (git
+    /// hooks and configuration, `.husky`) stay unwritable.
+    pub(crate) protect_persistence: bool,
 }
+
+/// Paths inside a write root that an unattended confined run may not write:
+/// what is there runs later on its own (git hooks, git configuration that
+/// names helpers and hooks, husky hooks).
+pub(super) const PERSISTENCE_SUBPATHS: &[&str] = &[".git/hooks", ".git/config", ".husky"];
 
 pub(crate) async fn confined_terminal_execution_request(
     backend: &SharedExecutionBackend,
@@ -24,7 +33,10 @@ pub(crate) async fn confined_terminal_execution_request(
         read_paths,
         write_paths,
         &[],
-        ConfinedCapabilities::default(),
+        ConfinedCapabilities {
+            protect_persistence: true,
+            ..ConfinedCapabilities::default()
+        },
     )
     .await
 }
@@ -474,6 +486,20 @@ pub(super) fn macos_manifest_sandbox_policy(
         policy.push_str(&format!(
             "\n(allow file-read* file-test-existence file-write*\n  {data_clauses})\n"
         ));
+        if capabilities.protect_persistence {
+            // Seatbelt applies the last matching rule, so this deny wins
+            // over the write grant above.
+            let deny_clauses = paths
+                .iter()
+                .flat_map(|path| {
+                    PERSISTENCE_SUBPATHS.iter().map(move |sub| {
+                        format!("(literal \"{path}/{sub}\") (subpath \"{path}/{sub}\")")
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            policy.push_str(&format!("\n(deny file-write*\n  {deny_clauses})\n"));
+        }
         if !ancestor_clauses.is_empty() {
             policy.push_str(&format!(
                 "(allow file-read* file-test-existence\n  {ancestor_clauses})\n"

@@ -243,10 +243,74 @@ impl TerminalTool {
             return None;
         }
         let access = terminal_confined::confined_access(command)?;
+        if !self.confined_paths_ok(args, command).await {
+            return None;
+        }
         if self.is_allowed(command, &trust.grant_session).await {
             return None;
         }
         Some(access)
+    }
+
+    /// Whether a confined-tier run's folder and reads are ones the tier may
+    /// use without the owner ([`terminal_confined::confined_dir_ok`]): the
+    /// folder it runs in (the workspace root by default) is not home, a
+    /// hidden folder under it or a secret/persistence folder, and nothing it
+    /// is given to read (`read_paths`, `read_roots`, an argument resolved in
+    /// that folder) is a secret.
+    pub(super) async fn confined_paths_ok(&self, args: &TerminalArgs, command: &str) -> bool {
+        let root = self.backend.workspace_root().as_str().to_string();
+        let dir = match args
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+        {
+            Some(dir) => match self.backend.resolve_path(dir).await {
+                Ok(resolved) => self
+                    .backend
+                    .canonicalize(&resolved)
+                    .await
+                    .unwrap_or(resolved)
+                    .as_str()
+                    .to_string(),
+                Err(_) => return false,
+            },
+            None => self
+                .backend
+                .canonicalize(self.backend.workspace_root())
+                .await
+                .map(|path| path.as_str().to_string())
+                .unwrap_or(root),
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let home = dirs::home_dir().map(|home| dunce::canonicalize(&home).unwrap_or(home));
+        if !terminal_confined::confined_dir_ok(&dir, home.as_deref()) {
+            return false;
+        }
+        let resolve = |path: &str| {
+            let expanded = shellexpand::tilde(path.trim()).into_owned();
+            let path = std::path::PathBuf::from(expanded);
+            if path.is_absolute() {
+                path
+            } else {
+                dir.join(path)
+            }
+        };
+        let words = shell_words::split(command).unwrap_or_default();
+        !args
+            .read_paths
+            .iter()
+            .chain(args.read_roots.iter())
+            .map(String::as_str)
+            .chain(
+                words
+                    .iter()
+                    .skip(1)
+                    .map(String::as_str)
+                    .filter(|word| !word.starts_with('-')),
+            )
+            .any(|path| terminal_confined::confined_read_is_secret(&resolve(path)))
     }
 
     /// Run a confined-tier command: in the confined sandbox with the tier's
