@@ -614,10 +614,21 @@ impl ManageApiTool {
         service: &str,
         args: &ManageApiArgs,
         status_tx: Option<&mpsc::Sender<StatusUpdate>>,
+        kernel_approved: Option<&ApprovalScope>,
     ) -> anyhow::Result<Option<LearnedApiArtifact>> {
         let Some((url, learn_kind)) = Self::learning_target(args) else {
             return Ok(None);
         };
+        // The saved guide is text later turns follow: the kernel asked the
+        // owner (`learning_approval_for`) before this runs.
+        if kernel_approved != Some(&ApprovalScope::Call) {
+            return Ok(Some(LearnedApiArtifact {
+                output: "Learning skipped: saving an API guide as a skill needs the owner's \
+                         approval through the agent kernel."
+                    .to_string(),
+                safe_probe: None,
+            }));
+        }
         let Some(manage_skills) = &self.manage_skills else {
             return Ok(Some(LearnedApiArtifact {
                 output: "Learning skipped: the skills system is disabled for this daemon, so no reusable API guide could be saved."
@@ -847,6 +858,29 @@ impl ManageApiTool {
         }
     }
 
+    /// The owner approval for the learning stage: the fetched guide is
+    /// saved as a skill, text later turns follow, so it asks in every
+    /// session, as `manage_skills add` does for a skill from a URL.
+    fn learning_approval_for(args: &ManageApiArgs) -> Option<aidaemon_core::OwnerApprovalRequest> {
+        if args.action != "onboard" {
+            return None;
+        }
+        let (source, _) = Self::learning_target(args)?;
+        let service = args.service.as_deref().unwrap_or_default();
+        Some(aidaemon_core::OwnerApprovalRequest {
+            card: None,
+            effects: Vec::new(),
+            summary: format!(
+                "Learn an API guide for `{service}` from {source} and save it as a skill"
+            ),
+            subject: format!("manage_api learn {service} {source}"),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![
+                "This will fetch external instructions that can influence AI behavior.".to_string(),
+            ],
+        })
+    }
+
     fn probe_approval_for(args: &ManageApiArgs) -> Option<aidaemon_core::OwnerApprovalRequest> {
         if args.action != "onboard"
             || args
@@ -937,7 +971,7 @@ impl ManageApiTool {
 
         let mut derived_probe = None;
         if let Some(learning_artifact) = self
-            .run_learning_stage(&service, &args, status_tx.as_ref())
+            .run_learning_stage(&service, &args, status_tx.as_ref(), kernel_approved)
             .await?
         {
             derived_probe = learning_artifact.safe_probe.clone();
@@ -1045,12 +1079,23 @@ impl crate::tools::traits::ToolSemantics for ManageApiTool {
     ) -> crate::tools::traits::OwnerApprovalNeed {
         use crate::tools::traits::OwnerApprovalNeed;
         let probe = Self::owner_approval(call.arguments, facts);
-        match (self.auth_stage_approval(call.arguments).await, probe) {
+        let need = match (self.auth_stage_approval(call.arguments).await, probe) {
             (None, probe) => probe,
             (Some(auth), OwnerApprovalNeed::Ask(probe)) => {
                 OwnerApprovalNeed::Ask(Self::combined_request(auth, probe))
             }
             (Some(auth), _) => OwnerApprovalNeed::Ask(auth),
+        };
+        // Learning saves a skill from fetched text: asked in every session.
+        let learn = serde_json::from_value::<ManageApiArgs>(call.arguments.clone())
+            .ok()
+            .and_then(|args| Self::learning_approval_for(&args));
+        match (learn, need) {
+            (None, need) => need,
+            (Some(learn), OwnerApprovalNeed::Ask(other)) => {
+                OwnerApprovalNeed::Ask(Self::combined_request(other, learn))
+            }
+            (Some(learn), _) => OwnerApprovalNeed::Ask(learn),
         }
     }
 
@@ -1343,6 +1388,49 @@ mod tests {
             .await
     }
 
+    /// Learning a guide saves fetched text as a skill: it asks in every
+    /// session, and without the kernel's approval nothing is learned.
+    #[tokio::test]
+    async fn learning_an_api_guide_asks_in_every_session() {
+        use crate::tools::traits::OwnerApprovalNeed;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = synthetic_tool(&dir);
+        for trusted in [false, true] {
+            let learn = json!({
+                "action": "onboard",
+                "service": "synthetic",
+                "auth_mode": "existing",
+                "learn_url": "https://docs.example.invalid/openapi.json",
+            });
+            let OwnerApprovalNeed::Ask(request) = judge_onboard(&tool, learn, trusted).await else {
+                panic!("learning must ask (trusted={trusted})");
+            };
+            assert!(
+                request
+                    .summary
+                    .contains("Learn an API guide for `synthetic`"),
+                "{}",
+                request.summary
+            );
+        }
+        let args: ManageApiArgs = serde_json::from_value(json!({
+            "action": "onboard",
+            "service": "synthetic",
+            "learn_url": "https://docs.example.invalid/openapi.json",
+        }))
+        .unwrap();
+        let skipped = tool
+            .run_learning_stage("synthetic", &args, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            skipped.output.contains("needs the owner's approval"),
+            "{}",
+            skipped.output
+        );
+    }
+
     /// A manual-auth onboarding carries the profile change it makes on its
     /// own card, in every session (with the probe's, when it has one).
     #[tokio::test]
@@ -1394,7 +1482,12 @@ mod tests {
         assert!(
             request
                 .subject
-                .ends_with("manage_api probe POST https://docs.example.invalid/graphql")
+                .contains("manage_api probe POST https://docs.example.invalid/graphql")
+        );
+        assert!(
+            request
+                .subject
+                .ends_with("manage_api learn synthetic https://docs.example.invalid/graphql")
         );
     }
 

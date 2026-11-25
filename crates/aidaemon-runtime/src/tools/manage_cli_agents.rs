@@ -83,6 +83,21 @@ impl ManageCliAgentsTool {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Whether `name` is an agent the daemon discovered itself (a built-in
+    /// such as `claude` or `codex`), not one registered here. A registered
+    /// agent under that name would take its place, and with it the
+    /// permission mode the owner configured for the built-in.
+    fn is_discovered(&self, name: &str) -> bool {
+        discovered_in(&self.cli_tool.list_agents(), name)
+    }
+
+    fn shadowing_refusal(name: &str) -> String {
+        format!(
+            "Nothing was changed: '{name}' is a discovered CLI agent. A registered agent may not \
+             take a discovered agent's name; choose another name."
+        )
+    }
+
     async fn handle_add(
         &self,
         name: &str,
@@ -92,6 +107,9 @@ impl ManageCliAgentsTool {
         timeout_secs: Option<u64>,
         max_output_chars: Option<usize>,
     ) -> anyhow::Result<String> {
+        if self.is_discovered(name) {
+            return Ok(Self::shadowing_refusal(name));
+        }
         let result = self
             .cli_tool
             .add_agent(
@@ -135,7 +153,67 @@ impl ManageCliAgentsTool {
     }
 
     async fn handle_enable(&self, name: &str) -> anyhow::Result<String> {
+        if self.is_discovered(name) {
+            return Ok(Self::shadowing_refusal(name));
+        }
         self.cli_tool.enable_agent(name, true).await
+    }
+
+    /// The owner approval for `enable` (it starts offering a registered
+    /// agent the owner turned off: its stored command, shown on the card)
+    /// and `remove`. `None` for other actions.
+    async fn stored_agent_approval(&self, arguments: &Value) -> Option<OwnerApprovalNeed> {
+        let args = serde_json::from_value::<ManageCliAgentsArgs>(arguments.clone()).ok()?;
+        if !matches!(args.action.as_str(), "enable" | "remove") {
+            return None;
+        }
+        let Some(name) = args.name.as_deref().filter(|name| !name.trim().is_empty()) else {
+            return Some(OwnerApprovalNeed::NotNeeded);
+        };
+        let stored = self
+            .state
+            .list_dynamic_cli_agents()
+            .await
+            .ok()
+            .and_then(|agents| agents.into_iter().find(|agent| agent.name == name));
+        let request = if args.action == "enable" {
+            // Nothing stored, or a discovered agent's name: the call changes
+            // nothing (and says so).
+            let agent = stored?;
+            if self.is_discovered(name) {
+                return Some(OwnerApprovalNeed::NotNeeded);
+            }
+            let stored_args: Vec<String> =
+                serde_json::from_str(&agent.args_json).unwrap_or_default();
+            aidaemon_core::OwnerApprovalRequest {
+                card: None,
+                effects: Vec::new(),
+                summary: format!(
+                    "Turn CLI agent '{name}' back on ({} {})",
+                    agent.command,
+                    stored_args.join(" ")
+                ),
+                subject: json!({
+                    "action": "enable",
+                    "name": name,
+                    "command": agent.command,
+                    "args": stored_args,
+                })
+                .to_string(),
+                risk: aidaemon_core::ApprovalRisk::Medium,
+                warnings: vec!["The agent can run commands again once it is on.".to_string()],
+            }
+        } else {
+            aidaemon_core::OwnerApprovalRequest {
+                card: None,
+                effects: Vec::new(),
+                summary: format!("Remove CLI agent '{name}'"),
+                subject: json!({"action": "remove", "name": name}).to_string(),
+                risk: aidaemon_core::ApprovalRisk::Medium,
+                warnings: Vec::new(),
+            }
+        };
+        Some(OwnerApprovalNeed::Ask(request))
     }
 
     async fn handle_disable(&self, name: &str) -> anyhow::Result<String> {
@@ -340,6 +418,9 @@ impl crate::tools::traits::ToolSemantics for ManageCliAgentsTool {
         if call.refused {
             return OwnerApprovalNeed::NotNeeded;
         }
+        if let Some(need) = self.stored_agent_approval(call.arguments).await {
+            return need;
+        }
         Self::owner_approval(call.arguments)
     }
 
@@ -366,9 +447,40 @@ impl crate::tools::traits::ToolSemantics for ManageCliAgentsTool {
     }
 }
 
+/// Whether `agents` (as `CliAgentTool::list_agents` lists them) holds a
+/// discovered agent named `name`. The source label is the registry's own
+/// typed value, not prose.
+fn discovered_in(agents: &[(String, String, String, bool)], name: &str) -> bool {
+    agents
+        .iter()
+        .any(|(agent, _, source, _)| agent == name && source == "discovered")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registered_agent_may_not_take_a_discovered_agents_name() {
+        let agents = vec![
+            (
+                "codex".to_string(),
+                String::new(),
+                "discovered".to_string(),
+                true,
+            ),
+            (
+                "synthetic".to_string(),
+                String::new(),
+                "dynamic".to_string(),
+                true,
+            ),
+        ];
+        assert!(discovered_in(&agents, "codex"));
+        assert!(!discovered_in(&agents, "synthetic"));
+        assert!(!discovered_in(&agents, "other"));
+        assert!(ManageCliAgentsTool::shadowing_refusal("codex").contains("Nothing was changed"));
+    }
 
     #[test]
     fn addition_asks_with_exact_arguments_and_declares_its_process() {
