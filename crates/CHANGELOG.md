@@ -12,6 +12,20 @@ stability promise.
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+### Added
+- `aidaemon-coding-agents`: typed agent events (`AgentEvent`: session, steps, plan, usage, turn end) read from Claude Code's stream-json, Codex's app server and ACP; typed reports (`Report`); peer coordination over a scoped local MCP server (`peer`), with private run files under `~/.aidaemon/run`.
+- `aidaemon-mcp`: `server`, a loopback MCP server with per-run scoped endpoints whose revocation closes live connections.
+- `aidaemon-client-protocol` 1.46 to 1.51: run updates (1.46), coding-agent models (1.47), socket sign-in over iroh (1.48), coding agents as a conversation's model (`ModelChoice::Agent`, 1.49), follow-ups in a run's thread (1.50), and `SessionRequest.audience` with `challenge_message_v2`, which binds a challenge signature to the daemon and endpoint (1.51). `ChannelWait.claim_code` carries a bot's one-time claim code.
+- `aidaemon-channels`: `claim`, one-time claim codes for unowned bots, and `write_private_file`.
+
+### Changed
+- `aidaemon-client-gateway`: device callers cannot run device-management slash commands (`ClientHost::owner_only_command`); the challenge sign-in accepts the unbound v1 message only from this computer; signed file links cover the file's size and change time; the pairing page and the daemon fingerprint (random per install, `Pairing::new` takes it) name only their own daemon.
+- `aidaemon-client-core`: `DeviceKey::sign_challenge` takes the audience and endpoint; `Http::audience`; pairing and sign-in refuse plain http to another computer unless `AIDAEMON_ALLOW_PLAINTEXT_GATEWAY` is set.
+- `aidaemon-providers`: no redirects, bounded SSE, the ChatGPT backend only to https chatgpt.com.
+- `aidaemon-tools`, `aidaemon-policies`, `aidaemon-tool-browser`: the audit's approval, egress and path-class fixes (see the daemon's changelog).
+
 ## [0.22.1] - 2026-11-23
 
 No changes in the crates: released with the daemon's 0.22.1, whose 0.22.0 never shipped. Everything under 0.22.0 is in it.

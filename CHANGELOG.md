@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+### Added
+
+- **Coding agents show their work as it happens.** Claude Code, Codex and ACP agents report typed events (each step, its plan, usage, its end), and the app shows every background run over the composer and in the transcript under the reply that started it: what it is doing, elapsed time and Stop while it runs, how it ended and which files it changed afterwards (client protocol 1.46–1.49). Runs one request started read as one piece of work ("2 agents working together · 1 done") with Stop all.
+- **Talk to a coding agent directly.** Each agent session in a conversation is a participant with its own thread: a finished agent takes a follow-up in its own session (Claude Code, Codex, ACP agents that can load a session), with attachments, dictation and multiline input. A code conversation can be set to a coding agent instead of a model from the composer's picker, and Settings → Models lists each agent's models and lets you choose one.
+- **Coding agents coordinate as peers.** A lead agent can hand work to another configured agent over a scoped local MCP server, in a worktree of its own when it writes; a peer never runs with more access than its lead.
+- **Coding agents queue instead of failing.** Up to six run at once; a launch past the cap, or a message whose folder another run holds, waits in line and starts by itself. Agents given the same task side by side all start when what they may change does not overlap, and a restart reports agents it cut off and restarts ones that never ran.
+- **Agents answer with typed reports.** Claude Code and Codex end their runs with a report in fields (summary, changed files, checks), shown as text, and a turn its agents fully answered ships no restatement.
+
+### Changed
+
+- **An unowned bot is claimed with a one-time code.** A Telegram, Slack or Discord bot with no owner yet answers only a direct message carrying its claim code (`/claim XXXX-XXXX-XXXX`), shown where the bot was connected (the `/connect` reply, the setup screen, or the daemon log for bots from config). The first person to message it no longer becomes its owner.
+- **Self-update installs only signed releases.** Release archives are signed with the project's ed25519 key (`scripts/release-signing-key.pub.pem`); the updater refuses an unsigned or mis-signed release and never runs as root, and `install.sh` checks the signature. The legacy Linux `install-service` unit runs as the sudo user.
+- **The daemon reads its config from `AIDAEMON_HOME`, then `~/.aidaemon` when it holds a `config.toml`, then the current directory.** `memory-export` no longer walks parent directories for a `.env`.
+- **The database key moves to the keychain** after the encrypted database opens, where a keychain is available; plaintext copies left by the encryption migration are deleted once the encrypted database verifies.
+- **Challenge sign-in names the daemon it is meant for** (client protocol 1.51). Apps older than 0.22.2 need an update before signing in from another device by challenge; socket sign-in over iroh is unchanged.
+- Large modules are split by concern (the terminal tool, the terminal bridge, the mandate store, the cli_agent tool), and tests moved beside the code they test.
+
+### Security
+
+This release closes the findings of a full audit:
+
+- **Approvals cover more:** `manage_config enable_stt` (which ran a shell with a model-chosen path), `restore` and unsetting a guarded table; `manage_mcp` starting a project server (only the exact entry its card showed; blank names refused), `set_env` and `remove`; saving skills and learned API guides; enabling or removing CLI agents; changing an automation's instructions, workspace or schedule; writes that plant persistence (shell start-up files, LaunchAgents, systemd units, cron, git hooks, `~/.aidaemon/AGENTS.md`); `render_pdf` of a page that reaches beyond its folder.
+- **Terminal:** builds and tests on the host count as egress after untrusted content; the command classifier reads scripts where the call runs; "allow for session" covers only its own chat and the program's subcommand, never a call that runs more through its flags (`git -c`, `curl -d @file`, interpreters with `-c`); the confined tier refuses home, hidden, system and secret folders and cannot write git hooks or configuration.
+- **Browser:** approval cards name the live page and show the script; a session approval covers one site.
+- **Untrusted content:** goal, scheduled and executor results keep their untrusted mark; a quiet automation's previous report and email trigger content arrive wrapped as data; every daemon marker shape in external content is defused.
+- **Memory:** owner facts reach only the owner's turns; `remember_fact` scopes by channel; `manage_memories` list and search filter by audience.
+- **Paired devices and the app:** a paired device cannot pair or unpair devices through a slash command; a link never moves a paired browser to another daemon without confirmation; pairing links are always confirmed and name the daemon; the client refuses unencrypted http to another computer; content links open only as web or mail links and remote images load on request; approval keys in the terminal app arm after a second; the daemon fingerprint is random per install; signed file links read only the file they were made for.
+- **Secrets and network:** the ChatGPT token goes only to chatgpt.com; provider clients follow no redirects; outbound fetches block embedded-IPv4 and reserved ranges; CLI token stores, shell histories and browser profiles count as secrets; config files and bot attachments are owner-only from the first byte; key-bearing statements stay out of the log; coding-agent run files live under `~/.aidaemon/run`.
+- **Supply chain:** CI actions are pinned to commits with a read-only default token; Homebrew hashes and the relay servers' downloads are verified; `url` 2.5.9 (RUSTSEC-2026-0592) and `cookie` 0.18.3 (RUSTSEC-2026-0594).
+
 ## [0.22.1] - 2026-11-23
 
 ### Fixed
