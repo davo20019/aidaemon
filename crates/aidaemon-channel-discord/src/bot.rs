@@ -327,24 +327,7 @@ impl DiscordBot {
 
     /// Run the adapter, restarting it with backoff when it stops.
     pub async fn start_with_retry(self: Arc<Self>) {
-        let mut backoff = aidaemon_tools::backoff::ChannelReconnectBackoff::new(
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        );
-        loop {
-            info!("Starting Discord client");
-            let started = tokio::time::Instant::now();
-            self.clone().run().await;
-            let ran_for = started.elapsed();
-            let delay = backoff.next_jittered_delay(ran_for, 0.10);
-            warn!(
-                backoff_secs = delay.as_secs(),
-                ran_for_secs = ran_for.as_secs(),
-                "Discord client stopped, restarting"
-            );
-            tokio::time::sleep(delay).await;
-        }
+        aidaemon_channels::bot::supervise("Discord client", || self.clone().run()).await
     }
 
     /// Run the adapter until it stops, handling each event on its own task.

@@ -780,31 +780,15 @@ impl SlackBot {
         }
     }
 
-    /// Start the Slack Socket Mode client with automatic retry on crash.
+    /// Start the Slack Socket Mode client, restarted with backoff when it
+    /// stops.
     pub async fn start_with_retry(self: Arc<Self>) {
-        let mut backoff = aidaemon_tools::backoff::ChannelReconnectBackoff::new(
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        );
-
-        loop {
-            info!("Starting Slack Socket Mode client");
-            let started = tokio::time::Instant::now();
+        aidaemon_channels::bot::supervise("Slack client", || async {
             if let Err(e) = self.clone().start().await {
                 warn!("Slack client error: {}", e);
             }
-            let ran_for = started.elapsed();
-
-            let delay = backoff.next_jittered_delay(ran_for, 0.10);
-
-            warn!(
-                backoff_secs = delay.as_secs(),
-                ran_for_secs = ran_for.as_secs(),
-                "Slack client stopped, restarting"
-            );
-            tokio::time::sleep(delay).await;
-        }
+        })
+        .await
     }
 
     /// Resolve the bot's identity, then hold the connection.

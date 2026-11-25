@@ -73,3 +73,33 @@ pub trait SharedCommandDispatch: Send + Sync {
         user_role: UserRole,
     ) -> Option<String>;
 }
+
+/// Keep a bot running: run `start` again whenever it returns, after a
+/// backoff (5 s doubling to 60 s, reset by a run of a minute or more, 10%
+/// jitter). `label` names the bot in the log ("Slack client").
+pub async fn supervise<F, Fut>(label: &str, mut start: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use std::time::Duration;
+    let mut backoff = aidaemon_tools::backoff::ChannelReconnectBackoff::new(
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    loop {
+        tracing::info!(label, "Starting");
+        let started = tokio::time::Instant::now();
+        start().await;
+        let ran_for = started.elapsed();
+        let delay = backoff.next_jittered_delay(ran_for, 0.10);
+        tracing::warn!(
+            label,
+            backoff_secs = delay.as_secs(),
+            ran_for_secs = ran_for.as_secs(),
+            "Stopped, restarting"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}

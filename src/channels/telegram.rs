@@ -211,6 +211,58 @@ impl Cx<'_> {
     fn channel_hub_weak(&self) -> Option<Weak<ChannelHub>> {
         self.tg.channel_hub().map(|hub| Arc::downgrade(&hub))
     }
+
+    /// Save a bot `/connect` added, unless one with its token is already
+    /// connected. `shown` names it in the reply; `Err` is the reply.
+    async fn save_connected_bot(
+        &self,
+        bot: &crate::traits::DynamicBot,
+        shown: &str,
+    ) -> Result<i64, String> {
+        match super::connect::check_bot_exists(
+            self.state.as_ref(),
+            &bot.channel_type,
+            &bot.bot_token,
+        )
+        .await
+        {
+            Ok(true) => {
+                return Err(format!(
+                    "{shown} is already connected.\n\nUse /bots to see all connected bots."
+                ));
+            }
+            Ok(false) => {}
+            Err(e) => warn!("Failed to check existing bots: {}", e),
+        }
+        super::connect::persist_dynamic_bot(self.state.as_ref(), bot)
+            .await
+            .inspect_err(|e| warn!("Failed to save bot: {}", e))
+    }
+
+    /// Start a bot `/connect` added at once, when the hub is up: build it,
+    /// give it the hub, register and spawn it. `false`: it starts on the
+    /// next restart.
+    async fn start_connected_bot<T: HubChannel + 'static>(
+        &self,
+        build: impl FnOnce() -> Arc<T>,
+        set_hub: impl FnOnce(&T, Weak<ChannelHub>),
+        spawn: impl FnOnce(Arc<T>),
+    ) -> bool {
+        let Some(weak_hub) = self.channel_hub_weak() else {
+            return false;
+        };
+        let Some(hub) = weak_hub.upgrade() else {
+            return false;
+        };
+        let channel = build();
+        set_hub(&channel, weak_hub);
+        let name = hub
+            .register_channel(channel.clone() as Arc<dyn HubChannel>)
+            .await;
+        info!(channel = %name, "Registered new bot with hub");
+        spawn(channel);
+        true
+    }
 }
 
 /// The daemon's commands, after the shared ones, in the "/" menu.
@@ -1687,45 +1739,27 @@ impl Cx<'_> {
             Err(e) => return e,
         };
 
-        // Check if this bot is already connected
-        match super::connect::check_bot_exists(self.state.as_ref(), "telegram", token).await {
-            Ok(true) => {
-                return format!(
-                    "Bot @{} is already connected.\n\nUse /bots to see all connected bots.",
-                    bot_username
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!("Failed to check existing bots: {}", e);
-            }
-        }
-
-        // Save the new bot with same allowed users as current bot
-        let allowed_user_ids_str: Vec<String> = self
+        // The new bot lets in the users this one does.
+        let allowed: Vec<u64> = self
             .allowed_user_ids
             .read()
-            .unwrap()
-            .iter()
-            .map(|id| id.to_string())
-            .collect();
-
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let new_bot = crate::traits::DynamicBot {
             id: 0, // Will be set by database
             channel_type: "telegram".to_string(),
             bot_token: token.to_string(),
             app_token: None,
-            allowed_user_ids: allowed_user_ids_str,
+            allowed_user_ids: allowed.iter().map(u64::to_string).collect(),
             extra_config: serde_json::json!({"username": bot_username}).to_string(),
             created_at: String::new(), // Will be set by database
         };
-
-        let db_id = match super::connect::persist_dynamic_bot(self.state.as_ref(), &new_bot).await {
+        let db_id = match self
+            .save_connected_bot(&new_bot, &format!("Bot @{bot_username}"))
+            .await
+        {
             Ok(id) => id,
-            Err(e) => {
-                warn!("Failed to save bot: {}", e);
-                return e;
-            }
+            Err(reply) => return reply,
         };
 
         info!(
@@ -1755,37 +1789,24 @@ impl Cx<'_> {
             }
         };
 
-        // Try to spawn the bot immediately if we have a hub reference
-        let hub_ref = self.channel_hub_weak();
-        if let Some(weak_hub) = hub_ref
-            && let Some(hub) = weak_hub.upgrade()
-        {
-            // Create the new channel with same config as this one
-            let new_channel = Arc::new(new_telegram_bot(
-                token,
-                self.allowed_user_ids
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-                TelegramWebhookConfig::default(),
-                self.owner_user_ids.clone(),
-                self.runtime_deps(),
-                self.terminal.web_app_url().to_string(),
-                self.terminal.lite_allowed_prefixes(),
-            ));
-
-            // Give the new channel a reference to the hub too
-            new_channel.set_channel_hub(weak_hub);
-
-            // Register with the hub
-            let channel_name = hub
-                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
-                .await;
-            info!(channel = %channel_name, "Registered new Telegram bot with hub");
-
-            // Spawn the bot in the background using helper to avoid type cycles
-            spawn_telegram_channel(new_channel);
-
+        let started = self
+            .start_connected_bot(
+                || {
+                    Arc::new(new_telegram_bot(
+                        token,
+                        allowed,
+                        TelegramWebhookConfig::default(),
+                        self.owner_user_ids.clone(),
+                        self.runtime_deps(),
+                        self.terminal.web_app_url().to_string(),
+                        self.terminal.lite_allowed_prefixes(),
+                    ))
+                },
+                |bot, hub| bot.set_channel_hub(hub),
+                spawn_telegram_channel,
+            )
+            .await;
+        if started {
             return format!(
                 "✓ Bot @{} connected and started!\n\n\
                     The bot is now active and ready to receive messages.\n\
@@ -1820,20 +1841,6 @@ impl Cx<'_> {
             Err(e) => return e,
         };
 
-        // Check if already connected
-        match super::connect::check_bot_exists(self.state.as_ref(), "discord", token).await {
-            Ok(true) => {
-                return format!(
-                    "Bot {} is already connected.\n\nUse /bots to see all connected bots.",
-                    bot_name
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!("Failed to check existing bots: {}", e);
-            }
-        }
-
         // Discord user IDs differ from Telegram IDs: the bot starts with no
         // one allowed, and the first DM that carries this one-time code
         // (shown only in this owner's chat) claims it.
@@ -1848,9 +1855,12 @@ impl Cx<'_> {
             created_at: String::new(),
         };
 
-        let db_id = match super::connect::persist_dynamic_bot(self.state.as_ref(), &new_bot).await {
+        let db_id = match self
+            .save_connected_bot(&new_bot, &format!("Bot {bot_name}"))
+            .await
+        {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(reply) => return reply,
         };
 
         info!(
@@ -1860,34 +1870,25 @@ impl Cx<'_> {
             "New Discord bot connected"
         );
 
-        // Try to spawn the bot immediately if we have a hub reference
-        let hub_ref = self.channel_hub_weak();
-        if let Some(weak_hub) = hub_ref
-            && let Some(hub) = weak_hub.upgrade()
-        {
-            // Create the new Discord channel with empty allowed_user_ids —
-            // the bot will auto-claim the first DM user.
-            let new_channel = Arc::new(super::discord::new_discord_bot(
-                token,
-                vec![], // Empty: auto-claim on first DM
-                vec![], // Owner set on auto-claim
-                None,   // No guild_id for dynamic bots
-                self.runtime_deps(),
-            ));
-
-            new_channel.owner_claim().set_code(&claim_code);
-            // Give the new channel a reference to the hub
-            new_channel.set_channel_hub(weak_hub);
-
-            // Register with the hub
-            let channel_name = hub
-                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
-                .await;
-            info!(channel = %channel_name, "Registered new Discord bot with hub");
-
-            // Spawn the bot in the background
-            spawn_discord_channel(new_channel);
-
+        // No one is allowed yet: the first DM with the claim code claims it.
+        let started = self
+            .start_connected_bot(
+                || {
+                    let bot = Arc::new(super::discord::new_discord_bot(
+                        token,
+                        vec![],
+                        vec![],
+                        None, // No guild_id for dynamic bots
+                        self.runtime_deps(),
+                    ));
+                    bot.owner_claim().set_code(&claim_code);
+                    bot
+                },
+                |bot, hub| bot.set_channel_hub(hub),
+                spawn_discord_channel,
+            )
+            .await;
+        if started {
             return format!(
                 "✓ Discord bot {} connected and started!\n\n\
                     To claim it as yours, send it this DM on Discord:\n/claim {}\n\n\
@@ -1927,20 +1928,6 @@ impl Cx<'_> {
                 Err(e) => return e,
             };
 
-        // Check if already connected
-        match super::connect::check_bot_exists(self.state.as_ref(), "slack", bot_token).await {
-            Ok(true) => {
-                return format!(
-                    "Slack bot {} ({}) is already connected.\n\nUse /bots to see all connected bots.",
-                    bot_name, team_name
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!("Failed to check existing bots: {}", e);
-            }
-        }
-
         // Slack user ids are not Telegram ids: the bot starts with no one
         // allowed, and the first DM that carries this one-time code (shown
         // only in this owner's chat) claims it.
@@ -1957,9 +1944,12 @@ impl Cx<'_> {
             created_at: String::new(),
         };
 
-        let db_id = match super::connect::persist_dynamic_bot(self.state.as_ref(), &new_bot).await {
+        let db_id = match self
+            .save_connected_bot(&new_bot, &format!("Slack bot {bot_name} ({team_name})"))
+            .await
+        {
             Ok(id) => id,
-            Err(e) => return e,
+            Err(reply) => return reply,
         };
 
         info!(
@@ -1970,35 +1960,26 @@ impl Cx<'_> {
             "New Slack bot connected"
         );
 
-        // Try to spawn the bot immediately if we have a hub reference
-        let hub_ref = self.channel_hub_weak();
-        if let Some(weak_hub) = hub_ref
-            && let Some(hub) = weak_hub.upgrade()
-        {
-            // Create the new Slack channel with same config as this Telegram channel
-            let new_channel = Arc::new(super::slack::new_slack_bot(
-                app_token,
-                bot_token,
-                allowed_user_ids_str, // Slack uses String user IDs
-                Vec::new(),           // Empty preserves legacy allowed-user owner behavior
-                Vec::new(),           // Dynamic bot starts without delegated workspaces
-                false,                // use_threads default
-                self.runtime_deps(),
-            ));
-
-            new_channel.owner_claim().set_code(&claim_code);
-            // Give the new channel a reference to the hub
-            new_channel.set_channel_hub(weak_hub);
-
-            // Register with the hub
-            let channel_name = hub
-                .register_channel(new_channel.clone() as Arc<dyn HubChannel>)
-                .await;
-            info!(channel = %channel_name, "Registered new Slack bot with hub");
-
-            // Spawn the bot in the background
-            spawn_slack_channel(new_channel);
-
+        let started = self
+            .start_connected_bot(
+                || {
+                    let bot = Arc::new(super::slack::new_slack_bot(
+                        app_token,
+                        bot_token,
+                        allowed_user_ids_str,
+                        Vec::new(), // Owners are set when it is claimed
+                        Vec::new(), // Dynamic bot starts without delegated workspaces
+                        false,      // use_threads default
+                        self.runtime_deps(),
+                    ));
+                    bot.owner_claim().set_code(&claim_code);
+                    bot
+                },
+                |bot, hub| bot.set_channel_hub(hub),
+                spawn_slack_channel,
+            )
+            .await;
+        if started {
             return format!(
                 "✓ Slack bot {} ({}) connected and started!\n\n\
                     To claim it as yours, send it this direct message in Slack:\n/claim {}\n\n\

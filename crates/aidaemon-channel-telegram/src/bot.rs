@@ -488,35 +488,10 @@ impl TelegramBot {
         }
     }
 
-    /// Start the Telegram dispatcher with automatic retry on crash.
-    /// Uses exponential backoff: 5s → 10s → 20s → 40s → 60s cap.
-    /// Resets backoff to initial after a stable run (60s+).
+    /// Start the Telegram dispatcher, restarted with backoff when it stops.
     pub async fn start_with_retry(self: Arc<Self>) {
-        // Fetch bot username once at startup
-        let bot_username = self.get_bot_username().await;
-
-        let mut backoff = aidaemon_tools::backoff::ChannelReconnectBackoff::new(
-            Duration::from_secs(5),
-            Duration::from_secs(60),
-            Duration::from_secs(60),
-        );
-
-        loop {
-            info!(name = %bot_username, "Starting Telegram dispatcher");
-            let started = tokio::time::Instant::now();
-            self.clone().start().await;
-            let ran_for = started.elapsed();
-
-            let delay = backoff.next_jittered_delay(ran_for, 0.10);
-
-            warn!(
-                name = %bot_username,
-                backoff_secs = delay.as_secs(),
-                ran_for_secs = ran_for.as_secs(),
-                "Telegram dispatcher stopped, restarting"
-            );
-            tokio::time::sleep(delay).await;
-        }
+        let label = format!("Telegram dispatcher {}", self.get_bot_username().await);
+        aidaemon_channels::bot::supervise(&label, || self.clone().start()).await
     }
 
     pub async fn start(self: Arc<Self>) {
