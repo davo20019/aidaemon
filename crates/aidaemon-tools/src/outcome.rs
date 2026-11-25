@@ -183,8 +183,17 @@ pub fn check_argument_contract<T: OutcomeTool + ?Sized>(
 /// Run an [`OutcomeTool`] for a kernel agent. A failed or rejected call is an
 /// error result the model can react to.
 pub(crate) async fn run_as_core<T: OutcomeTool + ?Sized>(tool: &T, arguments: Value) -> ToolResult {
+    run_as_core_with(tool, arguments, &ToolCallContext::default()).await
+}
+
+/// [`run_as_core`] with the facts the host knows about the call.
+pub(crate) async fn run_as_core_with<T: OutcomeTool + ?Sized>(
+    tool: &T,
+    arguments: Value,
+    facts: &ToolCallContext,
+) -> ToolResult {
     let raw = arguments.to_string();
-    let outcome = match tool.execute(&raw, &ToolCallContext::default()).await {
+    let outcome = match tool.execute(&raw, facts).await {
         Ok(outcome) => outcome,
         Err(error) => return Ok(ToolOutput::error(error.to_string())),
     };
@@ -228,6 +237,7 @@ pub struct KernelAdapter<T: ?Sized> {
     validator: Option<CallValidator>,
     timeout: Option<Duration>,
     runner: Option<Arc<dyn OutcomeRunner>>,
+    facts: ToolCallContext,
 }
 
 impl<T: OutcomeTool + ?Sized> KernelAdapter<T> {
@@ -241,7 +251,16 @@ impl<T: OutcomeTool + ?Sized> KernelAdapter<T> {
             validator: None,
             timeout: None,
             runner: None,
+            facts: ToolCallContext::default(),
         }
+    }
+
+    /// Call the tool with these facts (who is asking, from which chat)
+    /// instead of none: what the host knows about the turn the tool is
+    /// offered in, such as its audience.
+    pub fn with_call_facts(mut self, facts: ToolCallContext) -> Self {
+        self.facts = facts;
+        self
     }
 
     /// Offer the tool under this spec instead of its own schema.
@@ -403,7 +422,7 @@ impl<T: OutcomeTool + ?Sized + 'static> aidaemon_core::Tool for KernelAdapter<T>
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> ToolResult {
         match &self.runner {
             Some(runner) => runner.run(&self.spec.name, arguments, ctx).await,
-            None => run_as_core(self.tool.as_ref(), arguments).await,
+            None => run_as_core_with(self.tool.as_ref(), arguments, &self.facts).await,
         }
     }
 }

@@ -73,7 +73,10 @@ async fn test_search_relational_expansion() {
     // initial_ids does NOT contain father_name. The neighborhood expansion
     // is then the only path that can surface "Frank".
     let out = tool
-        .call(&json!({"action": "search", "query": "carol's mother", "limit": 1}).to_string())
+        .call_with(
+            &json!({"action": "search", "query": "carol's mother", "limit": 1}).to_string(),
+            owner_in_own_chat(),
+        )
         .await
         .unwrap();
 
@@ -134,7 +137,10 @@ async fn test_search_keyword_query_triggers_neighborhood_via_result_signal() {
     // limit=1 so only the top-ranked initial hit is in the base results;
     // neighborhood expansion is the only path that can surface "Frank".
     let out = tool
-        .call(&json!({"action": "search", "query": "carol", "limit": 1}).to_string())
+        .call_with(
+            &json!({"action": "search", "query": "carol", "limit": 1}).to_string(),
+            owner_in_own_chat(),
+        )
         .await
         .unwrap();
 
@@ -194,7 +200,10 @@ async fn test_search_neighborhood_from_result_entities_when_classifier_empty() {
     // limit=1 ensures only the top-ranked initial hit (mother_name) is in the
     // primary block; neighborhood expansion is the ONLY path that can surface Frank.
     let out = tool
-        .call(&json!({"action": "search", "query": "carol", "limit": 1}).to_string())
+        .call_with(
+            &json!({"action": "search", "query": "carol", "limit": 1}).to_string(),
+            owner_in_own_chat(),
+        )
         .await
         .unwrap();
 
@@ -258,7 +267,10 @@ async fn search_header_reports_honest_counts() {
             .unwrap();
     }
     let out = tool
-        .call(&json!({"action": "search", "query": "zephyr"}).to_string())
+        .call_with(
+            &json!({"action": "search", "query": "zephyr"}).to_string(),
+            owner_in_own_chat(),
+        )
         .await
         .unwrap();
     assert!(out.contains("(3 shown of"), "{out}");
@@ -315,7 +327,10 @@ async fn test_search_tool_finds_port_among_substring_noise() {
     }
 
     let result = tool
-        .call(&json!({"action": "search", "query": "database port"}).to_string())
+        .call_with(
+            &json!({"action": "search", "query": "database port"}).to_string(),
+            owner_in_own_chat(),
+        )
         .await
         .unwrap();
 
@@ -481,6 +496,17 @@ async fn trusted_session_argument_bypasses_nothing() {
         .unwrap()
         .output;
     assert!(trusted.contains("Jordan Lee"), "{trusted}");
+}
+
+/// The owner asking in their own conversation: the audience that sees
+/// every fact a search may return.
+fn owner_in_own_chat() -> aidaemon_tools::semantics::ToolCallContext {
+    aidaemon_tools::semantics::ToolCallContext {
+        session_id: "test".into(),
+        channel_visibility: Some(aidaemon_core::ChannelVisibility::Private),
+        user_role: Some(aidaemon_core::UserRole::Owner),
+        ..Default::default()
+    }
 }
 
 fn test_tool(state: Arc<SqliteStateStore>) -> ManageMemoriesTool {

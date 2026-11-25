@@ -36,6 +36,10 @@ pub struct FullTurn {
 pub struct FullMemory {
     recall: Arc<RecallSource>,
     tools: Vec<Arc<dyn Tool>>,
+    /// Its own memory tools ([`FullMemory::over`]), adapted for each turn
+    /// with that turn's audience, so a list or search shows what the turn's
+    /// asker may see.
+    own_tools: Vec<Arc<dyn aidaemon_tools::OutcomeTool>>,
     /// Its background jobs, when it runs them.
     jobs: Option<Arc<MemoryJobs>>,
     /// Records owner turns for the jobs, when the host keeps no log.
@@ -78,6 +82,7 @@ impl FullMemory {
         Self {
             recall,
             tools: Vec::new(),
+            own_tools: Vec::new(),
             jobs: None,
             recorder: None,
             opened: None,
@@ -175,8 +180,8 @@ impl FullMemory {
         settings: RecallSettings,
         host_settings: Arc<dyn SettingsStore>,
     ) -> Self {
-        let mut system = Self::new(Arc::new(RecallSource::new(store.clone(), settings)))
-            .with_tools(tools::kernel_tools(store.clone(), host_settings));
+        let mut system = Self::new(Arc::new(RecallSource::new(store.clone(), settings)));
+        system.own_tools = tools::outcome_tools(store.clone(), host_settings);
         system.store = Some(store);
         system
     }
@@ -261,6 +266,22 @@ impl RecallHost for NoHost {
     }
 }
 
+/// The turn's audience as call facts for its memory tools: the owner in
+/// their own chat sees every fact, anyone else what recall would show them.
+fn call_facts(turn: &RecallTurn) -> aidaemon_tools::semantics::ToolCallContext {
+    aidaemon_tools::semantics::ToolCallContext {
+        session_id: turn.session_id.clone(),
+        user_role: Some(if turn.owner {
+            aidaemon_core::UserRole::Owner
+        } else {
+            aidaemon_core::UserRole::Guest
+        }),
+        channel_visibility: Some(turn.visibility),
+        channel_id: turn.channel_id.clone(),
+        ..Default::default()
+    }
+}
+
 /// What recall knows about a turn given only the [`MemoryTurn`].
 fn plain_turn(turn: &MemoryTurn) -> RecallTurn {
     let owner = turn.scope == "owner";
@@ -293,6 +314,7 @@ impl MemorySystem for FullMemory {
             };
         // Recall starts now, beside the rest of the turn's setup; the
         // injection hook awaits it at the first model call.
+        let facts = call_facts(&recall_turn);
         let recall = match self.claim_speculative(&recall_turn) {
             Some(speculative) => {
                 FullRecall::new(self.recall.clone(), host, recall_turn).adopt(speculative)
@@ -309,7 +331,13 @@ impl MemorySystem for FullMemory {
             hooks.push(recorder.clone());
         }
         let mut tools = if turn.read || turn.write {
-            self.tools.clone()
+            let mut tools = self.tools.clone();
+            tools.extend(self.own_tools.iter().map(|tool| {
+                Arc::new(
+                    aidaemon_tools::KernelAdapter::new(tool.clone()).with_call_facts(facts.clone()),
+                ) as Arc<dyn Tool>
+            }));
+            tools
         } else {
             Vec::new()
         };
@@ -323,7 +351,9 @@ impl MemorySystem for FullMemory {
             let tool = tools::RememberFactTool::new(store.clone())
                 .with_project_notes(notes.clone())
                 .for_project(Some(project.clone()));
-            *slot = Arc::new(aidaemon_tools::KernelAdapter::new(Arc::new(tool)));
+            *slot = Arc::new(
+                aidaemon_tools::KernelAdapter::new(Arc::new(tool)).with_call_facts(facts.clone()),
+            );
         }
         MemoryParts { hooks, tools }
     }

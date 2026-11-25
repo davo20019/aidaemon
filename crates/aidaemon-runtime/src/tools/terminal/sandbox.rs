@@ -15,7 +15,9 @@ pub(crate) struct ConfinedCapabilities {
 
 /// Paths inside a write root that an unattended confined run may not write:
 /// what is there runs later on its own (git hooks, git configuration that
-/// names helpers and hooks, husky hooks).
+/// names helpers and hooks, husky hooks). Only the macOS profile can deny
+/// a path inside a write root.
+#[cfg(target_os = "macos")]
 pub(super) const PERSISTENCE_SUBPATHS: &[&str] = &[".git/hooks", ".git/config", ".husky"];
 
 pub(crate) async fn confined_terminal_execution_request(
