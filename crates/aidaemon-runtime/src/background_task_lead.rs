@@ -1198,6 +1198,11 @@ pub fn spawn_background_task_lead(
             // The note goes with what the task lead acts on (the run's
             // instruction), not only its mission (live 2026-11-15: with it in
             // the mission alone, the lead never said nothing_new).
+            let carries_previous_report = goal.goal_type == "continuous"
+                && aidaemon_work::automations::quiet_run_carries_report(
+                    goal.context.as_deref(),
+                    previous_result.as_deref(),
+                );
             let user_text = match (goal.goal_type == "continuous")
                 .then(|| {
                     aidaemon_work::automations::quiet_run_note(
@@ -1640,6 +1645,9 @@ pub fn spawn_background_task_lead(
             request.project_scope = dispatch_project_scope.clone();
             request.approval_session_id = Some(session_id.clone());
             request.bound_task_attempt = dispatch_attempt.clone();
+            // The previous report holds what that run read: the lead it is
+            // handed to starts tainted.
+            request.untrusted_input = carries_previous_report;
             let task_lead_run = TurnEngine::new(&*agent).spawn_child(request).await;
 
             // A child can finish after its keepalive observed a revoked or

@@ -1319,6 +1319,10 @@ pub struct ChildAgentRequest {
     /// `None` leaves the child unlimited.
     pub time_limit: Option<ChildTimeLimit>,
     pub model_tier: Option<aidaemon_providers::routing::Tier>,
+    /// The mission or task carries text someone else may have authored (a
+    /// quiet automation's previous report, which holds what that run read):
+    /// the child starts as if it had already read untrusted content.
+    pub untrusted_input: bool,
 }
 
 impl ChildAgentRequest {
@@ -1346,6 +1350,7 @@ impl ChildAgentRequest {
             parent_authority: None,
             time_limit: None,
             model_tier: None,
+            untrusted_input: false,
         }
     }
 }

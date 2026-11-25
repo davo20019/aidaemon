@@ -1382,6 +1382,7 @@ impl SpawnAgentTool {
                                     time_limit,
                                     model_tier: args.model_tier.map(Into::into),
                                     bound_task_attempt: None,
+                                    untrusted_input: false,
                                 })
                             )
                         )
@@ -1760,6 +1761,7 @@ impl SpawnAgentTool {
                     time_limit: self.time_limit(),
                     model_tier,
                     bound_task_attempt: None,
+                    untrusted_input: false,
                 }),
             ),
         )

@@ -94,6 +94,14 @@ pub fn run_mission(description: &str, context: Option<&str>, previous: Option<&s
     }
 }
 
+/// Whether [`quiet_run_note`] hands this run its previous report: the run
+/// then holds text that run read (pages, files, tool output), so it must
+/// start tainted.
+pub fn quiet_run_carries_report(context: Option<&str>, previous: Option<&str>) -> bool {
+    NotifyMode::from_context(context) == NotifyMode::Changes
+        && previous.is_some_and(|text| !text.trim().is_empty())
+}
+
 /// What a quiet automation's run is told about the last run and how to say
 /// it found nothing new; `None` for one that tells every run. It goes with
 /// the instruction the run's task lead acts on and with its mission.
@@ -264,6 +272,15 @@ mod notify_tests {
             NotifyMode::Changes
         );
         assert_eq!(NotifyMode::from_context(None), NotifyMode::EveryRun);
+    }
+
+    #[test]
+    fn only_a_handed_on_report_taints_the_next_run() {
+        let changes = Some(r#"{"notify":"changes"}"#);
+        assert!(super::quiet_run_carries_report(changes, Some("v1")));
+        assert!(!super::quiet_run_carries_report(changes, Some("  ")));
+        assert!(!super::quiet_run_carries_report(changes, None));
+        assert!(!super::quiet_run_carries_report(None, Some("v1")));
     }
 
     #[test]

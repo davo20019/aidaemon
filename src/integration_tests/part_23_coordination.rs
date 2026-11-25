@@ -423,6 +423,7 @@ mod coordination_tests {
                 parent_authority: Some(parent),
                 time_limit: None,
                 model_tier: None,
+                untrusted_input: false,
             })
             .await
             .unwrap();
@@ -1090,6 +1091,7 @@ mod coordination_tests {
                 parent_authority: Some(inherited(&family)),
                 time_limit: None,
                 model_tier: None,
+                untrusted_input: false,
             })
             .await
             .unwrap();

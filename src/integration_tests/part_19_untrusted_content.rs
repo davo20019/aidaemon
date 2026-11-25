@@ -1105,3 +1105,67 @@ async fn a_confirmation_is_checked_with_the_owners_earlier_messages() {
     drop(calls);
     assert_eq!(sent.lock().unwrap().len(), 1, "the confirmed send ran");
 }
+
+/// A child handed input someone else may have written (a quiet automation's
+/// previous report) starts tainted: its first send is checked by the clean
+/// verifier. The same child with clean input sends unchecked.
+async fn child_send_with_input(untrusted_input: bool) -> (
+    Arc<crate::testing::MockProvider>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime};
+    let mut script = vec![MockProvider::tool_call_response(
+        "message_probe",
+        &json!({"to": "jordan@example.invalid"}).to_string(),
+    )];
+    if untrusted_input {
+        script.push(MockProvider::text_response(DENY));
+    }
+    script.push(MockProvider::text_response("Done."));
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![Arc::new(MessageProbe(sent.clone()))];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(
+        MockProvider::with_responses(script),
+        tools,
+        None,
+    )
+    .await
+    .unwrap();
+    let provider = harness.provider.clone();
+    let agent = Arc::new(harness.agent);
+    let mut request = ChildAgentRequest::new(
+        "Report what changed",
+        "Send Jordan Lee what changed since the previous report.",
+        ChannelContext::private("telegram"),
+        UserRole::Owner,
+    );
+    request.untrusted_input = untrusted_input;
+    let _ = agent.run_child(request).await;
+    (provider, sent)
+}
+
+#[tokio::test]
+async fn a_child_handed_untrusted_input_starts_tainted() {
+    let (provider, sent) = child_send_with_input(true).await;
+    assert!(sent.lock().unwrap().is_empty(), "the send must not run");
+    let verifier = provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .filter(|call| is_clean_verifier_call(call))
+        .count();
+    assert_eq!(verifier, 1, "the child's send is checked once");
+
+    let (provider, sent) = child_send_with_input(false).await;
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec!["jordan@example.invalid".to_string()]
+    );
+    assert!(!provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .any(is_clean_verifier_call));
+}

@@ -1021,9 +1021,21 @@ impl TurnEngine<'_> {
             parent_authority,
             time_limit,
             model_tier,
+            untrusted_input,
         } = request;
         let (mission, task) = (mission.as_str(), task.as_str());
         let goal_id = goal_id.as_deref();
+        // Input someone else may have authored taints the child from its
+        // first turn: settle the authority it would inherit now and mark it.
+        let parent_authority = if untrusted_input {
+            let mut authority = self
+                .inherited_for_child(parent_authority, user_role, &channel_ctx, goal_id)
+                .await;
+            authority.untrusted_context = true;
+            Some(authority)
+        } else {
+            parent_authority
+        };
         let task_id = task_id.as_deref();
         let inherited_project_scope = project_scope.as_deref();
         let arg_specialist = specialist.as_deref();
