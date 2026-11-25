@@ -64,6 +64,7 @@ pub mod setup;
 pub mod shells;
 pub mod surfaces;
 pub mod token;
+mod util;
 pub mod views;
 
 use std::collections::{HashMap, HashSet};

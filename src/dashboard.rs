@@ -245,18 +245,10 @@ fn oauth_callback_page(outcome: &OAuthCallbackOutcome) -> String {
     )
 }
 
-/// Escape HTML special characters to prevent XSS in rendered pages.
-/// Constant-time byte comparison to prevent timing side-channel attacks
-/// on dashboard bearer token authentication.
+/// Constant-time byte comparison, so a token check leaks nothing through
+/// timing (`subtle`; unequal lengths are unequal).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    subtle::ConstantTimeEq::ct_eq(a, b).into()
 }
 
 fn html_escape(s: &str) -> String {

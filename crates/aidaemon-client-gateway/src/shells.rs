@@ -24,7 +24,6 @@ use aidaemon_shells::{ShellChange, ShellError, ShellId, ShellInfo, ShellRegistry
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
 use axum::response::Response;
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -61,13 +60,9 @@ pub struct ShellDesk {
     tickets: Mutex<Vec<Ticket>>,
 }
 
-fn sha(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
+use crate::util::sha;
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
+use crate::util::lock;
 
 fn refusal(error: ShellError) -> ProtocolError {
     let code = match &error {

@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::hub::{MediaKind, MediaMessage};
-use aidaemon_events::payloads::{ResourceInvalidatedData, ResourceRegisteredData};
-use aidaemon_events::{Event, EventStore, EventType};
+use aidaemon_events::EventStore;
+use aidaemon_events::payloads::ResourceRegisteredData;
 use aidaemon_tools::BackendKind;
 use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::backend::SharedExecutionBackend;
@@ -95,22 +95,10 @@ impl SendFileTool {
     }
 
     async fn invalidate_resource(&self, session_id: &str, resource_id: &str, reason: &str) {
-        let Some(store) = &self.event_store else {
-            return;
-        };
-        let data = ResourceInvalidatedData {
-            schema_version: ResourceInvalidatedData::SCHEMA_VERSION,
-            resource_id: resource_id.to_string(),
-            reason: reason.to_string(),
-            turn_id: None,
-        };
-        if let Ok(value) = serde_json::to_value(data) {
+        // Best effort: a handle that stays registered is checked again on use.
+        if let Some(store) = &self.event_store {
             let _ = store
-                .append(Event::new(
-                    session_id,
-                    EventType::ResourceInvalidated,
-                    value,
-                ))
+                .invalidate_resource(session_id, resource_id, reason)
                 .await;
         }
     }
@@ -686,6 +674,7 @@ impl aidaemon_tools::semantics::ToolSemantics for SendFileTool {
 mod tests {
     use super::*;
     use aidaemon_events::payloads::{ResourceProvenance, ResourceRegisteredData};
+    use aidaemon_events::{Event, EventType};
     use aidaemon_tools::file_delivery::is_recoverable_source;
     use aidaemon_tools::testing::CallWithFacts;
     use aidaemon_tools::testing::ToolCalls as _;

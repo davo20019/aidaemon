@@ -29,7 +29,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -59,9 +58,7 @@ fn ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn sha(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
+use crate::util::sha;
 
 fn random_hex() -> String {
     format!(

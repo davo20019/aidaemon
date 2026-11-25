@@ -3027,6 +3027,30 @@ impl EventStore {
         Ok(reconciled)
     }
 
+    /// Retire a resource handle in `session_id` (its file is gone or no
+    /// longer what was registered), so [`Self::get_resource`] stops
+    /// resolving it.
+    pub async fn invalidate_resource(
+        &self,
+        session_id: &str,
+        resource_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let data = super::ResourceInvalidatedData {
+            schema_version: super::ResourceInvalidatedData::SCHEMA_VERSION,
+            resource_id: resource_id.to_string(),
+            reason: reason.to_string(),
+            turn_id: None,
+        };
+        self.append(Event::new(
+            session_id,
+            EventType::ResourceInvalidated,
+            serde_json::to_value(data)?,
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// Resolve the latest state of an opaque resource handle inside one
     /// session. The latest lifecycle event wins, so an invalidation prevents a
     /// stale locator from being used even when an older registration exists.

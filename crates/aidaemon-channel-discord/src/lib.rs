@@ -37,7 +37,6 @@ mod format;
 mod gateway;
 mod mapping;
 mod rest;
-mod tls;
 #[cfg(feature = "zlib")]
 mod zlib;
 

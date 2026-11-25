@@ -211,17 +211,6 @@ impl crate::state::types::MessageStore for SqliteStateStore {
         Ok(result)
     }
 
-    async fn get_context(
-        &self,
-        session_id: &str,
-        _query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Message>> {
-        // Canonical context retrieval is event-backed. The in-memory working
-        // window is hydrated from events on cold start by get_history().
-        self.get_history(session_id, limit).await
-    }
-
     async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
         // Clear working memory
         {

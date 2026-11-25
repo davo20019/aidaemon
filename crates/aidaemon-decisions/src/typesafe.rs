@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::wire::{f32_field, network_error, probabilities, short};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
@@ -127,12 +128,12 @@ impl Decider for TypesafeDecider {
             .json(&request_body(&self.model, request))
             .send()
             .await
-            .map_err(|error| DecisionError::Transient(network_error(&error)))?;
+            .map_err(|error| DecisionError::Transient(network_error("TypeSafe API", &error)))?;
         let status = reply.status();
         let body = reply
             .text()
             .await
-            .map_err(|error| DecisionError::Transient(network_error(&error)))?;
+            .map_err(|error| DecisionError::Transient(network_error("TypeSafe API", &error)))?;
         if !status.is_success() {
             return Err(status_error(status.as_u16(), &body));
         }
@@ -154,18 +155,6 @@ impl Decider for TypesafeDecider {
         response.check_against(request)?;
         Ok(response)
     }
-}
-
-/// A reqwest error without its URL.
-fn network_error(error: &reqwest::Error) -> String {
-    let kind = if error.is_timeout() {
-        "timed out"
-    } else if error.is_connect() {
-        "could not connect"
-    } else {
-        "request failed"
-    };
-    format!("TypeSafe API {kind}")
 }
 
 fn request_body(model: &str, request: &DecisionRequest) -> Value {
@@ -208,14 +197,6 @@ fn request_body(model: &str, request: &DecisionRequest) -> Value {
     })
 }
 
-fn short(text: &str) -> String {
-    const MAX: usize = 200;
-    match text.char_indices().nth(MAX) {
-        Some((cut, _)) => format!("{}...", &text[..cut]),
-        None => text.to_string(),
-    }
-}
-
 /// Error bodies are `{"detail": ...}`: a string or object for 400, a list
 /// of `{loc, msg, type}` for 422.
 fn status_error(status: u16, body: &str) -> DecisionError {
@@ -240,27 +221,6 @@ fn status_error(status: u16, body: &str) -> DecisionError {
         400 | 413 | 415 | 422 => DecisionError::InvalidRequest(format!("HTTP {status}: {detail}")),
         _ => DecisionError::Other(format!("HTTP {status}: {detail}")),
     }
-}
-
-fn f32_field(value: &Value, field: &str) -> Option<f32> {
-    value
-        .get(field)
-        .and_then(Value::as_f64)
-        .filter(|n| n.is_finite())
-        .map(|n| n as f32)
-}
-
-fn probabilities(value: &Value) -> Option<BTreeMap<String, f32>> {
-    let map = value.get("probabilities")?.as_object()?;
-    Some(
-        map.iter()
-            .filter_map(|(k, v)| {
-                v.as_f64()
-                    .filter(|p| p.is_finite())
-                    .map(|p| (k.clone(), (p as f32).clamp(0.0, 1.0)))
-            })
-            .collect(),
-    )
 }
 
 fn parse_answers(

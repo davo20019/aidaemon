@@ -79,7 +79,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive", "runtime-tokio", "sqlite"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "any", "migrate", "offline"] }
 sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "deserialize", "load-extension", "migrate", "offline", "unlock-notify"] }
-subtle = { version = "2", default-features = false, features = ["const-generics", "i128"] }
+subtle = { version = "2", features = ["const-generics"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -161,7 +161,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive", "runtime-tokio", "sqlite"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "any", "migrate", "offline"] }
 sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "deserialize", "load-extension", "migrate", "offline", "unlock-notify"] }
-subtle = { version = "2", default-features = false, features = ["const-generics", "i128"] }
+subtle = { version = "2", features = ["const-generics"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit-mut"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }

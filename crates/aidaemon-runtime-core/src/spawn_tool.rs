@@ -229,17 +229,17 @@ impl SpawnAgentTool {
     }
 }
 
-/// Truncate a string to at most `max_chars` bytes without splitting a
+/// Truncate a string to at most `max_bytes` bytes without splitting a
 /// multi-byte UTF-8 character. Returns the original string when it fits.
-pub fn truncate_utf8(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
         return s;
     }
-    // Find the last char boundary at or before `max_chars`.
+    // Find the last char boundary at or before `max_bytes`.
     let boundary = s
         .char_indices()
         .map(|(i, _)| i)
-        .take_while(|&i| i <= max_chars)
+        .take_while(|&i| i <= max_bytes)
         .last()
         .unwrap_or(0);
     &s[..boundary]

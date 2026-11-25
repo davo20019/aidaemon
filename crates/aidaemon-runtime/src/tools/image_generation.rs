@@ -19,8 +19,8 @@ use sha2::Digest;
 use tokio::sync::mpsc;
 
 use aidaemon_channels::attachments::{save_tool_observation_image, sniff_image_mime};
-use aidaemon_events::payloads::{ResourceInvalidatedData, ResourceRegisteredData};
-use aidaemon_events::{Event, EventStore, EventType};
+use aidaemon_events::EventStore;
+use aidaemon_events::payloads::ResourceRegisteredData;
 use aidaemon_providers::chatgpt_login::{
     self as chatgpt_codex, CODEX_BACKEND_BASE_URL, ChatGptCredentialManager,
 };
@@ -456,22 +456,10 @@ impl GenerateImageTool {
     }
 
     async fn invalidate_resource(&self, session_id: &str, resource_id: &str, reason: &str) {
-        let Some(store) = &self.event_store else {
-            return;
-        };
-        let data = ResourceInvalidatedData {
-            schema_version: ResourceInvalidatedData::SCHEMA_VERSION,
-            resource_id: resource_id.to_string(),
-            reason: reason.to_string(),
-            turn_id: None,
-        };
-        if let Ok(value) = serde_json::to_value(data) {
+        // Best effort: a handle that stays registered is checked again on use.
+        if let Some(store) = &self.event_store {
             let _ = store
-                .append(Event::new(
-                    session_id,
-                    EventType::ResourceInvalidated,
-                    value,
-                ))
+                .invalidate_resource(session_id, resource_id, reason)
                 .await;
         }
     }
@@ -802,6 +790,7 @@ impl aidaemon_tools::semantics::ToolSemantics for GenerateImageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aidaemon_events::{Event, EventType};
     use aidaemon_tools::testing::ToolCalls as _;
     use std::sync::Mutex as StdMutex;
 

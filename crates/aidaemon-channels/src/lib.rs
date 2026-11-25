@@ -34,6 +34,9 @@ pub mod download;
 pub mod hub;
 mod inbound_files;
 pub use aidaemon_tools::text::truncate_ellipsis;
+/// TLS for the sockets reqwest does not open (a bot's websocket), trusting
+/// what the daemon's HTTPS client trusts.
+pub use aidaemon_tools::tls;
 pub use inbound_files::write_private_file;
 pub mod latex;
 pub mod live_status;

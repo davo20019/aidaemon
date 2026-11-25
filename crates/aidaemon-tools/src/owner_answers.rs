@@ -13,6 +13,34 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Which chat's approvals cover a session: a sub-agent's session is bound
+/// to its parent chat, whose grants its other agents share.
+#[derive(Debug, Default)]
+pub struct GrantSessions(Mutex<HashMap<String, String>>);
+
+impl GrantSessions {
+    /// Record that `session`'s approvals are those of `grant_session`.
+    pub fn bind(&self, session: &str, grant_session: &str) {
+        if session.is_empty() || grant_session.is_empty() || session == grant_session {
+            return;
+        }
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_string(), grant_session.to_string());
+    }
+
+    /// The key `session`'s approvals are kept under.
+    pub fn key(&self, session: &str) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+            .unwrap_or_else(|| session.to_string())
+    }
+}
+
 /// Approvals by (session, subject), each good for one call.
 #[derive(Debug, Default)]
 pub struct OwnerAnsweredCalls(Mutex<HashMap<(String, String), u32>>);

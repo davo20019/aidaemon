@@ -41,6 +41,8 @@ pub use typesafe::TypesafeDecider;
 
 #[cfg(all(test, any(feature = "gemini", feature = "typesafe")))]
 mod test_http;
+#[cfg(any(feature = "gemini", feature = "typesafe"))]
+mod wire;
 
 #[cfg(feature = "testing")]
 pub mod testing;

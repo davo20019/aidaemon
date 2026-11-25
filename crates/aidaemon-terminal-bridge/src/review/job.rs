@@ -87,21 +87,8 @@ pub(crate) fn render_process_output(output: &std::process::Output, max_chars: us
     truncate_with_note(&join_process_output(output), max_chars)
 }
 
-pub(crate) fn normalize_review_request_id(value: Option<&str>) -> Option<String> {
-    let raw = value?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let cleaned = raw
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .collect::<String>();
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned.chars().take(64).collect())
-    }
-}
+/// A client-sent id kept to `[A-Za-z0-9_-]`, at most 64 characters.
+pub(crate) use crate::uploads::normalize_upload_id as normalize_review_request_id;
 
 pub(crate) fn next_review_request_id() -> String {
     let short = uuid::Uuid::new_v4()

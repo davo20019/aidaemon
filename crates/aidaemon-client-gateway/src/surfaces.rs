@@ -28,7 +28,6 @@ use aidaemon_surfaces::{
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -72,13 +71,9 @@ pub struct SurfaceDesk {
     names: Mutex<HashMap<String, String>>,
 }
 
-fn sha(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
+use crate::util::sha;
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
+use crate::util::lock;
 
 /// The protocol error for a surface failure.
 fn refusal(error: SurfaceError) -> ProtocolError {

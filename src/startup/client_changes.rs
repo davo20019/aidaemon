@@ -147,15 +147,7 @@ pub(crate) fn exit_code(output: &str) -> Option<i32> {
     })
 }
 
-fn stored_ms(text: &str) -> Option<u64> {
-    let at = chrono::DateTime::parse_from_rfc3339(text)
-        .map(|t| t.with_timezone(&chrono::Utc))
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").map(|t| t.and_utc())
-        })
-        .ok()?;
-    u64::try_from(at.timestamp_millis()).ok()
-}
+use super::client_gateway::stored_ms;
 
 /// Paths a session's tool calls name: `written` by its file tools, and
 /// `seen` (worked in) by any of them.

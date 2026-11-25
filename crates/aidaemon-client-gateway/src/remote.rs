@@ -34,7 +34,6 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::ClientGateway;
@@ -113,9 +112,7 @@ fn revocation_of(gateway: &ClientGateway, token: &str) -> CancellationToken {
         })
 }
 
-fn sha(text: &str) -> String {
-    hex::encode(Sha256::digest(text.as_bytes()))
-}
+use crate::util::sha;
 
 /// The routes a peer with no session may reach: redeeming a pairing offer,
 /// waiting on it, and signing in with a paired key.

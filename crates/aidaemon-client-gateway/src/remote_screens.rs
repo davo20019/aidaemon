@@ -42,9 +42,7 @@ struct Remote {
 
 type Remotes = Arc<Mutex<HashMap<SurfaceId, Remote>>>;
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
+use crate::util::lock;
 
 /// The screens paired devices share.
 #[derive(Default)]

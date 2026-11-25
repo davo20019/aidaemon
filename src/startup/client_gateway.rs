@@ -136,13 +136,8 @@ pub(crate) struct SystemSources {
 }
 
 /// A stored time (RFC 3339 or SQLite's `YYYY-MM-DD HH:MM:SS`, UTC) in ms.
-fn stored_ms(text: &str) -> Option<u64> {
-    let at = chrono::DateTime::parse_from_rfc3339(text)
-        .map(|t| t.with_timezone(&chrono::Utc))
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").map(|t| t.and_utc())
-        })
-        .ok()?;
+pub(crate) fn stored_ms(text: &str) -> Option<u64> {
+    let at = aidaemon_work::scheduler::parse_datetime_flexible(text)?;
     u64::try_from(at.timestamp_millis()).ok()
 }
 

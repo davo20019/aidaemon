@@ -267,21 +267,7 @@ pub fn build_empty_response_fallback(response_note: Option<&str>) -> String {
     format!("{base} Provider detail: {note_preview}.")
 }
 
-/// `text` cut to `max_chars` characters, with `...` when cut.
-fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    for (count, ch) in text.chars().enumerate() {
-        if count >= max_chars {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
-}
+use super::helpers::truncate_for_resume as truncate_with_ellipsis;
 
 #[cfg(test)]
 mod tests {

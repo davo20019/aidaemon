@@ -96,7 +96,7 @@ pub struct BrowserSessionRegistry {
     /// The chat whose grants a session's approvals are (a sub-agent's
     /// session maps to its parent chat), set on every call from the
     /// dispatcher's typed `grant_session`.
-    grant_sessions: std::sync::Mutex<HashMap<String, String>>,
+    grant_sessions: aidaemon_tools::owner_answers::GrantSessions,
 }
 
 /// A tab as surfaced to the tool/LLM: opaque id, title, raw URL (the tool
@@ -136,7 +136,7 @@ impl BrowserSessionRegistry {
             approvals: Mutex::new(HashMap::new()),
             local_sites: Mutex::new(HashMap::new()),
             button_sites: Mutex::new(HashMap::new()),
-            grant_sessions: std::sync::Mutex::new(HashMap::new()),
+            grant_sessions: Default::default(),
         }
     }
 
@@ -145,24 +145,13 @@ impl BrowserSessionRegistry {
     /// prompt.
     /// Record that `session_id`'s approvals are those of `grant_session`.
     pub fn bind_grant_session(&self, session_id: &str, grant_session: &str) {
-        if session_id.is_empty() || grant_session.is_empty() || session_id == grant_session {
-            return;
-        }
-        self.grant_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.to_string(), grant_session.to_string());
+        self.grant_sessions.bind(session_id, grant_session);
     }
 
     /// The key approvals for `session_id` are kept under: the chat whose
     /// approvals cover it.
     pub fn grant_key(&self, session_id: &str) -> String {
-        self.grant_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned()
-            .unwrap_or_else(|| session_id.to_string())
+        self.grant_sessions.key(session_id)
     }
 
     /// Whether the owner approved ordinary mutation on `site` (an origin)
