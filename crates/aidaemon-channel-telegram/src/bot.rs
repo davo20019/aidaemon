@@ -1112,33 +1112,14 @@ impl TelegramBot {
         };
         let (filename, mime_type) = (filename.to_string(), mime_type.to_string());
 
-        // Check file size before downloading
-        let max_bytes = self.deps.max_file_size_mb * 1_048_576;
-        let file_size = file.file_size.unwrap_or(0);
-        if file_size > max_bytes {
-            anyhow::bail!(
-                "File too large ({:.1} MB). Maximum is {} MB.",
-                file_size as f64 / 1_048_576.0,
-                self.deps.max_file_size_mb
-            );
-        }
-
-        let bytes = self
-            .sdk_transport()
-            .download(
-                &aidaemon_channels::Attachment::new(filename.clone(), file.file_id.clone())
-                    .with_mime_type(Some(mime_type.clone()))
-                    .with_size_bytes(file.file_size),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to download file from Telegram: {e}"))?;
-        if bytes.len() as u64 > max_bytes {
-            anyhow::bail!(
-                "File too large ({:.1} MB). Maximum is {} MB.",
-                bytes.len() as f64 / 1_048_576.0,
-                self.deps.max_file_size_mb
-            );
-        }
+        let bytes = aidaemon_channels::attachments::download_inbound(
+            self.sdk_transport().as_ref(),
+            &aidaemon_channels::Attachment::new(filename.clone(), file.file_id.clone())
+                .with_mime_type(Some(mime_type.clone()))
+                .with_size_bytes(file.file_size),
+            self.deps.max_file_size_mb,
+        )
+        .await?;
 
         let (filename, mime_type) = if msg.photo().is_some() {
             aidaemon_channels::attachments::telegram_photo_filename_and_mime(&bytes)
@@ -1146,28 +1127,12 @@ impl TelegramBot {
             (filename, mime_type)
         };
 
-        // Sanitize filename: strip path separators, null bytes, limit length
-        let sanitized = aidaemon_events::attachments::sanitize_filename(&filename);
-        let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let dest_name = format!("{}_{}", uuid_prefix, sanitized);
-        let dest_path = self.deps.inbox_dir.join(&dest_name);
-
-        // Private to this user: other accounts on the machine never read it.
-        aidaemon_channels::write_private_file(&self.deps.inbox_dir, &dest_path, &bytes)?;
-
-        info!(
-            file = %dest_path.display(),
-            size = bytes.len(),
-            mime = %mime_type,
-            "Saved inbound file"
-        );
-
-        Ok(aidaemon_channels::attachments::message_attachment(
-            dest_path,
-            sanitized,
+        Ok(aidaemon_channels::attachments::save_inbound(
+            &self.deps.inbox_dir,
+            &filename,
             mime_type,
-            bytes.len() as u64,
-        ))
+            &bytes,
+        )?)
     }
 
     /// Read a Mini App payload.
@@ -2009,17 +1974,15 @@ async fn send_markdown_chunks_or_fallback_result(
     markdown: &str,
 ) -> anyhow::Result<Vec<String>> {
     let html = markdown_to_telegram_html(markdown);
-    let html_chunks = split_telegram_html(&html, 4096);
-    let plain_chunks = split_telegram_text(&markdown_to_telegram_plain_fallback(markdown), 4096);
+    let html_chunks = split_telegram_html(&html, TELEGRAM_MAX_MESSAGE_LEN);
     let mut first_err: Option<anyhow::Error> = None;
     let mut message_ids = Vec::new();
 
-    for (i, html_chunk) in html_chunks.iter().enumerate() {
-        let plain_chunk = plain_chunks
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or(html_chunk.as_str());
-        match send_html_or_fallback(bot, chat_id, html_chunk, plain_chunk).await {
+    for html_chunk in &html_chunks {
+        // The fallback is this chunk's own text, never a slice of a separate
+        // split of the whole message (which need not line up with it).
+        let plain_chunk = crate::format::html_to_plain(html_chunk);
+        match send_html_or_fallback(bot, chat_id, html_chunk, &plain_chunk).await {
             Ok(message) => message_ids.push(message.id.to_string()),
             Err(e) => {
                 warn!("Failed to send Telegram message: {}", e);
@@ -2061,19 +2024,14 @@ async fn send_expandable_blockquote_reply(
     markdown: &str,
 ) -> anyhow::Result<Vec<String>> {
     let html_body = markdown_to_telegram_html(markdown);
-    let plain = markdown_to_telegram_plain_fallback(markdown);
     let max_chunk = TELEGRAM_MAX_MESSAGE_LEN - TELEGRAM_EXPANDABLE_WRAPPER_LEN;
     let html_chunks = split_telegram_html(&html_body, max_chunk);
-    let plain_chunks = split_telegram_text(&plain, max_chunk);
     let mut first_err: Option<anyhow::Error> = None;
     let mut message_ids = Vec::new();
-    for (i, html_chunk) in html_chunks.iter().enumerate() {
+    for html_chunk in &html_chunks {
         let wrapped = format!("<blockquote expandable>{}</blockquote>", html_chunk);
-        let plain_chunk = plain_chunks
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or(html_chunk.as_str());
-        match send_html_or_fallback(bot, chat_id, &wrapped, plain_chunk).await {
+        let plain_chunk = crate::format::html_to_plain(html_chunk);
+        match send_html_or_fallback(bot, chat_id, &wrapped, &plain_chunk).await {
             Ok(message) => message_ids.push(message.id.to_string()),
             Err(e) => {
                 warn!("Failed to send expandable Telegram message: {}", e);

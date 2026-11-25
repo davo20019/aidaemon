@@ -26,7 +26,6 @@ use aidaemon_channels::{
     MessageRef, OutboundFile, OutboundMessage,
 };
 use aidaemon_core::ChannelVisibility;
-use aidaemon_events::attachments::sanitize_filename;
 use aidaemon_events::conversation::MessageAttachment;
 use aidaemon_tools::semantics::{
     ApprovalResponse, GoalConfirmationStyle, PermissionMode, RiskLevel, UserRole,
@@ -745,45 +744,24 @@ impl DiscordBot {
         &self,
         files: &[aidaemon_channels::Attachment],
     ) -> anyhow::Result<Vec<MessageAttachment>> {
-        let max_bytes = self.deps.max_file_size_mb * 1_048_576;
-        let too_large = |bytes: u64| {
-            anyhow::anyhow!(
-                "File too large ({:.1} MB). Maximum is {} MB.",
-                bytes as f64 / 1_048_576.0,
-                self.deps.max_file_size_mb
-            )
-        };
         let mut attachments = Vec::new();
         for file in files {
-            if file.size_bytes.unwrap_or(0) > max_bytes {
-                return Err(too_large(file.size_bytes.unwrap_or(0)));
-            }
-            let bytes = self.transport().download(file).await?;
-            // The size Discord reported can be missing; the bytes decide.
-            if bytes.len() as u64 > max_bytes {
-                return Err(too_large(bytes.len() as u64));
-            }
+            let bytes = aidaemon_channels::attachments::download_inbound(
+                self.transport().as_ref(),
+                file,
+                self.deps.max_file_size_mb,
+            )
+            .await?;
             let mime_type = file
                 .mime_type
                 .clone()
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            let sanitized = sanitize_filename(&file.name);
-            let dest_name = format!("{}_{}", &uuid::Uuid::new_v4().to_string()[..8], sanitized);
-            let dest_path = self.deps.inbox_dir.join(&dest_name);
-            // Private to this user: other accounts on the machine never read it.
-            aidaemon_channels::write_private_file(&self.deps.inbox_dir, &dest_path, &bytes)?;
-            info!(
-                file = %dest_path.display(),
-                size = bytes.len(),
-                mime = %mime_type,
-                "Saved inbound Discord file"
-            );
-            attachments.push(aidaemon_channels::attachments::message_attachment(
-                dest_path,
-                sanitized,
+            attachments.push(aidaemon_channels::attachments::save_inbound(
+                &self.deps.inbox_dir,
+                &file.name,
                 mime_type,
-                bytes.len() as u64,
-            ));
+                &bytes,
+            )?);
         }
         Ok(attachments)
     }

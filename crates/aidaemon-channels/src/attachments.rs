@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use aidaemon_events::conversation::{AttachmentProvenance, MessageAttachment};
 
 pub use aidaemon_events::attachments::{
-    RESOURCE_ID_PREFIX, new_resource_id, save_tool_observation_image, sha256_file,
+    RESOURCE_ID_PREFIX, new_resource_id, sanitize_filename, save_tool_observation_image,
+    sha256_file,
 };
 
 /// Format a single saved file as the legacy text stub (backward compatible).
@@ -203,6 +204,72 @@ pub fn build_inbound_text_without_local_paths(
     } else {
         format!("{stubs}\n{user_text}")
     }
+}
+
+/// The refusal for an inbound file over the owner's size limit.
+fn too_large(size_bytes: Option<u64>, max_file_size_mb: u64) -> anyhow::Error {
+    match size_bytes {
+        Some(bytes) => anyhow::anyhow!(
+            "File too large ({:.1} MB). Maximum is {} MB.",
+            bytes as f64 / 1_048_576.0,
+            max_file_size_mb
+        ),
+        None => anyhow::anyhow!("File too large. Maximum is {max_file_size_mb} MB."),
+    }
+}
+
+/// Download an inbound file through its bot's transport, refused over
+/// `max_file_size_mb`: before downloading when the platform reported the
+/// size, and while downloading ([`crate::Channel::download_limited`]) when it
+/// did not or reported less.
+pub async fn download_inbound<T: crate::Channel + ?Sized>(
+    transport: &T,
+    attachment: &crate::Attachment,
+    max_file_size_mb: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let max_bytes = max_file_size_mb * 1_048_576;
+    if let Some(size) = attachment.size_bytes.filter(|size| *size > max_bytes) {
+        return Err(too_large(Some(size), max_file_size_mb));
+    }
+    match transport.download_limited(attachment, max_bytes).await {
+        Ok(bytes) => Ok(bytes),
+        Err(crate::ChannelError::TooLarge { .. }) => Err(too_large(None, max_file_size_mb)),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to download {}: {e}",
+            attachment.name
+        )),
+    }
+}
+
+/// Save a downloaded inbound file to `inbox_dir`, private to this user,
+/// under a sanitized name with a random prefix, and describe it for the
+/// message.
+pub fn save_inbound(
+    inbox_dir: &Path,
+    filename: &str,
+    mime_type: String,
+    bytes: &[u8],
+) -> std::io::Result<MessageAttachment> {
+    let sanitized = sanitize_filename(filename);
+    let dest_name = format!(
+        "{}_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8],
+        sanitized
+    );
+    let dest_path = inbox_dir.join(dest_name);
+    crate::write_private_file(inbox_dir, &dest_path, bytes)?;
+    tracing::info!(
+        file = %dest_path.display(),
+        size = bytes.len(),
+        mime = %mime_type,
+        "Saved inbound file"
+    );
+    Ok(message_attachment(
+        dest_path,
+        sanitized,
+        mime_type,
+        bytes.len() as u64,
+    ))
 }
 
 pub fn message_attachment(

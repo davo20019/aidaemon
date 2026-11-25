@@ -22,7 +22,6 @@ use aidaemon_channels::slash::{CommandCategory, CommandDef, build_help_text, sha
 use aidaemon_channels::tasks::QueuedMessage;
 use aidaemon_channels::turns::{Turn, TurnRunner, TurnSurface};
 use aidaemon_core::ChannelVisibility;
-use aidaemon_events::attachments::sanitize_filename;
 use aidaemon_events::conversation::MessageAttachment;
 use aidaemon_tools::semantics::{
     ApprovalResponse, GoalConfirmationStyle, PermissionMode, RiskLevel, UserRole,
@@ -2206,15 +2205,6 @@ impl SlackBot {
                 .and_then(|v| v.as_str())
                 .unwrap_or("application/octet-stream");
 
-            let max_bytes = self.deps.max_file_size_mb * 1_048_576;
-            if file_size > max_bytes {
-                anyhow::bail!(
-                    "File too large ({:.1} MB). Maximum is {} MB.",
-                    file_size as f64 / 1_048_576.0,
-                    self.deps.max_file_size_mb
-                );
-            }
-
             let download_url = file
                 .get("url_private_download")
                 .or_else(|| file.get("url_private"))
@@ -2225,56 +2215,23 @@ impl SlackBot {
                         filename
                     )
                 })?;
-
-            let resp = self
-                .http
-                .get(download_url)
-                .header("Authorization", format!("Bearer {}", self.bot_token))
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                anyhow::bail!("Failed to download Slack file: HTTP {}", resp.status());
-            }
-            if let Some(content_length) = resp.content_length()
-                && content_length > max_bytes
-            {
-                anyhow::bail!(
-                    "File too large ({:.1} MB). Maximum is {} MB.",
-                    content_length as f64 / 1_048_576.0,
-                    self.deps.max_file_size_mb
-                );
-            }
-            let bytes = resp.bytes().await?;
-            if bytes.len() as u64 > max_bytes {
-                anyhow::bail!(
-                    "File too large ({:.1} MB). Maximum is {} MB.",
-                    bytes.len() as f64 / 1_048_576.0,
-                    self.deps.max_file_size_mb
-                );
-            }
-
-            let sanitized = sanitize_filename(filename);
-            let uuid_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let dest_name = format!("{}_{}", uuid_prefix, sanitized);
-            let dest_path = self.deps.inbox_dir.join(&dest_name);
-
-            // Private to this user: other accounts on the machine never read it.
-            aidaemon_channels::write_private_file(&self.deps.inbox_dir, &dest_path, &bytes)?;
-
-            info!(
-                file = %dest_path.display(),
-                size = bytes.len(),
-                mime = %mime_type,
-                "Saved inbound Slack file"
-            );
-
-            attachments.push(aidaemon_channels::attachments::message_attachment(
-                dest_path,
-                sanitized,
+            // Through the transport: the token only goes to Slack hosts, a
+            // sign-in page (no `files:read`) is refused, and the size limit
+            // holds while downloading.
+            let bytes = aidaemon_channels::attachments::download_inbound(
+                self.transport.as_ref(),
+                &aidaemon_channels::Attachment::new(filename, download_url)
+                    .with_mime_type(Some(mime_type.to_string()))
+                    .with_size_bytes(Some(file_size).filter(|size| *size > 0)),
+                self.deps.max_file_size_mb,
+            )
+            .await?;
+            attachments.push(aidaemon_channels::attachments::save_inbound(
+                &self.deps.inbox_dir,
+                filename,
                 mime_type.to_string(),
-                bytes.len() as u64,
-            ));
+                &bytes,
+            )?);
         }
 
         Ok(attachments)
