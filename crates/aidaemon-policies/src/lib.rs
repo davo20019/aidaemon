@@ -30,6 +30,9 @@
 //! other hook allows. (The kernel refuses a call the owner already declined
 //! in the run before any hook sees it.)
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod approval;
 mod context_window;
 mod conversation;

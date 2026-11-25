@@ -74,29 +74,7 @@ use run::*;
 use state::*;
 use watch::*;
 
-/// What the tool keeps in its host's store: the agents it may run and their
-/// invocation log, the chat's recent history for a run's context, the goal
-/// and task a delegated run reports to, and notices for a chat no one reads.
-pub trait CliAgentStore:
-    aidaemon_tools::services::DynamicCliAgentStore
-    + aidaemon_tools::services::SettingsStore
-    + aidaemon_events::stores::MessageStore
-    + aidaemon_work::stores::GoalStore
-    + aidaemon_work::stores::TaskStore
-    + aidaemon_work::stores::NotificationStore
-{
-}
-
-impl<T> CliAgentStore for T where
-    T: aidaemon_tools::services::DynamicCliAgentStore
-        + aidaemon_tools::services::SettingsStore
-        + aidaemon_events::stores::MessageStore
-        + aidaemon_work::stores::GoalStore
-        + aidaemon_work::stores::TaskStore
-        + aidaemon_work::stores::NotificationStore
-        + ?Sized
-{
-}
+pub use crate::stores::CliAgentStore;
 
 /// `[cli_agents]`: the coding agents the daemon may run, and their limits.
 #[derive(Debug, Deserialize, Clone)]

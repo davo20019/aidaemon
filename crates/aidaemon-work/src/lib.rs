@@ -2,6 +2,9 @@
 //! Goals, mandates, tasks, work coordination and notifications: the domain
 //! types, the store traits and their SQLite implementation.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod admissibility;
 pub mod authority;
 pub mod automations;

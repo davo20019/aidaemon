@@ -13,6 +13,9 @@
 //! The runner is [`ChannelRunner`]; see [`runner`] for how to wire an agent,
 //! an [`EventRouter`] and channels together.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod admin_commands;
 #[cfg(feature = "conformance")]
 pub mod approval_conformance;

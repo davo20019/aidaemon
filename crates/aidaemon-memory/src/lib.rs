@@ -73,6 +73,9 @@
 //! `aidaemon_policies::Recall` (snippets for injection) in your own crate.
 //! The SDK only ever sees those traits.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod consolidation;

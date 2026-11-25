@@ -8,6 +8,9 @@
 //! relay handoff records) and the [`SecretStore`] holding the bridge key to
 //! [`spawn_if_configured`].
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};

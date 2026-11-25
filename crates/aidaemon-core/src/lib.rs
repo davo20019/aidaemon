@@ -15,6 +15,9 @@
 //! `examples/kernel_tour.rs` for a runnable tour of the kernel, and
 //! `aidaemon-sdk`'s `examples/quickstart.rs` for the shortest working agent.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod agent;
 mod approval;
 mod audience;

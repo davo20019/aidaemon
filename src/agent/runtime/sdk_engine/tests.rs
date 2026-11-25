@@ -4385,23 +4385,23 @@ fn no_name_keyed_dispatch_remains() {
         (
             "tool_calls.rs",
             include_str!(
-                "../../../../crates/aidaemon-runtime/src/engine/turn_engine/tool_calls.rs"
+                "../../../../crates/aidaemon-runtime-core/src/engine/turn_engine/tool_calls.rs"
             ),
         ),
         (
             "turn_hooks.rs",
             include_str!(
-                "../../../../crates/aidaemon-runtime/src/engine/turn_engine/turn_hooks.rs"
+                "../../../../crates/aidaemon-runtime-core/src/engine/turn_engine/turn_hooks.rs"
             ),
         ),
         (
             "turn_engine/mod.rs",
-            include_str!("../../../../crates/aidaemon-runtime/src/engine/turn_engine/mod.rs"),
+            include_str!("../../../../crates/aidaemon-runtime-core/src/engine/turn_engine/mod.rs"),
         ),
         ("approvals.rs", include_str!("../approvals.rs")),
         (
             "tool_roster.rs",
-            include_str!("../../../../crates/aidaemon-runtime/src/engine/tool_roster.rs"),
+            include_str!("../../../../crates/aidaemon-runtime-core/src/engine/tool_roster.rs"),
         ),
     ];
     let names = [

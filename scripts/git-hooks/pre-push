@@ -79,7 +79,7 @@ trap 'rm -f "$log"' EXIT
 sdk_crates=(aidaemon-core aidaemon-providers aidaemon-tools aidaemon-tool-browser
     aidaemon-store-sqlite aidaemon-mcp aidaemon-agents aidaemon-policies aidaemon-eval
     aidaemon-sdk aidaemon-macros aidaemon-memory aidaemon-events aidaemon-work
-    aidaemon-decisions aidaemon-runtime aidaemon-skills aidaemon-secrets aidaemon-nodes
+    aidaemon-decisions aidaemon-runtime-core aidaemon-runtime aidaemon-skills aidaemon-secrets aidaemon-nodes
     aidaemon-terminal-bridge aidaemon-client-protocol aidaemon-client-gateway
     aidaemon-channels aidaemon-channel-telegram aidaemon-channel-slack
     aidaemon-channel-discord aidaemon-parity-agent aidaemon-client-core aidaemon-surfaces aidaemon-shells)

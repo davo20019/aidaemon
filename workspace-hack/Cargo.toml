@@ -13,6 +13,10 @@ publish = false
 # The parts of the file between the BEGIN HAKARI SECTION and END HAKARI SECTION comments
 # are managed by hakari.
 
+# Its dependencies exist only to unify features; nothing uses them.
+[lints.cargo]
+unused_dependencies = "allow"
+
 ### BEGIN HAKARI SECTION
 [dependencies]
 aho-corasick = { version = "1" }

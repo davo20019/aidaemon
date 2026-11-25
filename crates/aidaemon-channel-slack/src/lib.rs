@@ -22,6 +22,9 @@
 //! `reply_in_thread` is on (the default), so their conversation id is
 //! `"{channel}:{ts}"`.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 #[cfg(feature = "bot")]
 pub mod bot;
 mod events;

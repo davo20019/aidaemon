@@ -21,13 +21,37 @@ pub use aidaemon_tools::services::{
 };
 pub use aidaemon_work::stores::*;
 
+/// What the CLI agent tool (`tools::cli_agent`) keeps in its host's store: the agents it may run and their
+/// invocation log, the chat's recent history for a run's context, the goal
+/// and task a delegated run reports to, and notices for a chat no one reads.
+pub trait CliAgentStore:
+    aidaemon_tools::services::DynamicCliAgentStore
+    + aidaemon_tools::services::SettingsStore
+    + aidaemon_events::stores::MessageStore
+    + aidaemon_work::stores::GoalStore
+    + aidaemon_work::stores::TaskStore
+    + aidaemon_work::stores::NotificationStore
+{
+}
+
+impl<T> CliAgentStore for T where
+    T: aidaemon_tools::services::DynamicCliAgentStore
+        + aidaemon_tools::services::SettingsStore
+        + aidaemon_events::stores::MessageStore
+        + aidaemon_work::stores::GoalStore
+        + aidaemon_work::stores::TaskStore
+        + aidaemon_work::stores::NotificationStore
+        + ?Sized
+{
+}
+
 /// Every store slice the agent host hands its parts, as one trait object.
 ///
 /// Implemented for any type that implements all of the slices.
 pub trait StateStore:
     Send
     + Sync
-    + crate::tools::cli_agent::CliAgentStore
+    + CliAgentStore
     + crate::turn::compaction::CompactionStore
     + MessageStore
     + DialogueStateStore

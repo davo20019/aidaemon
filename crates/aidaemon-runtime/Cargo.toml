@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon-runtime"
-description = "aidaemon's turn runtime: model routing and side calls, budgets, and the turn on top of the aidaemon-core kernel; internal to aidaemon, no stability promise"
+description = "aidaemon's turn runtime: the built-in tools and the agent on top of aidaemon-runtime-core, whose modules it re-exports; internal to aidaemon, no stability promise"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,16 +19,19 @@ exclude = ["tests/", "benches/"]
 [features]
 # Test-only helpers that dependents' test builds need, as `cfg(test)` cannot
 # reach across a crate boundary.
-testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing", "aidaemon-tools/testing"]
+testing = ["dep:tempfile", "aidaemon-runtime-core/testing", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing", "aidaemon-tools/testing"]
 # SQLCipher: `state::SqliteStateStore` applies a database's encryption key.
 # The host links SQLite with SQLCipher (`libsqlite3-sys/bundled-sqlcipher`).
-encryption = []
+encryption = ["aidaemon-runtime-core/encryption"]
 # The `computer_use` tool (desktop apps through accessibility and screenshots).
 computer_use = []
 # Its macOS harness (accessibility, window capture, input).
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo", "dep:image", "dep:aidaemon-surfaces"]
 
 [dependencies]
+# Everything but tools/ and agent/, re-exported at this crate's root (lib.rs):
+# split out so an edit to a tool recompiles this crate, not the whole runtime.
+aidaemon-runtime-core = { version = "0.24.0", path = "../aidaemon-runtime-core" }
 dunce = "1.0"
 aidaemon-agents = { version = "0.24.0", path = "../aidaemon-agents" }
 aidaemon-channels = { version = "0.24.0", path = "../aidaemon-channels" }

@@ -23,6 +23,9 @@
 //! Loopback only, with a local token from `aidaemon client-token`. The
 //! application supplies what only it knows through [`ClientHost`].
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod approvals;
 
 /// A tool call's kind of work as the app is told it: the daemon's card

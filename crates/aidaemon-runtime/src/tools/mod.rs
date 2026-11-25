@@ -24,7 +24,7 @@ mod semantic_command_risk;
 pub mod set_reminder;
 pub mod terminal;
 mod terminal_confined;
-pub mod terminal_grants;
+pub use crate::terminal_grants;
 
 /// The domain types and tool vocabulary these tools name.
 pub(crate) mod traits {

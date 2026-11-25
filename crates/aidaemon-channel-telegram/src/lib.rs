@@ -13,6 +13,9 @@
 //! assert_eq!(channel.name(), "telegram");
 //! ```
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod api;
 #[cfg(feature = "bot")]
 pub mod bot;

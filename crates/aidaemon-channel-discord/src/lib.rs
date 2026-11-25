@@ -28,6 +28,9 @@
 //! [`DiscordChannel::with_zlib_compression`] turns on `zlib-stream` transport
 //! compression.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 #[cfg(feature = "bot")]
 pub mod bot;
 mod format;

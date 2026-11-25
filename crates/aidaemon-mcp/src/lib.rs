@@ -33,6 +33,9 @@
 //! you pass) and is killed when the [`McpServer`] and every tool taken from
 //! it are dropped.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod client;
 pub mod registry;
 pub mod server;

@@ -475,10 +475,8 @@ pub fn group_followup(
                 bounded_child_response(end.report.text.trim(), max_report_chars).0
             }
             GroupWork::Checks => {
-                kept = crate::tools::terminal::keep_head_and_tail(
-                    end.report.text.trim(),
-                    max_report_chars,
-                );
+                kept =
+                    crate::text_cut::keep_head_and_tail(end.report.text.trim(), max_report_chars);
                 kept.as_str()
             }
         };

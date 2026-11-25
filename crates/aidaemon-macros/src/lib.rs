@@ -4,6 +4,9 @@
 //! runtime support the generated code needs (serde, schemars and the
 //! argument checks). The full reference is on `aidaemon_sdk::tool`.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};

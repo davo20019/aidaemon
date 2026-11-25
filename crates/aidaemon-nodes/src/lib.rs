@@ -10,6 +10,9 @@
 //! instance key ([`auth::load_or_create_instance_key`]) and the settings
 //! ([`config::NodesConfig`], the `[nodes]` config section).
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod announcement;
 pub mod auth;
 pub mod channel;

@@ -19,6 +19,9 @@
 //! its own confidence is often confidently wrong, so a rule like "act only
 //! when sure" should not run on a self-reported answer.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;

@@ -7,11 +7,11 @@ use std::path::Path;
 /// Files allowed to reach a provider without the gateway, each with its reason.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "crates/aidaemon-runtime/src/llm/",
+        "crates/aidaemon-runtime-core/src/llm/",
         "defines the runtime and the gateway",
     ),
     (
-        "crates/aidaemon-runtime/src/chat_bridge/",
+        "crates/aidaemon-runtime-core/src/chat_bridge/",
         "calls providers",
     ),
     ("src/llm_runtime/door_tests.rs", "these tests"),
@@ -26,7 +26,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     ("src/agent/runtime/llm.rs", "the main loop's failover"),
     (
-        "crates/aidaemon-runtime/src/engine/turn_engine/",
+        "crates/aidaemon-runtime-core/src/engine/turn_engine/",
         "the main loop (moved from src/agent/runtime/sdk_engine), including its own compaction",
     ),
 ];
@@ -63,7 +63,11 @@ fn rust_files_under(dir: &str) -> impl Iterator<Item = String> + use<> {
 }
 
 /// The daemon's code and the runtime crate's.
-const SCANNED: &[&str] = &["src", "crates/aidaemon-runtime/src"];
+const SCANNED: &[&str] = &[
+    "src",
+    "crates/aidaemon-runtime-core/src",
+    "crates/aidaemon-runtime/src",
+];
 
 fn scanned_files() -> impl Iterator<Item = String> {
     SCANNED.iter().flat_map(|dir| rust_files_under(dir))
@@ -90,10 +94,10 @@ fn nothing_outside_the_gateway_reaches_a_provider() {
 /// means the files were read, not skipped.
 #[test]
 fn the_scan_sees_the_gateway() {
-    assert!(
-        scanned_files().any(|path| path == "crates/aidaemon-runtime/src/llm/gateway.rs"
-            && reaches_a_provider(&path))
-    );
+    assert!(scanned_files().any(
+        |path| path == "crates/aidaemon-runtime-core/src/llm/gateway.rs"
+            && reaches_a_provider(&path)
+    ));
 }
 
 /// What reaches a decision backend directly. Callers ask through
@@ -111,7 +115,7 @@ const RAW_DECIDER: &[&str] = &[
 #[test]
 fn nothing_outside_the_gateway_holds_a_decider() {
     let offenders = scanned_files()
-        .filter(|path| !path.starts_with("crates/aidaemon-runtime/src/llm/"))
+        .filter(|path| !path.starts_with("crates/aidaemon-runtime-core/src/llm/"))
         .filter(|path| path != "src/llm_runtime/door_tests.rs")
         .filter(|path| {
             let text =

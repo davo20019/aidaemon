@@ -11,6 +11,9 @@
 //! [`BrowserSettings`], so a host can parse and validate its configuration
 //! without building Chrome support.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod settings;
 
 pub use settings::{BrowserSettings, SessionIsolation};

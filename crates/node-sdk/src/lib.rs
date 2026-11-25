@@ -1,3 +1,6 @@
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use aidaemon_node_protocol::*;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

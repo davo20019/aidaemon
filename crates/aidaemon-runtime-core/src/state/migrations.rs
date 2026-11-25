@@ -213,7 +213,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
 
     // The terminal's standing approvals (prefixes, capabilities,
     // trust-all) have one owner, which converts older shapes once.
-    crate::tools::terminal_grants::ensure_schema(pool).await?;
+    crate::terminal_grants::ensure_schema(pool).await?;
 
     // Command patterns for learning command safety over time
     sqlx::query(

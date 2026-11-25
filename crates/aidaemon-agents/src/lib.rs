@@ -69,6 +69,9 @@
 //! delegation is re-run if annotated idempotent and marked indeterminate
 //! otherwise, and nothing the child did is repeated.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod specialist;
 
 use std::collections::HashMap;

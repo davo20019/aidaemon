@@ -68,6 +68,9 @@
 //!
 //! See the SDK guide at <https://docs.aidaemon.ai/sdk>.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub use aidaemon_core::*;
 
 /// Test helpers: the kernel's scripted provider and response builders and,

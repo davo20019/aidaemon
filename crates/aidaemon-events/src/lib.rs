@@ -3,6 +3,9 @@
 //! Sits on a host's SQLite pool the way `aidaemon-store-sqlite` and
 //! `aidaemon_memory::sqlite` do, and owns the `events` table contract.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod attachments;
 pub mod checkpoint_audit;
 pub mod context;

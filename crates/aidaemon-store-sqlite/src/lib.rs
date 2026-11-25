@@ -39,6 +39,9 @@
 //! # Ok(()) }
 //! ```
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 #[cfg(feature = "channels")]
 mod approvals;
 #[cfg(feature = "client-events")]

@@ -327,29 +327,7 @@ impl DaemonJudge {
     }
 }
 
-/// A coding agent's run, as a card it raises names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Asker {
-    /// The run's id.
-    pub run: String,
-    /// Its agent ("Codex").
-    pub agent: String,
-}
-
-/// The asks being judged now, by the id of the daemon call each is judged
-/// as ([`daemon_call`] makes it unique): the card an ask raises reads its
-/// run here ([`asker_of`]).
-static ASKING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Asker>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// The run whose agent's ask is daemon call `call_id`, while it is judged.
-pub fn asker_of(call_id: &str) -> Option<Asker> {
-    ASKING
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(call_id)
-        .cloned()
-}
+pub use crate::approvals::agent_asks::{Asker, asker_of};
 
 /// The daemon call an action is judged as: the daemon tool whose judgment
 /// applies, with arguments its schema takes.
@@ -429,12 +407,9 @@ impl ActionJudge for DaemonJudge {
             return self.authorize(call).await;
         };
         let id = call.id.clone();
-        ASKING
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id.clone(), asker.clone());
+        crate::approvals::agent_asks::begin(&id, asker.clone());
         let verdict = self.authorize(call).await;
-        ASKING.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        crate::approvals::agent_asks::end(&id);
         verdict
     }
 }

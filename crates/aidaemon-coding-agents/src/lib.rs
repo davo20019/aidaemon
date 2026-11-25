@@ -20,6 +20,9 @@
 //! its arguments, environment and stdin ([`Launch`], [`Plan`]) and reads
 //! its output through the host ([`read_through`]).
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 pub mod acp;
 mod action;
 mod agent;

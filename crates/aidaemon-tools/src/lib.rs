@@ -38,6 +38,9 @@
 //! # let _ = agent; Ok(()) }
 //! ```
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use std::sync::Arc;
 
 use aidaemon_core::Tool;

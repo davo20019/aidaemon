@@ -16,6 +16,9 @@
 //! - A shell ends when the owner closes it, its program exits or its
 //!   conversation goes; never on a clock.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

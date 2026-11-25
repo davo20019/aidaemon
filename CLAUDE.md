@@ -102,7 +102,10 @@ background tasks`.
 - `src/startup/`: subsystem setup (stores, provider/router, tools, skills, MCP,
   memory, channels, DB security, wiring).
 - `src/agent/`: the daemon's `Agent` (construction, host ports) and the
-  runtime's tests on it. The runtime is `crates/aidaemon-runtime/src/`:
+  runtime's tests on it. The runtime is `crates/aidaemon-runtime-core/src/`
+  (everything but the built-in tools and the agent, which are
+  `crates/aidaemon-runtime/src/{tools,agent}`; that crate re-exports core's
+  modules, so `aidaemon_runtime::turn` paths are unchanged):
   `turn/` (bootstrap, closeout, completion, memory), `engine/` (tool roster,
   gate, dispatch) and `engine/turn_engine/`, one turn on the SDK kernel.
 - Tools: `crates/aidaemon-tools` and `crates/aidaemon-runtime/src/tools/`
@@ -112,7 +115,7 @@ background tasks`.
   traits, which live in the crates that own them; `src/traits/state_store.rs`
   keeps only what the app assembles itself (`StateStore`, `MandateToolStore`,
   `SkillsStore`, `HealthCheckStore`).
-- State: `crates/aidaemon-runtime/src/state/` (the SQLite `StateStore` and
+- State: `crates/aidaemon-runtime-core/src/state/` (the SQLite `StateStore` and
   its schema; `src/state/` re-exports). Goals, mandates, tasks, work
   coordination and notifications: `crates/aidaemon-work/src/sqlite/`; task
   plans: `crates/aidaemon-work/src/plans/`. Memory: `crates/aidaemon-memory`
@@ -129,21 +132,21 @@ background tasks`.
 - `deploy/`: setup for the project's public servers, `relay.aidaemon.ai`
   (iroh-relay, the remote-access default) and `dns.aidaemon.ai` (address
   lookup). They must run the workspace's iroh version; see `deploy/README.md`.
-- Specialists: prompts in `crates/aidaemon-runtime/specialists/<kind>.md`, user overrides in
-  `~/.aidaemon/specialists/`, code in `crates/aidaemon-runtime/src/specialists/`, exposed via
+- Specialists: prompts in `crates/aidaemon-runtime-core/specialists/<kind>.md`, user overrides in
+  `~/.aidaemon/specialists/`, code in `crates/aidaemon-runtime-core/src/specialists/`, exposed via
   `spawn_agent`.
 - MCP: `src/startup/mcp.rs`, `crates/aidaemon-mcp` (`manage_mcp` is
-  `registry/manage.rs`), `crates/aidaemon-runtime/src/state/dynamic_mcp.rs`.
+  `registry/manage.rs`), `crates/aidaemon-runtime-core/src/state/dynamic_mcp.rs`.
 - Project memory: notes per project id in `aidaemon_memory::project`
   (files, never the database); a turn's project is resolved from typed state
-  in `aidaemon-runtime/src/turn/turn_project.rs` and gated by
+  in `aidaemon-runtime-core/src/turn/turn_project.rs` and gated by
   `turn::memory::memory_project` (owner, private/internal, no mandate).
   Personal-only categories never become notes (`project::route`).
 
 ## Project Instruction Loading
 
 The daemon's agents load project guidance through
-`crates/aidaemon-runtime/src/turn/project_instructions.rs`
+`crates/aidaemon-runtime-core/src/turn/project_instructions.rs`
 (one shared resolver for direct and CLI agents; keep it that way). Per
 directory it prefers `AGENTS.override.md`, then `AGENTS.md`, then `CLAUDE.md` /
 `GEMINI.md`; never `README.md`. The owner's `~/.aidaemon/AGENTS.md` comes

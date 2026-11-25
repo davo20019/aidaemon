@@ -5,6 +5,9 @@
 //! the other two; everything else must pass for all three.
 //!
 //! cargo run -p aidaemon-parity-agent
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use std::sync::Arc;
 
 use aidaemon_sdk::memory::{HashEmbedder, Memory, ScopedMemory, SqliteMemoryStore};

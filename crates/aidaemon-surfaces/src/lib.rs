@@ -17,6 +17,9 @@
 //!   stream keeps only its newest frame.
 //! - Only the device holding the lease sends input.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod registry;
 mod types;
 

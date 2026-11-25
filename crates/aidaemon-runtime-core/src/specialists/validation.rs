@@ -81,7 +81,7 @@ mod tests {
     /// a dropped tool at spawn means "not available here", never a typo.
     #[test]
     fn bundled_specialists_name_only_real_tools() {
-        // The workspace root: this crate sits at `crates/aidaemon-runtime`.
+        // The workspace root: this crate sits at `crates/aidaemon-runtime-core`.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut sources = String::new();
         let mut stack = vec![root.join("src"), root.join("crates")];
@@ -96,7 +96,7 @@ mod tests {
             }
         }
         let mut checked = 0;
-        for entry in std::fs::read_dir(root.join("crates/aidaemon-runtime/specialists"))
+        for entry in std::fs::read_dir(root.join("crates/aidaemon-runtime-core/specialists"))
             .unwrap()
             .flatten()
         {

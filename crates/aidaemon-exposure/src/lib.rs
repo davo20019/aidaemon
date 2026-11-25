@@ -12,6 +12,9 @@
 //! as a foreground child that is stopped with the daemon, never as a
 //! background service.
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 

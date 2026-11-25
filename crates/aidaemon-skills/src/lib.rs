@@ -8,6 +8,9 @@
 //! ([`promotion::SkillPromoter`]), and gives the tools that manage them
 //! ([`tools`]: `use_skill`, `skill_resources`, `manage_skills`).
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};

@@ -34,6 +34,7 @@ use crate::host::DecisionRecorder;
 use crate::turn::tool_dispatch::{ScopeCheck, access_manifest_scope_check, names_sensitive_path};
 use crate::untrusted::UntrustedVerifier;
 
+pub mod agent_asks;
 pub mod broker;
 
 pub use broker::ApprovalBroker;
@@ -1028,7 +1029,7 @@ impl OwnerApprovalResolver<'_> {
         // A coding agent a run launched asks: its card names that run
         // (typed, by the ask's own call id), so a client shows which agent
         // waits on the owner.
-        let card = match crate::tools::agent_mode::asker_of(&interruption.call.id) {
+        let card = match agent_asks::asker_of(&interruption.call.id) {
             Some(asker) => {
                 let mut shown = card.into_owned();
                 if let Some(card) = &mut shown.card {
@@ -1330,7 +1331,7 @@ impl DetachedNestedJudge {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Answer {
         let card = asked_by(self.mission.as_deref(), request);
-        let card = match crate::tools::agent_mode::asker_of(&call.id) {
+        let card = match agent_asks::asker_of(&call.id) {
             Some(asker) => {
                 let mut shown = card.into_owned();
                 if let Some(card) = &mut shown.card {

@@ -81,6 +81,9 @@
 //! # }
 //! ```
 
+// Feature unification only (cargo-hakari); keeps the unused-dependency lint quiet.
+use workspace_hack as _;
+
 mod report;
 mod runner;
 mod scenario;
