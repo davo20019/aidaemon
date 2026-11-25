@@ -525,9 +525,6 @@ impl crate::tools::traits::ToolSemantics for ScheduleTaskTool {
         call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> crate::tools::traits::OwnerApprovalNeed {
-        if call.refused {
-            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
-        }
         let Ok(args) = serde_json::from_value::<ScheduleTaskArgs>(call.arguments.clone()) else {
             return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
         };

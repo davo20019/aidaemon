@@ -579,9 +579,6 @@ impl ToolSemantics for NodeRestartTool {
         call: &ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         let Ok(args) = serde_json::from_value::<NodeRestartArgs>(call.arguments.clone()) else {
             return OwnerApprovalNeed::NotNeeded;
         };

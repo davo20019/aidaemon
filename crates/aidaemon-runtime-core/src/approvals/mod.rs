@@ -482,6 +482,11 @@ impl AppApprovalRules {
             TerminalScope::Escalate(escalation) => (false, Some(escalation)),
             TerminalScope::InScope => (false, None),
         };
+        // A call the dispatcher refuses runs nothing, so nothing about it
+        // needs the owner: no tool is asked.
+        if refused {
+            return rule_decision(OwnerApprovalNeed::NotNeeded);
+        }
         let approval_call = ApprovalCall {
             arguments: &judged.call.arguments,
             as_sent: &call.arguments,

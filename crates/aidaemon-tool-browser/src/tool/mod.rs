@@ -3389,9 +3389,6 @@ impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
         call: &aidaemon_tools::semantics::ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> aidaemon_tools::semantics::OwnerApprovalNeed {
-        if call.refused {
-            return aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded;
-        }
         match self.kernel_approval_need(call.arguments, facts).await {
             Some((request, ..)) => aidaemon_tools::semantics::OwnerApprovalNeed::Ask(request),
             None => aidaemon_tools::semantics::OwnerApprovalNeed::Unjudged,

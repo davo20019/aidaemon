@@ -1782,9 +1782,6 @@ impl crate::tools::traits::ToolSemantics for ComputerUseTool {
         call: &crate::tools::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> crate::tools::traits::OwnerApprovalNeed {
-        if call.refused {
-            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
-        }
         match self.owner_approval_need(call.arguments, facts).await {
             Some(need) => crate::tools::traits::OwnerApprovalNeed::Ask(need.request),
             None => crate::tools::traits::OwnerApprovalNeed::Unjudged,

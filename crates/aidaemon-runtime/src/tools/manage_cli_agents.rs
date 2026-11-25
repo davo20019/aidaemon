@@ -415,9 +415,6 @@ impl crate::tools::traits::ToolSemantics for ManageCliAgentsTool {
         call: &crate::tools::traits::ApprovalCall<'_>,
         _facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         if let Some(need) = self.stored_agent_approval(call.arguments).await {
             return need;
         }

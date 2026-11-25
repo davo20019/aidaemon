@@ -338,7 +338,6 @@ mod tests {
     /// dispatcher refuses need no card.
     #[tokio::test]
     async fn set_privacy_asks_before_widening_a_memory() {
-        use crate::traits::ToolSemantics;
         use aidaemon_memory::stores::FactStore as _;
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -388,16 +387,6 @@ mod tests {
                 );
             }
         }
-        let args = set("report_format", "global");
-        let refused = crate::traits::ApprovalCall {
-            refused: true,
-            ..crate::traits::ApprovalCall::as_sent(&args)
-        };
-        assert!(matches!(
-            tool.owner_approval_request(&refused, &Default::default())
-                .await,
-            crate::traits::OwnerApprovalNeed::NotNeeded
-        ));
     }
 
     /// A security-sensitive config change asks the owner in every session;
@@ -442,16 +431,6 @@ mod tests {
                 );
             }
         }
-        let args = json!({"action": "set", "key": "provider.base_url", "value": "\"x\""});
-        let refused = crate::traits::ApprovalCall {
-            refused: true,
-            ..crate::traits::ApprovalCall::as_sent(&args)
-        };
-        assert!(matches!(
-            tool.owner_approval_request(&refused, &Default::default())
-                .await,
-            crate::traits::OwnerApprovalNeed::NotNeeded
-        ));
     }
 
     /// `manage_cli_agents`'s approval judgment without its CLI registry: the
@@ -465,9 +444,6 @@ mod tests {
             call: &crate::traits::ApprovalCall<'_>,
             _facts: &crate::traits::ToolCallContext,
         ) -> crate::traits::OwnerApprovalNeed {
-            if call.refused {
-                return crate::traits::OwnerApprovalNeed::NotNeeded;
-            }
             crate::tools::ManageCliAgentsTool::owner_approval(call.arguments)
         }
     }
@@ -638,7 +614,6 @@ mod tests {
     /// need no card, and neither does a call the dispatcher refuses.
     #[tokio::test]
     async fn http_auth_changes_always_ask_before_dispatch() {
-        use crate::traits::ToolSemantics;
         let dir = tempfile::TempDir::new().unwrap();
         let concrete = Arc::new(crate::tools::ManageHttpAuthTool::new(
             crate::config::config_file(synthetic_auth_config(&dir)),
@@ -701,17 +676,6 @@ mod tests {
                     "{args}"
                 );
             }
-            let refused = crate::traits::ApprovalCall {
-                arguments: &upsert,
-                as_sent: &upsert,
-                refused: true,
-            };
-            assert_eq!(
-                concrete
-                    .owner_approval_request(&refused, &crate::traits::ToolCallContext::default())
-                    .await,
-                crate::traits::OwnerApprovalNeed::NotNeeded
-            );
         }
     }
 
@@ -722,7 +686,6 @@ mod tests {
     /// does a call the dispatcher refuses.
     #[tokio::test]
     async fn oauth_changes_always_ask_before_dispatch() {
-        use crate::traits::ToolSemantics;
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
         std::fs::write(
@@ -873,17 +836,6 @@ mod tests {
                     "{args}"
                 );
             }
-            let refused = crate::traits::ApprovalCall {
-                arguments: &register,
-                as_sent: &register,
-                refused: true,
-            };
-            assert_eq!(
-                concrete
-                    .owner_approval_request(&refused, &crate::traits::ToolCallContext::default())
-                    .await,
-                crate::traits::OwnerApprovalNeed::NotNeeded
-            );
         }
     }
 

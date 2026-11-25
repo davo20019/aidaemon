@@ -232,9 +232,6 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
         if let Some(reason) = Self::unreadable_reason(call.arguments) {
             return OwnerApprovalNeed::Ask(self.unreadable_request(call.as_sent, &reason));
         }
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         let trust = TerminalTrust::for_approval(facts);
         match TerminalTool::owner_approval_request(self, call.arguments, &trust).await {
             Ok(Some(request)) => OwnerApprovalNeed::Ask(request),

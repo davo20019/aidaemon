@@ -257,7 +257,7 @@ impl ToolSemantics for HandOverTool {
         call: &ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
-        if call.refused || facts.user_role != Some(UserRole::Owner) {
+        if facts.user_role != Some(UserRole::Owner) {
             return OwnerApprovalNeed::NotNeeded;
         }
         let Some(session) = facts.session() else {

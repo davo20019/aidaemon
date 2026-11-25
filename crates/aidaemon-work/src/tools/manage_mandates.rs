@@ -2300,9 +2300,6 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
         call: &crate::traits::ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> crate::traits::OwnerApprovalNeed {
-        if call.refused {
-            return crate::traits::OwnerApprovalNeed::NotNeeded;
-        }
         self.owner_approval(call.arguments, facts).await
     }
 

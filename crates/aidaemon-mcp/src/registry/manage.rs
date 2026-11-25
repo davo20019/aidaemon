@@ -802,9 +802,6 @@ impl ToolSemantics for ManageMcpTool {
         call: &ApprovalCall<'_>,
         facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
             && args.action == "project_start"
         {

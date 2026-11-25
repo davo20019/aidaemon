@@ -1913,9 +1913,6 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
         facts: &ToolCallContext,
     ) -> crate::tools::traits::OwnerApprovalNeed {
         use crate::tools::traits::OwnerApprovalNeed;
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         let Ok(args) = serde_json::from_value::<Args>(call.arguments.clone()) else {
             return OwnerApprovalNeed::NotNeeded;
         };

@@ -248,9 +248,6 @@ impl crate::tools::traits::ToolSemantics for ManageMemoriesTool {
         call: &crate::tools::traits::ApprovalCall<'_>,
         _facts: &ToolCallContext,
     ) -> crate::tools::traits::OwnerApprovalNeed {
-        if call.refused {
-            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
-        }
         self.memory.privacy_approval(call.arguments).await
     }
 

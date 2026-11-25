@@ -233,9 +233,6 @@ impl aidaemon_tools::semantics::ToolSemantics for ManageMemoriesTool {
         call: &ApprovalCall<'_>,
         _facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         self.privacy_approval(call.arguments).await
     }
 

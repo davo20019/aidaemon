@@ -3333,9 +3333,6 @@ impl aidaemon_tools::semantics::ToolSemantics for ManageSkillsTool {
         call: &aidaemon_tools::semantics::ApprovalCall<'_>,
         _facts: &ToolCallContext,
     ) -> aidaemon_tools::semantics::OwnerApprovalNeed {
-        if call.refused {
-            return aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded;
-        }
         let need = Self::owner_approval(call.arguments, !self.registry_urls.is_empty());
         self.with_draft_shown(need, call.arguments).await
     }

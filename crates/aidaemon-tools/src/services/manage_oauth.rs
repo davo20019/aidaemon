@@ -1473,9 +1473,6 @@ impl crate::semantics::ToolSemantics for ManageOAuthTool {
         call: &crate::semantics::ApprovalCall<'_>,
         _facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
-        if call.refused {
-            return OwnerApprovalNeed::NotNeeded;
-        }
         self.owner_approval(call.arguments).await
     }
 
