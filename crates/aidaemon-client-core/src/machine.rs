@@ -435,16 +435,19 @@ pub fn transport_of(url: &str) -> Transport {
 }
 
 /// `http://host:port` (or a socket address) as the gateway's socket URL.
+/// Any path on `base` is dropped; [`socket_url_at`] keeps it.
 pub fn socket_url(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    let (scheme, rest) = match base.split_once("://") {
-        Some(("https", rest)) => ("wss", rest),
-        Some(("http", rest)) => ("ws", rest),
-        Some((other, rest)) => (other, rest),
-        None => ("ws", base),
+    let origin = match base.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{}", rest.split('/').next().unwrap_or(rest)),
+        None => base.split('/').next().unwrap_or(base).to_string(),
     };
-    let host = rest.split('/').next().unwrap_or(rest);
-    format!("{scheme}://{host}/client/v1/ws")
+    socket_url_at(&origin)
+}
+
+/// The gateway's socket URL under `base`, path kept (a gateway reached
+/// over iroh is served under one).
+pub fn socket_url_at(base: &str) -> String {
+    crate::surfaces::path_socket_url(base, "/client/v1/ws")
 }
 
 /// A new request id.

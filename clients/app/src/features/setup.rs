@@ -27,18 +27,6 @@ fn lead(label: impl IntoReactive<SharedString>) -> Text {
         .text_color(colors::MUTED)
 }
 
-fn labeled(label: &'static str, control: impl IntoElement) -> View {
-    view()
-        .gap_1p5()
-        .child(
-            text(label)
-                .text_size(px(type_scale::XS))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors::MUTED),
-        )
-        .child(control)
-}
-
 /// A provider or its model by name, behind the provider's mark when it has
 /// one.
 fn provider_name(preset: &str, name: String, weight: FontWeight) -> View {
@@ -277,11 +265,11 @@ fn pair_elsewhere(store: Store) -> View {
             "A server or another computer that stays on. Start `aidaemon` there; it prints a link \
              and a code. Paste the link here."
         }))
-        .child(labeled(
+        .child(ui::labeled(
             "Pairing link",
             field("https://…/client/v1/pair#…", link_text),
         ))
-        .child(labeled(
+        .child(ui::labeled(
             "This device's name",
             field(if link::MOBILE { "Phone" } else { "Desktop" }, name),
         ))
@@ -679,12 +667,12 @@ fn choices(
                                 }
                                 if needs_base_url && local {
                                     // Its usual address unless another is named.
-                                    form = form.child(labeled(
+                                    form = form.child(ui::labeled(
                                         "Address (leave empty for its usual one)",
                                         field("http://localhost:8081/v1", base_url),
                                     ));
                                 } else if needs_base_url {
-                                    form = form.child(labeled(
+                                    form = form.child(ui::labeled(
                                         "Address",
                                         field("https://api.example.com/v1", base_url),
                                     ));
@@ -723,12 +711,12 @@ fn choices(
                                     ));
                                 }
                                 if needs_base_url && !local {
-                                    form = form.child(labeled(
+                                    form = form.child(ui::labeled(
                                         "API key (leave empty if your server needs none)",
                                         secret_field("Paste the key", key),
                                     ));
                                 } else if !local {
-                                    form = form.child(labeled(
+                                    form = form.child(ui::labeled(
                                         "API key",
                                         secret_field("Paste the key", key),
                                     ));
@@ -798,7 +786,7 @@ fn choices(
                                                     found.models.len()
                                                 )
                                             }))
-                                            .child(labeled(
+                                            .child(ui::labeled(
                                                 "Model",
                                                 view().flex_row().child(ui::choice(
                                                     "Model",
@@ -998,12 +986,12 @@ fn channel_step(store: Store) -> View {
                                             crate::features::links::open_https(help.clone());
                                         },
                                     ))
-                                    .child(labeled(
+                                    .child(ui::labeled(
                                         "Bot token",
                                         secret_field("Paste the bot's token", token),
                                     ));
                                 if option.needs_app_token {
-                                    form = form.child(labeled(
+                                    form = form.child(ui::labeled(
                                         "App-level token",
                                         secret_field("xapp-…", app_token),
                                     ));

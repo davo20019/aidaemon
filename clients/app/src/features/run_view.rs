@@ -944,11 +944,14 @@ pub(crate) fn result_facts(
             RunMismatch::ChangeNotSeen { path } => {
                 format!(
                     "Says it changed {}, but no change was seen",
-                    file_name(path)
+                    super::files::file_name(path)
                 )
             }
             RunMismatch::ChangeNotClaimed { path } => {
-                format!("Changed {} without saying so", file_name(path))
+                format!(
+                    "Changed {} without saying so",
+                    super::files::file_name(path)
+                )
             }
             RunMismatch::CheckNotRun { command } | RunMismatch::CheckFailed { command }
                 if reported(command) =>
@@ -970,7 +973,7 @@ pub(crate) fn result_facts(
 
 /// A file a run changed; in a coding conversation it opens its diff.
 fn changed_file(store: Store, path: String, coding: bool) -> View {
-    let name = file_name(&path).to_string();
+    let name = super::files::file_name(&path).to_string();
     let tint = if coding {
         colors::ACCENT
     } else {
@@ -999,10 +1002,6 @@ fn changed_file(store: Store, path: String, coding: bool) -> View {
     } else {
         row
     }
-}
-
-fn file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// The steps of a run the view wasn't opened on: one quiet line that

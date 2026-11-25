@@ -559,7 +559,8 @@ fn shown_file(store: Store, link: AttachmentRef, size_bytes: u64) -> View {
         }))
 }
 
-fn status_letter(status: FileStatus) -> (&'static str, Tone) {
+/// A changed file's one-letter mark and its tone.
+pub(crate) fn status_letter(status: FileStatus) -> (&'static str, Tone) {
     match status {
         FileStatus::Added => ("A", Tone::Success),
         FileStatus::Untracked => ("U", Tone::Success),
@@ -570,7 +571,8 @@ fn status_letter(status: FileStatus) -> (&'static str, Tone) {
     }
 }
 
-fn status_word(status: FileStatus) -> &'static str {
+/// How a file changed, in words.
+pub(crate) fn status_word(status: FileStatus) -> &'static str {
     match status {
         FileStatus::Added => "added",
         FileStatus::Untracked => "new, not yet in git",
@@ -598,6 +600,11 @@ fn size_words(bytes: u64) -> String {
     } else {
         format!("{size:.0} {}", UNITS[unit])
     }
+}
+
+/// The last part of a path (either separator).
+pub(crate) fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 #[cfg(test)]

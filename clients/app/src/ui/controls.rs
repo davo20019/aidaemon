@@ -1583,7 +1583,7 @@ pub fn focus_band(s: nsh_core::element::StyleRefinement) -> nsh_core::element::S
 /// accessibility label is not drawn).
 pub fn labeled(caption: &'static str, control: impl IntoElement) -> View {
     view()
-        .gap(px(4.0))
+        .gap_1p5()
         .child(
             text(caption)
                 .text_size(px(type_scale::XS))

@@ -457,7 +457,7 @@ fn group_summary(runs: &[RunSummary]) -> String {
     files.dedup();
     match files.as_slice() {
         [] => {}
-        [one] => line.push_str(&format!(" · changed {}", file_name(one))),
+        [one] => line.push_str(&format!(" · changed {}", super::files::file_name(one))),
         many => line.push_str(&format!(" · changed {} files", many.len())),
     }
     let start = runs.iter().map(|r| r.started_at_ms).min().unwrap_or(0);
@@ -571,7 +571,10 @@ fn run_line(r: &RunSummary) -> String {
         RunPhase::Running => r.step.clone(),
         RunPhase::Succeeded => match r.edited.len() {
             0 => "Finished".into(),
-            1 => format!("Finished · changed {}", file_name(&r.edited[0])),
+            1 => format!(
+                "Finished · changed {}",
+                super::files::file_name(&r.edited[0])
+            ),
             n => format!("Finished · changed {n} files"),
         },
         RunPhase::Failed => match &r.reason {
@@ -598,11 +601,6 @@ fn run_line(r: &RunSummary) -> String {
     } else {
         format!("{name} · {state}")
     }
-}
-
-/// A path's last part.
-fn file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// A request's runs, a row each (under its group's line when there are
@@ -1107,7 +1105,11 @@ fn delegated_agent_card(
         if let Some(report) = &result.report
             && !report.changed_files.is_empty()
         {
-            let names: Vec<&str> = report.changed_files.iter().map(|p| file_name(p)).collect();
+            let names: Vec<&str> = report
+                .changed_files
+                .iter()
+                .map(|p| super::files::file_name(p))
+                .collect();
             body = body.child(fact(
                 Glyph::File,
                 ui::Tone::Neutral,

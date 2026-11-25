@@ -202,55 +202,53 @@ pub async fn pair_remote(store: Store, link: String, name: String) -> Result<(),
 /// come back to the engine thread and into the [`Store`].
 pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
     use aidaemon_client_core::surfaces::{self, MediaEvent};
-    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<MediaEvent>();
-    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    // Closing drops the only sender: the socket task closes and ends.
-    let sender = std::rc::Rc::new(std::cell::RefCell::new(Some(out_tx)));
-    let send = {
-        let sender = sender.clone();
-        move |text: String| {
-            if let Some(tx) = sender.borrow().as_ref() {
-                let _ = tx.send(text);
-            }
-        }
-    };
-    store.media_attached(
-        epoch,
-        crate::store::MediaLink {
-            send: Box::new(send),
-            close: Box::new(move || {
-                sender.borrow_mut().take();
-            }),
-        },
+    let attach = store;
+    open_socket(
+        move |link| attach.media_attached(epoch, link),
+        move |events, outgoing| surfaces::run(url, ticket, events, outgoing),
+        move |event| store.media_event(epoch, event),
+        |event| matches!(event, MediaEvent::Closed(_)),
+        MediaEvent::Closed,
+        "the live view",
     );
-    spawn(async move {
-        let started = background(async move {
-            tokio::spawn(surfaces::run(url, ticket, events_tx, out_rx));
-        })
-        .await;
-        if started.is_err() {
-            store.media_event(
-                epoch,
-                MediaEvent::Closed("could not start the live view".into()),
-            );
-            return;
-        }
-        let mut closed = false;
-        while let Some(event) = events.recv().await {
-            closed |= matches!(event, MediaEvent::Closed(_));
-            store.media_event(epoch, event);
-        }
-        if !closed {
-            store.media_event(epoch, MediaEvent::Closed("the connection dropped".into()));
-        }
-    });
 }
 
 /// Open a conversation shell's socket on the background runtime; its
 /// events come back to the engine thread and into the [`Store`].
 pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
     use aidaemon_client_core::shells::{self, ShellEvent};
-    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<ShellEvent>();
+    let attach = store;
+    open_socket(
+        move |link| attach.shell_attached(epoch, link),
+        move |events, outgoing| shells::run(url, ticket, events, outgoing),
+        move |event| store.shell_event(epoch, event),
+        |event| matches!(event, ShellEvent::Closed(_)),
+        ShellEvent::Closed,
+        "the shell",
+    );
+}
+
+/// Open a ticketed socket (a live view's, a shell's): hand the UI its
+/// [`crate::store::SocketLink`] through `attach`, run `run` on the
+/// background runtime, and `deliver` each event on the engine thread, a
+/// closing one (`closed_event`) last even when the connection just drops.
+fn open_socket<E, F>(
+    attach: impl FnOnce(crate::store::SocketLink),
+    run: impl FnOnce(
+        tokio::sync::mpsc::UnboundedSender<E>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> F
+    + Send
+    + 'static,
+    deliver: impl Fn(E) + 'static,
+    is_closed: fn(&E) -> bool,
+    closed_event: fn(String) -> E,
+    what: &'static str,
+) where
+    E: Send + 'static,
+    F: std::future::Future<Output = String> + Send + 'static,
+{
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<E>();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     // Closing drops the only sender: the socket task closes and ends.
     let sender = std::rc::Rc::new(std::cell::RefCell::new(Some(out_tx)));
@@ -262,34 +260,28 @@ pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
             }
         }
     };
-    store.shell_attached(
-        epoch,
-        crate::store::ShellLink {
-            send: Box::new(send),
-            close: Box::new(move || {
-                sender.borrow_mut().take();
-            }),
-        },
-    );
+    attach(crate::store::SocketLink {
+        send: Box::new(send),
+        close: Box::new(move || {
+            sender.borrow_mut().take();
+        }),
+    });
     spawn(async move {
         let started = background(async move {
-            tokio::spawn(shells::run(url, ticket, events_tx, out_rx));
+            tokio::spawn(run(events_tx, out_rx));
         })
         .await;
         if started.is_err() {
-            store.shell_event(
-                epoch,
-                ShellEvent::Closed("could not start the shell".into()),
-            );
+            deliver(closed_event(format!("could not start {what}")));
             return;
         }
         let mut closed = false;
         while let Some(event) = events.recv().await {
-            closed |= matches!(event, ShellEvent::Closed(_));
-            store.shell_event(epoch, event);
+            closed |= is_closed(&event);
+            deliver(event);
         }
         if !closed {
-            store.shell_event(epoch, ShellEvent::Closed("the connection dropped".into()));
+            deliver(closed_event("the connection dropped".into()));
         }
     });
 }

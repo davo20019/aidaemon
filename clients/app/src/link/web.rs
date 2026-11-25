@@ -568,7 +568,7 @@ pub fn start(store: Store) {
             let iroh = over_iroh();
             // Over iroh the base has a path, which `socket_url` drops.
             let url = if iroh {
-                format!("{}/client/v1/ws", base.replacen("http", "ws", 1))
+                aidaemon_client_core::machine::socket_url_at(&base)
             } else {
                 aidaemon_client_core::machine::socket_url(&base)
             };
@@ -917,19 +917,12 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
                         uri: f["uri"].as_str().unwrap_or_default().to_owned(),
                     }
                 }
-                "header" => match serde_json::from_str::<MediaHeader>(&text) {
-                    Ok(MediaHeader::Ready { .. }) => MediaEvent::Ready,
-                    Ok(MediaHeader::Controller { controller }) => {
-                        MediaEvent::Controller(controller)
-                    }
-                    Ok(MediaHeader::Closed { reason }) => MediaEvent::Closed(reason),
-                    Ok(MediaHeader::Focus {
-                        what,
-                        label,
-                        rect,
-                        typing,
-                    }) => aidaemon_client_core::surfaces::focus_event(what, label, rect, typing),
-                    _ => continue,
+                "header" => match serde_json::from_str::<MediaHeader>(&text)
+                    .ok()
+                    .and_then(aidaemon_client_core::surfaces::header_event)
+                {
+                    Some(event) => event,
+                    None => continue,
                 },
                 _ => MediaEvent::Closed(text),
             };

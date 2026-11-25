@@ -65,9 +65,9 @@ pub fn pairing(store: Store) -> View {
                     .line_height(px(type_scale::LH_SM))
                     .text_color(colors::MUTED),
             )
-            .child(when(!from_link, move || labeled("Offer", field("Offer id from the link", offer))))
-            .child(labeled("Code", field("Pairing code", code)))
-            .child(labeled("Device name", field("How the daemon will list this device", name)))
+            .child(when(!from_link, move || ui::labeled("Offer", field("Offer id from the link", offer))))
+            .child(ui::labeled("Code", field("Pairing code", code)))
+            .child(ui::labeled("Device name", field("How the daemon will list this device", name)))
             .child(
                 view().flex_row().child(
                     btn("Pair", Variant::Primary, Size::Md, submit)
@@ -81,18 +81,6 @@ pub fn pairing(store: Store) -> View {
                 Some(untracked(move || status_message(message, tone)))
             })),
     )
-}
-
-fn labeled(label: &'static str, control: impl IntoElement) -> View {
-    view()
-        .gap_1p5()
-        .child(
-            text(label)
-                .text_size(px(type_scale::XS))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(colors::MUTED),
-        )
-        .child(control)
 }
 
 /// Where pairing a phone from this computer stands.

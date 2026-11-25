@@ -208,12 +208,12 @@ fn file_list(root: String, files: Vec<FileChange>, open: Signal<Option<(String, 
     let rows = files
         .into_iter()
         .map(|file| {
-            let (letter, tone) = status(file.status);
+            let (letter, tone) = super::files::status_letter(file.status);
             ui::TreeFile {
                 label: format!(
                     "{}, {}{}",
                     file.path,
-                    status_word(file.status),
+                    super::files::status_word(file.status),
                     if file.by_session {
                         ", written in this conversation"
                     } else {
@@ -381,28 +381,6 @@ pub fn file_patch(patch: &str, path: &str) -> String {
         }
     }
     out
-}
-
-fn status(status: FileStatus) -> (&'static str, Tone) {
-    match status {
-        FileStatus::Added => ("A", Tone::Success),
-        FileStatus::Untracked => ("U", Tone::Success),
-        FileStatus::Deleted => ("D", Tone::Danger),
-        FileStatus::Renamed => ("R", Tone::Info),
-        FileStatus::Modified => ("M", Tone::Warning),
-        FileStatus::Unknown => ("?", Tone::Neutral),
-    }
-}
-
-fn status_word(status: FileStatus) -> &'static str {
-    match status {
-        FileStatus::Added => "added",
-        FileStatus::Untracked => "new, not yet in git",
-        FileStatus::Deleted => "deleted",
-        FileStatus::Renamed => "renamed",
-        FileStatus::Modified => "modified",
-        FileStatus::Unknown => "changed",
-    }
 }
 
 /// How `path` in repository `root` changed, as last read.

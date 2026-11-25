@@ -64,14 +64,15 @@ pub fn socket_url(http_base: &str, transport: &SurfaceTransport) -> String {
 }
 
 /// The WebSocket URL of `path` on the gateway at `http_base` (`https://host`
-/// becomes `wss://host`, `http://` becomes `ws://`): a live view's or a
-/// shell's socket.
+/// becomes `wss://host`, `http://` becomes `ws://`, another scheme stays,
+/// none is `ws://`): a live view's, a shell's or the client's socket.
 pub fn path_socket_url(http_base: &str, path: &str) -> String {
     let base = http_base.trim_end_matches('/');
     let ws = match base.split_once("://") {
         Some(("https", rest)) => format!("wss://{rest}"),
         Some(("http", rest)) => format!("ws://{rest}"),
-        _ => format!("ws://{base}"),
+        Some(_) => base.to_string(),
+        None => format!("ws://{base}"),
     };
     format!("{ws}{path}")
 }
@@ -156,16 +157,24 @@ pub fn key_press(code: &str, key: &str) -> [SurfaceInput; 2] {
 /// A binary message from the frame socket.
 pub fn read(bytes: &[u8]) -> Option<MediaEvent> {
     let (header, payload) = media::decode(bytes).ok()?;
-    Some(match header {
-        MediaHeader::Ready { .. } => MediaEvent::Ready,
+    match header {
         MediaHeader::Frame {
             seq, codec, w, h, ..
-        } => MediaEvent::Frame {
+        } => Some(MediaEvent::Frame {
             seq,
             w,
             h,
             uri: data_uri(&codec, payload)?,
-        },
+        }),
+        other => header_event(other),
+    }
+}
+
+/// The event a header other than a frame's means (a frame's image comes
+/// with its payload: [`read`]). `None` for a frame or an unknown header.
+pub fn header_event(header: MediaHeader) -> Option<MediaEvent> {
+    Some(match header {
+        MediaHeader::Ready { .. } => MediaEvent::Ready,
         MediaHeader::Controller { controller } => MediaEvent::Controller(controller),
         MediaHeader::Closed { reason } => MediaEvent::Closed(reason),
         MediaHeader::Focus {
@@ -174,7 +183,7 @@ pub fn read(bytes: &[u8]) -> Option<MediaEvent> {
             rect,
             typing,
         } => focus_event(what, label, rect, typing),
-        MediaHeader::Unknown => return None,
+        MediaHeader::Frame { .. } | MediaHeader::Unknown => return None,
     })
 }
 

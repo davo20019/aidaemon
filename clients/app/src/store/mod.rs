@@ -251,12 +251,15 @@ const NEW: &str = "";
 /// Where commands go: the link of this platform.
 pub type Outbox = Box<dyn Fn(String, Command)>;
 
-/// A live view's frame socket as the platform's link opened it: send a
-/// message to it, or close it.
-pub struct MediaLink {
+/// A ticketed socket (a live view's frames, a shell's output) as the
+/// platform's link opened it: send a message to it, or close it.
+pub struct SocketLink {
     pub send: Box<dyn Fn(String)>,
     pub close: Box<dyn Fn()>,
 }
+
+/// A live view's frame socket.
+pub type MediaLink = SocketLink;
 
 /// The client's reads that pages build from, each a memo: a page rebuilds
 /// when its own read changes, not on every frame.

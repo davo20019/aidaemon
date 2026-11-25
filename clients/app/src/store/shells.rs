@@ -15,10 +15,7 @@ use aidaemon_client_protocol::{ShellInfo, ShellTransport};
 use super::Store;
 
 /// A shell socket as the link opened it.
-pub struct ShellLink {
-    pub send: Box<dyn Fn(String)>,
-    pub close: Box<dyn Fn()>,
-}
+pub type ShellLink = super::SocketLink;
 
 /// Where a terminal view takes its shell's events.
 pub type ShellSink = Rc<dyn Fn(ShellEvent)>;
@@ -32,15 +29,9 @@ pub(super) struct Attached {
 }
 
 /// The socket address of a shell: `transport.url` (a path) on the gateway
-/// at `http_base` (`https://host` becomes `wss://host`).
+/// at `http_base`.
 fn socket_url(http_base: &str, transport: &ShellTransport) -> String {
-    let base = http_base.trim_end_matches('/');
-    let ws = match base.split_once("://") {
-        Some(("https", rest)) => format!("wss://{rest}"),
-        Some(("http", rest)) => format!("ws://{rest}"),
-        _ => format!("ws://{base}"),
-    };
-    format!("{ws}{}", transport.url)
+    aidaemon_client_core::surfaces::path_socket_url(http_base, &transport.url)
 }
 
 impl Store {
