@@ -400,3 +400,52 @@ mod tests {
         assert_eq!(relative, aidaemon_core::CallEffects::unknown());
     }
 }
+
+mod persistence_tests {
+    use super::*;
+    use crate::fs::test_support::EditFileTool;
+    use crate::semantics::{ApprovalCall, OwnerApprovalNeed, ToolCallContext, ToolSemantics};
+
+    /// A write into a shell start-up file, a launch agent, a git hook or the
+    /// agent's own instructions asks the owner; an ordinary write does not
+    /// judge (the policy's other rules decide).
+    #[tokio::test]
+    async fn writes_that_plant_persistence_ask_the_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let write = WriteFileTool::new(crate::testing::active_execution_backend());
+        let edit = EditFileTool::new(crate::testing::active_execution_backend());
+        let facts = ToolCallContext::default();
+        for target in [
+            home.join(".zshrc"),
+            home.join("Library/LaunchAgents/com.example.synthetic.plist"),
+            home.join("repo/.git/hooks/pre-commit"),
+            home.join(".aidaemon/AGENTS.md"),
+        ] {
+            let args = json!({"path": target.to_string_lossy(), "content": "x"});
+            let need = write
+                .owner_approval_request(&ApprovalCall::as_sent(&args), &facts)
+                .await;
+            assert!(
+                matches!(need, OwnerApprovalNeed::Ask(_)),
+                "{target:?}: {need:?}"
+            );
+            let edit_args = json!({
+                "path": target.to_string_lossy(),
+                "old_text": "a",
+                "new_text": "b"
+            });
+            let need = edit
+                .owner_approval_request(&ApprovalCall::as_sent(&edit_args), &facts)
+                .await;
+            assert!(matches!(need, OwnerApprovalNeed::Ask(_)), "edit {target:?}");
+        }
+        let ordinary = json!({"path": home.join("notes.md").to_string_lossy(), "content": "x"});
+        assert_eq!(
+            write
+                .owner_approval_request(&ApprovalCall::as_sent(&ordinary), &facts)
+                .await,
+            OwnerApprovalNeed::Unjudged
+        );
+    }
+}

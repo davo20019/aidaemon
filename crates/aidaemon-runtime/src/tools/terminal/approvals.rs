@@ -232,6 +232,12 @@ impl TerminalTool {
             || trust.untrusted_source
             || trust.trusted_session
             || approval_floor_reason(command).is_some()
+            || aidaemon_tools::command_risk::persistence_floor_reason(
+                command,
+                args.working_dir.as_deref(),
+                &[],
+            )
+            .is_some()
         {
             return None;
         }
@@ -323,6 +329,9 @@ impl TerminalTool {
     ///   1. capability escalation  → new authority always asks
     ///   2. daemonization          → the owner's Critical daemonization card
     ///   3. untrusted trigger      → external triggers always ask
+    ///  3b. persistence path       → a change naming a shell start-up file,
+    ///      launch agent, cron entry, git hook or the daemon's instructions
+    ///      always asks (before the trusted session and every grant)
     ///   4. detach && !allowed     → novel detached commands ask
     ///   5. trusted session        → scheduled tasks run without asking; this
     ///      precedes the floor on purpose (an explicit owner grant: unattended
@@ -345,6 +354,17 @@ impl TerminalTool {
         let daemon_hits = detect_daemonization_primitives(command);
         let daemonization = !daemon_hits.is_empty();
         let deterministic_approval_floor = approval_floor_reason(command);
+        let declared_writes = args
+            .write_paths
+            .iter()
+            .chain(args.write_roots.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let persistence_floor = aidaemon_tools::command_risk::persistence_floor_reason(
+            command,
+            args.working_dir.as_deref(),
+            &declared_writes,
+        );
         let mut approval_risk = RiskLevel::High;
         let mut approval_warnings = Vec::new();
         if args.detach && !daemonization {
@@ -380,6 +400,14 @@ impl TerminalTool {
                 .push("Command originated from an untrusted external trigger.".to_string());
             info!(command = %LoggedCommand(command), risk = %approval_risk, "Forcing approval: untrusted source");
             true
+        } else if let Some(reason) = persistence_floor {
+            // A write that plants something run or obeyed later (a shell
+            // start-up file, a launch agent, a git hook, the daemon's own
+            // instructions) asks every time: no grant, scheduled session or
+            // confined tier stands in for the owner seeing it.
+            approval_warnings.push(reason);
+            info!(command = %LoggedCommand(command), "Forcing approval: persistence path");
+            true
         } else if args.detach && !is_allowed {
             // Allowlisted commands (permanent or session approvals) may run
             // detached without asking again; only novel detached commands do.
@@ -400,7 +428,14 @@ impl TerminalTool {
             info!(command = %LoggedCommand(command), "Auto-approved: allowlisted command runs confined");
             false
         } else if let Some(side_calls) = self.side_calls.get() {
-            match assess_command(side_calls, command, &self.backend).await {
+            match assess_command(
+                side_calls,
+                command,
+                args.working_dir.as_deref(),
+                &self.backend,
+            )
+            .await
+            {
                 Ok(semantic) => {
                     approval_risk = semantic.risk_level;
                     approval_warnings = semantic.warnings;

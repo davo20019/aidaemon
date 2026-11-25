@@ -354,9 +354,103 @@ pub fn approval_floor_reason(command: &str) -> Option<String> {
     None
 }
 
+/// Why a command that changes things must ask the owner because it names a
+/// persistence path ([`crate::path_class::is_persistence_path`]): a shell
+/// start-up file, a launch agent, a cron entry, a git hook, the daemon's
+/// own instructions. Every argument word counts (a redirection target
+/// glued to `>` too), and `extra` paths (the call's declared write paths
+/// and roots); relative ones resolve against `working_dir` when it is
+/// absolute. A command that only observes is never asked about here.
+pub fn persistence_floor_reason(
+    command: &str,
+    working_dir: Option<&str>,
+    extra: &[String],
+) -> Option<String> {
+    let base = working_dir
+        .map(str::trim)
+        .filter(|dir| std::path::Path::new(dir).is_absolute());
+    let resolve = |word: &str| -> Option<std::path::PathBuf> {
+        let word = word.trim_start_matches(['>', '<', '&', '|']).trim();
+        let word = word
+            .split_once('=')
+            .filter(|(key, _)| key.starts_with('-'))
+            .map_or(word, |(_, value)| value);
+        if word.is_empty() || word.starts_with('-') {
+            return None;
+        }
+        let expanded = shellexpand::tilde(word).into_owned();
+        let path = std::path::PathBuf::from(&expanded);
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            base.map(|base| std::path::Path::new(base).join(&expanded))
+        }
+    };
+    // A redirection glued to a word (`x>>~/.bashrc`) targets what follows it.
+    let names = |word: &str| {
+        [word, word.rsplit(['>', '<']).next().unwrap_or(word)]
+            .iter()
+            .filter_map(|word| resolve(word))
+            .any(|path| crate::path_class::is_persistence_path(&path, &[]))
+    };
+    if let Some(path) = extra.iter().find(|path| names(path)) {
+        return Some(format!(
+            "Writes {path}, which runs or is loaded automatically later (persists beyond the task)."
+        ));
+    }
+    if crate::command_effects::command_effects(command).observation_only {
+        return None;
+    }
+    for (segment, _) in split_by_operators(command) {
+        let Ok(parts) = shell_words::split(&segment) else {
+            continue;
+        };
+        if let Some(word) = parts.iter().skip(1).find(|word| names(word)) {
+            return Some(format!(
+                "Command names {word}, which runs or is loaded automatically later (persists beyond the task)."
+            ));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_naming_a_persistence_path_asks() {
+        for command in [
+            "echo 'export X=1' >> ~/.zshrc",
+            "echo x>>~/.bashrc",
+            "cp agent.plist ~/Library/LaunchAgents/",
+            "tee /srv/app/.git/hooks/pre-commit < hook",
+            "ln -sf /tmp/x ~/.aidaemon/AGENTS.md",
+        ] {
+            assert!(
+                persistence_floor_reason(command, None, &[]).is_some(),
+                "{command}"
+            );
+        }
+        assert!(
+            persistence_floor_reason("cp hook .git/hooks/pre-push", Some("/srv/app"), &[])
+                .is_some()
+        );
+        assert!(
+            persistence_floor_reason(
+                "make install",
+                None,
+                &["/home/synthetic/.config/systemd/user".to_string()]
+            )
+            .is_some()
+        );
+        for command in ["cat ~/.zshrc", "cargo build", "cp a b", "echo hi > out.txt"] {
+            assert!(
+                persistence_floor_reason(command, Some("/srv/app"), &[]).is_none(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn operator_split_respects_quotes() {

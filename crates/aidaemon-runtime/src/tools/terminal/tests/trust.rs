@@ -909,9 +909,11 @@ async fn a_request_to_a_site_on_this_computer_is_not_outbound() {
     }
 }
 
-/// Ordinary local work on the host (builds, tests, local git, file
-/// shuffling) is not egress; programs outside the local-work table,
-/// inline interpreters and remote git are.
+/// Ordinary local work on the host (local git, file shuffling) is not
+/// egress; a build or test runner is, since it runs whatever the project's
+/// files define (a turn that read untrusted content may just have written
+/// that `Makefile` or test). Programs outside the local-work table, inline
+/// interpreters and remote git are egress too.
 #[tokio::test]
 async fn host_local_work_is_not_egress() {
     let (host, _) = host_and_sandboxed_terminals().await;
@@ -922,19 +924,28 @@ async fn host_local_work_is_not_egress() {
         )
     };
     for local in [
-        "cargo test",
-        "cargo +nightly build --release",
-        "cargo test 2>&1 | tail -n 50",
         "git add -A && git commit -m x",
         "mkdir -p build && cp a build/",
-        "npm run build",
-        "python3 scripts/check.py --fast",
-        "go test ./...",
-        "make -j4 && ls build",
+        "cargo fmt",
     ] {
         let annotations = ann(local);
         assert!(!annotations.egress, "{local} is local work");
         assert!(!annotations.read_only, "{local} still mutates");
+    }
+    for runs_project_code in [
+        "cargo test",
+        "cargo +nightly build --release",
+        "cargo test 2>&1 | tail -n 50",
+        "npm run build",
+        "python3 scripts/check.py --fast",
+        "go test ./...",
+        "make -j4 && ls build",
+        "pytest tests/test_x.py",
+    ] {
+        assert!(
+            ann(runs_project_code).egress,
+            "{runs_project_code} runs project code on the host"
+        );
     }
     for egress in [
         "python3 -c \"print(1)\"",

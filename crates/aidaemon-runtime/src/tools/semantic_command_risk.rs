@@ -19,6 +19,25 @@ use aidaemon_tools::backend::SharedExecutionBackend;
 use aidaemon_tools::semantics::RiskLevel;
 
 const MAX_REFERENCED_FILES: usize = 3;
+
+/// The files a build or test runner reads its instructions from, in the
+/// folder it runs in: what such a run does is what these say, so the
+/// classifier sees them (a turn may just have written one).
+const PROJECT_CODE_DEFINITIONS: &[&str] = &[
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "package.json",
+    "build.rs",
+    "conftest.py",
+    "setup.py",
+    "noxfile.py",
+    "tox.ini",
+    "CMakeLists.txt",
+    "justfile",
+    "Rakefile",
+    "build.gradle",
+];
 const MAX_REFERENCED_FILE_CHARS: usize = 8_000;
 
 const ALLOWED_EFFECTS: &[&str] = &[
@@ -114,6 +133,7 @@ fn classifier_messages(
     backend_kind: &str,
     backend_id: &str,
     workspace_root: &str,
+    working_dir: Option<&str>,
     allows_outside_workspace: bool,
     referenced_files: &[ReferencedFileContext],
 ) -> Vec<Value> {
@@ -123,6 +143,7 @@ fn classifier_messages(
             "backend_kind": backend_kind,
             "backend_id": backend_id,
             "workspace_root": workspace_root,
+            "working_dir": working_dir.unwrap_or(workspace_root),
             "backend_allows_outside_workspace": allows_outside_workspace
         },
         "command": command,
@@ -208,23 +229,75 @@ fn backend_path_is_within(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(separator))
 }
 
+/// The scripts `command` names, and (for a build or test runner) the
+/// project files that define what it runs, read where the command runs:
+/// relative paths resolve against the call's own absolute working
+/// directory, else the workspace root. Only files inside the workspace or
+/// that working directory are read.
 async fn referenced_file_context(
     backend: &SharedExecutionBackend,
     command: &str,
+    working_dir: Option<&str>,
 ) -> Vec<ReferencedFileContext> {
     let workspace = backend
         .canonicalize(backend.workspace_root())
         .await
         .unwrap_or_else(|_| backend.workspace_root().clone());
+    let base = working_dir
+        .map(str::trim)
+        .filter(|dir| std::path::Path::new(dir).is_absolute());
+    let base_canonical = match base {
+        Some(dir) => match backend.resolve_path(dir).await {
+            Ok(resolved) => backend.canonicalize(&resolved).await.ok(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let join = |candidate: &str| match base {
+        Some(dir)
+            if !std::path::Path::new(candidate).is_absolute() && !candidate.starts_with('~') =>
+        {
+            format!("{}/{candidate}", dir.trim_end_matches(['/', '\\']))
+        }
+        _ => candidate.to_string(),
+    };
+    let mut candidates = script_path_candidates(command)
+        .iter()
+        .map(|candidate| join(candidate))
+        .collect::<Vec<_>>();
+    if aidaemon_tools::command_effects::command_effects(command).runs_project_code {
+        candidates.extend(
+            PROJECT_CODE_DEFINITIONS
+                .iter()
+                .map(|name| join(name))
+                .take(PROJECT_CODE_DEFINITIONS.len()),
+        );
+    }
+    let within = |path: &str| {
+        backend_path_is_within(path, workspace.as_str())
+            || base_canonical
+                .as_ref()
+                .is_some_and(|dir| backend_path_is_within(path, dir.as_str()))
+    };
     let mut files = Vec::new();
-    for candidate in script_path_candidates(command) {
+    let mut definitions = 0;
+    let script_count = script_path_candidates(command).len();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let is_definition = index >= script_count;
+        if is_definition && definitions >= MAX_REFERENCED_FILES {
+            break;
+        }
         let Ok(resolved) = backend.resolve_path(&candidate).await else {
             continue;
         };
         let Ok(canonical) = backend.canonicalize(&resolved).await else {
             continue;
         };
-        if !backend_path_is_within(canonical.as_str(), workspace.as_str()) {
+        if !within(canonical.as_str())
+            || files
+                .iter()
+                .any(|f: &ReferencedFileContext| f.path == canonical.as_str())
+        {
             continue;
         }
         let Ok(metadata) = backend.metadata(&canonical).await else {
@@ -240,6 +313,7 @@ async fn referenced_file_context(
             continue;
         };
         let truncated = content.chars().count() > MAX_REFERENCED_FILE_CHARS;
+        definitions += usize::from(is_definition);
         files.push(ReferencedFileContext {
             path: canonical.to_string(),
             content: aidaemon_events::text::truncate_str(content, MAX_REFERENCED_FILE_CHARS),
@@ -324,14 +398,16 @@ fn parse_assessment(raw: &str) -> Option<SemanticCommandAssessment> {
 pub(crate) async fn assess_command(
     gateway: &SideCallGateway,
     command: &str,
+    working_dir: Option<&str>,
     backend: &SharedExecutionBackend,
 ) -> anyhow::Result<SemanticCommandAssessment> {
-    let referenced_files = referenced_file_context(backend, command).await;
+    let referenced_files = referenced_file_context(backend, command, working_dir).await;
     let messages = classifier_messages(
         command,
         backend.kind().as_str(),
         backend.id(),
         backend.workspace_root().as_str(),
+        working_dir,
         backend.allows_outside_workspace(),
         &referenced_files,
     );
@@ -529,6 +605,7 @@ mod tests {
         assess_command(
             gateway,
             command,
+            None,
             &aidaemon_tools::testing::active_execution_backend(),
         )
         .await
@@ -645,6 +722,7 @@ mod tests {
             "local",
             "local:test",
             "/workspace",
+            None,
             false,
             &[],
         );
@@ -694,11 +772,47 @@ mod tests {
                 .unwrap(),
         );
 
-        let files = referenced_file_context(&backend, "python3 check.py").await;
+        let files = referenced_file_context(&backend, "python3 check.py", None).await;
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("check.py"));
         assert_eq!(files[0].content, "print('semantic script context')\n");
         assert!(!files[0].truncated);
+    }
+
+    /// A relative script resolves where the call runs, not at the
+    /// workspace root, and a build runner's own definition (its
+    /// `Makefile`) is shown too.
+    #[tokio::test]
+    async fn scripts_and_build_definitions_resolve_in_the_calls_working_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let sub = directory.path().join("sub");
+        tokio::fs::create_dir_all(&sub).await.unwrap();
+        tokio::fs::write(directory.path().join("check.py"), "print('root')\n")
+            .await
+            .unwrap();
+        tokio::fs::write(sub.join("check.py"), "print('sub')\n")
+            .await
+            .unwrap();
+        tokio::fs::write(sub.join("Makefile"), "all:\n\techo synthetic\n")
+            .await
+            .unwrap();
+        let config = aidaemon_tools::execution::ExecutionConfig {
+            workspace_root: Some(directory.path().to_string_lossy().into_owned()),
+            allow_outside_workspace: Some(false),
+            ..aidaemon_tools::execution::ExecutionConfig::default()
+        };
+        let backend: SharedExecutionBackend = Arc::new(
+            aidaemon_tools::execution::local_backend(&config)
+                .await
+                .unwrap(),
+        );
+        let sub_dir = sub.to_string_lossy().into_owned();
+        let files = referenced_file_context(&backend, "python3 check.py", Some(&sub_dir)).await;
+        assert_eq!(files[0].content, "print('sub')\n");
+        assert!(files.iter().all(|file| file.content != "print('root')\n"));
+        let files = referenced_file_context(&backend, "make", Some(&sub_dir)).await;
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].path.ends_with("Makefile"));
     }
 
     #[test]

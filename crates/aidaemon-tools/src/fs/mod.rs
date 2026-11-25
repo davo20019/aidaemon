@@ -130,6 +130,13 @@ pub trait FilePolicy: Send + Sync {
     fn refusal_hint(&self, _path: &Path) -> Option<String> {
         None
     }
+    /// Whether writing `path` plants something that runs or is obeyed later
+    /// without anyone asking (a shell start-up file, a launch agent, a git
+    /// hook, the app's own instruction files): such a write always asks
+    /// the owner.
+    fn is_persistence(&self, path: &Path) -> bool {
+        crate::path_class::is_persistence_path(path, &[])
+    }
 }
 
 /// The policy for tools confined to a [`Workspace`].
@@ -258,6 +265,64 @@ impl FilePolicy for HostFilePolicy {
     fn plants_configuration(&self, path: &str) -> bool {
         crate::command_effects::is_git_config_path(path)
     }
+
+    fn is_persistence(&self, path: &Path) -> bool {
+        self.paths.is_persistence(path)
+    }
+}
+
+/// The owner card a file-tool write needs when its target plants
+/// persistence ([`FilePolicy::is_persistence`]), judged on the path as
+/// written, as the backend resolves it, and with its folder's symlinks
+/// resolved. `Unjudged` for any other write, so the policy's other rules
+/// decide; an exact mandate grant covers it.
+pub(crate) async fn persistence_write_approval(
+    backend: &SharedBackend,
+    policy: &dyn FilePolicy,
+    tool: &str,
+    arguments: &Value,
+    effects: CallEffects,
+    facts: &crate::semantics::ToolCallContext,
+) -> crate::semantics::OwnerApprovalNeed {
+    use crate::semantics::OwnerApprovalNeed;
+    if facts.mandate_preapproved {
+        return OwnerApprovalNeed::Unjudged;
+    }
+    let Some(raw) = path_arg(arguments).map(str::trim).filter(|p| !p.is_empty()) else {
+        return OwnerApprovalNeed::Unjudged;
+    };
+    let mut candidates = vec![std::path::PathBuf::from(
+        shellexpand::tilde(raw).into_owned(),
+    )];
+    if let Ok(resolved) = backend.resolve_path(raw).await {
+        let resolved_path = std::path::PathBuf::from(resolved.as_str());
+        if let (Some(parent), Some(name)) = (resolved_path.parent(), resolved_path.file_name())
+            && let Ok(parent) = backend
+                .canonicalize(&BackendPath::new(parent.to_string_lossy().into_owned()))
+                .await
+        {
+            candidates.push(Path::new(parent.as_str()).join(name));
+        }
+        candidates.push(resolved_path);
+    }
+    let Some(target) = candidates.iter().find(|path| policy.is_persistence(path)) else {
+        return OwnerApprovalNeed::Unjudged;
+    };
+    let target = target.display().to_string();
+    OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+        effects: effects.keys,
+        summary: format!(
+            "Write {target}? What this file holds runs or is followed later without asking \
+             (a shell start-up file, login item, scheduled job, git hook or the agent's own \
+             instructions)."
+        ),
+        subject: format!("{tool} {target}"),
+        risk: aidaemon_core::ApprovalRisk::High,
+        warnings: vec![format!(
+            "{target} runs or is loaded automatically later; a change there persists beyond this task."
+        )],
+        card: None,
+    })
 }
 
 pub(crate) fn workspace_parts(workspace: Workspace) -> (SharedBackend, Arc<dyn FilePolicy>) {

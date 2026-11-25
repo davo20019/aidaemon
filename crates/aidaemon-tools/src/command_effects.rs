@@ -27,6 +27,14 @@ pub struct CommandEffects {
     /// target cannot be read structurally (variables, substitutions, piped
     /// arguments, `git clean`).
     pub delete_targets: Option<Vec<String>>,
+    /// Some command runs code the project defines: a build or test runner
+    /// (`make`, `cargo build`, `npm run`, `pytest`, ...) executes the
+    /// project's own build scripts, tests and hooks, and an interpreter
+    /// handed a script runs that script. Local work by its shape, but what
+    /// it does is whatever the project's files say, so on an unconfined
+    /// host it can reach anything. Over-reports (wrappers and groupings are
+    /// unwrapped) rather than miss.
+    pub runs_project_code: bool,
 }
 
 /// Executables whose invocation only reads or prints, matched on the bare
@@ -722,6 +730,10 @@ pub fn command_effects(command: &str) -> CommandEffects {
         observation_only: is_observation_only(command),
         deletes,
         local_work_only: is_local_work_only(command),
+        runs_project_code: command.contains("$'")
+            || expanded_commands(command)
+                .iter()
+                .any(|tokens| runs_project_code(basename(&tokens[0]), &tokens[1..])),
         delete_targets: if command.contains("$'") {
             None
         } else {
@@ -916,6 +928,89 @@ pub fn literal_path_operands(command: &str) -> Vec<String> {
         }
     }
     operands
+}
+
+/// Build and test runners, with the subcommands that run project code
+/// (build scripts, tests, package scripts, plugins). An empty list: every
+/// invocation does.
+const PROJECT_CODE_RUNNERS: &[(&str, &[&str])] = &[
+    ("make", &[]),
+    ("gmake", &[]),
+    ("cmake", &[]),
+    ("ninja", &[]),
+    ("pytest", &[]),
+    ("tox", &[]),
+    ("nox", &[]),
+    ("xcodebuild", &[]),
+    ("gradle", &[]),
+    ("gradlew", &[]),
+    ("mvn", &[]),
+    ("rake", &[]),
+    ("python", &[]),
+    ("python3", &[]),
+    ("node", &[]),
+    ("deno", &[]),
+    ("bun", &[]),
+    ("ruby", &[]),
+    ("perl", &[]),
+    ("php", &[]),
+    (
+        "cargo",
+        &[
+            "build", "b", "check", "c", "test", "t", "clippy", "run", "r", "bench", "doc", "d",
+            "install",
+        ],
+    ),
+    (
+        "npm",
+        &[
+            "test",
+            "t",
+            "run",
+            "run-script",
+            "build",
+            "lint",
+            "start",
+            "install",
+            "i",
+            "ci",
+            "exec",
+            "x",
+        ],
+    ),
+    (
+        "pnpm",
+        &[
+            "test", "t", "run", "build", "lint", "start", "install", "i", "exec", "dlx",
+        ],
+    ),
+    (
+        "yarn",
+        &["test", "run", "build", "lint", "start", "install"],
+    ),
+    ("npx", &[]),
+    ("go", &["test", "run", "generate"]),
+    ("swift", &["build", "test", "run"]),
+];
+
+/// Whether this one command runs code the project defines
+/// ([`CommandEffects::runs_project_code`]).
+fn runs_project_code(program: &str, args: &[String]) -> bool {
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    let Some((_, subcommands)) = PROJECT_CODE_RUNNERS
+        .iter()
+        .find(|(name, _)| *name == program)
+    else {
+        return false;
+    };
+    if subcommands.is_empty() {
+        return true;
+    }
+    // The first word that is not an option or a toolchain selector.
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
+        .is_none_or(|subcommand| subcommands.contains(&subcommand))
 }
 
 fn is_local_work_only(command: &str) -> bool {
@@ -4666,6 +4761,36 @@ mod tests {
             "cargo build",
         ] {
             assert!(!only_reads_this_computer(not_a_read), "{not_a_read}");
+        }
+    }
+
+    /// A build or test runner runs the project's own code; moving files or
+    /// local git does not.
+    #[test]
+    fn build_and_test_runners_run_project_code() {
+        for runner in [
+            "make",
+            "make -C sub all",
+            "cargo test -q",
+            "cargo +nightly build",
+            "cd /srv/app && npm run build",
+            "pytest tests/test_x.py",
+            "python3 scripts/gen.py",
+            "go test ./...",
+            "env FOO=1 make",
+        ] {
+            assert!(command_effects(runner).runs_project_code, "{runner}");
+        }
+        for plain in [
+            "git status",
+            "cp a b",
+            "mkdir -p out",
+            "cargo fmt",
+            "cargo tree",
+            "ls -la",
+            "npm view left-pad",
+        ] {
+            assert!(!command_effects(plain).runs_project_code, "{plain}");
         }
     }
 

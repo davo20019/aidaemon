@@ -58,6 +58,117 @@ pub const SECRET_READ_PATTERNS: &[&str] = &[
     "secrets",
 ];
 
+/// Shell start-up files: whatever they hold runs in every new shell.
+const SHELL_STARTUP_FILES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".cshrc",
+    ".tcshrc",
+    ".kshrc",
+    ".mkshrc",
+    ".xprofile",
+    ".xinitrc",
+    ".xsessionrc",
+    "microsoft.powershell_profile.ps1",
+    "profile.ps1",
+];
+
+/// Folders whose files the system starts on its own (at login, on a
+/// schedule, as a service), as consecutive path components.
+const STARTUP_FOLDERS: &[&[&str]] = &[
+    &["Library", "LaunchAgents"],
+    &["Library", "LaunchDaemons"],
+    &["Library", "StartupItems"],
+    &["systemd", "user"],
+    &["systemd", "system"],
+    &[".config", "autostart"],
+    &[".config", "environment.d"],
+    &[".config", "fish", "conf.d"],
+    &["etc", "cron.d"],
+    &["etc", "cron.daily"],
+    &["etc", "cron.hourly"],
+    &["etc", "cron.weekly"],
+    &["etc", "cron.monthly"],
+    &["var", "spool", "cron"],
+    &["etc", "profile.d"],
+    &["Start Menu", "Programs", "Startup"],
+    &[".git", "hooks"],
+    &[".husky"],
+];
+
+/// Files under the daemon's own folder that later turns load as
+/// instructions: the owner's `AGENTS.md` (and its override), specialist
+/// prompts and skills.
+const DAEMON_INSTRUCTION_ENTRIES: &[&str] =
+    &["AGENTS.md", "AGENTS.override.md", "specialists", "skills"];
+
+/// The daemon's own folder name under the home directory.
+const DAEMON_DIR_NAME: &str = ".aidaemon";
+
+/// Whether writing `path` plants something that runs or is obeyed later
+/// without anyone asking: a shell start-up file, a login item, launch
+/// agent, service unit, cron entry or git hook, or instructions the daemon
+/// loads into every later prompt (`~/.aidaemon/AGENTS.md`, specialists,
+/// skills). `daemon_dirs` are the daemon's own folders (where its config
+/// lives) besides the default `~/.aidaemon`.
+pub fn is_persistence_path(path: &Path, daemon_dirs: &[PathBuf]) -> bool {
+    let components: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    if path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy();
+        SHELL_STARTUP_FILES.iter().any(|file| eq(&name, file))
+            || eq(&name, "crontab")
+            || (eq(&name, "config.fish")
+                && components
+                    .iter()
+                    .rev()
+                    .nth(1)
+                    .is_some_and(|dir| eq(dir, "fish")))
+    }) {
+        return true;
+    }
+    let holds_run = |run: &[&str]| {
+        components
+            .windows(run.len())
+            .any(|window| window.iter().zip(run).all(|(c, r)| eq(c, r)))
+    };
+    if STARTUP_FOLDERS.iter().any(|run| holds_run(run)) {
+        return true;
+    }
+    // `~/.aidaemon/<entry>` and `<daemon dir>/<entry>`.
+    let under_entry = |dir_len: usize| {
+        components
+            .get(dir_len)
+            .is_some_and(|entry| DAEMON_INSTRUCTION_ENTRIES.iter().any(|e| eq(entry, e)))
+    };
+    if components
+        .iter()
+        .enumerate()
+        .any(|(i, c)| eq(c, DAEMON_DIR_NAME) && under_entry(i + 1))
+    {
+        return true;
+    }
+    daemon_dirs.iter().any(|dir| {
+        let dir_len = dir.components().count();
+        (path.starts_with(dir)
+            || dunce::canonicalize(dir)
+                .ok()
+                .is_some_and(|dir| path.starts_with(&dir)))
+            && under_entry(dir_len)
+    })
+}
+
 /// Classifies paths for the file tools: secrets a read refuses, and the
 /// wider set of sensitive paths a write refuses. Beyond the built-in
 /// patterns, an app adds its own files (its config, its env file) as
@@ -198,6 +309,19 @@ impl DaemonPaths {
     pub fn is_own_file(&self, path: &Path) -> bool {
         self.classifier.is_protected(path)
     }
+
+    /// True for a path whose content runs or is obeyed later without
+    /// anyone asking ([`is_persistence_path`]), the daemon's own folders
+    /// being where its config files live.
+    pub fn is_persistence(&self, path: &Path) -> bool {
+        let dirs = self
+            .classifier
+            .protected_paths()
+            .iter()
+            .filter_map(|file| file.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        is_persistence_path(path, &dirs)
+    }
 }
 
 /// Env files named by the daemon's own environment variables
@@ -278,6 +402,41 @@ mod tests {
         }
         assert!(!paths.is_sensitive(Path::new("/home/user/code/main.rs")));
         assert!(!paths.is_sensitive(Path::new("/repo/src/environment.rs")));
+    }
+
+    #[test]
+    fn persistence_paths_are_classified() {
+        let daemon = PathBuf::from("/srv/synthetic-daemon");
+        let paths = DaemonPaths::new(vec![daemon.join("config.toml")]);
+        for persistent in [
+            "/home/synthetic/.zshrc",
+            "/home/synthetic/.bash_profile",
+            "/Users/synthetic/Library/LaunchAgents/com.example.agent.plist",
+            "/Library/LaunchDaemons/com.example.plist",
+            "/home/synthetic/.config/systemd/user/example.service",
+            "/home/synthetic/.config/autostart/example.desktop",
+            "/home/synthetic/.config/fish/config.fish",
+            "/etc/cron.d/example",
+            "/var/spool/cron/crontabs/synthetic",
+            "/srv/app/.git/hooks/pre-commit",
+            "/srv/app/.husky/pre-push",
+            "/home/synthetic/.aidaemon/AGENTS.md",
+            "/home/synthetic/.aidaemon/specialists/coder.md",
+            "/home/synthetic/.aidaemon/skills/example/SKILL.md",
+            "/srv/synthetic-daemon/AGENTS.md",
+            "/srv/synthetic-daemon/specialists/x.md",
+        ] {
+            assert!(paths.is_persistence(Path::new(persistent)), "{persistent}");
+        }
+        for ordinary in [
+            "/srv/app/src/main.rs",
+            "/srv/app/AGENTS.md",
+            "/home/synthetic/.aidaemon/files/inbox/report.pdf",
+            "/srv/app/profile.rs",
+            "/srv/app/docs/launchagents.md",
+        ] {
+            assert!(!paths.is_persistence(Path::new(ordinary)), "{ordinary}");
+        }
     }
 
     #[test]

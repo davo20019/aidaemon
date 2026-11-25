@@ -316,9 +316,14 @@ pub(super) fn terminal_run_annotations(
                 })
         });
     // On the host every program can reach the network; only observations
-    // and ordinary local work (builds, tests, local git) are not egress.
-    let host_beyond_local_work =
-        !run_is_confined(confinement) && !effects.observation_only && !effects.local_work_only;
+    // and ordinary local work (local git, file shuffling) are not egress. A
+    // build or test runner is local work by its shape but runs whatever the
+    // project's files define (a `Makefile`, `build.rs`, a test, a package
+    // script), which a turn that read untrusted content may just have
+    // written: on the host it reaches as far as any program.
+    let host_beyond_local_work = !run_is_confined(confinement)
+        && !effects.observation_only
+        && (!effects.local_work_only || effects.runs_project_code);
     let reaches_network = args.network
         || aidaemon_tools::command_effects::fetches_network(text)
         || host_beyond_local_work;

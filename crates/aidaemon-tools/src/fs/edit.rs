@@ -437,6 +437,7 @@ core_tool!(
     }
 );
 
+#[async_trait]
 impl crate::semantics::ToolSemantics for EditFile {
     fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
         crate::semantics::ToolDispatchFacts {
@@ -542,6 +543,24 @@ impl crate::semantics::ToolSemantics for EditFile {
     /// the execution backend puts it, which is not known here).
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
         self.policy.write_effects(&*self.backend, arguments)
+    }
+
+    /// A write that plants persistence (a shell start-up file, a launch
+    /// agent, a git hook, the agent's own instructions) always asks.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::semantics::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::semantics::OwnerApprovalNeed {
+        super::persistence_write_approval(
+            &self.backend,
+            &*self.policy,
+            "edit_file",
+            call.arguments,
+            self.call_effects(&call.arguments.to_string()),
+            facts,
+        )
+        .await
     }
 
     fn call_annotations_in(
