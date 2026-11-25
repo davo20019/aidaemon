@@ -46,7 +46,7 @@ impl LanAuthority {
                 .with_context(|| format!("{} holds no CA key", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-                write_owner_only(path, &key.serialize_pem())
+                aidaemon_tools::config_file::write_owner_only(path, &key.serialize_pem())
                     .with_context(|| format!("could not save the CA key at {}", path.display()))?;
                 key
             }
@@ -114,28 +114,6 @@ fn ca_params() -> CertificateParams {
     params.not_before = time::macros::datetime!(2025-01-01 00:00 UTC);
     params.not_after = time::macros::datetime!(2050-01-01 00:00 UTC);
     params
-}
-
-fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    {
-        use std::io::Write;
-        let mut file = options.open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 /// This computer's address on its main network (the one its default route

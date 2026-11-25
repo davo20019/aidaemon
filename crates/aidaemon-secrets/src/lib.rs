@@ -549,35 +549,53 @@ fn encode_env_value(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
-#[cfg(unix)]
-fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_file_mode_0600(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-/// Write `body` to `path`, which is created owner-only when it does not
-/// exist yet: a new secrets file is never readable by other local users,
-/// not even for the moment before its mode is set.
-fn write_secret_file(path: &Path, body: &str) -> std::io::Result<()> {
+/// Write `content` to `path`, owner-only (0600) from the first byte, and
+/// atomically: it goes to a fresh sibling file created 0600 (a unique name,
+/// so concurrent writers never share one) and is renamed over `path`. A
+/// file holding keys or tokens is never readable by others, not even for
+/// the moment between a write and a chmod, and a crash mid-write leaves the
+/// old file whole. The parent directory is created when missing.
+pub fn write_owner_only(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(dir) = parent {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(format!(
+            ".{name}.{}.{nanos}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(body.as_bytes())?;
-    file.sync_all()
+    let written = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(content.as_ref())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 fn upsert_env_secret(env_path: &Path, field_name: &str, value: &str) -> anyhow::Result<()> {
@@ -607,18 +625,11 @@ fn upsert_env_secret(env_path: &Path, field_name: &str, value: &str) -> anyhow::
         lines.push(assignment);
     }
 
-    if let Some(parent) = env_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let mut body = lines.join("\n");
     if !body.is_empty() {
         body.push('\n');
     }
-    write_secret_file(env_path, &body)?;
-    set_file_mode_0600(env_path)?;
+    write_owner_only(env_path, &body)?;
     Ok(())
 }
 
@@ -646,8 +657,7 @@ fn remove_env_secret(env_path: &Path, field_name: &str) -> anyhow::Result<()> {
     if !body.is_empty() {
         body.push('\n');
     }
-    write_secret_file(env_path, &body)?;
-    set_file_mode_0600(env_path)?;
+    write_owner_only(env_path, &body)?;
     Ok(())
 }
 

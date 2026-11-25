@@ -25,7 +25,7 @@ pub fn mint(path: &Path) -> std::io::Result<String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    write_owner_only_file(path, &format!("{}\n", hash(&token)))?;
+    aidaemon_tools::config_file::write_owner_only(path, &format!("{}\n", hash(&token)))?;
     Ok(token)
 }
 
@@ -77,7 +77,7 @@ pub fn client_token_file(config: &ClientGatewayConfig) -> PathBuf {
 pub fn mint_local_token(config: &ClientGatewayConfig) -> std::io::Result<PathBuf> {
     let token = mint(&token_file(config))?;
     let path = client_token_file(config);
-    write_owner_only_file(&path, &format!("{token}\n"))?;
+    aidaemon_tools::config_file::write_owner_only(&path, &format!("{token}\n"))?;
     Ok(path)
 }
 
@@ -109,34 +109,11 @@ pub fn install_fingerprint(token_file: &Path) -> String {
         }
     }
     let fresh = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-    if let Err(error) = write_owner_only_file(&path, &format!("{fresh}\n")) {
+    if let Err(error) = aidaemon_tools::config_file::write_owner_only(&path, &format!("{fresh}\n"))
+    {
         tracing::warn!(%error, path = %path.display(), "Could not keep the daemon fingerprint");
     }
     fresh
-}
-
-fn write_owner_only_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    // Created owner-only, never widened and narrowed after: another local
-    // user must not be able to open the file between the two.
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    {
-        use std::io::Write;
-        let mut file = options.open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]

@@ -118,39 +118,9 @@ fn backup_paths(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Write `content` to `path`, owner-only (0600) from the first byte: it
-/// goes to a fresh sibling file created 0600 and is renamed over `path`, so
-/// a config holding keys or bot tokens is never readable by others, not
-/// even for the moment between a write and a chmod.
-pub fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config".to_string());
-    let tmp = parent
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-        .join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let written = (|| {
-        let mut file = options.open(&tmp)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
-}
+/// Write `content` to `path`, owner-only (0600) from the first byte and
+/// atomically (a fresh sibling file renamed over `path`).
+pub use aidaemon_secrets::write_owner_only;
 
 /// Owner-only read/write (0600) on Unix, best effort.
 #[cfg(unix)]

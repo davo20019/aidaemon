@@ -111,13 +111,9 @@ async fn move_env_key_to_keychain(config_path: &Path, key: &str) {
         return;
     }
     let env_path = resolve_env_file_path(config_path);
-    let key_prefix = format!("{DB_ENCRYPTION_ENV_KEY}=");
-    let Ok(env_text) = std::fs::read_to_string(&env_path) else {
-        return;
-    };
-    if !env_text
-        .lines()
-        .any(|line| line.trim_start().starts_with(&key_prefix))
+    let env_store = aidaemon_secrets::EnvSecretStore::at(&env_path);
+    if !env_path.exists()
+        || aidaemon_secrets::SecretStore::get(&env_store, DB_ENCRYPTION_ENV_KEY).is_err()
     {
         return;
     }
@@ -151,15 +147,7 @@ async fn move_env_key_to_keychain(config_path: &Path, key: &str) {
         warn!(error = %err, "Could not point config.toml at the keychain database key");
         return;
     }
-    let kept: Vec<&str> = env_text
-        .lines()
-        .filter(|line| !line.trim_start().starts_with(&key_prefix))
-        .collect();
-    let mut body = kept.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    match write_secret_file(&env_path, &body) {
+    match aidaemon_secrets::SecretStore::delete(&env_store, DB_ENCRYPTION_ENV_KEY) {
         Ok(()) => info!(
             env_path = %env_path.display(),
             "Moved the database encryption key from the env file to the OS keychain"
@@ -562,40 +550,16 @@ fn resolve_env_file_path(config_path: &Path) -> PathBuf {
         .join(".env")
 }
 
+/// Store the database key in the env file through the secrets crate's
+/// writer (one lock, `KEY = v` lines replaced, atomic owner-only write, the
+/// key registered for redaction).
 #[cfg(feature = "encryption")]
 fn persist_key_to_env_file(env_path: &Path, key: &str) -> anyhow::Result<()> {
-    let mut lines: Vec<String> = if env_path.exists() {
-        std::fs::read_to_string(env_path)?
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        vec![]
-    };
-
-    let key_prefix = format!("{}=", DB_ENCRYPTION_ENV_KEY);
-    let mut replaced = false;
-    for line in &mut lines {
-        if line.trim_start().starts_with(&key_prefix) {
-            *line = format!("{}{}", key_prefix, key);
-            replaced = true;
-        }
-    }
-    if !replaced {
-        lines.push(format!("{}{}", key_prefix, key));
-    }
-
-    if let Some(parent) = env_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut body = lines.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    write_secret_file(env_path, &body)?;
-    set_file_mode_0600(env_path)?;
-    Ok(())
+    aidaemon_secrets::SecretStore::set(
+        &aidaemon_secrets::EnvSecretStore::at(env_path),
+        DB_ENCRYPTION_ENV_KEY,
+        key,
+    )
 }
 
 #[cfg(feature = "encryption")]
@@ -656,23 +620,6 @@ fn remove_if_exists(path: PathBuf) {
     {
         warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
     }
-}
-
-/// Write `body` to `path`, which is created owner-only when it does not
-/// exist yet: a new secrets file is never readable by other local users,
-/// not even for the moment before its mode is set.
-fn write_secret_file(path: &Path, body: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(body.as_bytes())?;
-    file.sync_all()
 }
 
 fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {

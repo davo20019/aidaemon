@@ -195,9 +195,19 @@ fn write_owner_only(path: &std::path::Path, contents: &str) -> std::io::Result<(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    // Created owner-only, never widened and narrowed after.
-    let _ = std::fs::remove_file(&tmp);
+    // A unique sibling, created owner-only and never widened then narrowed:
+    // two writers never share a temp file, and a failed write leaves none.
+    // (This crate depends on no workspace crate, so it keeps its own copy of
+    // `aidaemon_secrets::write_owner_only`.)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -205,13 +215,17 @@ fn write_owner_only(path: &std::path::Path, contents: &str) -> std::io::Result<(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    {
+    let written = (|| {
         use std::io::Write;
         let mut file = options.open(&tmp)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    written
 }
 
 #[cfg(test)]

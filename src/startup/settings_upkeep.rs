@@ -5,6 +5,7 @@
 //! at the next start; what happened is left in a result file the Settings
 //! page shows.
 
+use aidaemon_tools::config_file::write_owner_only;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,12 +62,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn write_owner_only(path: &Path, text: &str) -> std::io::Result<()> {
-    std::fs::write(path, text)?;
-    aidaemon_tools::config_file::set_owner_only_permissions(path);
-    Ok(())
 }
 
 /// Schedule `upkeep` for the next start (replacing what was scheduled).
