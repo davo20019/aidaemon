@@ -948,6 +948,13 @@
           "description": "The bot, as the owner finds it (`@synthetic_bot`).",
           "type": "string"
         },
+        "claim_code": {
+          "description": "The one-time code whose direct message claims the bot (`None` for a\nbot connected before). Only this screen shows it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "connected": {
           "default": false,
           "description": "The owner's first message arrived and was answered there.",
@@ -6776,6 +6783,13 @@
     "SessionRequest": {
       "description": "`POST /client/v1/sessions`.",
       "properties": {
+        "audience": {
+          "description": "The daemon the signature names (protocol 1.51): it signs\n[`challenge_message_v2`] for this audience. Absent: the older\n[`challenge_message`], which a gateway takes from its own computer\nonly.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "challenge_id": {
           "type": "string"
         },
