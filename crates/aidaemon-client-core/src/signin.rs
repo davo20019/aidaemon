@@ -250,6 +250,7 @@ async fn sign_in_from(
     signer: &impl Signer,
     endpoint: Option<String>,
 ) -> Result<AccessGrant, SignInError> {
+    refuse_plaintext(gateway)?;
     let audience = http.audience(gateway).ok_or_else(|| {
         SignInError::Refused(format!(
             "{gateway} is not an address a device can sign in at"
@@ -314,6 +315,34 @@ pub struct PairRequest {
     pub fingerprint: Option<String>,
 }
 
+/// Set to allow an unencrypted `http://` gateway on another computer (a
+/// test network): the pairing code, sign-in and every message would cross
+/// it in the clear.
+pub const ALLOW_PLAINTEXT_ENV: &str = "AIDAEMON_ALLOW_PLAINTEXT_GATEWAY";
+
+/// Refuse `gateway` when it is unencrypted (`http://`, `ws://`) and not on
+/// this computer, unless [`ALLOW_PLAINTEXT_ENV`] is set: anyone on the way
+/// would read the pairing code, the sign-in and the token. Loopback, HTTPS
+/// and peer-to-peer (`iroh://`, encrypted end to end) addresses pass.
+pub fn refuse_plaintext(gateway: &str) -> Result<(), SignInError> {
+    let scheme = gateway
+        .trim()
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    let plaintext = matches!(scheme.as_deref(), Some("http" | "ws"));
+    if !plaintext || aidaemon_client_protocol::is_loopback_url(gateway) {
+        return Ok(());
+    }
+    if std::env::var_os(ALLOW_PLAINTEXT_ENV).is_some() {
+        return Ok(());
+    }
+    Err(SignInError::Refused(format!(
+        "{gateway} is not encrypted, so the pairing code and everything after it would \
+         cross the network in the clear. Use the daemon's https:// or iroh:// address \
+         (or set {ALLOW_PLAINTEXT_ENV}=1 on a network you trust)."
+    )))
+}
+
 /// Redeem the offer with `public_key` (SEC1 uncompressed, base64url), then
 /// wait (polling every `poll`) until the owner approves. Returns the device
 /// id the gateway gave.
@@ -323,6 +352,7 @@ pub async fn redeem_and_wait(
     public_key: String,
     poll: Duration,
 ) -> anyhow::Result<String> {
+    refuse_plaintext(&request.gateway)?;
     let mut enrollment: Enrollment = post(
         http,
         &request.gateway,
@@ -712,6 +742,19 @@ pub fn percent_decode(text: &str) -> String {
 #[cfg(test)]
 mod pairing_link_tests {
     use super::PairingLink;
+
+    #[test]
+    fn an_unencrypted_gateway_elsewhere_is_refused() {
+        use super::refuse_plaintext;
+        assert!(refuse_plaintext("http://127.0.0.1:8788").is_ok());
+        assert!(refuse_plaintext("http://localhost:8788").is_ok());
+        assert!(refuse_plaintext("https://app.example.com").is_ok());
+        assert!(refuse_plaintext(&format!("iroh://{}@relay.example.test", "a".repeat(64))).is_ok());
+        if std::env::var_os(super::ALLOW_PLAINTEXT_ENV).is_none() {
+            assert!(refuse_plaintext("http://192.0.2.10:8788").is_err());
+            assert!(refuse_plaintext("HTTP://daemon.example.com").is_err());
+        }
+    }
 
     #[test]
     fn both_pairing_link_forms_read_back() {
