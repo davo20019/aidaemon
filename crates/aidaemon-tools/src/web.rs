@@ -153,6 +153,19 @@ pub fn validate_url_for_ssrf(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A client for one probe of a public URL: no redirects, `timeout`, and
+/// connections only to public addresses ([`PublicOnlyResolver`], so a name
+/// that passed [`validate_url_for_ssrf`] cannot be re-pointed at a private
+/// one between the check and the connection). Probes of loopback test
+/// servers build their own client.
+pub fn public_probe_client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
+        .build()
+}
+
 /// Refuses at connection time any name that resolves to a blocked address.
 /// The check before a request and the connection look a name up separately,
 /// so a name could answer with a public address first and a private one next.

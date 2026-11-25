@@ -811,10 +811,20 @@ impl ManageOAuthTool {
         service: &str,
         identity_url: &str,
     ) -> anyhow::Result<(reqwest::StatusCode, Vec<u8>, bool)> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        // `identity_url` passed the SSRF check when it was stored; the
+        // public-only resolver holds that at connection time (tests probe a
+        // loopback server).
+        let loopback_test = cfg!(test)
+            && reqwest::Url::parse(identity_url)
+                .is_ok_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")));
+        let client = if loopback_test {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .build()?
+        } else {
+            crate::web::public_probe_client(Duration::from_secs(30))?
+        };
         let token_key = format!("oauth_{}_access_token", service);
         let mut refreshed = false;
         loop {

@@ -1049,17 +1049,18 @@ impl ManageHttpAuthTool {
             .into());
         }
 
-        let client = reqwest::Client::builder()
-            // Verification is an exact read-only probe. Do not let it leave
-            // the profile-bound origin through a redirect.
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(
-                timeout_secs
-                    .unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS)
-                    .min(MAX_VERIFY_TIMEOUT_SECS),
-            ))
-            .build()
-            .map_err(|err| anyhow::anyhow!("Failed to build HTTP client: {}", err))?;
+        // Verification is an exact read-only probe of a public HTTPS URL: no
+        // redirect may leave the profile-bound origin, and neither the URL
+        // nor what its name resolves to may be a private address.
+        if let Err(reason) = crate::web::validate_url_for_ssrf(parsed_url.as_str()) {
+            return Ok(format!("Verification probe blocked: {reason}").into());
+        }
+        let client = crate::web::public_probe_client(Duration::from_secs(
+            timeout_secs
+                .unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS)
+                .min(MAX_VERIFY_TIMEOUT_SECS),
+        ))
+        .map_err(|err| anyhow::anyhow!("Failed to build HTTP client: {}", err))?;
 
         let builder = match verify_method.as_str() {
             "HEAD" => client.head(url),
