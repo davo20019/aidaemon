@@ -430,6 +430,11 @@ pub(super) async fn refresh_direct_session(
     prep.prompt_placement = plan.prompt;
     prep.env = plan.env;
     prep.env_remove = plan.env_remove;
+    // Its sign-in, as its first launch had it.
+    prep.args.extend(prep.signed.args.iter().cloned());
+    prep.env.extend(prep.signed.env.iter().cloned());
+    prep.env_remove
+        .extend(prep.signed.env_remove.iter().cloned());
     prep.host = plan.host;
     prep.keep_alive = plan.keep_alive;
     prep.keeps_session = plan.keeps_session;

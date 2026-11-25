@@ -67,6 +67,33 @@ pub trait CodingAgent: Send + Sync {
         ""
     }
 
+    /// The ways the owner can have it sign in besides its own saved
+    /// sign-in ([`crate::SignInMethod::Own`], always offered). Empty: only
+    /// its own.
+    fn sign_ins(&self) -> &[crate::SignInMethod] {
+        &[]
+    }
+
+    /// A word about running it on its own sign-in, when there is one to
+    /// say (shown while that is the choice).
+    fn sign_in_note(&self) -> Option<crate::SignInNote> {
+        None
+    }
+
+    /// What `sign_in` adds to its launch, for a run and for its readiness
+    /// check alike (`Err`: it can't sign in that way, in words for the
+    /// owner). Its own sign-in adds nothing.
+    fn signed_in(&self, sign_in: &crate::SignIn) -> Result<crate::SignedIn, String> {
+        match sign_in {
+            crate::SignIn::Own => Ok(crate::SignedIn::default()),
+            other => Err(format!(
+                "{} can't sign in with {}",
+                self.name(),
+                other.method().as_str()
+            )),
+        }
+    }
+
     /// Whether a run can be given a model ([`RunRequest::model`]): its
     /// launch or its protocol sets one. `false`: it runs on its own.
     fn takes_model(&self) -> bool {

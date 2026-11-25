@@ -123,6 +123,38 @@
         }
       ]
     },
+    "AgentSignIn": {
+      "description": "How a coding agent signs in to its own service (protocol 1.54).",
+      "oneOf": [
+        {
+          "const": "own",
+          "description": "Its own saved sign-in, whatever it is.",
+          "type": "string"
+        },
+        {
+          "const": "gemini_api_key",
+          "description": "A Gemini API key the owner gave AIdaemon, handed to it at launch.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentSignInNote": {
+      "description": "A word about a coding agent's own sign-in, with where to read more\n(protocol 1.54).",
+      "properties": {
+        "link": {
+          "description": "A web page about it.",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "link"
+      ],
+      "type": "object"
+    },
     "Applies": {
       "description": "When a saved change takes effect.",
       "oneOf": [
@@ -1266,6 +1298,32 @@
           "default": false,
           "description": "The owner chose \"same as AIdaemon\": it follows the level\n(protocol 1.43).",
           "type": "boolean"
+        },
+        "sign_in": {
+          "$ref": "#/$defs/AgentSignIn",
+          "description": "How it signs in now (protocol 1.54)."
+        },
+        "sign_in_key_saved": {
+          "description": "A key is saved for it to sign in with (protocol 1.54).",
+          "type": "boolean"
+        },
+        "sign_in_note": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentSignInNote"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A word about running it on its own sign-in, shown while that is the\nchoice (protocol 1.54)."
+        },
+        "sign_ins": {
+          "description": "The ways the owner can have it sign in besides its own saved\nsign-in, which is always offered; empty: only its own (protocol\n1.54).",
+          "items": {
+            "$ref": "#/$defs/AgentSignIn"
+          },
+          "type": "array"
         },
         "takes_model": {
           "default": false,
@@ -7486,6 +7544,37 @@
           "required": [
             "kind",
             "agent"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Set how coding agent `agent` signs in (protocol 1.54). `key`: the\nkey it signs in with, stored first (needed for a key sign-in when\nnone is saved; replaces a saved one).",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SecretText"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "set_agent_sign_in",
+              "type": "string"
+            },
+            "sign_in": {
+              "$ref": "#/$defs/AgentSignIn"
+            }
+          },
+          "required": [
+            "kind",
+            "agent",
+            "sign_in"
           ],
           "type": "object"
         }

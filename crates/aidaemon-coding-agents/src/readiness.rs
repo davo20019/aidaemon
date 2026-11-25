@@ -73,7 +73,24 @@ pub enum Probe {
     },
     /// Open an Agent Client Protocol session (the arguments start its
     /// server): it opens, or the agent says why not. No prompt is sent.
-    AcpSession { serve: Vec<String> },
+    /// `signed`: what its sign-in adds, as a run's launch has it.
+    AcpSession {
+        serve: Vec<String>,
+        signed: crate::SignedIn,
+    },
+}
+
+impl Probe {
+    /// This probe as a launch with `signed` asks it: its sign-in's
+    /// arguments after the server's, its variables set and removed. A
+    /// status probe runs the agent's own command, which has no sign-in to
+    /// choose, so it is left as it is.
+    pub fn signed(self, signed: crate::SignedIn) -> Self {
+        match self {
+            Self::AcpSession { serve, .. } => Self::AcpSession { serve, signed },
+            status => status,
+        }
+    }
 }
 
 /// The longest an agent is given to answer a check. A check is not work:
@@ -128,8 +145,17 @@ async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>
             )
             .into()
         }
-        Probe::AcpSession { serve } => {
-            let Ok(mut child) = process.args(serve).stdin(Stdio::piped()).spawn() else {
+        Probe::AcpSession { serve, signed } => {
+            for name in &signed.env_remove {
+                process.env_remove(name);
+            }
+            process.envs(signed.env.iter().map(|(name, value)| (name, value)));
+            let Ok(mut child) = process
+                .args(serve)
+                .args(&signed.args)
+                .stdin(Stdio::piped())
+                .spawn()
+            else {
                 return Readiness::Unchecked.into();
             };
             let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -256,6 +282,7 @@ mod tests {
             )
         };
         let probe = |script: String| Probe::AcpSession {
+            signed: crate::SignedIn::default(),
             serve: vec!["-c".into(), script],
         };
         let ready = probe(agent(

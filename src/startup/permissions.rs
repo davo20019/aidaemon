@@ -83,6 +83,8 @@ pub(crate) async fn upgrade(config_path: &Path, pool: &SqlitePool) -> anyhow::Re
             .await?;
     }
     let permissions = Permissions::from_config(&config.load_table().await?);
+    // A coding agent's sign-in key (Settings, Coding agents) is kept there.
+    permissions.set_secrets(crate::config::secret_store().clone());
     info!(
         level = permissions.level().as_str(),
         "AIdaemon's permission level"

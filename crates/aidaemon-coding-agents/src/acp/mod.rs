@@ -27,6 +27,12 @@ use crate::{
     RunRequest,
 };
 
+/// Where `agy acp` keeps its data when it runs on a Gemini API key: a
+/// folder of its own under `~/.gemini` (`--app-data-dir`), whose
+/// `settings.json` names the key as its sign-in. Its own folder
+/// (`antigravity-cli`) keeps the owner's saved sign-in untouched.
+const AGY_KEY_FOLDER: &str = "aidaemon-agy";
+
 /// A coding agent run over the Agent Client Protocol.
 #[derive(Debug, Clone)]
 pub struct AcpAgent {
@@ -40,6 +46,10 @@ pub struct AcpAgent {
     account: &'static str,
     /// What a client draws for it ([`CodingAgent::mark`]).
     mark: Option<&'static str>,
+    /// It can run on a Gemini API key AIdaemon hands it, in its own data
+    /// folder under `~/.gemini` (this name), apart from the owner's own
+    /// sessions with it.
+    gemini_key_folder: Option<&'static str>,
 }
 
 impl AcpAgent {
@@ -54,6 +64,7 @@ impl AcpAgent {
             arguments: None,
             account: "",
             mark: None,
+            gemini_key_folder: None,
         }
     }
 
@@ -71,8 +82,9 @@ impl AcpAgent {
                 valued: &["--agent", "--model"],
                 subcommands: &["acp"],
             }),
-            account: "Its own Antigravity sign-in: your Google account and its plan.",
+            account: "Its own Antigravity sign-in, or a Gemini API key you give AIdaemon.",
             mark: Some("gemini"),
+            gemini_key_folder: Some(AGY_KEY_FOLDER),
             ..Self::custom("Antigravity CLI", "agy", &["acp"])
         }
     }
@@ -157,6 +169,52 @@ impl CodingAgent for AcpAgent {
         self.account
     }
 
+    fn sign_ins(&self) -> &[crate::SignInMethod] {
+        if self.gemini_key_folder.is_some() {
+            &[crate::SignInMethod::GeminiApiKey]
+        } else {
+            &[]
+        }
+    }
+
+    /// Google's FAQ: a consumer sign-in driven from another app is not
+    /// supported; a Gemini API key is.
+    fn sign_in_note(&self) -> Option<crate::SignInNote> {
+        self.gemini_key_folder.map(|_| crate::SignInNote {
+            text: "Google prefers third-party apps to use agy with a Gemini API key.",
+            link: "https://antigravity.google/docs/faq",
+        })
+    }
+
+    /// On a Gemini API key: its own data folder, whose settings name the
+    /// key as its sign-in (`agy acp` reads its sign-in from there and the
+    /// key from `GEMINI_API_KEY`), and no other Google credential in its
+    /// environment.
+    fn signed_in(&self, sign_in: &crate::SignIn) -> Result<crate::SignedIn, String> {
+        match (sign_in, self.gemini_key_folder) {
+            (crate::SignIn::Own, _) => Ok(crate::SignedIn::default()),
+            (crate::SignIn::GeminiApiKey(key), Some(folder)) => {
+                let gemini = dirs::home_dir()
+                    .ok_or("there is no home folder to keep its settings in")?
+                    .join(".gemini");
+                key_settings(&gemini.join(folder))?;
+                Ok(crate::SignedIn {
+                    args: vec!["--app-data-dir".into(), folder.into()],
+                    env: vec![("GEMINI_API_KEY".into(), key.clone())],
+                    env_remove: crate::sign_in::GOOGLE_CREDENTIAL_VARS
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                })
+            }
+            (other, None) => Err(format!(
+                "{} can't sign in with {}",
+                self.name,
+                other.method().as_str()
+            )),
+        }
+    }
+
     /// Set over the protocol once its session opens (`session/set_model`).
     fn takes_model(&self) -> bool {
         true
@@ -174,6 +232,7 @@ impl CodingAgent for AcpAgent {
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::AcpSession {
             serve: self.serve.clone(),
+            signed: crate::SignedIn::default(),
         })
     }
 
@@ -212,6 +271,42 @@ impl CodingAgent for AcpAgent {
             ..Plan::plain()
         })
     }
+}
+
+/// Make `folder`'s `settings.json` name a Gemini API key as its sign-in,
+/// keeping whatever else it holds.
+fn key_settings(folder: &std::path::Path) -> Result<(), String> {
+    let path = folder.join("settings.json");
+    let mut settings = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if settings
+        .pointer("/auth/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("gemini-api-key")
+    {
+        return Ok(());
+    }
+    if let Some(object) = settings.as_object_mut() {
+        let auth = object
+            .entry("auth")
+            .or_insert_with(|| serde_json::json!({}));
+        if !auth.is_object() {
+            *auth = serde_json::json!({});
+        }
+        auth["type"] = serde_json::json!("gemini-api-key");
+    }
+    let failed = |error: std::io::Error| {
+        format!(
+            "its settings in {} could not be written: {error}",
+            folder.display()
+        )
+    };
+    std::fs::create_dir_all(folder).map_err(failed)?;
+    let text = serde_json::to_string_pretty(&settings).unwrap_or_default();
+    std::fs::write(&path, text + "\n").map_err(failed)
 }
 
 #[cfg(test)]
@@ -296,5 +391,46 @@ mod tests {
         assert!(plan.host.is_some());
         // Whether it can is the agent's own word, once it runs.
         assert!(!plan.keeps_session);
+    }
+
+    #[test]
+    fn agy_on_a_gemini_key_uses_its_own_folder_and_only_that_key() {
+        let agent = AcpAgent::antigravity();
+        assert_eq!(agent.sign_ins(), [crate::SignInMethod::GeminiApiKey]);
+        assert!(agent.sign_in_note().is_some());
+        // Its own sign-in adds nothing.
+        assert_eq!(
+            agent.signed_in(&crate::SignIn::Own).unwrap(),
+            crate::SignedIn::default()
+        );
+        // Another agent offers none.
+        let other = AcpAgent::custom("Synthetic Agent", "synthetic-agent", &["--acp"]);
+        assert!(other.sign_ins().is_empty());
+        assert!(other.sign_in_note().is_none());
+        assert!(
+            other
+                .signed_in(&crate::SignIn::GeminiApiKey("synthetic-key".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn key_settings_name_the_key_and_keep_the_rest() {
+        let folder = std::env::temp_dir().join(format!("aidaemon-agy-{}", uuid::Uuid::new_v4()));
+        key_settings(&folder).unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(folder.join("settings.json")).unwrap())
+                .unwrap()
+        };
+        assert_eq!(read()["auth"]["type"], "gemini-api-key");
+        std::fs::write(
+            folder.join("settings.json"),
+            r#"{"trustedWorkspaces":["/synthetic"],"auth":{"type":"oauth-personal"}}"#,
+        )
+        .unwrap();
+        key_settings(&folder).unwrap();
+        assert_eq!(read()["auth"]["type"], "gemini-api-key");
+        assert_eq!(read()["trustedWorkspaces"][0], "/synthetic");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

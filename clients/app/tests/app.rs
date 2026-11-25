@@ -531,6 +531,60 @@ fn a_coding_agent_s_mode_is_picked_and_full_access_waits_for_approval() -> Resul
 }
 
 #[test]
+fn agy_s_sign_in_is_picked_in_the_app_and_a_key_is_pasted_there() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let before = sent("get_settings");
+    feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    let result = SETTINGS.replace(
+        r#""restart_pending": false}"#,
+        r#""restart_pending": false, "coding_agents": [{"name": "agy", "program": "Antigravity CLI", "mode": "every_command", "modes": ["every_command", "full_access"], "readiness": "ready", "takes_model": true, "sign_ins": ["gemini_api_key"], "sign_in_note": {"text": "Google prefers third-party apps to use agy with a Gemini API key.", "link": "https://antigravity.google/docs/faq"}}]}"#,
+    );
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
+    ))]);
+    app.wait_for("On this device")?;
+    app.press("Models")?;
+    // Its own sign-in, with the note while that is the choice.
+    app.wait_for("Google prefers third-party apps to use agy with a Gemini API key.")?;
+    app.wait_for("Learn more")?;
+    // A key sign-in with no key saved waits for the key: nothing is sent
+    // until it is pasted and saved.
+    let before = nsh_app_aidaemon::settings_sent_ids().len();
+    app.press("label:Antigravity CLI sign-in")?;
+    app.press("Gemini API key")?;
+    app.wait_for("No key saved yet")?;
+    app.wait_for_gone(
+        "Google prefers third-party apps to use agy with a Gemini API key.",
+        std::time::Duration::from_secs(5),
+    )?;
+    app.type_text("label:Gemini API key", "synthetic-gemini-key")?;
+    app.press("Save key")?;
+    let mut change = None;
+    for _ in 0..100 {
+        change = nsh_app_aidaemon::settings_sent_ids()
+            .into_iter()
+            .skip(before)
+            .find(|(_, c)| c.contains("set_agent_sign_in"));
+        if change.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (_, json) = change.ok_or("no set_agent_sign_in was sent")?;
+    let sent: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if sent["change"]
+        != serde_json::json!({"kind": "set_agent_sign_in", "agent": "agy", "sign_in": "gemini_api_key", "key": "synthetic-gemini-key"})
+    {
+        return Err(format!("the change sent: {}", sent["change"]));
+    }
+    Ok(())
+}
+
+#[test]
 fn each_coding_agent_says_whether_it_is_ready_and_check_again_asks() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

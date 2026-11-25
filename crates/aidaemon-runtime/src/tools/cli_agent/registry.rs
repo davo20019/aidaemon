@@ -322,6 +322,7 @@ impl CliAgentTool {
         let listed = Arc::downgrade(&tool.tools);
         let registry = tool.coding_agents.clone();
         let local = tool.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
+        let permissions = tool.permissions.clone();
         crate::tools::agent_mode::publish(Arc::new(move || {
             listed
                 .upgrade()
@@ -343,6 +344,11 @@ impl CliAgentTool {
                                     command: entry.command.clone(),
                                     prefix,
                                     local,
+                                    sign_in: permissions
+                                        .get()
+                                        .cloned()
+                                        .unwrap_or_default()
+                                        .sign_in_of(name),
                                 }
                             })
                             .collect()

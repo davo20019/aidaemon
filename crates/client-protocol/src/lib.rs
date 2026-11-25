@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 53;
+pub const PROTOCOL_MINOR: u16 = 54;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1527,6 +1527,50 @@ pub struct CodingAgent {
     /// none (any id it knows may still be typed) (protocol 1.47).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<AgentModelOption>,
+    /// The ways the owner can have it sign in besides its own saved
+    /// sign-in, which is always offered; empty: only its own (protocol
+    /// 1.54).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sign_ins: Vec<AgentSignIn>,
+    /// How it signs in now (protocol 1.54).
+    #[serde(default, skip_serializing_if = "AgentSignIn::is_own")]
+    pub sign_in: AgentSignIn,
+    /// A key is saved for it to sign in with (protocol 1.54).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_in_key_saved: bool,
+    /// A word about running it on its own sign-in, shown while that is the
+    /// choice (protocol 1.54).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_note: Option<AgentSignInNote>,
+}
+
+/// How a coding agent signs in to its own service (protocol 1.54).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSignIn {
+    /// Its own saved sign-in, whatever it is.
+    #[default]
+    Own,
+    /// A Gemini API key the owner gave AIdaemon, handed to it at launch.
+    GeminiApiKey,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+impl AgentSignIn {
+    pub fn is_own(&self) -> bool {
+        *self == Self::Own
+    }
+}
+
+/// A word about a coding agent's own sign-in, with where to read more
+/// (protocol 1.54).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AgentSignInNote {
+    pub text: String,
+    /// A web page about it.
+    pub link: String,
 }
 
 /// A model a coding agent offers (protocol 1.47).
@@ -1881,6 +1925,15 @@ pub enum SettingsChange {
         agent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+    },
+    /// Set how coding agent `agent` signs in (protocol 1.54). `key`: the
+    /// key it signs in with, stored first (needed for a key sign-in when
+    /// none is saved; replaces a saved one).
+    SetAgentSignIn {
+        agent: String,
+        sign_in: AgentSignIn,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<SecretText>,
     },
     #[serde(other)]
     #[schemars(skip)]

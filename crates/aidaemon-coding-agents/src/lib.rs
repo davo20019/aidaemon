@@ -38,6 +38,7 @@ pub mod private_files;
 mod readiness;
 mod registry;
 pub mod report;
+mod sign_in;
 mod stdin;
 
 pub use action::{ActionJudge, AgentAction, AllowAll, TextEdit, Verdict};
@@ -54,3 +55,4 @@ pub use models::{ModelListing, list_models};
 pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, check_models};
 pub use registry::CodingAgents;
 pub use report::{Check, Report};
+pub use sign_in::{SignIn, SignInMethod, SignInNote, SignedIn};

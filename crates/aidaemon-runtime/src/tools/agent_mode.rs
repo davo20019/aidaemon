@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use aidaemon_coding_agents::{ActionJudge, AgentAction, Verdict};
 pub use aidaemon_coding_agents::{
-    AgentModel, AgentModels, Checked, CodingAgent, CodingAgents, PermissionMode, Readiness,
-    modes_within,
+    AgentModel, AgentModels, Checked, CodingAgent, CodingAgents, PermissionMode, Readiness, SignIn,
+    SignInMethod, modes_within,
 };
 use aidaemon_core::{NestedCalls, ToolCall};
 use async_trait::async_trait;
@@ -33,6 +33,9 @@ pub struct AgentInfo {
     pub prefix: Vec<String>,
     /// It runs on this machine (only such an agent is asked).
     pub local: bool,
+    /// The sign-in it runs with, as the owner chose it (`Err`: it can't
+    /// sign in that way now, in words for the owner).
+    pub sign_in: Result<aidaemon_coding_agents::SignIn, String>,
 }
 
 /// Lists one `cli_agent` tool's agents; empty once the tool is gone.
@@ -144,9 +147,24 @@ fn remember_checked(name: &str, checked: Checked) {
 /// Ask one agent now (its own probe; one that cannot be asked, or does not
 /// run here, is unchecked).
 async fn ask(info: &AgentInfo) -> Checked {
+    // Asked as a run launches it: with the sign-in the owner chose.
+    let signed = match info
+        .sign_in
+        .clone()
+        .and_then(|sign_in| info.agent.signed_in(&sign_in))
+    {
+        Ok(signed) => signed,
+        Err(reason) => return Readiness::NotUsable { reason, fix: None }.into(),
+    };
     let mut checked: Checked = match info.agent.readiness_probe() {
         Some(probe) if info.local => {
-            aidaemon_coding_agents::check_models(&probe, &info.command, &info.prefix, None).await
+            aidaemon_coding_agents::check_models(
+                &probe.signed(signed),
+                &info.command,
+                &info.prefix,
+                None,
+            )
+            .await
         }
         _ => Readiness::Unchecked.into(),
     };

@@ -741,6 +741,22 @@ impl SettingsHost {
                 agent_model_choice(agent, model.as_deref())?;
                 SettingsGate::Free
             }
+            // How an agent signs in widens nothing it may do; storing a key
+            // asks, as any stored secret does.
+            SettingsChange::SetAgentSignIn {
+                agent,
+                sign_in,
+                key,
+            } => {
+                let (coding_agent, _) = agent_sign_in_choice(agent, *sign_in)?;
+                match key {
+                    Some(_) => ask(
+                        format!("Store a Gemini API key for {}", coding_agent.name()),
+                        false,
+                    ),
+                    None => SettingsGate::Free,
+                }
+            }
             SettingsChange::SetAgentMode { agent, mode } => {
                 let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
@@ -1285,6 +1301,52 @@ impl SettingsHost {
                     applies: Some(Applies::Now),
                 })
             }
+            SettingsChange::SetAgentSignIn {
+                agent,
+                sign_in,
+                key,
+            } => {
+                use aidaemon_secrets::SecretStore as _;
+                let (coding_agent, method) = agent_sign_in_choice(&agent, sign_in)?;
+                if let Some(key) = key {
+                    let key = key.0.trim();
+                    if key.is_empty() {
+                        return Err("Paste the key first".to_string());
+                    }
+                    crate::config::secret_store()
+                        .set(&aidaemon_secrets::names::cli_agent_sign_in_key(&agent), key)
+                        .map_err(|error| format!("The key could not be stored: {error}"))?;
+                } else if method != aidaemon_runtime::tools::agent_mode::SignInMethod::Own
+                    && !self.permissions.has_sign_in_key(&agent)
+                {
+                    return Err(format!(
+                        "Paste a Gemini API key for {} first",
+                        coding_agent.name()
+                    ));
+                }
+                aidaemon_runtime::permissions::save_agent_sign_in(
+                    &crate::config::config_file(&self.config_path),
+                    &self.permissions,
+                    &agent,
+                    method,
+                )
+                .await
+                .map_err(|error| format!("The sign-in could not be saved: {error}"))?;
+                // Asked again, as it now signs in.
+                aidaemon_runtime::tools::agent_mode::recheck(&agent).await;
+                Ok(SettingsDone {
+                    message: match method {
+                        aidaemon_runtime::tools::agent_mode::SignInMethod::Own => {
+                            format!("{} now uses its own sign-in.", coding_agent.name())
+                        }
+                        aidaemon_runtime::tools::agent_mode::SignInMethod::GeminiApiKey => format!(
+                            "{} now signs in with your Gemini API key.",
+                            coding_agent.name()
+                        ),
+                    },
+                    applies: Some(Applies::Now),
+                })
+            }
             SettingsChange::CheckAgents => {
                 aidaemon_runtime::tools::agent_mode::check_all().await;
                 Ok(SettingsDone {
@@ -1494,6 +1556,44 @@ fn agent_model_choice(
     Ok((coding_agent, model))
 }
 
+/// The agent named `agent` and the sign-in method `sign_in` names, when
+/// it offers that method (its own sign-in it always does).
+fn agent_sign_in_choice(
+    agent: &str,
+    sign_in: aidaemon_client_protocol::AgentSignIn,
+) -> Result<
+    (
+        std::sync::Arc<dyn aidaemon_runtime::tools::agent_mode::CodingAgent>,
+        aidaemon_runtime::tools::agent_mode::SignInMethod,
+    ),
+    String,
+> {
+    use aidaemon_client_protocol::AgentSignIn as Wire;
+    use aidaemon_runtime::tools::agent_mode::SignInMethod;
+    let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
+        .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+    let method = match sign_in {
+        Wire::Own => SignInMethod::Own,
+        Wire::GeminiApiKey => SignInMethod::GeminiApiKey,
+        Wire::Unknown => return Err("Unknown way to sign in".to_string()),
+    };
+    if method != SignInMethod::Own && !coding_agent.sign_ins().contains(&method) {
+        return Err(format!("{} can't sign in that way", coding_agent.name()));
+    }
+    Ok((coding_agent, method))
+}
+
+fn wire_sign_in(
+    method: aidaemon_runtime::tools::agent_mode::SignInMethod,
+) -> aidaemon_client_protocol::AgentSignIn {
+    use aidaemon_client_protocol::AgentSignIn as Wire;
+    use aidaemon_runtime::tools::agent_mode::SignInMethod;
+    match method {
+        SignInMethod::Own => Wire::Own,
+        SignInMethod::GeminiApiKey => Wire::GeminiApiKey,
+    }
+}
+
 async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protocol::CodingAgent> {
     use aidaemon_client_protocol::AgentMode as Wire;
     use aidaemon_runtime::tools::agent_mode::{self, PermissionMode};
@@ -1563,6 +1663,16 @@ async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protoco
                         .collect()
                 })
                 .unwrap_or_default(),
+            sign_ins: agent.sign_ins().iter().copied().map(wire_sign_in).collect(),
+            sign_in: wire_sign_in(permissions.sign_in_method(&info.name)),
+            sign_in_key_saved: !agent.sign_ins().is_empty()
+                && permissions.has_sign_in_key(&info.name),
+            sign_in_note: agent.sign_in_note().map(|note| {
+                aidaemon_client_protocol::AgentSignInNote {
+                    text: note.text.to_string(),
+                    link: note.link.to_string(),
+                }
+            }),
             name: info.name,
         });
     }
@@ -1674,6 +1784,92 @@ allowed_user_ids = [1]
         (dir, host)
     }
 
+    /// An agent that can sign in with a key offers it, with its note, and
+    /// runs on its own sign-in until the owner picks a key; a key sign-in
+    /// needs a key, storing one asks, and an agent that offers none
+    /// refuses it.
+    #[tokio::test]
+    async fn a_coding_agents_sign_in_is_listed_and_a_key_is_needed() {
+        use aidaemon_client_protocol::AgentSignIn;
+        use aidaemon_runtime::tools::agent_mode::{self, AgentInfo};
+        let registry = agent_mode::CodingAgents::builtin();
+        agent_mode::publish(Arc::new(move || {
+            ["agy", "codex"]
+                .into_iter()
+                .map(|program| AgentInfo {
+                    name: format!("synthetic-sign-in-{program}"),
+                    agent: registry.for_program(program),
+                    command: format!("/synthetic/bin/{program}"),
+                    prefix: Vec::new(),
+                    local: false,
+                    sign_in: Ok(Default::default()),
+                })
+                .collect()
+        }));
+        let (_dir, host) = host(CONFIG).await;
+        let agents = coding_agents(&host.permissions).await;
+        let agy = agents
+            .iter()
+            .find(|a| a.name == "synthetic-sign-in-agy")
+            .unwrap();
+        assert_eq!(agy.sign_ins, vec![AgentSignIn::GeminiApiKey]);
+        assert_eq!(agy.sign_in, AgentSignIn::Own);
+        assert!(!agy.sign_in_key_saved);
+        assert!(agy.sign_in_note.is_some());
+        let codex = agents
+            .iter()
+            .find(|a| a.name == "synthetic-sign-in-codex")
+            .unwrap();
+        assert!(codex.sign_ins.is_empty() && codex.sign_in_note.is_none());
+
+        let key_sign_in = |agent: &str, key: Option<&str>| SettingsChange::SetAgentSignIn {
+            agent: agent.into(),
+            sign_in: AgentSignIn::GeminiApiKey,
+            key: key.map(|key| aidaemon_client_protocol::SecretText(key.into())),
+        };
+        // No key saved and none given: refused, with what to do.
+        let bare = key_sign_in("synthetic-sign-in-agy", None);
+        assert!(matches!(
+            host.gate(&bare).await.unwrap(),
+            SettingsGate::Free
+        ));
+        assert!(
+            host.change(bare, false)
+                .await
+                .unwrap_err()
+                .contains("Paste")
+        );
+        // Storing a key asks.
+        assert!(matches!(
+            host.gate(&key_sign_in("synthetic-sign-in-agy", Some("synthetic-key")))
+                .await
+                .unwrap(),
+            SettingsGate::Ask { .. }
+        ));
+        // One that offers no key sign-in refuses it.
+        assert!(
+            host.gate(&key_sign_in("synthetic-sign-in-codex", None))
+                .await
+                .unwrap_err()
+                .contains("can't sign in")
+        );
+        // Back to its own sign-in needs nothing.
+        host.change(
+            SettingsChange::SetAgentSignIn {
+                agent: "synthetic-sign-in-agy".into(),
+                sign_in: AgentSignIn::Own,
+                key: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.permissions.sign_in_method("synthetic-sign-in-agy"),
+            aidaemon_runtime::tools::agent_mode::SignInMethod::Own
+        );
+    }
+
     /// Each coding agent is listed with its mode; checked is the default
     /// for one the daemon can host, full access asks first, and the choice
     /// is kept per agent.
@@ -1691,6 +1887,7 @@ allowed_user_ids = [1]
                     prefix: Vec::new(),
                     // Not asked: it does not run here.
                     local: false,
+                    sign_in: Ok(Default::default()),
                 },
                 AgentInfo {
                     name: "synthetic-coder".into(),
@@ -1698,6 +1895,7 @@ allowed_user_ids = [1]
                     command: "/synthetic/bin/synthetic-coder".into(),
                     prefix: Vec::new(),
                     local: false,
+                    sign_in: Ok(Default::default()),
                 },
             ]
         }));

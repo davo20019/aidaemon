@@ -106,6 +106,22 @@ impl CliAgentTool {
                 fix.map(|fix| format!(" {fix}")).unwrap_or_default()
             )));
         }
+        // How it signs in (Settings, Coding agents): its own sign-in adds
+        // nothing; a key the owner gave it is handed to it at launch.
+        let signed = match self
+            .permissions()
+            .sign_in_of(tool_name)
+            .and_then(|sign_in| coding_agent.signed_in(&sign_in))
+        {
+            Ok(signed) => signed,
+            Err(reason) => {
+                mark_refused_before_launch(PrelaunchRefusal::Policy);
+                return Ok(Err(format!(
+                    "Blocked: {} (`{tool_name}`) can't sign in: {reason}",
+                    coding_agent.name()
+                )));
+            }
+        };
         info!(
             agent = %tool_name,
             mode = mode.as_str(),
@@ -257,15 +273,18 @@ impl CliAgentTool {
                 )));
             }
         };
-        let args = launch.args;
+        let mut args = launch.args;
         let aidaemon_coding_agents::Plan {
             prompt: prompt_placement,
-            env: plan_env,
-            env_remove: plan_env_remove,
+            env: mut plan_env,
+            env_remove: mut plan_env_remove,
             host: host_starter,
             keep_alive,
             keeps_session,
         } = plan;
+        args.extend(signed.args.iter().cloned());
+        plan_env.extend(signed.env.iter().cloned());
+        plan_env_remove.extend(signed.env_remove.iter().cloned());
         let writes = WriteScope::of(workspace_mode, &canonical_write_paths);
         let short_summary: String = task_prompt.chars().take(50).collect();
 
@@ -390,6 +409,7 @@ impl CliAgentTool {
             prompt_placement,
             env: plan_env,
             env_remove: plan_env_remove,
+            signed,
             host: host_starter,
             keep_alive,
             keeps_session,

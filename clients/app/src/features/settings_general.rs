@@ -8,8 +8,8 @@
 //! path.
 
 use aidaemon_client_protocol::{
-    AgentMode, AgentReadiness, CodingAgent, PermissionLevel, SecretText, Setting, Settings,
-    SettingsChange,
+    AgentMode, AgentReadiness, AgentSignIn, CodingAgent, PermissionLevel, SecretText, Setting,
+    Settings, SettingsChange,
 };
 use nsh_core::prelude::*;
 
@@ -523,6 +523,11 @@ pub fn agent_models(store: Store, agents: &[CodingAgent]) -> View {
         } else {
             ui::inactive(picker)
         });
+        // Offered only to one that can sign in another way; usable or
+        // not, since a sign-in is how one becomes usable.
+        if !agent.sign_ins.is_empty() {
+            row = row.child(agent_sign_in(store, agent));
+        }
         list = list.child(row);
     }
     view()
@@ -534,6 +539,134 @@ pub fn agent_models(store: Store, agents: &[CodingAgent]) -> View {
              are on the General tab.",
         ))
         .child(list)
+}
+
+/// A sign-in's id in the picker, and its words (`None`: one this app
+/// doesn't know).
+fn sign_in_choice(way: AgentSignIn) -> Option<(&'static str, &'static str)> {
+    match way {
+        AgentSignIn::Own => Some(("own", "Its own sign-in")),
+        AgentSignIn::GeminiApiKey => Some(("gemini_api_key", "Gemini API key")),
+        AgentSignIn::Unknown => None,
+    }
+}
+
+/// How an agent that can be given a key signs in: its own sign-in, with
+/// its note, or a key AIdaemon keeps and hands it at launch. A key way is
+/// sent once a key is saved or pasted.
+fn agent_sign_in(store: Store, agent: &CodingAgent) -> View {
+    let ways: Vec<AgentSignIn> = std::iter::once(AgentSignIn::Own)
+        .chain(agent.sign_ins.iter().copied())
+        .filter(|way| sign_in_choice(*way).is_some())
+        .collect();
+    let items = ways
+        .iter()
+        .filter_map(|way| sign_in_choice(*way))
+        .map(|(id, words)| (id.to_owned(), words.to_owned()))
+        .collect();
+    let way_of = move |id: &str| {
+        ways.iter()
+            .copied()
+            .find(|way| sign_in_choice(*way).is_some_and(|(known, _)| known == id))
+            .unwrap_or(AgentSignIn::Own)
+    };
+    let chosen = signal(agent.sign_in);
+    let saved = agent.sign_in_key_saved;
+    let name = agent.name.clone();
+    let picker = {
+        let name = name.clone();
+        let way_of = way_of.clone();
+        ui::choice(
+            format!("{} sign-in", agent.program),
+            "Choose how it signs in",
+            items,
+            move || sign_in_choice(chosen.get()).map(|(id, _)| id.to_owned()),
+            move |next: Option<String>| {
+                let way = next.as_deref().map(&way_of).unwrap_or(AgentSignIn::Own);
+                chosen.set(way);
+                // A key way waits for a key unless one is saved.
+                if way == AgentSignIn::Own || saved {
+                    store.set_agent_sign_in(name.clone(), way, None);
+                }
+            },
+        )
+        .flex_1()
+        .max_w(px(if ui::touch() { f32::MAX } else { 360.0 }))
+    };
+    let note = agent.sign_in_note.clone();
+    let details = dynamic(move || {
+        let way = chosen.get();
+        let note = note.clone();
+        let name = name.clone();
+        Some(untracked(move || {
+            if way == AgentSignIn::Own {
+                let Some(note) = note else {
+                    return view();
+                };
+                let link = note.link.clone();
+                return view()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(faint(note.text))
+                    .child(ui::btn("Learn more", Variant::Ghost, Size::Sm, move || {
+                        drop(open_url(&link));
+                    }));
+            }
+            let key = signal(String::new());
+            let save = {
+                let name = name.clone();
+                move || {
+                    let value = key.get_untracked();
+                    if value.trim().is_empty() {
+                        return;
+                    }
+                    store.set_agent_sign_in(name.clone(), way, Some(value));
+                    key.set(String::new());
+                }
+            };
+            let status = if saved {
+                ui::status("Key in the keychain", Tone::Success)
+            } else {
+                ui::status("No key saved yet", Tone::Neutral)
+            };
+            view()
+                .gap_2()
+                .child(status)
+                .child(
+                    ui::secret_field(
+                        if saved {
+                            "Paste a new key to replace it"
+                        } else {
+                            "Paste its API key"
+                        },
+                        key,
+                    )
+                    .label("Gemini API key")
+                    .w_full(),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            ui::btn("Save key", Variant::Primary, Size::Sm, save)
+                                .disabled(move || key.with(|k| k.trim().is_empty())),
+                        )
+                        .child(ui::btn("Get a key", Variant::Ghost, Size::Sm, move || {
+                            drop(open_url("https://aistudio.google.com/apikey"));
+                        })),
+                )
+        }))
+    });
+    view()
+        .gap_1()
+        .child(faint("Sign-in"))
+        .child(view().flex_row().child(picker))
+        .child(details)
 }
 
 /// The pick that leaves an agent on its own default model (no model id

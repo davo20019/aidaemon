@@ -724,6 +724,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         prompt_placement: aidaemon_coding_agents::PromptPlacement::LastArgument,
         env: Vec::new(),
         env_remove: Vec::new(),
+        signed: aidaemon_coding_agents::SignedIn::default(),
         host: None,
         keep_alive: None,
         keeps_session: true,

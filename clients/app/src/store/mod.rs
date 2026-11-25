@@ -1700,6 +1700,15 @@ impl Store {
         self.act(|c| c.set_agent_model(&agent, model));
     }
 
+    pub fn set_agent_sign_in(
+        &self,
+        agent: String,
+        sign_in: aidaemon_client_protocol::AgentSignIn,
+        key: Option<String>,
+    ) {
+        self.act(|c| c.set_agent_sign_in(&agent, sign_in, key));
+    }
+
     /// Ask every coding agent again whether it can do work now.
     pub fn check_agents(&self) {
         self.act(|c| c.check_agents());

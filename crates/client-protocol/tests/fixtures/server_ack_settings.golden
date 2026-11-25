@@ -66,6 +66,31 @@
           "readiness": "unchecked",
           "same_as_aidaemon": false,
           "takes_model": false
+        },
+        {
+          "account": "Its own sign-in, or a Gemini API key.",
+          "capped": false,
+          "mode": "every_command",
+          "modes": [
+            "every_command",
+            "full_access"
+          ],
+          "name": "agy",
+          "program": "Antigravity CLI",
+          "readiness": "ready",
+          "same_as_aidaemon": false,
+          "sign_in_key_saved": true,
+          "sign_in_note": {
+            "link": "https://example.com/faq",
+            "text": "Use a key."
+          },
+          "sign_ins": [
+            "gemini_api_key"
+          ],
+          "takes_model": true,
+          "within_level": [
+            "every_command"
+          ]
         }
       ],
       "config_path": "/home/synthetic/.aidaemon/config.toml",

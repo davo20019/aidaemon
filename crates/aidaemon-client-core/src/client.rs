@@ -15,12 +15,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aidaemon_client_protocol::{
-    AgentMode, Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
-    AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
-    MidRun, ModelChoice, ModelOptions, PermissionLevel, ProjectDir, ProjectFile, ProjectSummary,
-    QueuedMessage, SearchHit, ServerFrame, SessionChanges, SessionModel, Settings, SettingsChange,
-    SettingsOutcome, SetupAction, SetupStep, SlashCommand, StreamAccept, SurfaceController,
-    SurfaceInfo, SurfaceMode, SurfaceTransport, SystemStatus, TaskSummary, TurnState, TurnStatus,
+    AgentMode, AgentSignIn, Approval, ApprovalDecision, AttachmentRef, AutomationChange,
+    AutomationNotify, AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event,
+    LiveTurnState, MemoryItem, MidRun, ModelChoice, ModelOptions, PermissionLevel, ProjectDir,
+    ProjectFile, ProjectSummary, QueuedMessage, SearchHit, SecretText, ServerFrame, SessionChanges,
+    SessionModel, Settings, SettingsChange, SettingsOutcome, SetupAction, SetupStep, SlashCommand,
+    StreamAccept, SurfaceController, SurfaceInfo, SurfaceMode, SurfaceTransport, SystemStatus,
+    TaskSummary, TurnState, TurnStatus,
 };
 
 use crate::surfaces::LiveView;
@@ -1533,6 +1534,31 @@ impl Client {
         self.change_settings(SettingsChange::SetAgentModel {
             agent: agent.to_owned(),
             model,
+        });
+    }
+
+    /// Set how coding agent `agent` signs in. `key`: the key it signs in
+    /// with, stored first (a key sign-in with none saved needs one; a
+    /// blank key is no key). Nothing is sent for a way it doesn't offer,
+    /// or for the sign-in it already has with no new key.
+    pub fn set_agent_sign_in(&mut self, agent: &str, sign_in: AgentSignIn, key: Option<String>) {
+        let Read::Ready(settings) = &self.settings else {
+            return;
+        };
+        let Some(current) = settings.coding_agents.iter().find(|a| a.name == agent) else {
+            return;
+        };
+        let key = key
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty());
+        let offered = sign_in == AgentSignIn::Own || current.sign_ins.contains(&sign_in);
+        if !offered || (current.sign_in == sign_in && key.is_none()) {
+            return;
+        }
+        self.change_settings(SettingsChange::SetAgentSignIn {
+            agent: agent.to_owned(),
+            sign_in,
+            key: key.map(SecretText),
         });
     }
 
@@ -4129,6 +4155,44 @@ mod tests {
             &cx(None),
         );
         assert!(!client.settings_busy());
+    }
+
+    #[test]
+    fn an_agent_sign_in_is_sent_only_when_offered_and_changed() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.refresh_settings();
+        let read = settings_reads(&mut client);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{}","result":{{"type":"settings","settings":{{"config_path":"/home/synthetic/config.toml","database_path":"","groups":[],"coding_agents":[{{"name":"agy","program":"Antigravity CLI","modes":["every_command"],"sign_ins":["gemini_api_key"],"sign_in_note":{{"text":"Use a key.","link":"https://example.com/faq"}}}},{{"name":"claude","program":"Claude Code","modes":["checked"]}}]}}}}}}"#,
+                read[0]
+            )),
+            &cx(None),
+        );
+        // Its own sign-in it has; a way one doesn't offer; a blank key.
+        client.set_agent_sign_in("agy", AgentSignIn::Own, None);
+        client.set_agent_sign_in("agy", AgentSignIn::Own, Some("  ".into()));
+        client.set_agent_sign_in("claude", AgentSignIn::GeminiApiKey, Some("k".into()));
+        assert!(client.take_outgoing().is_empty());
+        client.set_agent_sign_in(
+            "agy",
+            AgentSignIn::GeminiApiKey,
+            Some(" synthetic-key ".into()),
+        );
+        let sent = client.take_outgoing();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1,
+            Command::ChangeSettings {
+                change: SettingsChange::SetAgentSignIn {
+                    agent: "agy".into(),
+                    sign_in: AgentSignIn::GeminiApiKey,
+                    key: Some(SecretText("synthetic-key".into())),
+                }
+            }
+        );
     }
 
     #[test]

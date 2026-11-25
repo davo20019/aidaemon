@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Antigravity CLI (`agy`) can sign in with a Gemini API key.** Settings → Models → Coding agents offers "Its own sign-in" (the default, unchanged) or "Gemini API key": the key is kept in the keychain and handed to `agy acp` at launch, in its own data folder (`~/.gemini/aidaemon-agy`), so your own agy sign-in and sessions are untouched. While agy runs on its own sign-in, a short note links Google's FAQ, which prefers a Gemini API key for agy driven by other apps.
+
 ### Security
 
 - **In a group chat, the requester's earlier messages vouch for an address too;** other participants' never do.

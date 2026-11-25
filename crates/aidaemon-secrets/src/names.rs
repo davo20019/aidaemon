@@ -107,3 +107,9 @@ mod tests {
         assert_eq!(otlp_header("X-Honeycomb"), "otlp_header_x-honeycomb");
     }
 }
+
+/// The key coding agent `agent` signs in with when the owner chose one for
+/// it (`cli_agent_agy_sign_in_key`), its name normalized like a header's.
+pub fn cli_agent_sign_in_key(agent: &str) -> String {
+    format!("cli_agent_{}_sign_in_key", normalized_header(agent))
+}

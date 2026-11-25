@@ -116,6 +116,9 @@ pub(super) struct PreparedRun {
     pub(super) prompt_placement: aidaemon_coding_agents::PromptPlacement,
     pub(super) env: Vec<(String, String)>,
     pub(super) env_remove: Vec<String>,
+    /// What its sign-in added to `args` and its environment, for a
+    /// re-prepared launch to add again.
+    pub(super) signed: aidaemon_coding_agents::SignedIn,
     pub(super) host: Option<Box<dyn aidaemon_coding_agents::HostStarter>>,
     pub(super) keep_alive: Option<Box<dyn std::any::Any + Send>>,
     /// The agent keeps its session where a follow-up can continue it.
