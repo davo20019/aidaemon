@@ -304,6 +304,49 @@ impl SlackChannel {
         .await
     }
 
+    /// Call a Web API method as the bot with a JSON body (or none), through
+    /// this channel's redaction, rate-limit retry (`429` or `ratelimited`)
+    /// and error mapping: for a host driving methods the [`Channel`] trait
+    /// has no verb for.
+    pub async fn api(&self, method: &str, body: Option<&Value>) -> Result<Value, ChannelError> {
+        self.call(method, &self.bot_token, body).await
+    }
+
+    /// Post `body` to an interaction's or command's `response_url`, which
+    /// must be a Slack host (the payload names it; nothing else may be
+    /// answered), through the one redaction boundary.
+    pub async fn respond(&self, response_url: &str, body: &Value) -> Result<(), ChannelError> {
+        if !self.slack_url(response_url) {
+            return Err(ChannelError::Other(
+                "slack: response URL is not a Slack host".into(),
+            ));
+        }
+        let response = self
+            .http
+            .post(response_url)
+            .json(&aidaemon_channels::outbound::redact_body(body))
+            .send()
+            .await
+            .map_err(|e| ChannelError::Transport(format!("command response: {e}")))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ChannelError::Other(format!(
+                "command response: HTTP {}",
+                response.status()
+            )))
+        }
+    }
+
+    /// [`Self::api`] with form-encoded fields.
+    pub async fn api_form(
+        &self,
+        method: &str,
+        fields: &[(&str, String)],
+    ) -> Result<Value, ChannelError> {
+        self.call_form(method, fields).await
+    }
+
     /// A Web API call with form-encoded fields (methods that take no JSON).
     async fn call_form(
         &self,
@@ -1083,30 +1126,11 @@ impl Channel for SlackChannel {
         command: &CommandInvocation,
         text: &str,
     ) -> Result<(), ChannelError> {
-        if !self.slack_url(&command.handle) {
-            return Err(ChannelError::Other(
-                "slack: command response URL is not a Slack host".into(),
-            ));
-        }
         let body = json!({
             "response_type": "ephemeral",
             "text": truncate_chars(&markdown_to_mrkdwn(text), MAX_MESSAGE_LEN),
         });
-        let response = self
-            .http
-            .post(&command.handle)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ChannelError::Transport(format!("command response: {e}")))?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(ChannelError::Other(format!(
-                "command response: HTTP {}",
-                response.status()
-            )))
-        }
+        self.respond(&command.handle, &body).await
     }
 }
 

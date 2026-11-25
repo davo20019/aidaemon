@@ -69,7 +69,6 @@ pub trait SlackHost: SharedCommandDispatch + 'static {
 /// leave margin). Text in a Block Kit section is limited to the adapter's
 /// [`crate::SECTION_TEXT_LIMIT`].
 const MAX_MESSAGE_LEN: usize = 39_000;
-const SLACK_API: &str = "https://slack.com/api";
 const DEFAULT_WORKSPACE_GRANT_HOURS: i64 = 24;
 const MAX_WORKSPACE_GRANT_HOURS: i64 = 168;
 
@@ -327,7 +326,6 @@ pub struct SlackBot {
     /// Bot name fetched from Slack API (e.g., "my_bot").
     /// Populated on first connection.
     bot_name: std::sync::RwLock<String>,
-    bot_token: String,
     allowed_user_ids: std::sync::RwLock<Vec<String>>,
     /// Explicit owners from `users.owner_ids.slack`. When empty, allowed users
     /// retain legacy owner behavior for backward compatibility.
@@ -340,8 +338,6 @@ pub struct SlackBot {
     /// Threads (`channel:thread_ts`) the bot is known to be answering in.
     bot_threads: std::sync::Mutex<std::collections::HashSet<String>>,
     host: Arc<dyn SlackHost>,
-    /// HTTP client for Slack Web API calls.
-    http: reqwest::Client,
     /// Our own bot user ID, resolved on first connection.
     bot_user_id: Mutex<Option<String>>,
     /// Slack team/workspace ID from `auth.test`; grants fail closed until known.
@@ -356,8 +352,6 @@ pub struct SlackBot {
     channel_members_cache: RwLock<HashMap<String, (Vec<String>, Instant)>>,
     deps: BotDeps,
     runner: TurnRunner,
-    /// `https://slack.com/api` (a test points it at a mock).
-    api_base: String,
     /// Holds the Socket Mode connection and asks prompts.
     transport: Arc<crate::SlackChannel>,
     prompts: Prompts,
@@ -440,18 +434,15 @@ impl SlackBot {
         Self {
             runner: TurnRunner::new(deps.turn_deps()),
             deps,
-            api_base: SLACK_API.to_string(),
-            transport: Arc::new(crate::SlackChannel::new(bot_token.clone(), app_token)),
+            transport: Arc::new(crate::SlackChannel::new(bot_token, app_token)),
             prompts: Prompts::default(),
             bot_name: std::sync::RwLock::new("slack".to_string()),
-            bot_token,
             allowed_user_ids: std::sync::RwLock::new(allowed_user_ids),
             owner_user_ids: std::sync::RwLock::new(owner_user_ids),
             owner_claim: aidaemon_channels::claim::OwnerClaim::new("Slack", None),
             workspace_grants: std::sync::RwLock::new(workspace_grants),
             use_threads,
             host,
-            http: reqwest::Client::new(),
             bot_user_id: Mutex::new(None),
             bot_threads: std::sync::Mutex::default(),
             team_id: std::sync::RwLock::new(None),
@@ -856,7 +847,7 @@ impl SlackBot {
 
     /// Resolve the bot's own user ID and name via `auth.test`.
     async fn resolve_bot_info(&self) {
-        match self.slack_api_get("auth.test").await {
+        match self.transport.api("auth.test", None).await {
             Ok(resp) => {
                 if let Some(user_id) = resp.get("user_id").and_then(|v| v.as_str()) {
                     let mut guard = self.bot_user_id.lock().await;
@@ -888,15 +879,11 @@ impl SlackBot {
         }
 
         // Call users.info API
-        let resp = self
-            .http
-            .get(format!("{}/users.info", self.api_base))
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .query(&[("user", user_id)])
-            .send()
+        let json = self
+            .transport
+            .api_form("users.info", &[("user", user_id.to_string())])
             .await
             .ok()?;
-        let json: Value = resp.json().await.ok()?;
         if json.get("ok")?.as_bool()? {
             let user = json.get("user")?;
             let name = user
@@ -959,38 +946,24 @@ impl SlackBot {
             return Some(name.clone());
         }
 
-        // Call conversations.info API
-        let resp = self
-            .http
-            .get(format!("{}/conversations.info", self.api_base))
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .query(&[("channel", channel_id)])
-            .send()
+        let json = match self
+            .transport
+            .api_form("conversations.info", &[("channel", channel_id.to_string())])
             .await
-            .ok()?;
-        let json: Value = resp.json().await.ok()?;
-        if json.get("ok")?.as_bool()? {
-            let name = json
-                .pointer("/channel/name")
-                .and_then(|v| v.as_str())?
-                .to_string();
-            let display_name = format!("#{}", name);
-            self.channel_name_cache
-                .write()
-                .await
-                .insert(channel_id.to_string(), display_name.clone());
-            Some(display_name)
-        } else {
-            debug!(
-                channel_id,
-                error = json
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                "Failed to resolve channel name"
-            );
-            None
-        }
+        {
+            Ok(json) => json,
+            Err(error) => {
+                debug!(channel_id, %error, "Failed to resolve channel name");
+                return None;
+            }
+        };
+        let name = json.pointer("/channel/name").and_then(|v| v.as_str())?;
+        let display_name = format!("#{}", name);
+        self.channel_name_cache
+            .write()
+            .await
+            .insert(channel_id.to_string(), display_name.clone());
+        Some(display_name)
     }
 
     /// Resolve the display names of members in a channel via `conversations.members` + `users.info`.
@@ -1005,48 +978,31 @@ impl SlackBot {
             return names.clone();
         }
 
-        // Call conversations.members API (limit 50)
-        let resp = match self
-            .http
-            .get(format!("{}/conversations.members", self.api_base))
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .query(&[("channel", channel_id), ("limit", "50")])
-            .send()
+        let json = match self
+            .transport
+            .api_form(
+                "conversations.members",
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("limit", "50".to_string()),
+                ],
+            )
             .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(error = %e, "Failed to fetch channel members");
+            Ok(json) => json,
+            Err(error) => {
+                // Without the list the model has no names to mention. For a
+                // private channel the bot needs `groups:read` as well as
+                // `channels:read`.
+                warn!(
+                    channel_id,
+                    %error,
+                    "Failed to fetch channel members; replies here cannot mention anyone \
+                     (private channels need the groups:read scope)"
+                );
                 return vec![];
             }
         };
-
-        let json: Value = match resp.json().await {
-            Ok(j) => j,
-            Err(_) => return vec![],
-        };
-
-        if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = json
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            if error == "channel_not_found" || error == "method_not_allowed_for_channel_type" {
-                warn!(
-                    channel_id,
-                    error,
-                    "Failed to fetch channel members — for private channels, \
-                     the bot needs the `groups:read` scope in addition to `channels:read`"
-                );
-            } else {
-                // Without the list the model has no names to mention.
-                warn!(
-                    channel_id,
-                    error, "Failed to fetch channel members; replies here cannot mention anyone"
-                );
-            }
-            return vec![];
-        }
 
         let member_ids: Vec<String> = json
             .get("members")
@@ -1089,86 +1045,9 @@ impl SlackBot {
         names
     }
 
-    /// Make a GET-style Slack API call (actually POST with empty body).
-    async fn slack_api_get(&self, method: &str) -> anyhow::Result<Value> {
-        let url = format!("{}/{}", self.api_base, method);
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send()
-            .await?;
-        let body: Value = resp.json().await?;
-        if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("Slack API {} failed: {}", method, error);
-        }
-        Ok(body)
-    }
-
-    /// Make a Slack Web API call with query parameters and one bounded 429 retry.
-    async fn slack_api_query(
-        &self,
-        method: &str,
-        params: &[(&str, String)],
-    ) -> anyhow::Result<Value> {
-        let url = format!("{}/{}", self.api_base, method);
-        let mut resp = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .query(params)
-            .send()
-            .await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-            && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
-                resp.headers(),
-                aidaemon_channels::rate_limit::default_retry_after_cap(),
-            )
-        {
-            aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
-            resp = self
-                .http
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", self.bot_token))
-                .query(params)
-                .send()
-                .await?;
-        }
-
-        let status = resp.status();
-        let response_text = resp.text().await?;
-        let result: Value = serde_json::from_str(&response_text).map_err(|error| {
-            anyhow::anyhow!(
-                "Slack API {} returned invalid JSON (HTTP {}): {}",
-                method,
-                status,
-                error
-            )
-        })?;
-        if !status.is_success() || result.get("ok").and_then(Value::as_bool) != Some(true) {
-            let error = result
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            anyhow::bail!(
-                "Slack API {} failed: {} (HTTP {}, response: {})",
-                method,
-                error,
-                status,
-                result
-            );
-        }
-        Ok(result)
-    }
-
     async fn fetch_slack_file_info(&self, file_id: &str) -> anyhow::Result<Value> {
         let params = [("file", file_id.to_string())];
-        let response = self.slack_api_query("files.info", &params).await?;
+        let response = self.transport.api_form("files.info", &params).await?;
         response
             .get("file")
             .cloned()
@@ -1266,7 +1145,7 @@ impl SlackBot {
             ("inclusive", "true".to_string()),
             ("limit", "15".to_string()),
         ]);
-        let history = self.slack_api_query(method, &params).await?;
+        let history = self.transport.api_form(method, &params).await?;
         let message = history
             .get("messages")
             .and_then(Value::as_array)
@@ -1292,7 +1171,7 @@ impl SlackBot {
             channel_type.to_string()
         } else {
             let params = [("channel", channel_id.to_string())];
-            match self.slack_api_query("conversations.info", &params).await {
+            match self.transport.api_form("conversations.info", &params).await {
                 Ok(response) => response
                     .get("channel")
                     .map(slack_channel_type)
@@ -1310,51 +1189,6 @@ impl SlackBot {
         };
 
         normalize_file_shared_message(message, event, &file, channel_id, &channel_type)
-    }
-
-    /// Make a POST Slack API call with a JSON body.
-    async fn slack_api_post(&self, method: &str, body: &Value) -> anyhow::Result<Value> {
-        let url = format!("{}/{}", self.api_base, method);
-        // The one redaction boundary every request to the chat passes.
-        let body_bytes = serde_json::to_vec(&aidaemon_channels::outbound::redact_body(body))?;
-        let mut resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .header("Content-Type", "application/json; charset=utf-8")
-            .body(body_bytes.clone())
-            .send()
-            .await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-            && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
-                resp.headers(),
-                aidaemon_channels::rate_limit::default_retry_after_cap(),
-            )
-        {
-            aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
-            resp = self
-                .http
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.bot_token))
-                .header("Content-Type", "application/json; charset=utf-8")
-                .body(body_bytes)
-                .send()
-                .await?;
-        }
-        let result: Value = resp.json().await?;
-        if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = result
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!(
-                "Slack API {} failed: {} (response: {})",
-                method,
-                error,
-                result
-            );
-        }
-        Ok(result)
     }
 
     /// Handle a Socket Mode envelope.
@@ -1418,7 +1252,8 @@ impl SlackBot {
             return false;
         };
         let replies = match self
-            .slack_api_query(
+            .transport
+            .api_form(
                 "conversations.replies",
                 &[
                     ("channel", channel_id.to_string()),
@@ -1935,12 +1770,7 @@ impl SlackBot {
                         "replace_original": false,
                         "text": mrkdwn,
                     });
-                    let _ = self
-                        .http
-                        .post(response_url)
-                        .json(&aidaemon_channels::outbound::redact_body(&updated))
-                        .send()
-                        .await;
+                    let _ = self.transport.respond(response_url, &updated).await;
                 }
                 continue;
             }
@@ -2016,12 +1846,7 @@ impl SlackBot {
                 "response_type": "ephemeral",
                 "text": mrkdwn,
             });
-            let _ = self
-                .http
-                .post(response_url)
-                .json(&aidaemon_channels::outbound::redact_body(&body))
-                .send()
-                .await;
+            let _ = self.transport.respond(response_url, &body).await;
         } else {
             let _ = self.post_message(channel_id, &reply, None).await;
         }
@@ -2167,7 +1992,7 @@ impl SlackBot {
         if let Some(ts) = thread_ts {
             body["thread_ts"] = Value::String(ts.to_string());
         }
-        self.slack_api_post("chat.postMessage", &body).await
+        Ok(self.transport.api("chat.postMessage", Some(&body)).await?)
     }
 
     /// Post a message with Block Kit blocks (e.g., buttons) to a Slack channel.
@@ -2186,7 +2011,7 @@ impl SlackBot {
         if let Some(ts) = thread_ts {
             body["thread_ts"] = Value::String(ts.to_string());
         }
-        self.slack_api_post("chat.postMessage", &body).await
+        Ok(self.transport.api("chat.postMessage", Some(&body)).await?)
     }
 
     /// Handle incoming file attachments.
@@ -2237,71 +2062,24 @@ impl SlackBot {
         Ok(attachments)
     }
 
-    /// Upload a file to Slack using the new files.getUploadURLExternal flow.
+    /// Upload a file to a session's conversation through the transport
+    /// (the upload URL must be a Slack host).
     async fn upload_file(
         &self,
-        channels: &str,
+        session_id: &str,
         filename: &str,
-        data: &[u8],
-        thread_ts: Option<&str>,
+        data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        // Step 1: Get upload URL (uses form-encoded, not JSON)
-        let url = format!("{}/files.getUploadURLExternal", self.api_base);
-        let form_resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .form(&[
-                ("filename", filename.to_string()),
-                ("length", data.len().to_string()),
-            ])
-            .send()
-            .await?;
-        let resp: Value = form_resp.json().await?;
-        if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let error = resp
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!(
-                "Slack API files.getUploadURLExternal failed: {} (response: {})",
-                error,
-                resp
-            );
-        }
-        let upload_url = resp
-            .get("upload_url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No upload_url in response"))?
-            .to_string();
-        let file_id = resp
-            .get("file_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No file_id in response"))?
-            .to_string();
-
-        // Step 2: Upload the file (Slack docs specify POST, not PUT)
-        let upload_resp = self
-            .http
-            .post(&upload_url)
-            .header("Content-Type", "application/octet-stream")
-            .body(data.to_vec())
-            .send()
-            .await?;
-        if !upload_resp.status().is_success() {
-            let status = upload_resp.status();
-            let body = upload_resp.text().await.unwrap_or_default();
-            anyhow::bail!("Slack file upload failed with status {}: {}", status, body);
-        }
-        // Step 3: Complete the upload and share to channel
-        let mut complete_params = serde_json::json!({
-            "files": [{"id": file_id, "title": filename}],
-            "channel_id": channels,
-        });
-        if let Some(ts) = thread_ts {
-            complete_params["thread_ts"] = Value::String(ts.to_string());
-        }
-        self.slack_api_post("files.completeUploadExternal", &complete_params)
+        self.transport
+            .send_file(
+                &self.conversation_for(session_id),
+                &aidaemon_channels::OutboundFile {
+                    name: filename.to_string(),
+                    bytes: data,
+                    mime_type: None,
+                    caption: None,
+                },
+            )
             .await?;
         Ok(())
     }
@@ -2349,19 +2127,15 @@ impl SlackBot {
     }
 
     /// A handle for Slack API calls from spawned tasks.
-    fn api_handle(&self) -> SlackApiHandle {
-        SlackApiHandle {
-            http: self.http.clone(),
-            bot_token: self.bot_token.clone(),
-            api_base: self.api_base.clone(),
-        }
+    fn api_handle(&self) -> Arc<crate::SlackChannel> {
+        self.transport.clone()
     }
 }
 
 /// One Slack conversation (a channel, or a thread in one), as the turn
 /// runner shows it.
 struct SlackSurface {
-    api: SlackApiHandle,
+    api: Arc<crate::SlackChannel>,
     channel: String,
     thread: Option<String>,
     /// The message the working reaction goes on; taken by the first turn.
@@ -2391,15 +2165,15 @@ impl TurnSurface for SlackSurface {
         let mut ids = Vec::new();
         let mut failure = None;
         for chunk in split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN) {
-            match slack_post_message(
-                &self.api.http,
-                &self.api.api_base,
-                &self.api.bot_token,
-                &self.channel,
-                &chunk,
-                self.thread.as_deref(),
-            )
-            .await
+            let mut body = serde_json::json!({ "channel": self.channel, "text": chunk });
+            if let Some(ts) = self.thread.as_deref() {
+                body["thread_ts"] = Value::String(ts.to_string());
+            }
+            match self
+                .api
+                .api("chat.postMessage", Some(&body))
+                .await
+                .map_err(anyhow::Error::from)
             {
                 Ok(response) => {
                     if let Some(ts) = response.get("ts").and_then(Value::as_str) {
@@ -2435,15 +2209,12 @@ impl TurnSurface for SlackSurface {
         else {
             return;
         };
-        let api = SlackApiHandle {
-            http: self.api.http.clone(),
-            bot_token: self.api.bot_token.clone(),
-            api_base: self.api.api_base.clone(),
-        };
+        let api = self.api.clone();
+
         let channel = self.channel.clone();
         tokio::spawn(async move {
             const WORKING: &str = "hourglass_flowing_sand";
-            let _ = api.add_reaction(&channel, &ts, WORKING).await;
+            add_reaction(&api, &channel, &ts, WORKING).await;
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(10)), if stale_secs > 0 => {
@@ -2452,15 +2223,15 @@ impl TurnSurface for SlackSurface {
                             .unwrap_or_default()
                             .as_secs();
                         if now.saturating_sub(heartbeat.load(Ordering::Relaxed)) > stale_secs {
-                            let _ = api.remove_reaction(&channel, &ts, WORKING).await;
-                            let _ = api.add_reaction(&channel, &ts, "warning").await;
+                            remove_reaction(&api, &channel, &ts, WORKING).await;
+                            add_reaction(&api, &channel, &ts, "warning").await;
                             return;
                         }
                     }
                     _ = stop.cancelled() => break,
                 }
             }
-            let _ = api.remove_reaction(&channel, &ts, WORKING).await;
+            remove_reaction(&api, &channel, &ts, WORKING).await;
         });
     }
 
@@ -2487,47 +2258,15 @@ impl TurnSurface for SlackSurface {
     }
 }
 
-/// Lightweight handle for making Slack API calls from spawned tasks.
-struct SlackApiHandle {
-    http: reqwest::Client,
-    bot_token: String,
-    api_base: String,
+/// Best effort: a reaction that fails leaves the turn as it was.
+async fn add_reaction(api: &crate::SlackChannel, channel: &str, ts: &str, name: &str) {
+    let body = serde_json::json!({ "channel": channel, "timestamp": ts, "name": name });
+    let _ = api.api("reactions.add", Some(&body)).await;
 }
 
-impl SlackApiHandle {
-    async fn add_reaction(&self, channel: &str, ts: &str, name: &str) -> anyhow::Result<()> {
-        let body = serde_json::json!({
-            "channel": channel,
-            "timestamp": ts,
-            "name": name,
-        });
-        let url = format!("{}/reactions.add", self.api_base);
-        let _ = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await;
-        Ok(())
-    }
-
-    async fn remove_reaction(&self, channel: &str, ts: &str, name: &str) -> anyhow::Result<()> {
-        let body = serde_json::json!({
-            "channel": channel,
-            "timestamp": ts,
-            "name": name,
-        });
-        let url = format!("{}/reactions.remove", self.api_base);
-        let _ = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await;
-        Ok(())
-    }
+async fn remove_reaction(api: &crate::SlackChannel, channel: &str, ts: &str, name: &str) {
+    let body = serde_json::json!({ "channel": channel, "timestamp": ts, "name": name });
+    let _ = api.api("reactions.remove", Some(&body)).await;
 }
 
 /// Convert `@DisplayName` mentions back to `<@USERID>` using a user cache snapshot.
@@ -2548,54 +2287,6 @@ fn restore_mentions_from_cache(text: &str, cache: &HashMap<String, String>) -> S
         }
     }
     result
-}
-
-/// Free function to post a message via Slack Web API.
-async fn slack_post_message(
-    http: &reqwest::Client,
-    api_base: &str,
-    bot_token: &str,
-    channel: &str,
-    text: &str,
-    thread_ts: Option<&str>,
-) -> anyhow::Result<Value> {
-    let mut body = serde_json::json!({
-        "channel": channel,
-        "text": text,
-    });
-    if let Some(ts) = thread_ts {
-        body["thread_ts"] = Value::String(ts.to_string());
-    }
-    let body = aidaemon_channels::outbound::redact_body(&body);
-    let mut resp = http
-        .post(format!("{api_base}/chat.postMessage"))
-        .header("Authorization", format!("Bearer {}", bot_token))
-        .json(&body)
-        .send()
-        .await?;
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-        && let Some(delay) = aidaemon_channels::rate_limit::retry_after_from_headers(
-            resp.headers(),
-            aidaemon_channels::rate_limit::default_retry_after_cap(),
-        )
-    {
-        aidaemon_channels::rate_limit::sleep_after_rate_limit("slack", delay).await;
-        resp = http
-            .post(format!("{api_base}/chat.postMessage"))
-            .header("Authorization", format!("Bearer {}", bot_token))
-            .json(&body)
-            .send()
-            .await?;
-    }
-    let result: Value = resp.json().await?;
-    if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let error = result
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        anyhow::bail!("chat.postMessage failed: {}", error);
-    }
-    Ok(result)
 }
 
 #[async_trait]
@@ -2629,7 +2320,7 @@ impl HubChannel for SlackBot {
         let (channel_id, thread_ts) = self.parse_session_id(session_id);
         match &media.kind {
             MediaKind::Photo { data } => {
-                self.upload_file(&channel_id, "screenshot.png", data, thread_ts.as_deref())
+                self.upload_file(session_id, "screenshot.png", data.clone())
                     .await?;
             }
             MediaKind::Document {
@@ -2637,8 +2328,7 @@ impl HubChannel for SlackBot {
                 filename,
             } => {
                 let data = tokio::fs::read(file_path).await?;
-                self.upload_file(&channel_id, filename, &data, thread_ts.as_deref())
-                    .await?;
+                self.upload_file(session_id, filename, data).await?;
             }
         }
         if !media.caption.is_empty() {
@@ -2713,8 +2403,6 @@ impl SlackBot {
     /// Talk to the Web API at `base` with `http`, as bot user `bot_user_id`
     /// (a test points it at a mock).
     pub fn with_api(mut self, base: &str, bot_user_id: &str, http: reqwest::Client) -> Self {
-        self.api_base = base.to_string();
-        self.http = http.clone();
         self.bot_user_id = Mutex::new(Some(bot_user_id.to_string()));
         self.transport = Arc::new(
             crate::SlackChannel::new("xoxb-synthetic", "xapp-synthetic")

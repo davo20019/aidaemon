@@ -164,7 +164,8 @@ async fn an_owner_reply_continues_a_thread_the_bot_is_in_and_no_other() {
     let api = MockApi::start(|request: &Recorded| {
         if request.path.starts_with("/conversations.replies") {
             // The bot has answered in the thread rooted at ...0600 only.
-            let user = if request.path.contains("1700000000.000600") {
+            // (Web API calls are form posts: the thread is in the body.)
+            let user = if request.body.contains("1700000000.000600") {
                 BOT
             } else {
                 STRANGER
