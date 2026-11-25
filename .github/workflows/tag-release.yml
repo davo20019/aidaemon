@@ -13,6 +13,10 @@ concurrency:
   group: tag-release
   cancel-in-progress: false
 
+# Jobs read the repository; the ones that publish ask for more themselves.
+permissions:
+  contents: read
+
 jobs:
   tag:
     name: Tag the new version
@@ -23,7 +27,7 @@ jobs:
       contents: write
       actions: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Read the version
         id: version

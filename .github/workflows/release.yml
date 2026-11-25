@@ -25,6 +25,10 @@ env:
   # integration suite needs. Match the daemon's own worker stack budget.
   RUST_MIN_STACK: "8388608"
 
+# Jobs read the repository; the ones that publish ask for more themselves.
+permissions:
+  contents: read
+
 jobs:
   quality-gate:
     name: Quality gate
@@ -34,7 +38,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # CI already ran every test on this exact commit (the pull request or
       # the master push): reuse its result instead of spending most of an
@@ -102,7 +106,7 @@ jobs:
 
       - name: Cache cargo registry
         if: steps.ci.outputs.green != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -112,7 +116,7 @@ jobs:
 
       - name: Cache fastembed model
         if: steps.ci.outputs.green != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .fastembed_cache
           key: fastembed-allminilml6v2-v2
@@ -158,14 +162,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # The toolchain comes from rust-toolchain.toml.
       # ONNX Runtime's prebuilt library (ort-sys, through fastembed), fetched
       # from pyke's CDN by every build; a truncated download failed the
       # v0.21.0 Linux build.
       - name: Cache ONNX Runtime download
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/ort.pyke.io
@@ -275,7 +279,7 @@ jobs:
           shasum -a 256 "AIdaemon-${{ matrix.name }}.dmg" > "AIdaemon-${{ matrix.name }}.dmg.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: aidaemon-${{ matrix.name }}
           path: |
@@ -295,12 +299,12 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust
         run: rustup toolchain install && rustc --version
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: openssl
         with:
           path: C:\vcpkg\installed\x64-windows-static-md
@@ -335,7 +339,7 @@ jobs:
           "$hash  aidaemon-windows-x86_64.zip" | Out-File -Encoding ascii -NoNewline aidaemon-windows-x86_64.zip.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: aidaemon-windows-x86_64
           path: |
@@ -350,7 +354,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust
         run: |
@@ -377,7 +381,7 @@ jobs:
           echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
 
       - name: Install wasm-bindgen CLI
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: wasm-bindgen@${{ env.WASM_BINDGEN_CLI_VERSION }}
 
@@ -413,7 +417,7 @@ jobs:
           shasum -a 256 aidaemon-app-web.tar.gz > aidaemon-app-web.tar.gz.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: aidaemon-app-web
           path: |
@@ -428,16 +432,41 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
 
+      # A detached ed25519 signature beside each download, made with the
+      # release key (secret RELEASE_SIGNING_KEY, a PEM private key). The
+      # daemon's updater and install.sh check it against the public key
+      # they carry (src/updater.rs, scripts/release-signing-key.pub.pem);
+      # the updater refuses a release without one.
+      - name: Sign the downloads
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_SIGNING_KEY}" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set: this release is unsigned, and installed daemons will not update themselves to it."
+            exit 0
+          fi
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          umask 077
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+          shopt -s nullglob
+          for file in artifacts/*.tar.gz artifacts/*.zip artifacts/*.dmg; do
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$file" -out "$file.sig"
+            openssl pkeyutl -verify -pubin -inkey scripts/release-signing-key.pub.pem \
+              -rawin -in "$file" -sigfile "$file.sig"
+          done
+
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: ${{ contains(github.ref_name, '-') }}
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -447,6 +476,7 @@ jobs:
             artifacts/*.dmg
             artifacts/*.zip
             artifacts/*.sha256
+            artifacts/*.sig
 
   # The phone apps run after the release so a store-side failure never holds
   # the downloads back. Each one is skipped (green, no package) until its
@@ -463,7 +493,7 @@ jobs:
     steps:
       - name: Checkout
         if: env.ANDROID_KEYSTORE_BASE64 != ''
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust
         if: env.ANDROID_KEYSTORE_BASE64 != ''
@@ -473,7 +503,7 @@ jobs:
 
       - name: Install a JDK
         if: env.ANDROID_KEYSTORE_BASE64 != ''
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: "17"
@@ -514,7 +544,7 @@ jobs:
       # Kept too: Play has it once PLAY_SERVICE_ACCOUNT_JSON is set; else upload it in Play Console.
       - name: Keep the App Bundle
         if: env.ANDROID_KEYSTORE_BASE64 != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: aidaemon-android-aab
           path: aidaemon-android.aab
@@ -528,7 +558,7 @@ jobs:
     steps:
       - name: Checkout
         if: env.IOS_CERTIFICATE_P12_BASE64 != ''
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Import the signing certificate and profile
         if: env.IOS_CERTIFICATE_P12_BASE64 != ''
@@ -585,7 +615,7 @@ jobs:
     timeout-minutes: 350
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust
         run: rustup toolchain install && rustc --version
@@ -715,18 +745,21 @@ jobs:
         run: |
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}"
 
-          curl -sL "${BASE_URL}/aidaemon-macos-aarch64.tar.gz" -o macos-aarch64.tar.gz
-          curl -sL "${BASE_URL}/aidaemon-macos-x86_64.tar.gz" -o macos-x86_64.tar.gz
-          curl -sL "${BASE_URL}/aidaemon-linux-x86_64.tar.gz" -o linux-x86_64.tar.gz
-          curl -sL "${BASE_URL}/aidaemon-linux-aarch64.tar.gz" -o linux-aarch64.tar.gz
-
-          echo "macos_arm64=$(sha256sum macos-aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "macos_x86_64=$(sha256sum macos-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "linux_x86_64=$(sha256sum linux-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "linux_arm64=$(sha256sum linux-aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # Each archive is checked against the .sha256 the build job made
+          # from the bytes it built (curl -f: an error page is a failure,
+          # not a file to hash).
+          for pair in macos_arm64:macos-aarch64 macos_x86_64:macos-x86_64 \
+                      linux_x86_64:linux-x86_64 linux_arm64:linux-aarch64; do
+            key="${pair%%:*}"
+            asset="aidaemon-${pair#*:}.tar.gz"
+            curl -fsSL "${BASE_URL}/${asset}" -o "$asset"
+            curl -fsSL "${BASE_URL}/${asset}.sha256" -o "${asset}.sha256"
+            sha256sum -c "${asset}.sha256"
+            echo "${key}=$(cut -d' ' -f1 "${asset}.sha256")" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Checkout tap
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: davo20019/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

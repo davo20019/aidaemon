@@ -9,6 +9,10 @@ on:
         description: 'Version to update (e.g. 0.3.1)'
         required: true
 
+# Jobs read the repository; the ones that publish ask for more themselves.
+permissions:
+  contents: read
+
 jobs:
   update-tap:
     name: Update Homebrew Formula
@@ -16,12 +20,17 @@ jobs:
     steps:
       - name: Get release info
         id: release
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
+          case "$VERSION" in
+            *[!0-9A-Za-z.-]*|"") echo "not a version: $VERSION" >&2; exit 1 ;;
+          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -30,18 +39,21 @@ jobs:
         run: |
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.tag }}"
 
-          curl -sL "${BASE_URL}/aidaemon-macos-aarch64.tar.gz" -o macos-aarch64.tar.gz
-          curl -sL "${BASE_URL}/aidaemon-macos-x86_64.tar.gz" -o macos-x86_64.tar.gz
-          curl -sL "${BASE_URL}/aidaemon-linux-x86_64.tar.gz" -o linux-x86_64.tar.gz
-          curl -sL "${BASE_URL}/aidaemon-linux-aarch64.tar.gz" -o linux-aarch64.tar.gz
-
-          echo "macos_arm64=$(sha256sum macos-aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "macos_x86_64=$(sha256sum macos-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "linux_x86_64=$(sha256sum linux-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "linux_arm64=$(sha256sum linux-aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # Each archive is checked against the .sha256 the build job made
+          # from the bytes it built (curl -f: an error page is a failure,
+          # not a file to hash).
+          for pair in macos_arm64:macos-aarch64 macos_x86_64:macos-x86_64 \
+                      linux_x86_64:linux-x86_64 linux_arm64:linux-aarch64; do
+            key="${pair%%:*}"
+            asset="aidaemon-${pair#*:}.tar.gz"
+            curl -fsSL "${BASE_URL}/${asset}" -o "$asset"
+            curl -fsSL "${BASE_URL}/${asset}.sha256" -o "${asset}.sha256"
+            sha256sum -c "${asset}.sha256"
+            echo "${key}=$(cut -d' ' -f1 "${asset}.sha256")" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Checkout tap
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: davo20019/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
