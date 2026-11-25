@@ -327,7 +327,7 @@ impl Hook for ConversationCompaction {
             estimate_tokens(&source.messages[covered..])
                 + summary
                     .as_ref()
-                    .map_or(0, |s| s.text.chars().count().div_ceil(4))
+                    .map_or(0, |s| crate::estimate_text_tokens(&s.text))
         };
         let mut summary = store.load(ctx.session_id).await;
         if unsummarized(&summary) > wait_threshold(window) {

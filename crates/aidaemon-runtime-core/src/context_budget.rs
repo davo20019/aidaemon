@@ -19,9 +19,10 @@ static TOKEN_ESTIMATE_CORRECTION: std::sync::LazyLock<
     std::sync::RwLock<HashMap<String, (f64, u32)>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
-/// Estimate token count from text using a simple heuristic (~4 chars per token).
+/// Estimate token count from text (~4 characters a token), as compaction
+/// counts it ([`aidaemon_policies::estimate_text_tokens`]).
 pub fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
+    aidaemon_policies::estimate_text_tokens(text)
 }
 
 pub fn record_token_estimate_calibration(model: &str, estimated: usize, actual: usize) {

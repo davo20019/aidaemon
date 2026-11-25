@@ -17,6 +17,14 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
         .div_ceil(4)
 }
 
+/// [`estimate_tokens`] for one text: characters / 4. Every estimate the
+/// daemon makes (compaction, the prompt budget, memory's budget) counts the
+/// same way, so they agree on non-ASCII text, where bytes run ~3x
+/// characters.
+pub fn estimate_text_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
 /// What one image costs a request, in estimate characters (about 1.2k
 /// tokens: a screenshot, not its base64 bytes).
 const IMAGE_CHARS: usize = 4_800;

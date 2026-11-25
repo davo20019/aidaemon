@@ -53,7 +53,7 @@ mod tracing_sink;
 mod untrusted;
 
 pub use approval::{ApprovalGrants, ApprovalMode, ApprovalPolicy, ApprovalRules, RuleDecision};
-pub use context_window::{ContextWindow, estimate_tokens, tool_spec_chars};
+pub use context_window::{ContextWindow, estimate_text_tokens, estimate_tokens, tool_spec_chars};
 pub use conversation::{
     COMPACTED_STATE_HEADINGS, CompactionJobs, CompactionLimits, Compactor, ConversationCompaction,
     ConversationSource, ConversationSummary, ConversationTurn, InMemorySummaries, PendingTurns,

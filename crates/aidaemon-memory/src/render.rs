@@ -15,10 +15,10 @@ pub struct RecallGoal {
     pub status: String,
 }
 
-/// The token estimate the memory budget is measured with (four bytes a
-/// token).
+/// The token estimate the memory budget is measured with (four characters
+/// a token, as the prompt budget and compaction count).
 pub fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
+    aidaemon_policies::estimate_text_tokens(text)
 }
 
 /// Extended context for memory-rich system prompts. Query-ranked items are
