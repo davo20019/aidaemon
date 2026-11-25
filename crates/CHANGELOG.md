@@ -12,6 +12,10 @@ stability promise.
 
 ## [Unreleased]
 
+### Changed
+- `aidaemon-client-gateway`: `FileStore::rotate_key`; revoking a device rotates the file-link key.
+- `aidaemon-client-core`: `Client::resign_files` takes the current time and re-reads at most once a minute; `Client::resign_project_file`.
+
 ## [0.24.0] - 2026-11-25
 
 ### Changed

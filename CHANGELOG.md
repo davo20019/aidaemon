@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **In a group chat, the requester's earlier messages vouch for an address too;** other participants' never do.
+- **A file written by a run that read untrusted text stays untrusted for whoever reads it next,** while its content is unchanged.
+- **Revoking a device ends every file link it holds at once** (the link key rotates); the app fetches fresh links for its other devices.
+- **Linux confined runs create a repository's missing `.git/hooks` first,** so it is mounted read-only too.
+- **`render_pdf` renders a private copy of the approved bytes,** so nothing can swap the file between the check and the render.
+- **Approval buttons wait again whenever the card moves under the pointer,** and the settings dialog and command palette are armed the same way.
+
 ## [0.24.0] - 2026-11-25
 
 ### Security
