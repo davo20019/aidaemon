@@ -2030,11 +2030,9 @@ fn change_approval_request(
     } else {
         aidaemon_core::ApprovalRisk::High
     };
-    aidaemon_core::OwnerApprovalRequest {
-        card: None,
-        effects: Vec::new(),
-        summary: summary.to_string(),
-        subject: json!({
+    aidaemon_core::OwnerApprovalRequest::plain(
+        summary.to_string(),
+        json!({
             "tool": "manage_automations",
             "action": action,
             "goal": goal_id,
@@ -2050,7 +2048,7 @@ fn change_approval_request(
         .to_string(),
         risk,
         warnings,
-    }
+    )
 }
 
 /// A stored schedule zone as the owner reads it beside a clock time;

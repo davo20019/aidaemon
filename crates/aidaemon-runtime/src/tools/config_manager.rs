@@ -552,14 +552,12 @@ impl ConfigManagerTool {
                 args.action
             ),
         };
-        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest::plain(
             summary,
-            subject: self.approval_subject(&args),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec!["Modifying security-sensitive configuration".to_string()],
-        })
+            self.approval_subject(&args),
+            aidaemon_core::ApprovalRisk::High,
+            vec!["Modifying security-sensitive configuration".to_string()],
+        ))
     }
 
     /// The typed effects of one call: every change writes the config file,

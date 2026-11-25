@@ -29,14 +29,12 @@ impl Hook for AskBeforeDestructive {
         if tool.annotations.destructive {
             ToolDecision::Interrupt {
                 reason: format!("`{}` is destructive; needs approval", call.name),
-                kind: InterruptKind::OwnerApproval(OwnerApprovalRequest {
-                    card: None,
-                    effects: Vec::new(),
-                    summary: format!("Run `{}`?", call.name),
-                    subject: format!("{} {}", call.name, call.arguments),
-                    risk: ApprovalRisk::High,
-                    warnings: Vec::new(),
-                }),
+                kind: InterruptKind::OwnerApproval(OwnerApprovalRequest::plain(
+                    format!("Run `{}`?", call.name),
+                    format!("{} {}", call.name, call.arguments),
+                    ApprovalRisk::High,
+                    Vec::new(),
+                )),
             }
         } else {
             ToolDecision::Allow

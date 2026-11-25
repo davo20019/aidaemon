@@ -356,6 +356,24 @@ pub struct OwnerApprovalRequest {
 }
 
 impl OwnerApprovalRequest {
+    /// A request with no declared effects and no card: the owner sees
+    /// `summary` and `warnings`, and stored grants match `subject`.
+    pub fn plain(
+        summary: impl Into<String>,
+        subject: impl Into<String>,
+        risk: ApprovalRisk,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            effects: Vec::new(),
+            summary: summary.into(),
+            subject: subject.into(),
+            risk,
+            warnings,
+            card: None,
+        }
+    }
+
     /// The request to ask the owner about `call`, the way
     /// `aidaemon_policies::ApprovalPolicy` asks: the call's declared effects
     /// (from `info`), its tool and arguments as the subject grants match,

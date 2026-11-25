@@ -1604,16 +1604,16 @@ impl HttpRequestTool {
             || !Self::authority_override_headers(headers).is_empty();
         let local_site = Self::local_site_needing_owner(&url);
         if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") && body.is_none() && !overrides {
-            return local_site.map(|site| aidaemon_core::OwnerApprovalRequest {
-                card: None,
-                effects: Vec::new(),
-                summary: format!(
-                    "Let http_request reach {site}, a site on this computer? Approve only if \
+            return local_site.map(|site| {
+                aidaemon_core::OwnerApprovalRequest::plain(
+                    format!(
+                        "Let http_request reach {site}, a site on this computer? Approve only if \
                      you asked for it."
-                ),
-                subject: format!("local site {site}"),
-                risk: aidaemon_core::ApprovalRisk::High,
-                warnings: Vec::new(),
+                    ),
+                    format!("local site {site}"),
+                    aidaemon_core::ApprovalRisk::High,
+                    Vec::new(),
+                )
             });
         }
         let method = if method.is_empty() {
@@ -1642,14 +1642,12 @@ impl HttpRequestTool {
         if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
             warnings.push("Write operation: may modify remote data".to_string());
         }
-        Some(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
+        Some(aidaemon_core::OwnerApprovalRequest::plain(
             summary,
             subject,
-            risk: aidaemon_core::ApprovalRisk::High,
+            aidaemon_core::ApprovalRisk::High,
             warnings,
-        })
+        ))
     }
 
     /// Whether the kernel's approval covers a request with this approval

@@ -1259,25 +1259,21 @@ impl ComputerUseTool {
                 } else {
                     label.clone()
                 };
-                aidaemon_core::OwnerApprovalRequest {
-                    card: None,
-                    effects: Vec::new(),
+                aidaemon_core::OwnerApprovalRequest::plain(
                     summary,
-                    subject: consequential_subject(bundle_id, label, args),
-                    risk: aidaemon_core::ApprovalRisk::Critical,
+                    consequential_subject(bundle_id, label, args),
+                    aidaemon_core::ApprovalRisk::Critical,
                     warnings,
-                }
+                )
             }
             None => {
                 let (subject, _) = app_ask.as_ref()?;
-                aidaemon_core::OwnerApprovalRequest {
-                    card: None,
-                    effects: Vec::new(),
-                    summary: format!("Allow aidaemon to inspect and control {app_label}?"),
-                    subject: subject.clone(),
-                    risk: aidaemon_core::ApprovalRisk::High,
+                aidaemon_core::OwnerApprovalRequest::plain(
+                    format!("Allow aidaemon to inspect and control {app_label}?"),
+                    subject.clone(),
+                    aidaemon_core::ApprovalRisk::High,
                     warnings,
-                }
+                )
             }
         };
         let consequential = consequential_label

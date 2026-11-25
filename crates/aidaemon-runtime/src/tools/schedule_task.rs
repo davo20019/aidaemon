@@ -159,14 +159,12 @@ impl Plan {
         if let Some(name) = self.name.as_deref() {
             card.details.push(format!("Name: {name}"));
         }
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: self.desc.clone(),
-            subject: self.subject.clone(),
-            risk: aidaemon_core::ApprovalRisk::Medium,
-            warnings: card.into_lines(),
-        }
+        aidaemon_core::OwnerApprovalRequest::plain(
+            self.desc.clone(),
+            self.subject.clone(),
+            aidaemon_core::ApprovalRisk::Medium,
+            card.into_lines(),
+        )
     }
 }
 

@@ -255,14 +255,12 @@ impl ApprovalRules for DraftsOnly {
         {
             RuleDecision::Allow
         } else {
-            RuleDecision::Ask(aidaemon_core::OwnerApprovalRequest {
-                effects: vec![],
-                summary: format!("{} wants to write", call.name),
-                subject: format!("{} {}", call.name, call.arguments),
-                risk: aidaemon_core::ApprovalRisk::High,
-                warnings: vec![],
-                card: None,
-            })
+            RuleDecision::Ask(aidaemon_core::OwnerApprovalRequest::plain(
+                format!("{} wants to write", call.name),
+                format!("{} {}", call.name, call.arguments),
+                aidaemon_core::ApprovalRisk::High,
+                vec![],
+            ))
         }
     }
 }

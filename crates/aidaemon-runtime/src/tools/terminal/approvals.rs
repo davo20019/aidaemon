@@ -616,13 +616,11 @@ impl TerminalTool {
         reason: &str,
     ) -> aidaemon_core::OwnerApprovalRequest {
         let shown = raw.to_string();
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!("terminal {shown}"),
-            subject: format!("terminal {shown}"),
-            risk: aidaemon_core::ApprovalRisk::Critical,
-            warnings: vec![
+        aidaemon_core::OwnerApprovalRequest::plain(
+            format!("terminal {shown}"),
+            format!("terminal {shown}"),
+            aidaemon_core::ApprovalRisk::Critical,
+            vec![
                 format!(
                     "Execution target: {} ({}) workspace {}",
                     self.backend.kind().as_str(),
@@ -634,7 +632,7 @@ impl TerminalTool {
                      does could be judged."
                 ),
             ],
-        }
+        )
     }
 
     /// The owner approval a terminal call needs, for the daemon's kernel

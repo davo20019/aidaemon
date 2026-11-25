@@ -361,18 +361,15 @@ impl ManageOAuthTool {
     }
 
     fn remove_request(service: &str) -> aidaemon_core::OwnerApprovalRequest {
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!("Disconnect OAuth service '{}'", service),
-            subject: json!({"action": "remove", "service": service, "confirm_disconnect": true})
-                .to_string(),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
+        aidaemon_core::OwnerApprovalRequest::plain(
+            format!("Disconnect OAuth service '{}'", service),
+            json!({"action": "remove", "service": service, "confirm_disconnect": true}).to_string(),
+            aidaemon_core::ApprovalRisk::High,
+            vec![
                 "Deletes the stored OAuth connection and tokens".to_string(),
                 "Leaves the service unavailable until it is connected again".to_string(),
             ],
-        }
+        )
     }
 
     /// The card names the provider's endpoints, never its client
@@ -382,14 +379,12 @@ impl ManageOAuthTool {
         args: &ManageOAuthArgs,
         plan: &RegisterPlan,
     ) -> aidaemon_core::OwnerApprovalRequest {
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
+        aidaemon_core::OwnerApprovalRequest::plain(
+            format!(
                 "Register custom OAuth provider '{}' (authorize={}, token={})",
                 service, plan.authorize_url, plan.token_url
             ),
-            subject: json!({
+            json!({
                 "action": "register_provider",
                 "service": service,
                 "display_name": args.display_name,
@@ -400,29 +395,27 @@ impl ManageOAuthTool {
                 "allowed_domains": plan.allowed_domains,
             })
             .to_string(),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
+            aidaemon_core::ApprovalRisk::High,
+            vec![
                 "Modifies OAuth configuration".to_string(),
                 "Can route credentialed API traffic to the configured domains".to_string(),
             ],
-        }
+        )
     }
 
     fn remove_provider_request(service: &str) -> aidaemon_core::OwnerApprovalRequest {
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
+        aidaemon_core::OwnerApprovalRequest::plain(
+            format!(
                 "Remove custom OAuth provider '{}' and delete its client credentials",
                 service
             ),
-            subject: json!({"action": "remove_provider", "service": service}).to_string(),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
+            json!({"action": "remove_provider", "service": service}).to_string(),
+            aidaemon_core::ApprovalRisk::High,
+            vec![
                 "Deletes OAuth provider configuration".to_string(),
                 "Deletes stored client credentials for this provider".to_string(),
             ],
-        }
+        )
     }
 
     /// The typed effects of one call: every action but the reads acts on

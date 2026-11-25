@@ -30,14 +30,12 @@ impl Hook for AskBeforeWrite {
         }
         ToolDecision::Interrupt {
             reason: format!("approve {} {}", call.name, call.arguments),
-            kind: InterruptKind::OwnerApproval(OwnerApprovalRequest {
-                card: None,
-                effects: Vec::new(),
-                summary: format!("Run {} {}", call.name, call.arguments),
-                subject: format!("{} {}", call.name, call.arguments),
-                risk: ApprovalRisk::High,
-                warnings: Vec::new(),
-            }),
+            kind: InterruptKind::OwnerApproval(OwnerApprovalRequest::plain(
+                format!("Run {} {}", call.name, call.arguments),
+                format!("{} {}", call.name, call.arguments),
+                ApprovalRisk::High,
+                Vec::new(),
+            )),
         }
     }
 }

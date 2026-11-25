@@ -2353,14 +2353,12 @@ async fn rewrite_after_approval_requires_a_new_judgment() {
         ) -> ToolDecision {
             ToolDecision::Interrupt {
                 reason: "approve exact arguments".into(),
-                kind: InterruptKind::OwnerApproval(aidaemon_core::OwnerApprovalRequest {
-                    card: None,
-                    effects: vec![],
-                    summary: "synthetic operation".into(),
-                    subject: call.arguments.to_string(),
-                    risk: aidaemon_core::ApprovalRisk::High,
-                    warnings: vec![],
-                }),
+                kind: InterruptKind::OwnerApproval(aidaemon_core::OwnerApprovalRequest::plain(
+                    "synthetic operation".into(),
+                    call.arguments.to_string(),
+                    aidaemon_core::ApprovalRisk::High,
+                    vec![],
+                )),
             }
         }
     }

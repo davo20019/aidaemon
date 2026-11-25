@@ -455,20 +455,18 @@ impl ManageHttpAuthTool {
     }
 
     fn remove_request(profile_name: &str) -> aidaemon_core::OwnerApprovalRequest {
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
+        aidaemon_core::OwnerApprovalRequest::plain(
+            format!(
                 "Remove manual API auth profile '{}' and delete its stored credentials",
                 profile_name
             ),
-            subject: json!({"action": "remove", "profile": profile_name}).to_string(),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
+            json!({"action": "remove", "profile": profile_name}).to_string(),
+            aidaemon_core::ApprovalRisk::High,
+            vec![
                 "Deletes API auth configuration".to_string(),
                 "Deletes stored credentials for this profile".to_string(),
             ],
-        }
+        )
     }
 
     /// The typed effects of one call: changing, removing or verifying a

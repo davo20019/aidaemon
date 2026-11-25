@@ -86,19 +86,12 @@ impl ManageMemoriesTool {
             // waving it through (the run reads the store again).
             Err(_) => String::new(),
         };
-        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!("Make memory {to}: [{category}] {key}{value}"),
-            subject: json!({"action": "set_privacy", "category": category, "key": key, "privacy": to.to_string()})
-                .to_string(),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![match to {
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest::plain(format!("Make memory {to}: [{category}] {key}{value}"), json!({"action": "set_privacy", "category": category, "key": key, "privacy": to.to_string()})
+                .to_string(), aidaemon_core::ApprovalRisk::High, vec![match to {
                 FactPrivacy::Global => "This will make this memory visible across all channels",
                 _ => "This will make this memory visible in its channel, not only in DMs",
             }
-            .to_string()],
-        })
+            .to_string()]))
     }
 }
 

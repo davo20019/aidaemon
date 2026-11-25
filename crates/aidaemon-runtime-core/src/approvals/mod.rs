@@ -452,18 +452,16 @@ impl AppApprovalRules {
             .collect::<Vec<_>>();
         folders.sort();
         folders.dedup();
-        Some(sdk::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
+        Some(sdk::OwnerApprovalRequest::plain(
+            format!(
                 "Write {}? This task looks like it is about {}, and this is outside it.",
                 paths.join(", "),
                 self.guessed_scopes.join(", ")
             ),
-            subject: format!("write outside guessed project: {}", folders.join(", ")),
-            risk: sdk::ApprovalRisk::Medium,
-            warnings: Vec::new(),
-        })
+            format!("write outside guessed project: {}", folders.join(", ")),
+            sdk::ApprovalRisk::Medium,
+            Vec::new(),
+        ))
     }
 
     /// Judge the call the dispatcher will execute (canonicalized), never

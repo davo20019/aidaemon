@@ -194,19 +194,17 @@ impl ManageMandatesTool {
             })
             .unwrap_or_default();
         let strategy_sha256 = self.judged_strategy_hash(&args);
-        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: card.summary,
-            subject: json!({
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest::plain(
+            card.summary,
+            json!({
                 "arguments": approved,
                 "autopilot": card.autopilot,
                 "strategy_sha256": strategy_sha256,
             })
             .to_string(),
-            risk: card.risk,
-            warnings: card.warnings,
-        })
+            card.risk,
+            card.warnings,
+        ))
     }
 
     /// The card kind for a request from [`Self::owner_approval`]: the

@@ -839,14 +839,12 @@ impl ManageApiTool {
     ) -> aidaemon_core::OwnerApprovalRequest {
         let mut warnings = auth.warnings;
         warnings.extend(probe.warnings);
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!("{}\n{}", auth.summary, probe.summary),
-            subject: format!("{}\n{}", auth.subject, probe.subject),
-            risk: aidaemon_core::ApprovalRisk::High,
+        aidaemon_core::OwnerApprovalRequest::plain(
+            format!("{}\n{}", auth.summary, probe.summary),
+            format!("{}\n{}", auth.subject, probe.subject),
+            aidaemon_core::ApprovalRisk::High,
             warnings,
-        }
+        )
     }
 
     /// The owner approval for the learning stage: the fetched guide is
@@ -858,18 +856,14 @@ impl ManageApiTool {
         }
         let (source, _) = Self::learning_target(args)?;
         let service = args.service.as_deref().unwrap_or_default();
-        Some(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
-                "Learn an API guide for `{service}` from {source} and save it as a skill"
-            ),
-            subject: format!("manage_api learn {service} {source}"),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
+        Some(aidaemon_core::OwnerApprovalRequest::plain(
+            format!("Learn an API guide for `{service}` from {source} and save it as a skill"),
+            format!("manage_api learn {service} {source}"),
+            aidaemon_core::ApprovalRisk::High,
+            vec![
                 "This will fetch external instructions that can influence AI behavior.".to_string(),
             ],
-        })
+        ))
     }
 
     fn probe_approval_for(args: &ManageApiArgs) -> Option<aidaemon_core::OwnerApprovalRequest> {
@@ -887,20 +881,18 @@ impl ManageApiTool {
         }
         let service = args.service.as_deref().unwrap_or_default();
         let subject = format!("manage_api probe POST {source}");
-        Some(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
+        Some(aidaemon_core::OwnerApprovalRequest::plain(
+            format!(
                 "{subject}\nThe live probe may POST a GraphQL introspection query to the \
                  endpoint learned from {source}, with the `{service}` credentials."
             ),
             subject,
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![
+            aidaemon_core::ApprovalRisk::High,
+            vec![
                 "Authenticated request: credentials will be sent".to_string(),
                 "The probe endpoint is discovered while learning".to_string(),
             ],
-        })
+        ))
     }
 
     async fn handle_onboard(

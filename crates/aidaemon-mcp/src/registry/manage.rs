@@ -121,33 +121,24 @@ impl ManageMcpTool {
         // Fails closed: a start judged without its project still asks, so a
         // judgment that cannot see what will run never lets it run unasked.
         let Ok((project, server)) = Self::project_server(project, name) else {
-            return (OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
-                card: None,
-                effects: Vec::new(),
-                summary: format!("Start the project's MCP server '{name}'"),
-                subject: json!({"action": "project_start", "name": name}).to_string(),
-                risk: aidaemon_core::ApprovalRisk::High,
-                warnings: vec![
+            return (OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest::plain(format!("Start the project's MCP server '{name}'"), json!({"action": "project_start", "name": name}).to_string(), aidaemon_core::ApprovalRisk::High, vec![
                     "The project's repository chose this server's command. Only approve if you trust the repository.".to_string(),
-                ],
-            }), None);
+                ])), None);
         };
         // What the start refuses never reaches the owner: it never runs.
         if server.unusable.is_some() || !ALLOWED_COMMANDS.contains(&server.command.as_str()) {
             return (OwnerApprovalNeed::NotNeeded, None);
         }
         let env_keys: Vec<&String> = server.env.keys().collect();
-        let need = OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!(
+        let need = OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest::plain(
+            format!(
                 "Start MCP server '{}' that project {} declares ({} {})",
                 server.name,
                 project.name,
                 server.command,
                 server.args.join(" ")
             ),
-            subject: json!({
+            json!({
                 "action": "project_start",
                 "project": project.id,
                 "name": server.name,
@@ -156,8 +147,8 @@ impl ManageMcpTool {
                 "env": server.env,
             })
             .to_string(),
-            risk: aidaemon_core::ApprovalRisk::High,
-            warnings: vec![format!(
+            aidaemon_core::ApprovalRisk::High,
+            vec![format!(
                 "The project's repository chose this command{}. It runs as a local process for \
                  this project's conversations until the daemon restarts. Only approve if you \
                  trust the repository.",
@@ -174,7 +165,7 @@ impl ManageMcpTool {
                     )
                 }
             )],
-        });
+        ));
         (need, Some((project, server)))
     }
 
@@ -385,32 +376,28 @@ impl ManageMcpTool {
                     return Some(OwnerApprovalNeed::NotNeeded);
                 }
                 let secret = McpRegistry::env_secret_key(name, key);
-                aidaemon_core::OwnerApprovalRequest {
-                    card: None,
-                    effects: Vec::new(),
-                    summary: format!(
+                aidaemon_core::OwnerApprovalRequest::plain(
+                    format!(
                         "Give MCP server '{name}' the stored secret `{secret}` as its environment \
                          variable {key}"
                     ),
-                    subject: json!({"action": "set_env", "name": name, "key": key}).to_string(),
-                    risk: aidaemon_core::ApprovalRisk::High,
-                    warnings: vec![
+                    json!({"action": "set_env", "name": name, "key": key}).to_string(),
+                    aidaemon_core::ApprovalRisk::High,
+                    vec![
                         "The server's process can read and send this secret anywhere. Only \
                          approve for a server you trust with it."
                             .to_string(),
                     ],
-                }
+                )
             }
-            ("remove", Some(name)) => aidaemon_core::OwnerApprovalRequest {
-                card: None,
-                effects: Vec::new(),
-                summary: format!(
+            ("remove", Some(name)) => aidaemon_core::OwnerApprovalRequest::plain(
+                format!(
                     "Remove MCP server '{name}', its saved settings and the secrets stored for it"
                 ),
-                subject: json!({"action": "remove", "name": name}).to_string(),
-                risk: aidaemon_core::ApprovalRisk::Medium,
-                warnings: Vec::new(),
-            },
+                json!({"action": "remove", "name": name}).to_string(),
+                aidaemon_core::ApprovalRisk::Medium,
+                Vec::new(),
+            ),
             ("set_env" | "remove", None) => return Some(OwnerApprovalNeed::NotNeeded),
             _ => return None,
         };
@@ -473,15 +460,12 @@ impl ManageMcpTool {
         } else {
             "Start"
         };
-        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: format!("{verb} MCP server '{name}' ({command} {})", args.join(" ")),
-            subject: json!({"action": action, "name": name, "command": command, "args": args})
-                .to_string(),
-            risk: aidaemon_core::ApprovalRisk::Medium,
-            warnings: vec!["This runs the server's stored command as a local process.".to_string()],
-        })
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest::plain(
+            format!("{verb} MCP server '{name}' ({command} {})", args.join(" ")),
+            json!({"action": action, "name": name, "command": command, "args": args}).to_string(),
+            aidaemon_core::ApprovalRisk::Medium,
+            vec!["This runs the server's stored command as a local process.".to_string()],
+        ))
     }
 
     /// Starts a server. The owner was asked by the kernel before this runs.

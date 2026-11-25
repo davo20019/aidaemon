@@ -342,14 +342,12 @@ mod tests {
             !resolver.run.is_cancelled(),
             "a verifier check is not the owner's"
         );
-        let owner = sdk::InterruptKind::OwnerApproval(sdk::OwnerApprovalRequest {
-            card: None,
-            effects: Vec::new(),
-            summary: "Open a site".to_string(),
-            subject: "browser".to_string(),
-            risk: sdk::ApprovalRisk::High,
-            warnings: Vec::new(),
-        });
+        let owner = sdk::InterruptKind::OwnerApproval(sdk::OwnerApprovalRequest::plain(
+            "Open a site".to_string(),
+            "browser".to_string(),
+            sdk::ApprovalRisk::High,
+            Vec::new(),
+        ));
         let answer = resolver.resolve(&state, &interruption(owner)).await;
         assert!(matches!(answer, Some(sdk::Resolution::Deny { .. })));
         assert!(resolver.run.is_cancelled());

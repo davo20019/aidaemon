@@ -185,33 +185,29 @@ impl ManageCliAgentsTool {
             }
             let stored_args: Vec<String> =
                 serde_json::from_str(&agent.args_json).unwrap_or_default();
-            aidaemon_core::OwnerApprovalRequest {
-                card: None,
-                effects: Vec::new(),
-                summary: format!(
+            aidaemon_core::OwnerApprovalRequest::plain(
+                format!(
                     "Turn CLI agent '{name}' back on ({} {})",
                     agent.command,
                     stored_args.join(" ")
                 ),
-                subject: json!({
+                json!({
                     "action": "enable",
                     "name": name,
                     "command": agent.command,
                     "args": stored_args,
                 })
                 .to_string(),
-                risk: aidaemon_core::ApprovalRisk::Medium,
-                warnings: vec!["The agent can run commands again once it is on.".to_string()],
-            }
+                aidaemon_core::ApprovalRisk::Medium,
+                vec!["The agent can run commands again once it is on.".to_string()],
+            )
         } else {
-            aidaemon_core::OwnerApprovalRequest {
-                card: None,
-                effects: Vec::new(),
-                summary: format!("Remove CLI agent '{name}'"),
-                subject: json!({"action": "remove", "name": name}).to_string(),
-                risk: aidaemon_core::ApprovalRisk::Medium,
-                warnings: Vec::new(),
-            }
+            aidaemon_core::OwnerApprovalRequest::plain(
+                format!("Remove CLI agent '{name}'"),
+                json!({"action": "remove", "name": name}).to_string(),
+                aidaemon_core::ApprovalRisk::Medium,
+                Vec::new(),
+            )
         };
         Some(OwnerApprovalNeed::Ask(request))
     }
