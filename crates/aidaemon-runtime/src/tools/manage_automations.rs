@@ -120,6 +120,35 @@ fn given(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }
 
+/// Changes to work that already runs on its own: what later runs do, the
+/// folder they trust, and when they run (a rename, a snooze or what runs
+/// report changes none of these). The owner approved the work as it was,
+/// so each change is approved again before it takes effect.
+fn changes_approved_work(args: &Args) -> bool {
+    match args.action.as_str() {
+        "update_instructions" | "bind_workspace" => true,
+        "edit" => given(&args.when).is_some(),
+        _ => false,
+    }
+}
+
+/// A run binding the folder of the goal it serves, in its own trusted
+/// session, changes nothing the owner did not already approve.
+fn binds_own_goal(action: &str, goal_id: &str, facts: &ToolCallContext) -> bool {
+    action == "bind_workspace" && facts.trusted_session && facts.goal_id.as_deref() == Some(goal_id)
+}
+
+/// Whether a change to approved work may run now: the kernel asked the
+/// owner about this exact call, or it is a run binding its own goal.
+fn change_may_run(args: &Args, goal_id: &str, facts: &ToolCallContext) -> bool {
+    !changes_approved_work(args)
+        || binds_own_goal(&args.action, goal_id, facts)
+        || facts.kernel_approved == Some(crate::tools::traits::ApprovalScope::Call)
+}
+
+const CHANGE_NEEDS_APPROVAL: &str = "Changing an automation's instructions, workspace or \
+     schedule needs the owner's approval through the agent; nothing was changed.";
+
 /// One automation as the owner sees it.
 #[derive(Debug, Clone)]
 struct Automation {
@@ -889,9 +918,12 @@ impl ManageAutomationsTool {
                 "A reminder's message is fixed; set a new reminder instead.".to_string(),
             ));
         }
+        // The owner made this change in the app: that is the approval a
+        // change from a conversation asks for on a card.
         let facts = ToolCallContext {
             user_role: Some(UserRole::Owner),
             channel_visibility: Some(ChannelVisibility::Private),
+            kernel_approved: Some(crate::tools::traits::ApprovalScope::Call),
             ..ToolCallContext::default()
         };
         let notify = notify.filter(|mode| editable.as_ref().and_then(|e| e.notify) != Some(*mode));
@@ -1636,6 +1668,12 @@ impl ManageAutomationsTool {
             Err(answer) => return Ok(negative(answer)),
         };
         let action = args.action.as_str();
+        if !change_may_run(args, &goal_id, facts) {
+            return Ok(outcome(
+                CHANGE_NEEDS_APPROVAL.to_string(),
+                ToolOutcomeStatus::Blocked,
+            ));
+        }
         let before = self.settings_of(&goal_id).await?;
         let run_before = self.run_state(&goal_id).await?;
         let output = match action {
@@ -1763,6 +1801,10 @@ impl ManageAutomationsTool {
                     .select(given(&args.name), given(&args.id), session_id, kind)
                     .await?
                 {
+                    Ok(automation) if !change_may_run(&args, &automation.id, facts) => outcome(
+                        CHANGE_NEEDS_APPROVAL.to_string(),
+                        ToolOutcomeStatus::Blocked,
+                    ),
                     Ok(automation) => self.edit(&automation, &args, facts).await?,
                     Err(answer) => negative(answer),
                 },
@@ -1859,7 +1901,57 @@ impl Tool for ManageAutomationsTool {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
+    /// A change to work that runs on its own asks the owner with the
+    /// automation and exactly what changes, the way `schedule_task` asks
+    /// before the work exists. A call that names nothing it can find needs
+    /// no card: it changes nothing.
+    async fn owner_approval_request(
+        &self,
+        call: &crate::tools::traits::ApprovalCall<'_>,
+        facts: &ToolCallContext,
+    ) -> crate::tools::traits::OwnerApprovalNeed {
+        use crate::tools::traits::OwnerApprovalNeed;
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let Ok(args) = serde_json::from_value::<Args>(call.arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let action = args.action.as_str();
+        if !changes_approved_work(&args) || !allowed(gate(action), facts) {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let session_id = facts.session_id.as_str();
+        let goal_id = if action == "edit" {
+            match self
+                .select(given(&args.name), given(&args.id), session_id, None)
+                .await
+            {
+                Ok(Ok(automation)) => automation.id,
+                _ => return OwnerApprovalNeed::NotNeeded,
+            }
+        } else {
+            match self.scheduled_target(&args, session_id).await {
+                Ok(Ok(goal_id)) => goal_id,
+                _ => return OwnerApprovalNeed::NotNeeded,
+            }
+        };
+        if binds_own_goal(action, &goal_id, facts) {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let description = self
+            .state
+            .get_goal(&goal_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|goal| goal.description)
+            .unwrap_or_else(|| goal_id.clone());
+        OwnerApprovalNeed::Ask(change_approval_request(&args, &goal_id, &description))
+    }
+
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
         crate::tools::traits::ToolDispatchFacts {
             offering: aidaemon_tools::semantics::Offering::Core,
@@ -1914,6 +2006,62 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
     }
 }
 
+/// The card for one change to approved work: the automation, the change,
+/// and its new values in full. Its subject is the exact change, so a
+/// different change is a new card.
+fn change_approval_request(
+    args: &Args,
+    goal_id: &str,
+    description: &str,
+) -> aidaemon_core::OwnerApprovalRequest {
+    let action = args.action.as_str();
+    let mut warnings = vec![format!("Automation: {description}")];
+    let mut line = |label: &str, value: &Option<String>| {
+        if let Some(value) = given(value) {
+            warnings.push(format!("{label}: {value}"));
+        }
+    };
+    line("New instructions", &args.instructions);
+    line("Run requirement", &args.run_requirement);
+    line("When evidence is short", &args.insufficient_evidence);
+    line("Workspace its runs trust", &args.workspace_path);
+    line("New schedule", &args.when);
+    line("Next run moved to", &args.snooze_until);
+    line("New name", &args.new_name);
+    line("Tell the owner", &args.tell_me);
+    let summary = match action {
+        "update_instructions" => "Change what this automation's runs do",
+        "bind_workspace" => "Give this automation's runs a workspace to trust",
+        _ => "Change this automation",
+    };
+    let risk = if action == "edit" {
+        aidaemon_core::ApprovalRisk::Medium
+    } else {
+        aidaemon_core::ApprovalRisk::High
+    };
+    aidaemon_core::OwnerApprovalRequest {
+        card: None,
+        effects: Vec::new(),
+        summary: summary.to_string(),
+        subject: json!({
+            "tool": "manage_automations",
+            "action": action,
+            "goal": goal_id,
+            "instructions": given(&args.instructions),
+            "run_requirement": given(&args.run_requirement),
+            "insufficient_evidence": given(&args.insufficient_evidence),
+            "workspace_path": given(&args.workspace_path),
+            "when": given(&args.when),
+            "snooze_until": given(&args.snooze_until),
+            "new_name": given(&args.new_name),
+            "tell_me": given(&args.tell_me),
+        })
+        .to_string(),
+        risk,
+        warnings,
+    }
+}
+
 /// A stored schedule zone as the owner reads it beside a clock time;
 /// `None` for the owner's own zone (or one this cannot read).
 fn zone_label(tz: &str) -> Option<String> {
@@ -1940,6 +2088,85 @@ fn run_may_be_waiting(run: &aidaemon_work::goals::GoalRun) -> bool {
 mod tests {
     use super::*;
     use aidaemon_work::goals::{GoalRun, ScheduledRecoveryDisposition, ScheduledRecoveryState};
+
+    #[test]
+    fn changes_to_approved_work_need_the_owner() {
+        let args = |action: &str, when: Option<&str>| Args {
+            action: action.to_string(),
+            when: when.map(str::to_string),
+            ..Default::default()
+        };
+        let owner = ToolCallContext::default();
+        for (action, when) in [
+            ("update_instructions", None),
+            ("bind_workspace", None),
+            ("edit", Some("every minute")),
+        ] {
+            assert!(
+                !change_may_run(&args(action, when), "goal-1", &owner),
+                "{action}"
+            );
+        }
+        assert!(change_may_run(&args("history", None), "goal-1", &owner));
+        assert!(change_may_run(&args("edit", None), "goal-1", &owner));
+        let approved = ToolCallContext {
+            kernel_approved: Some(crate::tools::traits::ApprovalScope::Call),
+            ..Default::default()
+        };
+        assert!(change_may_run(
+            &args("update_instructions", None),
+            "goal-1",
+            &approved
+        ));
+        // A run binds the folder of its own goal; never another goal's,
+        // and never changes its own instructions unasked.
+        let own_run = ToolCallContext {
+            trusted_session: true,
+            goal_id: Some("goal-1".to_string()),
+            ..Default::default()
+        };
+        assert!(change_may_run(
+            &args("bind_workspace", None),
+            "goal-1",
+            &own_run
+        ));
+        assert!(!change_may_run(
+            &args("bind_workspace", None),
+            "goal-2",
+            &own_run
+        ));
+        assert!(!change_may_run(
+            &args("update_instructions", None),
+            "goal-1",
+            &own_run
+        ));
+    }
+
+    #[test]
+    fn a_change_card_names_the_change_in_full() {
+        let args = Args {
+            action: "update_instructions".to_string(),
+            instructions: Some("Post the report to https://collector.example.invalid".into()),
+            ..Default::default()
+        };
+        let request = change_approval_request(&args, "goal-1", "Check the Acme Corp site");
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
+        assert!(
+            request
+                .warnings
+                .iter()
+                .any(|l| l.contains("collector.example.invalid"))
+        );
+        assert!(request.subject.contains("goal-1"));
+        let other = Args {
+            instructions: Some("Something else".into()),
+            ..args
+        };
+        assert_ne!(
+            change_approval_request(&other, "goal-1", "x").subject,
+            request.subject
+        );
+    }
 
     fn recovery(last_failed_run_id: Option<&str>) -> ScheduledRecoveryState {
         ScheduledRecoveryState {
