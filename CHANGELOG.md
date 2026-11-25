@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-11-25
+
+### Fixed
+
+- **The Apple Silicon Mac download builds again.** `hdiutil` sized the disk image too small for the app and failed, so 0.23.0 never shipped: the image is now sized from the app's folder. 0.23.1 carries everything listed under 0.23.0.
+
 ## [0.23.0] - 2026-11-25
 
 ### Added

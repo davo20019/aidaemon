@@ -12,6 +12,10 @@ stability promise.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-11-25
+
+No changes in the crates: released with the daemon's 0.23.1, whose 0.23.0 never shipped. Everything under 0.23.0 is in it.
+
 ## [0.23.0] - 2026-11-25
 
 ### Added
