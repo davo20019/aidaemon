@@ -42,8 +42,12 @@ fn tabs(store: Store) -> View {
             view()
                 .h(px(ui::fit::bar()))
                 .flex_row()
-                .items_center()
+                // The tabs stand on the bar's line, level with the
+                // conversation header's beside it.
+                .items_end()
                 .px_4()
+                .border_b_1()
+                .border_color(colors::LINE)
                 .child(
                     // Code has its changes and files; a desktop has Steps
                     // beside the chat (a phone has them under each reply);
@@ -55,7 +59,7 @@ fn tabs(store: Store) -> View {
                             agents.get(),
                         );
                         Some(untracked(move || {
-                            ui::tab_bar_of(store.inspector_tab(), &tabs)
+                            ui::bar_tabs_of(store.inspector_tab(), &tabs)
                         }))
                     })),
                 )
@@ -63,9 +67,12 @@ fn tabs(store: Store) -> View {
                     // A phone's, or a medium window's drawer.
                     move || store.is_compact() || drawer.get(),
                     move || {
-                        ui::icon_btn(ui::Glyph::Close, "Close", ui::Size::Md, move || {
-                            store.close_panes()
-                        })
+                        view().self_center().child(ui::icon_btn(
+                            ui::Glyph::Close,
+                            "Close",
+                            ui::Size::Md,
+                            move || store.close_panes(),
+                        ))
                     },
                 )),
         )

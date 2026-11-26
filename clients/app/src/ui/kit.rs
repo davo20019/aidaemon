@@ -383,12 +383,26 @@ pub fn tab_bar(selected: Signal<usize>, labels: &[&'static str]) -> View {
 /// [`tab_bar`] of some tabs: each `(index, label)`, `selected` holding an
 /// index.
 pub fn tab_bar_of(selected: Signal<usize>, tabs_shown: &[(usize, &'static str)]) -> View {
-    let mut bar = tabs()
-        .flex_row()
-        .gap_1()
-        .border_b_1()
-        .border_color(colors::LINE)
-        .indicator_style(|s| s.bottom(px(-1.0)).h(px(2.0)).bg(colors::ACCENT));
+    tab_row(selected, tabs_shown, true)
+}
+
+/// [`tab_bar_of`] as a pane's header bar: no rule of its own, its tabs
+/// standing on the bar's bottom edge, so the underline is the bar's line,
+/// level with the headers beside it. The bar draws that line
+/// (`border_b_1`) and bottom-aligns this (`items_end`).
+pub fn bar_tabs_of(selected: Signal<usize>, tabs_shown: &[(usize, &'static str)]) -> View {
+    tab_row(selected, tabs_shown, false)
+}
+
+fn tab_row(selected: Signal<usize>, tabs_shown: &[(usize, &'static str)], ruled: bool) -> View {
+    let mut bar = tabs().flex_row().gap_1();
+    bar = if ruled {
+        bar.border_b_1()
+            .border_color(colors::LINE)
+            .indicator_style(|s| s.bottom(px(-1.0)).h(px(2.0)).bg(colors::ACCENT))
+    } else {
+        bar.indicator_style(|s| s.bottom(px(0.0)).h(px(2.0)).bg(colors::ACCENT))
+    };
     for (index, label) in tabs_shown.iter().copied() {
         bar = bar.child(
             tab()
