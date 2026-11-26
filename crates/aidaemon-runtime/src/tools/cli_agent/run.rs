@@ -136,6 +136,9 @@ pub(super) struct PreparedRun {
     /// What it was asked, without the daemon's mission rules.
     pub(super) task: String,
     pub(super) final_prompt: String,
+    /// The conversation history put before the prompt for a new session
+    /// ([`crate::helper_run::HelperSpec::prior_context`]).
+    pub(super) prior_context: Option<String>,
     /// Released on drop until the run is tracked in the task table, whose
     /// reaper and cancel paths then own it.
     pub(super) claim: Option<WorkingDirClaimGuard>,
@@ -191,6 +194,18 @@ pub(super) fn adopt_conversation_tree(call: &mut RunCall, prep: &PreparedRun) {
         return;
     };
     binding.adopt_conversation_tree(scoped);
+}
+
+impl PreparedRun {
+    /// It continues its agent's own session after all: the history put
+    /// before its prompt for a new session is left out (the session has it).
+    pub(super) fn drop_prior_context(&mut self) {
+        if let Some(prefix) = self.prior_context.take() {
+            // The daemon's own text, removed exactly as it was put there.
+            self.final_prompt = self.final_prompt.replacen(&prefix, "", 1);
+            self.prompt = self.prompt.replacen(&prefix, "", 1);
+        }
+    }
 }
 
 /// The longest task a run's record keeps of what it was asked.

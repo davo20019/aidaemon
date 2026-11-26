@@ -1129,6 +1129,7 @@ impl CliAgentTool {
                     owner_follow_up: (continues.is_some() || thread_wait.is_some())
                         && owner_follow_up_call,
                     continues,
+                    prior_context: None,
                 };
                 let write_paths = helper_write_paths(&args, &spec, &session_id, facts);
                 let working_dir = args
@@ -1145,12 +1146,19 @@ impl CliAgentTool {
                 // context or restart-recovery notes) for the run's recorded
                 // task so the UI displays what was actually asked.
                 let raw_task = prompt.trim().to_string();
+                let mut spec = spec;
                 let prompt = if direct_agent_conversation
                     && spec.continues.is_none()
                     && thread_wait.is_none()
                 {
-                    self.prepend_direct_conversation_context(&session_id, &prompt)
-                        .await
+                    let with_context = self
+                        .prepend_direct_conversation_context(&session_id, &prompt)
+                        .await;
+                    spec.prior_context = with_context
+                        .strip_suffix(prompt.as_str())
+                        .filter(|prefix| !prefix.is_empty())
+                        .map(str::to_string);
+                    with_context
                 } else {
                     prompt
                 };

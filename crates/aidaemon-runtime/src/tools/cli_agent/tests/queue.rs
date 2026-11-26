@@ -735,6 +735,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         prompt: "second turn".to_string(),
         task: "second turn".to_string(),
         final_prompt: "second turn".to_string(),
+        prior_context: None,
         claim: None,
         folder_wait: None,
         thread_wait: None,
@@ -768,6 +769,10 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
     }
     let mcp_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     prep.mcp_guard = Some(Box::new(DropFlag(mcp_dropped.clone())));
+    // Queued while it looked like a new session: history was put first.
+    let prefix = "## Prior conversation\nuser: first turn\n\n## Current request\n";
+    prep.prior_context = Some(prefix.to_string());
+    prep.final_prompt = format!("{prefix}second turn");
 
     super::super::queue::refresh_direct_session(
         &tool.run_handles(),
@@ -785,6 +790,11 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
     drop(handed_off);
     assert!(mcp_dropped.load(std::sync::atomic::Ordering::SeqCst));
 
+    assert_eq!(
+        prep.final_prompt, "second turn",
+        "a continued session already holds the history"
+    );
+    assert!(prep.prior_context.is_none());
     let continued = prep
         .continues
         .expect("should resume earlier kept session even before ended_at is stamped");

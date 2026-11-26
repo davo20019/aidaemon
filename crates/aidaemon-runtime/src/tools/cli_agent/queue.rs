@@ -562,6 +562,7 @@ pub(super) async fn refresh_direct_session(
     prep.keep_alive = plan.keep_alive;
     prep.keeps_session = plan.keeps_session;
     prep.continues = Some(continues);
+    prep.drop_prior_context();
     let run_id = cli_run_id(&call.task_id);
     handles.runs.continues(&run_id, &run, &thread);
     handles.runs.keeps_session(&run_id, prep.keeps_session);
@@ -663,6 +664,7 @@ async fn refresh_thread_session(
     prep.keep_alive = plan.keep_alive;
     prep.keeps_session = plan.keeps_session;
     prep.continues = Some(continues);
+    prep.drop_prior_context();
     let run_id = cli_run_id(&call.task_id);
     handles.runs.continues(&run_id, &run, &canonical_thread);
     handles.runs.keeps_session(&run_id, prep.keeps_session);

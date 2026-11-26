@@ -431,6 +431,7 @@ impl CliAgentTool {
             prompt: prompt.to_string(),
             task,
             final_prompt,
+            prior_context: spec.prior_context.clone(),
             claim: claim_guard,
             folder_wait,
             thread_wait: None,

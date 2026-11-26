@@ -905,6 +905,7 @@ impl PeerLauncher for RuntimePeerLauncher {
             scope: write_paths.clone(),
             continues,
             owner_follow_up: false,
+            prior_context: None,
         };
 
         let binding = ActivePeerBinding {

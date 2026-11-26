@@ -38,6 +38,11 @@ pub struct HelperSpec {
     /// passed on with no model ([`is_owner_follow_up`]): its end shows in
     /// that thread and is not reviewed by the agent loop.
     pub owner_follow_up: bool,
+    /// The conversation's recent turns the daemon put before the prompt,
+    /// exactly as put there, for an agent starting a new session. A queued
+    /// run that ends up continuing the agent's own session (which holds
+    /// them already) leaves them out again.
+    pub prior_context: Option<String>,
 }
 
 /// The calls the daemon wrote itself from an owner's follow-up (typed, in
@@ -689,6 +694,7 @@ mod tests {
             scope: Vec::new(),
             continues: None,
             owner_follow_up: false,
+            prior_context: None,
         };
         let narrowed = helper_authority(&parent, spec.declaration("chat"), None);
         assert_eq!(
