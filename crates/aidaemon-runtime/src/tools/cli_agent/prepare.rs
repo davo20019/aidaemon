@@ -426,6 +426,33 @@ impl CliAgentTool {
     }
 }
 
+impl CliAgentTool {
+    /// Whether a run of `tool_name` may read any file on the machine: its
+    /// mode, held to `cap`, is full access and enforced (as
+    /// [`Self::prepare_run`] decides it). Otherwise it reads only its
+    /// working folder, as far as a file shared with it goes.
+    pub(super) fn reads_anywhere(
+        &self,
+        tool_name: &str,
+        enforce_native_access: bool,
+        cap: Option<aidaemon_coding_agents::PermissionMode>,
+    ) -> bool {
+        if !enforce_native_access {
+            return false;
+        }
+        let Some(agent) = self
+            .tools
+            .read()
+            .ok()
+            .and_then(|tools| tools.get(tool_name).map(|entry| self.entry_agent(entry)))
+        else {
+            return false;
+        };
+        let mode = self.permissions().agent_mode(tool_name, &*agent);
+        capped_mode(&*agent, mode, cap) == Some(aidaemon_coding_agents::PermissionMode::FullAccess)
+    }
+}
+
 /// `mode` held to `cap`: above it, the most `agent` offers within it
 /// (`None` when it offers nothing that low, so it does not run).
 pub(super) fn capped_mode(

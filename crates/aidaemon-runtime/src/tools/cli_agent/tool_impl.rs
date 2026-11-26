@@ -86,7 +86,7 @@ impl Tool for CliAgentTool {
                     "files": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "For run: files the agent needs to see (the owner's screenshot, a report, a log), when they are outside working_dir: copied into its working folder, where its sandbox reaches, and named in its prompt. Use this rather than only naming their paths."
+                        "description": "For run: files the agent needs to see (the owner's screenshot, a report, a log). Named in its prompt, and copied into its working folder when its sandbox can't reach them. Use this rather than only naming their paths."
                     },
                     "workspace_mode": {
                         "type": "string",
@@ -1161,36 +1161,31 @@ impl CliAgentTool {
                     Some(note) => format!("{note}\n\n{prompt}"),
                     None => prompt,
                 };
-                // Files it needs to see go into its own folder, which its
-                // sandbox reaches. Their reads were judged with the call
-                // (`call_access_manifest`), so only secrets are refused here.
+                // Files it needs to see: their paths, or a copy in its own
+                // folder when its sandbox can't reach them. Their reads were
+                // judged with the call (`call_access_manifest`), so only
+                // secrets are refused here.
                 let prompt = if args.files.iter().all(|path| path.trim().is_empty()) {
                     prompt
                 } else {
-                    let Some(folder) = working_dir.clone() else {
-                        mark_refused_before_launch(PrelaunchRefusal::Policy);
-                        return Ok(
-                            "Blocked: `files` needs a working_dir to copy them into.".to_string()
-                        );
+                    let recipient = super::shared_files::Recipient {
+                        folder: working_dir.clone().map(std::path::PathBuf::from),
+                        reads_anywhere: self.reads_anywhere(&tool, enforce_native_access, None),
                     };
-                    let shared = super::shared_files::check_sources(
-                        &args.files,
-                        Some(std::path::Path::new(&folder)),
-                        None,
-                    )
-                    .map(|sources| {
-                        tokio::task::spawn_blocking(move || {
-                            super::shared_files::stage(
-                                &sources,
-                                &[std::path::PathBuf::from(folder)],
-                            )
-                        })
-                    });
+                    let cwd = working_dir.clone().map(std::path::PathBuf::from);
+                    let shared =
+                        super::shared_files::check_sources(&args.files, cwd.as_deref(), None).map(
+                            |sources| {
+                                tokio::task::spawn_blocking(move || {
+                                    super::shared_files::share(&sources, &[recipient])
+                                })
+                            },
+                        );
                     let note = match shared {
-                        Ok(staging) => staging
+                        Ok(sharing) => sharing
                             .await
                             .map_err(|error| format!("sharing the files failed: {error}"))
-                            .and_then(|staged| staged),
+                            .and_then(|shared| shared),
                         Err(error) => Err(error),
                     };
                     match note {

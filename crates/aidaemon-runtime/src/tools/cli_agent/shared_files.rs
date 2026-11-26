@@ -1,8 +1,7 @@
 //! Files one agent gives another: a screenshot the owner sent, a review a
-//! peer wrote. A path alone is not enough, since a confined agent's sandbox
-//! reaches only its own folder; so each file is copied into the recipient's
-//! working folder, under [`SHARED_DIR`] (which ignores itself in git), and
-//! the recipient is told where.
+//! peer wrote. A recipient that can read a file where it is gets its path;
+//! a confined one, whose sandbox reaches only its own folder, gets a copy
+//! there, under [`SHARED_DIR`] (which ignores itself in git).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -106,62 +105,87 @@ pub(super) fn check_sources(
         .collect()
 }
 
-/// Copy `sources` into each of `folders` (the recipients' working folders)
-/// and return the note that tells a recipient where they are. Blocking.
-pub(super) fn stage(sources: &[SharedSource], folders: &[PathBuf]) -> Result<String, String> {
+/// Who a file is shared with: where it works, and whether it reads any
+/// file on the machine (a `full_access` run its mode is enforced on) or only
+/// its own working folder.
+#[derive(Debug, Clone)]
+pub(super) struct Recipient {
+    pub(super) folder: Option<PathBuf>,
+    pub(super) reads_anywhere: bool,
+}
+
+impl Recipient {
+    fn can_read(&self, path: &Path) -> bool {
+        self.reads_anywhere
+            || self.folder.as_ref().is_some_and(|folder| {
+                path.starts_with(dunce::canonicalize(folder).unwrap_or_else(|_| folder.clone()))
+            })
+    }
+}
+
+/// Tell `recipients` where `sources` are, copying a file only into the
+/// working folders of those that cannot read it where it is: the note for
+/// their prompt or message. Blocking.
+pub(super) fn share(sources: &[SharedSource], recipients: &[Recipient]) -> Result<String, String> {
     if sources.is_empty() {
         return Ok(String::new());
     }
-    let mut folders: Vec<PathBuf> = folders.to_vec();
-    folders.sort();
-    folders.dedup();
-    if folders.is_empty() {
-        return Err(
-            "the recipient has no working folder to put the files in; name their paths instead"
-                .to_string(),
-        );
-    }
     let batch: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-    let relative: Vec<PathBuf> = sources
-        .iter()
-        .map(|source| Path::new(SHARED_DIR).join(&batch).join(&source.name))
-        .collect();
-    for folder in &folders {
-        let shared = folder.join(SHARED_DIR);
-        std::fs::create_dir_all(shared.join(&batch))
-            .map_err(|error| format!("could not make {}: {error}", shared.display()))?;
-        // Ignores itself and everything in it, so the copies never show in
-        // the recipient's repository.
-        let ignore = shared.join(".gitignore");
-        if !ignore.exists() {
-            std::fs::write(&ignore, "*\n")
-                .map_err(|error| format!("could not write {}: {error}", ignore.display()))?;
+    let mut lines = Vec::new();
+    for source in sources {
+        let mut folders: Vec<&PathBuf> = Vec::new();
+        for recipient in recipients.iter().filter(|r| !r.can_read(&source.path)) {
+            let folder = recipient.folder.as_ref().ok_or(
+                "a recipient has no working folder to copy the files into; name their paths instead",
+            )?;
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
         }
-        prune(&shared, &batch);
-        for (source, relative) in sources.iter().zip(&relative) {
-            let dest = folder.join(relative);
-            std::fs::copy(&source.path, &dest).map_err(|error| {
-                format!(
-                    "could not copy `{}` to {}: {error}",
-                    source.path.display(),
-                    dest.display()
-                )
-            })?;
+        if folders.is_empty() {
+            lines.push(format!("- `{}`", source.path.display()));
+            continue;
         }
+        let relative = Path::new(SHARED_DIR).join(&batch).join(&source.name);
+        for folder in &folders {
+            copy_into(folder, &batch, &source.path, &relative)?;
+        }
+        lines.push(if recipients.len() == 1 {
+            format!("- `{}`", folders[0].join(&relative).display())
+        } else {
+            format!(
+                "- `{}` (if your sandbox can't read it there: `{}` in your working folder)",
+                source.path.display(),
+                relative.display()
+            )
+        });
     }
-    let one_folder = (folders.len() == 1).then(|| &folders[0]);
-    let lines: Vec<String> = relative
-        .iter()
-        .map(|relative| match one_folder {
-            Some(folder) => format!("- `{}`", folder.join(relative).display()),
-            None => format!("- `{}`", relative.display()),
-        })
-        .collect();
-    let heading = match one_folder {
-        Some(_) => "[Files shared with you, copied into your working folder:",
-        None => "[Files shared with you, copied into your working folder (paths relative to it):",
-    };
-    Ok(format!("{heading}\n{}]", lines.join("\n")))
+    Ok(format!("[Files shared with you:\n{}]", lines.join("\n")))
+}
+
+/// Copy `source` to `folder/relative`, under the self-ignoring
+/// [`SHARED_DIR`].
+fn copy_into(folder: &Path, batch: &str, source: &Path, relative: &Path) -> Result<(), String> {
+    let shared = folder.join(SHARED_DIR);
+    std::fs::create_dir_all(shared.join(batch))
+        .map_err(|error| format!("could not make {}: {error}", shared.display()))?;
+    // Ignores itself and everything in it, so the copies never show in the
+    // recipient's repository.
+    let ignore = shared.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, "*\n")
+            .map_err(|error| format!("could not write {}: {error}", ignore.display()))?;
+    }
+    prune(&shared, batch);
+    let dest = folder.join(relative);
+    std::fs::copy(source, &dest).map_err(|error| {
+        format!(
+            "could not copy `{}` to {}: {error}",
+            source.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Remove batches in `shared` older than [`KEEP_SHARED_FOR`], but `keep`.
@@ -211,56 +235,88 @@ fn safe_name(name: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_shared_file_is_copied_into_each_folder_and_ignored_by_git() {
-        let from = tempfile::tempdir().unwrap();
-        let source = from.path().join("screen.png");
-        std::fs::write(&source, b"\x89PNGsynthetic").unwrap();
-        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let sources = check_sources(
-            &["screen.png".to_string()],
-            Some(from.path()),
-            Some(&[from.path().to_path_buf()]),
-        )
-        .unwrap();
-        let note = stage(&sources, &[a.path().into(), b.path().into()]).unwrap();
-        assert!(note.contains("relative to it"), "{note}");
-        let relative = note
-            .lines()
-            .nth(1)
+    fn path_in(note: &str) -> PathBuf {
+        let line = note.lines().nth(1).unwrap();
+        line.trim_start_matches("- `")
+            .split('`')
+            .next()
             .unwrap()
-            .trim_start_matches("- `")
-            .trim_end_matches("`]")
-            .to_string();
-        for folder in [a.path(), b.path()] {
-            assert_eq!(
-                std::fs::read(folder.join(&relative)).unwrap(),
-                b"\x89PNGsynthetic"
-            );
-            assert_eq!(
-                std::fs::read_to_string(folder.join(SHARED_DIR).join(".gitignore")).unwrap(),
-                "*\n"
-            );
+            .into()
+    }
+
+    fn source(dir: &Path, name: &str, bytes: &[u8]) -> Vec<SharedSource> {
+        std::fs::write(dir.join(name), bytes).unwrap();
+        check_sources(&[name.to_string()], Some(dir), Some(&[dir.to_path_buf()])).unwrap()
+    }
+
+    #[test]
+    fn a_recipient_that_can_read_the_file_gets_its_path_and_no_copy() {
+        let from = tempfile::tempdir().unwrap();
+        let sources = source(from.path(), "screen.png", b"synthetic");
+        let to = tempfile::tempdir().unwrap();
+        // Unconfined, or confined to the folder the file is in.
+        for recipient in [
+            Recipient {
+                folder: Some(to.path().into()),
+                reads_anywhere: true,
+            },
+            Recipient {
+                folder: Some(from.path().into()),
+                reads_anywhere: false,
+            },
+        ] {
+            let note = share(&sources, &[recipient]).unwrap();
+            assert_eq!(path_in(&note), sources[0].path, "{note}");
+            assert!(!to.path().join(SHARED_DIR).exists());
+            assert!(!from.path().join(SHARED_DIR).exists());
         }
     }
 
     #[test]
-    fn one_folder_gets_absolute_paths() {
+    fn a_confined_recipient_gets_a_copy_in_its_folder_ignored_by_git() {
         let from = tempfile::tempdir().unwrap();
-        let source = from.path().join("review.md");
-        std::fs::write(&source, b"notes").unwrap();
+        let sources = source(from.path(), "screen.png", b"synthetic");
         let to = tempfile::tempdir().unwrap();
-        let sources = check_sources(&[source.to_string_lossy().into_owned()], None, None).unwrap();
-        let note = stage(&sources, &[to.path().into()]).unwrap();
-        let path = note
-            .lines()
-            .nth(1)
-            .unwrap()
-            .trim_start_matches("- `")
-            .trim_end_matches("`]")
-            .to_string();
-        assert!(Path::new(&path).is_absolute(), "{note}");
-        assert_eq!(std::fs::read(path).unwrap(), b"notes");
+        let note = share(
+            &sources,
+            &[Recipient {
+                folder: Some(to.path().into()),
+                reads_anywhere: false,
+            }],
+        )
+        .unwrap();
+        let copy = path_in(&note);
+        assert!(copy.starts_with(to.path().join(SHARED_DIR)), "{note}");
+        assert_eq!(std::fs::read(copy).unwrap(), b"synthetic");
+        assert_eq!(
+            std::fs::read_to_string(to.path().join(SHARED_DIR).join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
+    #[test]
+    fn only_the_recipients_that_need_a_copy_get_one() {
+        let from = tempfile::tempdir().unwrap();
+        let sources = source(from.path(), "review.md", b"notes");
+        let (confined, free) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let note = share(
+            &sources,
+            &[
+                Recipient {
+                    folder: Some(confined.path().into()),
+                    reads_anywhere: false,
+                },
+                Recipient {
+                    folder: Some(free.path().into()),
+                    reads_anywhere: true,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(path_in(&note), sources[0].path, "{note}");
+        assert!(note.contains("in your working folder"), "{note}");
+        assert!(confined.path().join(SHARED_DIR).exists());
+        assert!(!free.path().join(SHARED_DIR).exists());
     }
 
     #[test]

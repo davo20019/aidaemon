@@ -387,15 +387,31 @@ impl RuntimePeerLauncher {
         roots
     }
 
-    /// Check `paths`, which `caller_peer_id` shares, and copy them into
-    /// each of `folders` ([`shared_files`]): the note for the recipients.
-    /// A peer may share what its tree may read, the owner's uploads (the
-    /// daemon's inbox) and scratch files in a temp folder.
+    /// `agent` as a recipient of shared files, working in `folder`: the
+    /// root run in its own mode, a peer in its mode held to the root's.
+    fn recipient(
+        &self,
+        tool: &CliAgentTool,
+        agent: &str,
+        is_root: bool,
+        folder: Option<String>,
+    ) -> shared_files::Recipient {
+        let cap = if is_root { None } else { self.root.lead_mode };
+        shared_files::Recipient {
+            folder: folder.map(PathBuf::from),
+            reads_anywhere: tool.reads_anywhere(agent, self.root.enforce_native_access, cap),
+        }
+    }
+
+    /// Check `paths`, which `caller_peer_id` shares, and tell `recipients`
+    /// where they are ([`shared_files::share`]): the note for them. A peer
+    /// may share what its tree may read, the owner's uploads (the daemon's
+    /// inbox) and scratch files in a temp folder.
     async fn share_into(
         &self,
         caller_peer_id: &str,
         paths: &[String],
-        folders: Vec<PathBuf>,
+        recipients: Vec<shared_files::Recipient>,
     ) -> Result<String, String> {
         let mut roots = self.run_roots();
         if let Some(inbox) = self
@@ -408,7 +424,7 @@ impl RuntimePeerLauncher {
         }
         let cwd = self.peer_dir(caller_peer_id).map(PathBuf::from);
         let sources = shared_files::check_sources(paths, cwd.as_deref(), Some(&roots))?;
-        let note = tokio::task::spawn_blocking(move || shared_files::stage(&sources, &folders))
+        let note = tokio::task::spawn_blocking(move || shared_files::share(&sources, &recipients))
             .await
             .map_err(|error| format!("sharing the files failed: {error}"))??;
         info!(
@@ -549,15 +565,9 @@ impl PeerLauncher for RuntimePeerLauncher {
         let prompt = if request.files.is_empty() {
             request.prompt.clone()
         } else {
-            let folder = working_dir.clone().ok_or(
-                "the new peer has no working folder to put the files in; name their paths instead",
-            )?;
+            let recipient = self.recipient(&tool, &request.agent, false, working_dir.clone());
             let note = self
-                .share_into(
-                    &request.parent_peer_id,
-                    &request.files,
-                    vec![PathBuf::from(folder)],
-                )
+                .share_into(&request.parent_peer_id, &request.files, vec![recipient])
                 .await?;
             format!("{}\n\n{note}", request.prompt.trim_end())
         };
@@ -780,17 +790,21 @@ impl PeerLauncher for RuntimePeerLauncher {
         paths: &[String],
         recipients: &[String],
     ) -> Result<String, String> {
-        let mut folders = Vec::new();
+        let tool = self.upgrade_tool()?;
+        let mut shared_with = Vec::new();
         for recipient in recipients {
-            if self.tree.peer(recipient).is_none() {
-                return Err(format!("unknown peer `{recipient}`"));
-            }
-            let folder = self.peer_dir(recipient).ok_or_else(|| {
-                format!("peer `{recipient}` has no working folder to put the files in")
-            })?;
-            folders.push(PathBuf::from(folder));
+            let peer = self
+                .tree
+                .peer(recipient)
+                .ok_or_else(|| format!("unknown peer `{recipient}`"))?;
+            shared_with.push(self.recipient(
+                &tool,
+                &peer.agent,
+                peer.parent_peer_id.is_none(),
+                self.peer_dir(recipient),
+            ));
         }
-        self.share_into(caller_peer_id, paths, folders).await
+        self.share_into(caller_peer_id, paths, shared_with).await
     }
 
     async fn send_file(
