@@ -619,27 +619,47 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         .tree
         .post_message("peer-root", None, "plan", "HERON note")
         .unwrap();
-    // While the first run still runs, a second gets its own tree.
-    let overlapping = coord.start_root_tree(
-        "bash-agent",
-        "Lead",
-        root("/w/a"),
-        &[],
-        continuity(false, "run-x"),
-    );
-    assert_ne!(overlapping.tree.id(), first.tree.id());
-    end(&overlapping.tree);
-    // The overlapping run's tree is now the conversation's: the next run
-    // continues it.
-    let second = coord.start_root_tree(
+    // A follow-up queued while the first run still runs is prepared on a
+    // stand-in tree, and the conversation keeps the running one.
+    let queued = coord.start_root_tree(
         "bash-agent",
         "Lead",
         root("/w/a"),
         &[],
         continuity(false, "run-2"),
     );
-    assert_eq!(second.tree.id(), overlapping.tree.id());
-    end(&second.tree);
+    assert_ne!(queued.tree.id(), first.tree.id());
+    let mut binding = peer_mod::ActivePeerBinding {
+        tree: queued.tree.clone(),
+        peer_id: "peer-root".into(),
+        permit_slots: queued.permit_slots.clone(),
+        is_root: true,
+        launcher: Some(queued.launcher.clone()),
+        branch: None,
+        rebind: queued.rebind.clone(),
+    };
+    // Still running at start: it stays on its own tree.
+    let mut early = binding.clone();
+    assert!(!early.adopt_conversation_tree(&queued.scoped));
+    assert_eq!(early.tree.id(), queued.tree.id());
+    // Once the first run ended, starting takes the conversation's tree,
+    // and the endpoint the agent was given reaches it.
+    end(&first.tree);
+    assert!(binding.adopt_conversation_tree(&queued.scoped));
+    assert_eq!(binding.tree.id(), first.tree.id());
+    assert_eq!(
+        binding.tree.peer("peer-root").unwrap().run_id.as_deref(),
+        Some("run-2")
+    );
+    assert_eq!(
+        binding.tree.read_messages("peer-root", 0, false)[0].body,
+        "HERON note"
+    );
+    assert!(
+        !binding.adopt_conversation_tree(&queued.scoped),
+        "only once"
+    );
+    end(&binding.tree);
 
     // The real case: one run ends, the next continues its tree.
     let a = coord.start_root_tree(
@@ -692,4 +712,68 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
     end(&moved.tree);
     let other = coord.start_root_tree("bash-agent", "Lead", root("/w/b"), &[], None);
     assert_ne!(other.tree.id(), moved.tree.id());
+    end(&other.tree);
+
+    // A run ends (root marked done), the queued follow-up takes the tree
+    // before the ended run's cleanup: that late cleanup leaves the new
+    // run's root alone.
+    let ending = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/c"),
+        &[],
+        continuity(true, "run-7"),
+    );
+    ending.tree.set_peer_run_id("peer-root", "run-7");
+    let ending_binding = peer_mod::ActivePeerBinding {
+        tree: ending.tree.clone(),
+        peer_id: "peer-root".into(),
+        permit_slots: ending.permit_slots.clone(),
+        is_root: true,
+        launcher: Some(ending.launcher.clone()),
+        branch: None,
+        rebind: None,
+    };
+    let follow = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/c"),
+        &[],
+        continuity(false, "run-8"),
+    );
+    let mut follow_binding = peer_mod::ActivePeerBinding {
+        tree: follow.tree.clone(),
+        peer_id: "peer-root".into(),
+        permit_slots: follow.permit_slots.clone(),
+        is_root: true,
+        launcher: Some(follow.launcher.clone()),
+        branch: None,
+        rebind: follow.rebind.clone(),
+    };
+    ending.tree.update_peer(
+        "peer-root",
+        PeerUpdate {
+            state: PeerState::Completed,
+            run_id: None,
+            working_dir: None,
+            branch: None,
+            output: None,
+            resumable: None,
+        },
+    );
+    assert!(follow_binding.adopt_conversation_tree(&follow.scoped));
+    ending_binding.cleanup_children("run-7").await;
+    let root_now = follow_binding.tree.peer("peer-root").unwrap();
+    assert_eq!(
+        root_now.state,
+        PeerState::Running,
+        "the late cleanup left it alone"
+    );
+    assert_eq!(root_now.run_id.as_deref(), Some("run-8"));
+    follow_binding.cleanup_children("run-8").await;
+    assert_eq!(
+        follow_binding.tree.peer("peer-root").unwrap().state,
+        PeerState::Cancelled,
+        "its own run's cleanup still ends it"
+    );
 }

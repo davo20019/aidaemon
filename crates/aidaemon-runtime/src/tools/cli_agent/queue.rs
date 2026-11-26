@@ -29,7 +29,7 @@ impl CliAgentTool {
     /// slot frees, and runs from then on as an immediate launch does.
     pub(super) async fn queue_run(
         &self,
-        call: RunCall,
+        mut call: RunCall,
         mut prep: PreparedRun,
         slot: Option<SlotWait>,
     ) -> String {
@@ -352,6 +352,7 @@ impl CliAgentTool {
             };
             info!(task_id = %call.task_id, tool = %call.tool_name, "A queued CLI agent got a free slot");
             handles.runs.clear_activity(&cli_run_id(&call.task_id));
+            super::run::adopt_conversation_tree(&mut call, &prep);
             let started = match handles.start_process(&call, &mut prep, &shared).await {
                 Ok(started) => started,
                 Err(error) => {

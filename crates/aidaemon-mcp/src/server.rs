@@ -446,6 +446,19 @@ impl ScopedEndpoint {
         }
     }
 
+    /// Serve this endpoint's token with `handler` from now on: connections
+    /// made after this call reach it, ones already open keep the handler
+    /// they authenticated with. Lets a host choose what a caller reaches
+    /// after handing out the launch command that carries the token. A
+    /// revoked endpoint stays revoked.
+    pub fn rebind(&self, handler: Arc<dyn McpToolHandler>) {
+        if let Ok(mut map) = self.sessions.write()
+            && let Some(session) = map.get_mut(&self.token)
+        {
+            session.handler = handler;
+        }
+    }
+
     /// Explicitly revoke this endpoint's token before drop. Connections
     /// already open with it end too: revoking takes the caller's authority
     /// away, not only its next sign-in.
@@ -707,6 +720,66 @@ mod tests {
             let msg = args.get("msg").and_then(Value::as_str).unwrap_or_default();
             Ok(ToolOutput::text(format!("echo:{msg}")))
         }
+    }
+
+    struct PingTool;
+
+    #[async_trait]
+    impl Tool for PingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "ping".into(),
+                description: "Answer pong".into(),
+                parameters: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            }
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("pong"))
+        }
+    }
+
+    /// A connection made after `rebind` reaches the new handler with the
+    /// token already handed out; a revoked endpoint stays revoked.
+    #[tokio::test]
+    async fn a_rebound_endpoint_serves_its_new_handler() {
+        let server = LocalMcpServer::bind(ServerMeta::new("aidaemon-test", "0.1.0"))
+            .await
+            .unwrap();
+        let handler = |tool: Arc<dyn Tool>| -> Arc<dyn McpToolHandler> {
+            Arc::new(CoreToolsHandler::new(vec![tool], "synthetic-session"))
+        };
+        let endpoint = server.register_scoped(handler(Arc::new(EchoTool)));
+        endpoint.rebind(handler(Arc::new(PingTool)));
+
+        let (mut client_w, bridge_r) = tokio::io::duplex(16 * 1024);
+        let (bridge_w, client_r) = tokio::io::duplex(16 * 1024);
+        let addr = endpoint.addr().to_string();
+        let token = endpoint.token().to_string();
+        let bridge_task =
+            tokio::spawn(async move { run_io_bridge(&addr, &token, bridge_r, bridge_w).await });
+        let mut lines = BufReader::new(client_r).lines();
+        client_w
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+            .await
+            .unwrap();
+        let list: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(list["result"]["tools"][0]["name"], "ping");
+        drop(client_w);
+        bridge_task.await.unwrap().unwrap();
+
+        endpoint.revoke();
+        endpoint.rebind(handler(Arc::new(EchoTool)));
+        let (_w, bridge_r) = tokio::io::duplex(1024);
+        let (bridge_w, _r) = tokio::io::duplex(1024);
+        let refused = run_io_bridge(
+            &endpoint.addr().to_string(),
+            endpoint.token(),
+            bridge_r,
+            bridge_w,
+        )
+        .await;
+        assert!(refused.is_err(), "a revoked token is not brought back");
     }
 
     #[tokio::test]

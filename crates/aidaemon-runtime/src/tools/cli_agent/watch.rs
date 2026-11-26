@@ -588,7 +588,7 @@ pub(super) async fn watch_run(
                     resumable: Some(resumable),
                 },
             );
-            binding.cleanup_children().await;
+            binding.cleanup_children(&cli_run_id(&call.task_id)).await;
         }
         permit_slot.release();
         shared.done_notify.notify_waiters();

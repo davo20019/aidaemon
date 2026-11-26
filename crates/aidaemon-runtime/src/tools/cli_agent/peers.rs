@@ -168,7 +168,7 @@ impl PeerCoordinator {
     /// still running), else a fresh one, kept for the conversation's next run.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_root_tree(
-        &self,
+        self: &Arc<Self>,
         root_agent: &str,
         root_title: &str,
         root_ctx: PeerRootContext,
@@ -187,6 +187,7 @@ impl PeerCoordinator {
                 .is_some_and(|root| root.working_dir == root_ctx.working_dir);
             (same_folder && kept.continue_root(c.run_id.clone())).then_some(kept)
         });
+        let continued_any = continued.is_some();
         if let Some(tree) = &continued {
             info!(tree_id = %tree.id(), session_id = %root_ctx.session_id, agent = %root_agent, "A lead run continues its conversation's peer tree");
         }
@@ -198,27 +199,86 @@ impl PeerCoordinator {
                 self.limits,
             )
         });
+        // A run queued behind its conversation's running lead takes that
+        // tree when it starts ([`ActivePeerBinding::adopt_conversation_tree`]):
+        // until then the conversation keeps it.
+        let rebind = continuity
+            .as_ref()
+            .filter(|c| !continued_any && !c.fresh)
+            .map(|c| {
+                Arc::new(RootRebind {
+                    coord: self.clone(),
+                    root_ctx: root_ctx.clone(),
+                    continuity: TreeContinuity {
+                        lead: c.lead.clone(),
+                        fresh: false,
+                        run_id: c.run_id.clone(),
+                    },
+                })
+            });
         if let Some(continuity) = continuity {
             let mut kept = self
                 .conversation_trees
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if kept.len() >= KEPT_CONVERSATION_TREES && !kept.contains_key(&continuity.lead) {
-                // Drop one whose lead is not running; failing that, any.
-                let idle = kept
-                    .iter()
-                    .find(|(_, tree)| {
-                        tree.peer("peer-root")
-                            .is_none_or(|root| root.state.is_terminal())
-                    })
-                    .or_else(|| kept.iter().next())
-                    .map(|(lead, _)| lead.clone());
-                if let Some(idle) = idle {
-                    kept.remove(&idle);
-                }
+            let lead_running = kept.get(&continuity.lead).is_some_and(|tree| {
+                tree.peer("peer-root")
+                    .is_some_and(|root| !root.state.is_terminal())
+            });
+            if lead_running && !continued_any && !continuity.fresh {
+                // Leave the running lead's tree as the conversation's.
+            } else {
+                Self::keep_conversation_tree(&mut kept, continuity.lead, tree.clone());
             }
-            kept.insert(continuity.lead, tree.clone());
         }
+        let (launcher, handler, permit_slots) = self.lead_on(&tree, root_ctx);
+        let (endpoint, scoped) = self.mcp.endpoint_for(handler);
+        let prompt_hint = coordination_prompt_hint("peer-root", None, available_agents);
+        RootPeerSession {
+            tree,
+            endpoint,
+            scoped,
+            prompt_hint,
+            permit_slots,
+            launcher,
+            rebind,
+        }
+    }
+
+    /// Keep `tree` as `lead`'s conversation tree, within the kept bound.
+    fn keep_conversation_tree(
+        kept: &mut HashMap<ConversationLead, Arc<PeerTree>>,
+        lead: ConversationLead,
+        tree: Arc<PeerTree>,
+    ) {
+        if kept.len() >= KEPT_CONVERSATION_TREES && !kept.contains_key(&lead) {
+            // Drop one whose lead is not running; failing that, any.
+            let idle = kept
+                .iter()
+                .find(|(_, tree)| {
+                    tree.peer("peer-root")
+                        .is_none_or(|root| root.state.is_terminal())
+                })
+                .or_else(|| kept.iter().next())
+                .map(|(lead, _)| lead.clone());
+            if let Some(idle) = idle {
+                kept.remove(&idle);
+            }
+        }
+        kept.insert(lead, tree);
+    }
+
+    /// The lead's launcher and MCP handler on `tree`.
+    #[allow(clippy::type_complexity)]
+    fn lead_on(
+        &self,
+        tree: &Arc<PeerTree>,
+        root_ctx: PeerRootContext,
+    ) -> (
+        Arc<RuntimePeerLauncher>,
+        Arc<dyn McpToolHandler>,
+        Arc<StdMutex<HashMap<String, PermitSlot>>>,
+    ) {
         let permit_slots: Arc<StdMutex<HashMap<String, PermitSlot>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let launcher = Arc::new(RuntimePeerLauncher {
@@ -236,17 +296,17 @@ impl PeerCoordinator {
             launcher.clone(),
             self.mcp.clone(),
         );
-        let (endpoint, scoped) = self.mcp.endpoint_for(handler);
-        let prompt_hint = coordination_prompt_hint("peer-root", None, available_agents);
-        RootPeerSession {
-            tree,
-            endpoint,
-            scoped,
-            prompt_hint,
-            permit_slots,
-            launcher,
-        }
+        (launcher, handler, permit_slots)
     }
+}
+
+/// What a lead run that could not continue its conversation's tree when it
+/// was prepared (that tree's lead still ran: it was queued behind it) needs
+/// to take that tree when it starts.
+pub(super) struct RootRebind {
+    coord: Arc<PeerCoordinator>,
+    root_ctx: PeerRootContext,
+    continuity: TreeContinuity,
 }
 
 /// Authority and routing context captured from a root CLI run and inherited
@@ -279,6 +339,8 @@ pub(super) struct RootPeerSession {
     pub(super) prompt_hint: String,
     pub(super) permit_slots: Arc<StdMutex<HashMap<String, PermitSlot>>>,
     pub(super) launcher: Arc<RuntimePeerLauncher>,
+    /// Set when the run may still take its conversation's tree at start.
+    pub(super) rebind: Option<Arc<RootRebind>>,
 }
 
 /// Active peer metadata carried by a running CLI (root or child) so its
@@ -292,6 +354,8 @@ pub(super) struct ActivePeerBinding {
     pub(super) is_root: bool,
     pub(super) launcher: Option<Arc<RuntimePeerLauncher>>,
     pub(super) branch: Option<String>,
+    /// A lead run's way onto its conversation's tree at start.
+    pub(super) rebind: Option<Arc<RootRebind>>,
 }
 
 /// How much of each board post a lead run's result keeps.
@@ -300,6 +364,54 @@ const PEER_RECORD_BODY_CHARS: usize = 2_000;
 const PEER_RECORD_BOARD_CHARS: usize = 16_000;
 
 impl ActivePeerBinding {
+    /// A lead run starting: move it onto its conversation's tree when it
+    /// was prepared on a fresh one only because that tree's lead still ran
+    /// (it was queued behind it) and that tree can now go on. `scoped` is
+    /// the endpoint the run's agent connects with: it now reaches the
+    /// conversation's tree. Whether it moved.
+    pub(super) fn adopt_conversation_tree(&mut self, scoped: &ScopedEndpoint) -> bool {
+        let Some(plan) = self.rebind.take() else {
+            return false;
+        };
+        if !self.is_root || self.tree.acted() {
+            return false;
+        }
+        let kept = plan
+            .coord
+            .conversation_trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&plan.continuity.lead)
+            .cloned();
+        let Some(kept) = kept.filter(|kept| !Arc::ptr_eq(kept, &self.tree)) else {
+            return false;
+        };
+        let same_folder = kept
+            .peer("peer-root")
+            .is_some_and(|root| root.working_dir == plan.root_ctx.working_dir);
+        if !same_folder || !kept.continue_root(plan.continuity.run_id.clone()) {
+            return false;
+        }
+        let (launcher, handler, permit_slots) = plan.coord.lead_on(&kept, plan.root_ctx.clone());
+        scoped.rebind(handler);
+        // A permit the run already holds moves with it.
+        let held: Vec<(String, PermitSlot)> = self
+            .permit_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        permit_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(held);
+        info!(tree_id = %kept.id(), session_id = %plan.root_ctx.session_id, "A queued lead run continues its conversation's peer tree");
+        self.tree = kept;
+        self.launcher = Some(launcher);
+        self.permit_slots = permit_slots;
+        true
+    }
+
     /// The tree's record for a lead run's result (every peer and board
     /// post): its own report only summarizes them, and this is what its
     /// caller can quote. `None` for a peer, or a tree with nothing in it.
@@ -368,16 +480,28 @@ impl ActivePeerBinding {
         }
     }
 
-    /// Cancel any still-running descendant peers when a root CLI ends or is
-    /// cancelled.
-    pub(super) async fn cleanup_children(&self) {
+    /// Cancel any still-running descendant peers when a root CLI (run
+    /// `run_id`) ends or is cancelled. Once the next run of its conversation
+    /// continued the tree, the root is that run's: only this run's worktrees
+    /// are released (it continued only after all of this run's peers ended).
+    pub(super) async fn cleanup_children(&self, run_id: &str) {
         if !self.is_root {
             return;
         }
-        let runs = self.tree.cancel_subtree(&self.peer_id);
         let Some(launcher) = self.launcher.as_ref() else {
+            self.tree.cancel_subtree(&self.peer_id);
             return;
         };
+        let continued_by_another = self
+            .tree
+            .peer(&self.peer_id)
+            .and_then(|root| root.run_id)
+            .is_some_and(|root_run| root_run != run_id);
+        if continued_by_another {
+            launcher.release_worktrees().await;
+            return;
+        }
+        let runs = self.tree.cancel_subtree(&self.peer_id);
         for (peer_id, run_id) in runs {
             if peer_id == self.peer_id {
                 continue;
@@ -790,6 +914,7 @@ impl PeerLauncher for RuntimePeerLauncher {
             is_root: false,
             launcher: None,
             branch: branch.clone(),
+            rebind: None,
         };
 
         // A subpath child writes inside its ancestors' folder by their own

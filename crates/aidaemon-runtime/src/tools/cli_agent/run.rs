@@ -177,6 +177,22 @@ impl PreparedRun {
     }
 }
 
+/// A lead run about to start: onto its conversation's tree when it was
+/// queued behind that tree's lead ([`peers::ActivePeerBinding::adopt_conversation_tree`]).
+pub(super) fn adopt_conversation_tree(call: &mut RunCall, prep: &PreparedRun) {
+    let Some(binding) = call.peer_binding.as_mut() else {
+        return;
+    };
+    let Some(scoped) = prep
+        .mcp_guard
+        .as_ref()
+        .and_then(|guard| guard.downcast_ref::<aidaemon_mcp::ScopedEndpoint>())
+    else {
+        return;
+    };
+    binding.adopt_conversation_tree(scoped);
+}
+
 /// The longest task a run's record keeps of what it was asked.
 const ASKED_CHARS: usize = 2000;
 
@@ -637,6 +653,7 @@ impl CliAgentTool {
                 is_root: true,
                 launcher: Some(root_session.launcher),
                 branch: None,
+                rebind: root_session.rebind,
             };
             let has_known_agent = self
                 .tools
@@ -692,7 +709,7 @@ impl CliAgentTool {
         };
         prep.thread_wait = thread_wait;
         prep.mcp_guard = root_keep_alive;
-        let call = RunCall {
+        let mut call = RunCall {
             tool_name: tool_name.to_string(),
             task_id: task_id.clone(),
             session_id: session_id.to_string(),
@@ -774,6 +791,7 @@ impl CliAgentTool {
         }
         // prep's claim guard drops on an error return and releases the
         // claim.
+        adopt_conversation_tree(&mut call, &prep);
         let started = handles.start_process(&call, &mut prep, &shared).await?;
         shared
             .process
