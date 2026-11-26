@@ -3011,6 +3011,11 @@ impl Store {
         self.read(|c| c.lines(id).to_vec())
     }
 
+    /// Messages sent in `id` that the daemon has not shown back yet.
+    pub fn sending(&self, id: &str) -> Vec<aidaemon_client_core::client::Sending> {
+        self.read(|c| c.sending(id).to_vec())
+    }
+
     pub fn live(&self, id: &str) -> Option<LiveTurn> {
         self.read(|c| c.state.sessions.get(id).and_then(|v| v.live.clone()))
     }

@@ -269,6 +269,37 @@ pub struct DraftFile {
     pub marked_from: Option<String>,
 }
 
+/// A message the owner sent that the daemon has not shown back yet (its
+/// turn's `UserMessage`): the conversation shows it at once, as sending,
+/// so a send that takes seconds to start a turn never looks lost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sending {
+    /// The send's request id.
+    pub request_id: String,
+    pub text: String,
+    pub attachments: Vec<AttachmentRef>,
+    /// The agent thread (run) it was addressed to, if any: a conversation
+    /// that folds its agents' threads away shows it there, not inline.
+    pub thread: Option<String>,
+    /// The daemon accepted it (`MessageAccepted`): it is on its way to a
+    /// turn, no longer only in this client.
+    pub accepted: bool,
+}
+
+impl Sending {
+    /// Whether the daemon's user message `text` with `files` is this one,
+    /// shown back: the same text and files, or (text the daemon rewrote
+    /// around files) the same files.
+    fn shown_as(&self, text: &str, files: &[AttachmentRef]) -> bool {
+        let same_files = self
+            .attachments
+            .iter()
+            .map(|a| &a.id)
+            .eq(files.iter().map(|a| &a.id));
+        same_files && (self.text.trim() == text.trim() || !self.attachments.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DraftFileState {
     Uploading,
@@ -499,6 +530,9 @@ pub struct Client {
     /// Messages sent while the work runs (to be read now or after), until
     /// accepted: the waiting list reads again then.
     queue_sends: BTreeSet<String>,
+    /// Each conversation's messages sent and not yet shown back, oldest
+    /// first ([`Sending`]).
+    sending: BTreeMap<String, Vec<Sending>>,
     /// Stop requests in flight, by request id: the conversation each was
     /// for, so its report lands there and not on every page.
     stop_sends: BTreeMap<String, String>,
@@ -774,6 +808,7 @@ impl Client {
             )),
             _ => None,
         };
+        self.settle_sending(&frame);
         self.state.apply(frame);
         if let Some((session_id, agent)) = created_agent_session {
             self.composer_targets.insert(
@@ -3059,6 +3094,8 @@ impl Client {
                 // Sent while the work runs, either way: it waits (to be read
                 // or for its own turn) and the list shows it.
                 let queueing = effective_mid_run.is_some() && in_run.is_none();
+                // One that waits shows in the waiting list instead.
+                let echo = (!queueing).then(|| (text.clone(), attachments.clone(), in_run.clone()));
                 let id = self.send(Command::SendMessage {
                     session_id: session.map(str::to_owned),
                     text,
@@ -3072,6 +3109,9 @@ impl Client {
                 });
                 if queueing {
                     self.queue_sends.insert(id.clone());
+                }
+                if let (Some(session), Some((text, attachments, thread))) = (session, echo) {
+                    self.echo(session, &id, (text, attachments), thread);
                 }
                 if session.is_none() {
                     // The draft is spent once the conversation exists.
@@ -3121,6 +3161,7 @@ impl Client {
             .unwrap_or_else(|| run_id.to_owned());
         self.composer_targets
             .insert(session.to_owned(), ComposerTarget::Session { thread });
+        let echo = attachments.clone();
         let id = self.send(Command::SendMessage {
             session_id: Some(session.to_owned()),
             text: text.to_owned(),
@@ -3134,15 +3175,22 @@ impl Client {
         });
         if self.is_turn_running(session) {
             self.queue_sends.insert(id);
+        } else {
+            self.echo(
+                session,
+                &id,
+                (text.to_owned(), echo),
+                Some(run_id.to_owned()),
+            );
         }
         Ok(true)
     }
 
     /// Say `text` in `session`, as if typed (a suggested prompt, Retry).
     pub fn ask(&mut self, session: &str, text: String) {
-        self.send(Command::SendMessage {
+        let id = self.send(Command::SendMessage {
             session_id: Some(session.to_owned()),
-            text,
+            text: text.clone(),
             attachments: Vec::new(),
             mid_run: None,
             project_id: None,
@@ -3151,6 +3199,126 @@ impl Client {
             in_run: None,
             fresh_agent_session: false,
         });
+        self.echo(session, &id, (text, Vec::new()), None);
+    }
+
+    /// The messages sent in `session` that the daemon has not shown back
+    /// yet, oldest first: shown after its lines, as sending.
+    pub fn sending(&self, session: &str) -> &[Sending] {
+        self.sending
+            .get(session)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Show the message sent as `request_id` in `session` until the
+    /// daemon shows it back.
+    fn echo(
+        &mut self,
+        session: &str,
+        request_id: &str,
+        (text, attachments): (String, Vec<AttachmentRef>),
+        thread: Option<String>,
+    ) {
+        self.sending
+            .entry(session.to_owned())
+            .or_default()
+            .push(Sending {
+                request_id: request_id.to_owned(),
+                text,
+                attachments,
+                thread,
+                accepted: false,
+            });
+    }
+
+    /// What `frame` settles of the messages shown as sending: the daemon
+    /// accepted one, refused one, showed one back, answered one without a
+    /// turn of its own (a stop word, a status question: no `UserMessage`
+    /// comes), or the conversation is gone.
+    fn settle_sending(&mut self, frame: &ServerFrame) {
+        if self.sending.is_empty() {
+            return;
+        }
+        match frame {
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::MessageAccepted { .. },
+            } => {
+                if let Some(sent) = self
+                    .sending
+                    .values_mut()
+                    .flatten()
+                    .find(|s| &s.request_id == request_id)
+                {
+                    sent.accepted = true;
+                }
+            }
+            // Refused: it never reached a turn (the error says why).
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                ..
+            } => {
+                for list in self.sending.values_mut() {
+                    list.retain(|s| &s.request_id != request_id);
+                }
+            }
+            ServerFrame::Event {
+                event:
+                    Event::UserMessage {
+                        session_id,
+                        text,
+                        attachments,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(list) = self.sending.get_mut(session_id)
+                    && let Some(at) = list.iter().position(|s| s.shown_as(text, attachments))
+                {
+                    list.remove(at);
+                }
+            }
+            // Read again (a reconnect may have missed the event): what the
+            // daemon already holds is shown by its history.
+            ServerFrame::Ack {
+                result:
+                    CommandResult::History {
+                        session_id,
+                        messages,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(list) = self.sending.get_mut(session_id) {
+                    list.retain(|s| {
+                        !s.accepted
+                            || !messages
+                                // The protocol's role value.
+                                .iter()
+                                .any(|m| m.role == "user" && s.shown_as(&m.text, &m.attachments))
+                    });
+                }
+            }
+            // The daemon answered in the conversation without a turn of its
+            // own for what was accepted: nothing more is coming for it.
+            ServerFrame::Event {
+                event: Event::AssistantMessage { session_id, .. },
+                ..
+            } if !self.is_turn_running(session_id) => {
+                if let Some(list) = self.sending.get_mut(session_id) {
+                    list.retain(|s| !s.accepted);
+                }
+            }
+            ServerFrame::Event {
+                event: Event::SessionDeleted { session_id },
+                ..
+            } => {
+                self.sending.remove(session_id);
+            }
+            _ => {}
+        }
+        self.sending.retain(|_, list| !list.is_empty());
     }
 
     /// Run the slash command `slash` ("model fast", no leading `/`) in
@@ -5798,5 +5966,97 @@ mod tests {
             client.composer_target_view(Some("app:code1"), true).chip,
             "To: Codex 2 · working"
         );
+    }
+
+    /// A message sent shows at once, as sending, until the daemon shows
+    /// it back with its turn (live 2026-11-26: a follow-up to a coding
+    /// agent took seconds to appear, and looked lost).
+    #[test]
+    fn a_sent_message_shows_as_sending_until_the_daemon_shows_it_back() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        assert_eq!(
+            client.follow_up("app:s1", "cli-agent-1", " did you review it? "),
+            Ok(true)
+        );
+        let id = client.take_outgoing()[0].0.clone();
+        assert_eq!(client.sending("app:s1").len(), 1);
+        assert_eq!(client.sending("app:s1")[0].text, "did you review it?");
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:s1"}}}}"#
+            )),
+            &cx(Some("app:s1")),
+        );
+        assert!(
+            client.sending("app:s1")[0].accepted,
+            "still sending once accepted"
+        );
+        // Someone else's message in the conversation is not this one.
+        client.update(
+            frame(r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:s1","event":{"type":"user_message","session_id":"app:s1","text":"other","origin":"app"}}"#),
+            &cx(Some("app:s1")),
+        );
+        assert_eq!(client.sending("app:s1").len(), 1);
+        client.update(
+            frame(r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:s1","event":{"type":"user_message","session_id":"app:s1","text":"did you review it?","origin":"app"}}"#),
+            &cx(Some("app:s1")),
+        );
+        assert!(
+            client.sending("app:s1").is_empty(),
+            "shown back: one line, not two"
+        );
+    }
+
+    /// A refused send stops showing as sending; so does one the daemon
+    /// answered without a turn, or found in the history read again.
+    #[test]
+    fn a_sending_message_settles_when_refused_answered_or_read_again() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+
+        client.ask("app:s1", "hello".into());
+        let id = client.take_outgoing()[0].0.clone();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{id}","error":{{"code":"invalid","message":"No","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(client.sending("app:s1").is_empty());
+
+        client.ask("app:s1", "stop".into());
+        let id = client.take_outgoing()[0].0.clone();
+        let answer = r#"{"type":"event","seq":3,"at_ms":3,"session_id":"app:s1","event":{"type":"assistant_message","session_id":"app:s1","text":"Nothing is running."}}"#;
+        // Not accepted yet: a reply then is not its answer.
+        client.update(frame(answer), &cx(None));
+        assert_eq!(client.sending("app:s1").len(), 1);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:s1"}}}}"#
+            )),
+            &cx(None),
+        );
+        client.update(
+            frame(&answer.replace(r#""seq":3"#, r#""seq":4"#)),
+            &cx(None),
+        );
+        assert!(client.sending("app:s1").is_empty());
+
+        client.ask("app:s1", "again".into());
+        let id = client.take_outgoing()[0].0.clone();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:s1"}}}}"#
+            )),
+            &cx(None),
+        );
+        client.update(
+            frame(r#"{"type":"ack","request_id":"h1","result":{"type":"history","session_id":"app:s1","messages":[{"id":"m1","role":"user","text":"again","at_ms":5}]}}"#),
+            &cx(None),
+        );
+        assert!(client.sending("app:s1").is_empty());
     }
 }

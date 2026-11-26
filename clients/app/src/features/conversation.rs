@@ -23,6 +23,10 @@ enum Row {
     /// A day break: "Today", "Yesterday", "Mar 3".
     Day(String),
     User(String, u64, Vec<AttachmentRef>),
+    /// A message sent that the daemon has not shown back yet: shown at
+    /// once, marked as sending, then as sent once the daemon has it (it
+    /// may wait there for its turn).
+    Sending(String, Vec<AttachmentRef>, bool),
     /// A reply: its text, time and files, whether it only says the work
     /// went on in the background, whether its time and Copy show (the
     /// last reply before the owner speaks again), and the provider and
@@ -159,11 +163,21 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
         store.model_of(Some(session)).0,
         aidaemon_client_protocol::ModelChoice::Agent { .. }
     );
-    if is_direct {
+    let mut rows = if is_direct {
         rows
     } else {
         threaded(rows, &runs)
-    }
+    };
+    // What was just sent, at the end until the daemon shows it back; one
+    // addressed to an agent's thread shows there when threads fold away.
+    rows.extend(
+        store
+            .sending(session)
+            .into_iter()
+            .filter(|sent| is_direct || sent.thread.is_none())
+            .map(|sent| Row::Sending(sent.text, sent.attachments, sent.accepted)),
+    );
+    rows
 }
 
 /// `rows` without each launch line ("Started in the background: …") that
@@ -2046,7 +2060,7 @@ fn transcript(store: Store, session: String) -> View {
                 rows.len(),
                 rows[before..]
                     .iter()
-                    .any(|row| matches!(row, Row::User(..) | Row::Live)),
+                    .any(|row| matches!(row, Row::User(..) | Row::Sending(..) | Row::Live)),
             )
         });
         let before = shown_len.replace(len);
@@ -2180,6 +2194,7 @@ fn transcript_list(
                         Row::Retry => 7,
                         Row::Background => 8,
                         Row::Runs { .. } => 10,
+                        Row::Sending(..) => 11,
                     })
                 })
             });
@@ -2209,6 +2224,7 @@ fn transcript_list(
                             row.with(|r| match r {
                                 Some(
                                     Row::User(t, ..)
+                                    | Row::Sending(t, ..)
                                     | Row::Assistant(t, ..)
                                     | Row::Note(t)
                                     | Row::Day(t),
@@ -2224,9 +2240,11 @@ fn transcript_list(
                         };
                         let attached = move || {
                             row.with(|r| match r {
-                                Some(Row::User(_, _, files) | Row::Assistant(_, _, files, ..)) => {
-                                    files.clone()
-                                }
+                                Some(
+                                    Row::User(_, _, files)
+                                    | Row::Sending(_, files, _)
+                                    | Row::Assistant(_, _, files, ..),
+                                ) => files.clone(),
                                 _ => Vec::new(),
                             })
                         };
@@ -2240,6 +2258,23 @@ fn transcript_list(
                                     move || user_bubble(content),
                                 ))
                                 .child(message_footer(store, session, content, attached, at)),
+                            11 => column
+                                .items_end()
+                                .gap_1()
+                                .child(files(store, attached, true))
+                                .child(when(
+                                    move || !content().trim().is_empty(),
+                                    move || user_bubble(content),
+                                ))
+                                .child(
+                                    text(move || {
+                                        let accepted = row
+                                            .with(|r| matches!(r, Some(Row::Sending(_, _, true))));
+                                        if accepted { "Sent" } else { "Sending…" }
+                                    })
+                                    .text_size(px(type_scale::XS))
+                                    .text_color(colors::FAINT),
+                                ),
                             1 => column
                                 .gap_1()
                                 .child(when(
