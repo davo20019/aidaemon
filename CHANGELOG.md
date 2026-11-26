@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-11-26
+
+### Upgrading
+
+- **ChatGPT sign-in must be done again.** Logins made with the borrowed Codex CLI client are no longer used; run `aidaemon auth login openai` (or sign in from Settings) to connect your ChatGPT account through Sign in with ChatGPT.
+- **`generate_image` now needs an OpenAI API key.** It uses OpenAI's metered Images API instead of the ChatGPT backend, and says how to configure the key when none is set.
+
+### Added
+
+- **Conversations can be deleted from the app** (Delete…, with a confirmation; protocol 1.59). An erased conversation, deleted here, elsewhere or by `/wipe`, leaves nothing behind: no client-log events, no run records, no coding-agent result posted after the erase, and an app that was away drops it on its return.
+- **A message you send shows at once,** as sending and then sent, until the daemon shows it back with its turn.
+- **A coding-agent conversation keeps one team of peers across exchanges,** and across a daemon restart: the next run of its lead continues the board and finished peers, and a worktree peer resumes in its kept branch.
+
+### Changed
+
+- **ChatGPT uses OpenAI's official Sign in with ChatGPT flow** and `api.openai.com/v1`; truncated streams no longer run incomplete tool calls.
+- **The model picker offers what each provider lists now** (refreshed every 15 minutes) and leaves out a provider whose account cannot answer (no credit, rejected key, used-up quota) until a later trial call passes.
+- **A safety judgment whose primary model cannot answer falls back to each failover provider's strongest model,** not its fast tier.
+- **Gemini CLI can sign in with a Gemini API key;** every coding agent keeps its own sign-in by default.
+
+### Fixed
+
+- **The app's history pages back through the whole stored conversation,** not only the model's newest few dozen messages, and the first message after a restart joins the stored history.
+- **Messages waiting for their turn survive a daemon restart** and run in order once the cut-off turn has continued.
+- **Queued coding-agent follow-ups keep their peers endpoint** and their conversation's peer tree, and no longer repeat history the agent's own session already holds.
+- **A coding agent whose first readiness check timed out is asked again a minute later** instead of staying out of the Code picker until a restart.
+- **The composer's Send button stays inside the frame on narrow phones,** and the details pane's tabs sit on its header line.
+- **The Delete dialog no longer doubles a title's punctuation** ("Delete … ready.?").
+- **A stale app's refused remote sign-in is logged once an hour per device,** naming the device, not every two seconds.
+
 ## [0.25.0] - 2026-11-26
 
 ### Added

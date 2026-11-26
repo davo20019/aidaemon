@@ -21,9 +21,9 @@ exclude = ["tests/", "benches/"]
 mcp = ["dep:aidaemon-mcp"]
 
 [dependencies]
-aidaemon-core = { version = "0.25.0", path = "../aidaemon-core" }
-aidaemon-secrets = { version = "0.25.0", path = "../aidaemon-secrets", default-features = false }
-aidaemon-mcp = { version = "0.25.0", path = "../aidaemon-mcp", optional = true }
+aidaemon-core = { version = "0.25.1", path = "../aidaemon-core" }
+aidaemon-secrets = { version = "0.25.1", path = "../aidaemon-secrets", default-features = false }
+aidaemon-mcp = { version = "0.25.1", path = "../aidaemon-mcp", optional = true }
 async-trait = "0.1"
 dirs = "7"
 serde = { version = "1", features = ["derive"] }

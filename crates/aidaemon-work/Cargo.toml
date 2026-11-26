@@ -25,10 +25,10 @@ email-trigger = ["dep:async-imap", "dep:tokio-rustls", "dep:futures"]
 
 [dependencies]
 dunce = "1.0"
-aidaemon-channels = { version = "0.25.0", path = "../aidaemon-channels" }
-aidaemon-core = { version = "0.25.0", path = "../aidaemon-core" }
-aidaemon-events = { version = "0.25.0", path = "../aidaemon-events" }
-aidaemon-tools = { version = "0.25.0", path = "../aidaemon-tools", features = ["sqlite"] }
+aidaemon-channels = { version = "0.25.1", path = "../aidaemon-channels" }
+aidaemon-core = { version = "0.25.1", path = "../aidaemon-core" }
+aidaemon-events = { version = "0.25.1", path = "../aidaemon-events" }
+aidaemon-tools = { version = "0.25.1", path = "../aidaemon-tools", features = ["sqlite"] }
 anyhow = "1"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, optional = true }
