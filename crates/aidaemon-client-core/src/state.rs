@@ -272,6 +272,12 @@ impl State {
         for run in state.runs {
             self.put_run(run);
         }
+        // Ended runs a history brought back stay past a snapshot, but not a
+        // conversation's the snapshot no longer lists (erased while this
+        // client was away); a listed one's history brings its own again.
+        let listed: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
+        self.past_runs
+            .retain(|_, run| listed.contains(&run.session_id));
         // What running turns have got to: the working line comes back after
         // a reload or a dropped connection, and later status events find
         // their turn.
@@ -918,6 +924,44 @@ mod tests {
             session_id: Some("app:s1".into()),
             event,
         }
+    }
+
+    /// A client away while a conversation was erased, catching up by a
+    /// snapshot (its place in the log was trimmed), keeps nothing of it:
+    /// not its lines, not the ended runs its history brought.
+    #[test]
+    fn a_snapshot_drops_a_conversation_erased_while_away() {
+        use aidaemon_client_protocol::RunPhase;
+        let mut state = State::default();
+        let history = |session: &str, run_id: &str| ServerFrame::Ack {
+            request_id: "h".into(),
+            result: CommandResult::History {
+                session_id: session.into(),
+                messages: Vec::new(),
+                more: false,
+                runs: vec![RunSummary {
+                    session_id: session.into(),
+                    ..run(run_id, RunPhase::Succeeded, 10)
+                }],
+                agent_names: Default::default(),
+            },
+        };
+        state.apply(history("app:s1", "r-erased"));
+        state.apply(history("app:s2", "r-kept"));
+        let listed: SessionSummary = serde_json::from_value(serde_json::json!({
+            "id": "app:s2", "channel": "app", "title": "Kept", "writable": true
+        }))
+        .unwrap();
+        state.apply(ServerFrame::Snapshot {
+            seq: 9,
+            state: aidaemon_client_protocol::Snapshot {
+                sessions: vec![listed],
+                ..Default::default()
+            },
+        });
+        assert!(!state.sessions.contains_key("app:s1"));
+        assert!(!state.past_runs.contains_key("r-erased"));
+        assert!(state.past_runs.contains_key("r-kept"));
     }
 
     /// An erased conversation leaves nothing on show; another one stays.

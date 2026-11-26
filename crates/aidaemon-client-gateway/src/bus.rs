@@ -250,4 +250,37 @@ mod tests {
             .unwrap();
         assert_eq!(next, erase + 1, "numbering goes on");
     }
+
+    /// A client offline during the erase resumes from the last event it
+    /// had: it is told of the erase and replays nothing of the conversation.
+    #[tokio::test]
+    async fn a_client_back_after_an_erase_is_told_and_replays_none_of_it() {
+        let bus = bus().await;
+        let seen = bus
+            .publish(
+                Some("app:synthetic-a".into()),
+                said("app:synthetic-a", "HERON seen"),
+            )
+            .await
+            .unwrap();
+        // While the client is away: more of the conversation, then its erase.
+        bus.publish(
+            Some("app:synthetic-a".into()),
+            said("app:synthetic-a", "HERON missed"),
+        )
+        .await
+        .unwrap();
+        bus.publish(
+            None,
+            Event::SessionDeleted {
+                session_id: "app:synthetic-a".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let replay = bus.after(seen, 100).await.unwrap();
+        let text = serde_json::to_string(&replay).unwrap();
+        assert!(!text.contains("HERON"), "{text}");
+        assert!(text.contains("session_deleted"), "{text}");
+    }
 }
