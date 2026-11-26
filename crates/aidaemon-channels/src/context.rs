@@ -76,9 +76,13 @@ impl WorkspaceGrant {
 }
 
 /// Context about the channel/conversation where a message originated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so a message waiting for its turn keeps its sender's
+/// context across a daemon restart (`tasks::QueueSnapshot`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelContext {
     /// How visible is this conversation?
+    #[serde(with = "visibility_serde")]
     pub visibility: ChannelVisibility,
     /// Platform name: "telegram", "slack", "discord", "internal"
     pub platform: String,
@@ -121,7 +125,7 @@ pub struct ChannelContext {
 }
 
 /// One coding agent session of a conversation: one of its participants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationAgent {
     /// The name the owner gave it ("Designer"), else what it was first
     /// started for.
@@ -138,7 +142,7 @@ pub struct ConversationAgent {
 }
 
 /// Where a conversation's agent stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentState {
     /// One of its runs waits on the owner's answer.
     WaitingOnOwner,
@@ -151,7 +155,7 @@ pub enum AgentState {
 
 /// The run whose thread a message was posted in, as the client that showed
 /// it named it, with what its record says about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunThread {
     /// The run or thread id.
     pub run: String,
@@ -367,5 +371,42 @@ mod workspace_grant_tests {
         let encoded = toml::Value::try_from(&expected).expect("serialize grant");
         let decoded: Vec<WorkspaceGrant> = encoded.try_into().expect("deserialize grant");
         assert_eq!(decoded, expected);
+    }
+}
+
+/// [`ChannelVisibility`] as its lowercase name (its `Display`); an unknown
+/// name reads back as `Internal`, as [`ChannelVisibility::from_str_lossy`].
+mod visibility_serde {
+    use aidaemon_core::ChannelVisibility;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &ChannelVisibility, out: S) -> Result<S::Ok, S::Error> {
+        out.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<ChannelVisibility, D::Error> {
+        let name = String::deserialize(input)?;
+        Ok(ChannelVisibility::from_str_lossy(&name))
+    }
+}
+
+/// [`UserRole`] as its lowercase name (its `Display`). An unknown name
+/// reads back as `Public`, the least privilege: a stored role never grants
+/// more than it said.
+pub(crate) mod role_serde {
+    use aidaemon_core::UserRole;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &UserRole, out: S) -> Result<S::Ok, S::Error> {
+        out.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<UserRole, D::Error> {
+        // The role's own `Display` names: a machine format this module writes.
+        Ok(match String::deserialize(input)?.as_str() {
+            "owner" => UserRole::Owner,
+            "guest" => UserRole::Guest,
+            _ => UserRole::Public,
+        })
     }
 }

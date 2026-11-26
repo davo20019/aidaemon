@@ -152,13 +152,13 @@ async fn write_record(state: &dyn crate::traits::StateStore, record: &BootRecord
 
 /// Continues each chat turn the last stop cut off (see the module docs).
 ///
-/// Returns the continuations' tasks, each of which ends by clearing its
-/// chat from this boot's record. Dropping them leaves them running (the
+/// Returns the continuations' tasks with their chats, each of which ends
+/// by clearing its chat from this boot's record. Dropping them leaves them running (the
 /// daemon does); awaiting them is how a caller knows the record is settled.
 pub async fn resume_cut_off_turns(
     mut deps: ResumeDeps,
     previous: Option<PreviousBoot>,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<(String, tokio::task::JoinHandle<()>)> {
     let jobs = std::mem::take(&mut deps.interrupted_jobs);
     let Some(PreviousBoot {
         since,
@@ -287,8 +287,9 @@ pub async fn resume_cut_off_turns(
         let agent = deps.agent.clone();
         let hub = Arc::downgrade(&hub);
         let state = deps.state.clone();
+        let label = chat.clone();
         // Chats are continued side by side, each on its own task.
-        tasks.push(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let answered = agent
                 .answer_after_runs(RunsAnswer {
                     hub: Some(hub),
@@ -309,7 +310,8 @@ pub async fn resume_cut_off_turns(
                 Ok(false) => warn!(session_id = %chat, "The continued turn gave no reply"),
                 Err(error) => warn!(session_id = %chat, %error, "Continuing a cut-off turn failed"),
             }
-        }));
+        });
+        tasks.push((label, task));
     }
     tasks
 }
@@ -788,7 +790,7 @@ mod tests {
         // them, as a process stop would, rather than for a guessed number
         // of scheduler turns: a clear landing after the test rewrites the
         // record would undo it.
-        for continuation in continuations {
+        for (_, continuation) in continuations {
             continuation.await.unwrap();
         }
     }

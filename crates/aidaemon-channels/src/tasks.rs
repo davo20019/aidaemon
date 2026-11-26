@@ -28,15 +28,20 @@ const DEDUP_WINDOW_SECS: i64 = 120;
 const MAX_RUNNING_TASK_AGE_SECS: i64 = 3600;
 
 /// A queued message waiting to be processed.
-#[derive(Clone, Debug)]
+///
+/// Serializable so the queue outlives a daemon restart ([`QueueSnapshot`]):
+/// a message the daemon accepted is never lost to one.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct QueuedMessage {
-    /// Its id while it waits: what an app names to edit or remove it.
+    /// Its id while it waits: what an app names to edit or remove it. A
+    /// restored message gets a new one ([`TaskRegistry::restore_queues`]).
     pub id: u64,
     pub text: String,
     /// Authorization is captured when the message arrives. Channel workers
     /// must never reuse the role of the message that happened to start the
     /// session worker for later queued messages.
+    #[serde(with = "crate::context::role_serde")]
     pub user_role: UserRole,
     /// Full per-message channel/sender context, including any scoped grant.
     pub channel_ctx: ChannelContext,
@@ -45,7 +50,9 @@ pub struct QueuedMessage {
     pub attachments: Vec<MessageAttachment>,
     pub queued_at: DateTime<Utc>,
     /// Optional transport timing follows the exact message through queue
-    /// coalescing and later agent dispatch.
+    /// coalescing and later agent dispatch. Not kept across a restart: the
+    /// transport's timing says nothing about a turn run after one.
+    #[serde(skip)]
     pub ingress_timing: Option<crate::ports::InboundMessageTiming>,
     /// Whether the running turn may take it in mid-run. A message read as
     /// unrelated to the running work waits for its own turn.
@@ -66,9 +73,8 @@ impl QueuedMessage {
         channel_ctx: ChannelContext,
         attachments: Vec<MessageAttachment>,
     ) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
-            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_queued_id(),
             text: text.into(),
             user_role,
             channel_ctx,
@@ -120,6 +126,17 @@ impl QueuedMessage {
             && !other.placed_for_later
     }
 }
+
+/// A new id for a waiting message, unique in this process.
+fn next_queued_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Every session's waiting messages, oldest first: what the registry
+/// journals on each change ([`TaskRegistry::journal_to`]) and restores at
+/// boot ([`TaskRegistry::restore_queues`]).
+pub type QueueSnapshot = std::collections::BTreeMap<String, Vec<QueuedMessage>>;
 
 /// Outcome of an atomic check-and-queue attempt.
 #[derive(Debug)]
@@ -201,6 +218,9 @@ pub struct TaskRegistry {
     work_numbers: std::sync::Mutex<HashMap<String, Vec<(String, u64)>>>,
     /// When each chat last asked for `/wipe`, awaiting its confirmation.
     wipe_requests: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Where each change to the queues is published, latest first wins
+    /// ([`Self::journal_to`]); unset, the queues live in memory only.
+    journal: std::sync::OnceLock<tokio::sync::watch::Sender<QueueSnapshot>>,
 }
 
 /// How long a `/wipe` waits for the second `/wipe` that confirms it.
@@ -229,7 +249,57 @@ impl TaskRegistry {
             recently_seen: RwLock::new(HashMap::new()),
             work_numbers: std::sync::Mutex::new(HashMap::new()),
             wipe_requests: std::sync::Mutex::new(HashMap::new()),
+            journal: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Publish every change to the queues on `journal` (a snapshot of all
+    /// of them, taken while the change holds the queues' lock, so the
+    /// latest value is always the current queues). The daemon stores it,
+    /// and a message accepted to wait outlives a restart. Set once.
+    pub fn journal_to(&self, journal: tokio::sync::watch::Sender<QueueSnapshot>) {
+        let _ = self.journal.set(journal);
+    }
+
+    /// Put messages a previous run of the daemon left waiting back on their
+    /// sessions' queues, after anything queued since, each with a new id.
+    /// Returns the sessions that now have messages waiting: nothing is
+    /// running to drain them, so the caller starts their turns.
+    pub async fn restore_queues(&self, snapshot: QueueSnapshot) -> Vec<String> {
+        let mut queues = self.queues.write().await;
+        let mut restored = Vec::new();
+        for (session_id, messages) in snapshot {
+            if messages.is_empty() {
+                continue;
+            }
+            let queue = queues.entry(session_id.clone()).or_default();
+            for mut message in messages {
+                message.id = next_queued_id();
+                queue.push_back(message);
+            }
+            restored.push(session_id);
+        }
+        self.journal(&queues);
+        restored
+    }
+
+    /// Publish the queues as they are now (`queues` is the locked map).
+    fn journal(&self, queues: &HashMap<String, VecDeque<QueuedMessage>>) {
+        let Some(journal) = self.journal.get() else {
+            return;
+        };
+        let snapshot: QueueSnapshot = queues
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(session, queue)| (session.clone(), queue.iter().cloned().collect()))
+            .collect();
+        journal.send_if_modified(|current| {
+            let changed = !same_snapshot(current, &snapshot);
+            if changed {
+                *current = snapshot;
+            }
+            changed
+        });
     }
 
     /// Record a `/wipe` in `session_id` at `now`. The second one within
@@ -541,13 +611,17 @@ impl TaskRegistry {
         let queue = queues.entry(session_id.to_string()).or_default();
 
         queue.push_back(message);
-        Some(queue.len())
+        let position = queue.len();
+        self.journal(&queues);
+        Some(position)
     }
 
     /// Pop the next queued message for a session.
     pub async fn pop_queued_message(&self, session_id: &str) -> Option<QueuedMessage> {
         let mut queues = self.queues.write().await;
-        queues.get_mut(session_id).and_then(|q| q.pop_front())
+        let next = queues.get_mut(session_id).and_then(|q| q.pop_front());
+        self.journal(&queues);
+        next
     }
 
     /// Pop the next queued message and coalesce only immediately-adjacent
@@ -590,8 +664,9 @@ impl TaskRegistry {
     /// drain-only callers and tests.
     pub async fn pop_all_queued_messages(&self, session_id: &str) -> Option<QueuedMessage> {
         let mut queues = self.queues.write().await;
-        let queue = queues.get_mut(session_id)?;
-        Self::drain_and_coalesce(queue)
+        let next = Self::drain_and_coalesce(queues.get_mut(session_id)?);
+        self.journal(&queues);
+        next
     }
 
     /// Take the queued messages a running turn can absorb mid-run: from the
@@ -633,6 +708,7 @@ impl TaskRegistry {
             }
         }
         *queue = kept;
+        self.journal(&queues);
         taken
     }
 
@@ -650,6 +726,7 @@ impl TaskRegistry {
         for message in messages.into_iter().rev() {
             queue.push_front(message);
         }
+        self.journal(&queues);
     }
 
     /// The messages waiting in `session_id`'s queue, oldest first: id,
@@ -693,6 +770,7 @@ impl TaskRegistry {
                 queue.remove(at);
             }
         }
+        self.journal(&queues);
         true
     }
 
@@ -713,6 +791,7 @@ impl TaskRegistry {
         }
         message.placed_for_later = false;
         message.steerable = true;
+        self.journal(&queues);
         true
     }
 
@@ -770,7 +849,9 @@ impl TaskRegistry {
         let mut queues = self.queues.write().await;
         let queue = queues.entry(session_id.to_string()).or_default();
         queue.push_back(message);
-        QueueOutcome::Queued(queue.len())
+        let position = queue.len();
+        self.journal(&queues);
+        QueueOutcome::Queued(position)
     }
 
     /// Atomically finalize a task (complete, or fail with `error`) and drain
@@ -806,8 +887,9 @@ impl TaskRegistry {
         Self::cleanup_locked(&mut tasks, self.max_completed);
 
         let mut queues = self.queues.write().await;
-        let queue = queues.get_mut(session_id)?;
-        Self::drain_and_coalesce(queue)
+        let next = Self::drain_and_coalesce(queues.get_mut(session_id)?);
+        self.journal(&queues);
+        next
     }
 
     /// Get the number of queued messages for a session.
@@ -822,7 +904,24 @@ impl TaskRegistry {
         if let Some(queue) = queues.get_mut(session_id) {
             queue.clear();
         }
+        self.journal(&queues);
     }
+}
+
+/// Whether two snapshots hold the same messages (by id and text, in
+/// order): an unchanged queue is not written again.
+fn same_snapshot(a: &QueueSnapshot, b: &QueueSnapshot) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|((sa, qa), (sb, qb))| {
+            sa == sb
+                && qa.len() == qb.len()
+                && qa.iter().zip(qb).all(|(ma, mb)| {
+                    ma.id == mb.id
+                        && ma.text == mb.text
+                        && ma.steerable == mb.steerable
+                        && ma.placed_for_later == mb.placed_for_later
+                })
+        })
 }
 
 #[cfg(test)]
@@ -894,6 +993,73 @@ mod tests {
         let mut channel_ctx = ChannelContext::private("test");
         channel_ctx.sender_id = Some(sender_id.to_string());
         QueuedMessage::new(text, user_role, channel_ctx, Vec::new())
+    }
+
+    /// Each change to the queues is published, so the daemon can keep a
+    /// message it accepted across a restart; restoring puts the messages
+    /// back in order, with their sender's role and context, under new ids.
+    #[tokio::test]
+    async fn waiting_messages_are_journaled_and_restored_after_a_restart() {
+        let registry = TaskRegistry::new(10);
+        let (journal, mut saved) = tokio::sync::watch::channel(QueueSnapshot::new());
+        registry.journal_to(journal);
+        let (task, _) = registry.register("app:s1", "running").await;
+        let mut first = queued_as("first", "app:owner", UserRole::Owner);
+        first.channel_ctx.in_run = Some(crate::context::RunThread {
+            run: "cli-agent-1".into(),
+            working_dir: Some("/tmp/project".into()),
+            queue_only: true,
+        });
+        let first = first.placed_for_later();
+        registry
+            .queue_message_if_running("app:s1", first, Some("r1"))
+            .await;
+        registry
+            .queue_message_if_running(
+                "app:s1",
+                queued_as("second", "app:owner", UserRole::Owner),
+                Some("r2"),
+            )
+            .await;
+        assert!(saved.has_changed().unwrap());
+        let stored = serde_json::to_string(&*saved.borrow_and_update()).unwrap();
+
+        // A new process: nothing waits until the stored queues come back.
+        let restarted = TaskRegistry::new(10);
+        let snapshot: QueueSnapshot = serde_json::from_str(&stored).unwrap();
+        assert_eq!(restarted.restore_queues(snapshot).await, vec!["app:s1"]);
+        let waiting = restarted.queued_messages("app:s1").await;
+        assert_eq!(
+            waiting.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let next = restarted.pop_queued_message("app:s1").await.unwrap();
+        assert_eq!(next.user_role, UserRole::Owner);
+        assert!(next.placed_for_later);
+        assert_eq!(
+            next.channel_ctx.in_run.as_ref().map(|r| r.run.as_str()),
+            Some("cli-agent-1")
+        );
+        assert_ne!(
+            waiting[0].0,
+            registry.queued_messages("app:s1").await[0].0,
+            "a restored message gets an id of this process"
+        );
+
+        // Draining publishes the empty queue: nothing comes back next boot.
+        registry.finalize_and_drain(task, "app:s1", None).await;
+        registry.pop_all_queued_messages("app:s1").await;
+        assert!(saved.borrow_and_update().is_empty());
+    }
+
+    /// A stored role never reads back as more than it said.
+    #[test]
+    fn an_unknown_stored_role_reads_back_as_public() {
+        let mut message = serde_json::to_value(queued_as("hi", "x", UserRole::Guest)).unwrap();
+        assert_eq!(message["user_role"], "guest");
+        message["user_role"] = "admin".into();
+        let message: QueuedMessage = serde_json::from_value(message).unwrap();
+        assert_eq!(message.user_role, UserRole::Public);
     }
 
     #[tokio::test]

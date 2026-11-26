@@ -53,6 +53,7 @@ pub mod queue;
 #[cfg(feature = "http")]
 pub mod rate_limit;
 mod render;
+pub mod restored;
 pub mod router;
 pub mod runner;
 pub mod send_file;

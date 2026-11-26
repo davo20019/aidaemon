@@ -470,7 +470,7 @@ type QueuedNotices = std::collections::HashMap<String, Vec<(String, String)>>;
 /// Runs turns for one channel (bot).
 #[derive(Clone)]
 pub struct TurnRunner {
-    deps: TurnDeps,
+    pub(crate) deps: TurnDeps,
     /// Per session, the "got it" notice sent for each queued message (its
     /// text and the notice's message id), so the notice can be edited when
     /// that message's turn starts instead of a second bubble being sent.
@@ -1794,6 +1794,60 @@ mod tests {
             dedup_key: Some(key.into()),
             ingress_timing: None,
         }
+    }
+
+    /// Messages a restart left waiting come back on the queue with nothing
+    /// running to drain them: each runs as its own turn, in order, with
+    /// the role it was sent with.
+    #[tokio::test]
+    async fn messages_a_restart_left_waiting_run_in_order() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(None),
+            work: std::sync::Mutex::new(Vec::new()),
+            recorded: Default::default(),
+            turns: Default::default(),
+        });
+        let registry = Arc::new(TaskRegistry::new(10));
+        let runner = TurnRunner::new(TurnDeps {
+            agent: agent.clone(),
+            session_map: Arc::default(),
+            sessions: Arc::new(NoSessions),
+            task_registry: registry.clone(),
+            watchdog_stale_threshold_secs: 0,
+            watch: TurnWatch::default(),
+        });
+        let session = "test:restored";
+        let waiting = |text: &str| {
+            crate::tasks::QueuedMessage::new(
+                text,
+                UserRole::Owner,
+                ChannelContext::private("test"),
+                Vec::new(),
+            )
+            .placed_for_later()
+        };
+        let snapshot: crate::tasks::QueueSnapshot = [(
+            session.to_string(),
+            vec![waiting("first"), waiting("second")],
+        )]
+        .into();
+        assert_eq!(registry.restore_queues(snapshot).await, vec![session]);
+
+        let surface = Arc::new(Said::default());
+        let run = tokio::spawn(runner.clone().run_restored(surface, session));
+        for expected in 1..=2 {
+            for _ in 0..400 {
+                if agent.turns.lock().unwrap().len() == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            agent.release.notify_one();
+        }
+        run.await.unwrap();
+        assert_eq!(agent.turns.lock().unwrap().as_slice(), ["first", "second"]);
+        assert_eq!(registry.queue_len(session).await, 0);
     }
 
     /// A question about the running work is answered at once from its live

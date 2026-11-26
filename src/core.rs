@@ -416,10 +416,18 @@ pub async fn run(
     )
     .await;
     let resume_sessions = session_map.clone();
+    let resume_sessions_for_queues = session_map.clone();
 
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
     agent.set_task_registry(task_registry.clone());
+    // Messages accepted to wait for a turn outlive a restart: kept from
+    // now on, and what the last stop left waiting is back on its queues.
+    let restored_queues = crate::startup::resume_queued::keep_queues(
+        &task_registry,
+        state.clone() as Arc<dyn crate::traits::StateStore>,
+    )
+    .await;
     // Empty until the Client Gateway (when enabled) starts watching; the
     // channels' turns and the agent's background follow-ups share it.
     let turn_watch = aidaemon_channels::turns::TurnWatch::default();
@@ -606,10 +614,24 @@ pub async fn run(
             interrupted_jobs,
             tools: aidaemon_runtime::host::TurnHost::tools(&*agent).to_vec(),
         };
-        tokio::spawn(crate::startup::resume_turns::resume_cut_off_turns(
-            deps,
-            previous_boot,
-        ));
+        let runner = aidaemon_channels::turns::TurnRunner::new(channel_deps.turn_deps());
+        let registry = task_registry.clone();
+        let router = Arc::downgrade(&hub);
+        let sessions = resume_sessions_for_queues;
+        tokio::spawn(async move {
+            let continuations =
+                crate::startup::resume_turns::resume_cut_off_turns(deps, previous_boot).await;
+            // A chat's waiting messages run after its cut-off turn ends.
+            crate::startup::resume_queued::run_restored(
+                restored_queues,
+                continuations,
+                runner,
+                registry,
+                router,
+                sessions,
+            )
+            .await;
+        });
     }
     {
         // Failover into a dead key is only discovered during an outage.

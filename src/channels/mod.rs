@@ -75,10 +75,10 @@ impl ChannelRuntimeDeps {
         }
     }
 
-    /// What the shared turn runner needs from these.
-    #[cfg(test)]
-    pub(crate) fn turn_deps(&self) -> turns::TurnDeps {
-        turns::TurnDeps {
+    /// What the shared turn runner needs from these (a bot's, and the one
+    /// that runs messages a restart left waiting).
+    pub(crate) fn turn_deps(&self) -> aidaemon_channels::turns::TurnDeps {
+        aidaemon_channels::turns::TurnDeps {
             agent: self.agent.clone(),
             session_map: self.session_map.clone(),
             sessions: self.state.clone(),
