@@ -58,6 +58,7 @@ SHELL = {
     "integration_tests": "tests of the assembled product",
     "live_e2e_tests.rs": "live end-to-end tests of the assembled product",
     "contract_shape_tests.rs": "tests of the assembled product",
+    "layering_tests.rs": "tests that the runtime's modules form layers",
     "harness_eval": "the eval subject over the assembled daemon",
 }
 
@@ -116,6 +117,7 @@ CHANNEL_ADAPTERS = {
     "discord.rs": "builds the Discord bot on the daemon's services",
     "slack.rs": "the Slack bot's host: workspace grants from the config, /restart",
     "set_key.rs": "/setkey: which config entries take a key, saving one to the config",
+    "claim_config.rs": "owner claims: a claimed bot's access ids saved in its own config entry",
     "telegram.rs": "the Telegram bot's host: config-file commands (/setkey, /connect, "
     "/bots, /restart, owner claim), /setup over the setup wizard, the terminal surface",
 }
