@@ -376,7 +376,12 @@ pub struct TreeFile {
 }
 
 /// Files under their folders, folders open: a folder of one folder shows
-/// as one row (`src/ui`). Pressing a file calls `open` with its path.
+/// as one row (`src/ui`). Pressing a folder opens or closes it; pressing a
+/// file calls `open` with its path.
+///
+/// Plain rows, not `nsh_base::tree`: its virtualized rows (nsh 0.7.1) read
+/// a disposed memo when a folder closes, a panic that leaves the page
+/// unresponsive. A changed-files list is short; it needs no virtualizing.
 pub fn file_tree(
     label: &'static str,
     files: Vec<TreeFile>,
@@ -384,103 +389,138 @@ pub fn file_tree(
 ) -> View {
     use std::rc::Rc;
 
-    use nsh_base::{TreeEntry, tree};
-
-    use super::controls::{Glyph, icon};
-    use super::theme::{colors, fit};
-
     let items = tree_items(&files);
     let mut folders = Vec::new();
     folder_ids(&items, &mut folders);
     let expanded = signal(folders);
-    let items_for_count = items.clone();
-    let rows = move || visible_rows(&items_for_count, &expanded.get()) as f32;
-    let files = Rc::new(files);
-    let row_h = fit::row();
+    let tree = TreeRows {
+        files: Rc::new(files),
+        expanded,
+        open: Rc::new(open),
+    };
     view()
         .w_full()
-        .h(move || Length::from(px(rows() * row_h)))
-        .child(
-            tree()
-                .items(items)
-                .accessibility_label(SharedString::from(label))
-                .expanded(move || Some(expanded.get()))
-                .on_expanded_change(move |ids: &Vec<SharedString>| expanded.set(ids.clone()))
-                // The keyboard's row shows, as every other control's does.
-                .item_class("rounded-md focus-visible:ring-2 focus-visible:ring-ring")
-                .selected(nsh_base::SelectValue::Controlled(None))
-                .on_selected_change(move |id: &SharedString| {
-                    if let Some(path) = id.strip_prefix("f:") {
-                        open(path.to_owned())
+        .role(AccessibilityRole::Tree)
+        .label(SharedString::from(label))
+        .child(tree.rows(Rc::new(items), 0))
+}
+
+/// What every row of a [`file_tree`] shares.
+#[derive(Clone)]
+struct TreeRows {
+    files: std::rc::Rc<Vec<TreeFile>>,
+    expanded: Signal<Vec<SharedString>>,
+    open: std::rc::Rc<dyn Fn(String)>,
+}
+
+impl TreeRows {
+    /// `items`' rows at `depth`, an open folder's below it.
+    fn rows(&self, items: std::rc::Rc<Vec<nsh_base::TreeItem>>, depth: usize) -> View {
+        let mut list = view().w_full();
+        for item in items.iter() {
+            list = if item.children.is_empty() {
+                list.child(self.file_row(item, depth))
+            } else {
+                let id = item.id.clone();
+                let expanded = self.expanded;
+                let children = std::rc::Rc::new(item.children.clone());
+                let rows = self.clone();
+                list.child(self.folder_row(item, depth)).child(when(
+                    move || expanded.with(|ids| ids.contains(&id)),
+                    move || rows.rows(children.clone(), depth + 1),
+                ))
+            };
+        }
+        list
+    }
+
+    fn shell(depth: usize, press: impl Fn() + 'static) -> nsh_base::ButtonElement {
+        use super::theme::fit;
+
+        super::controls::row(|| false, press)
+            .w_full()
+            .h(px(fit::row()))
+            .pl(px(4.0 + depth as f32 * 12.0))
+    }
+
+    fn folder_row(&self, item: &nsh_base::TreeItem, depth: usize) -> View {
+        use super::controls::{Glyph, icon};
+        use super::theme::colors;
+
+        let expanded = self.expanded;
+        let toggle = item.id.clone();
+        view().child(
+            Self::shell(depth, move || {
+                expanded.update(|ids| {
+                    if let Some(at) = ids.iter().position(|i| *i == toggle) {
+                        ids.remove(at);
+                    } else {
+                        ids.push(toggle.clone());
                     }
                 })
-                .render_item(move |e: &TreeEntry| {
-                    let indent = 4.0 + e.depth as f32 * 12.0;
-                    let mut row = view()
-                        .h(px(row_h))
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .pl(px(indent))
-                        .pr_2()
-                        .rounded(px(super::theme::radius::CONTROL))
-                        .hover(|s| s.bg(colors::HOVER));
-                    if e.folder {
-                        return row
-                            .child(icon(Glyph::Folder).text_color(colors::FAINT))
-                            .child(
-                                text(e.label.clone())
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .number_of_lines(1)
-                                    .font_family(MONO)
-                                    .text_size(px(type_scale::XS))
-                                    .text_color(colors::MUTED),
-                            );
-                    }
-                    let path = e.id.strip_prefix("f:").unwrap_or(&e.id);
-                    let Some(file) = files.iter().find(|f| f.path == path) else {
-                        return row.child(text(e.label.clone()));
-                    };
-                    let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-                    row = row
-                        .child(
-                            text(file.letter)
-                                .w(px(14.0))
-                                .font_family(MONO)
-                                .text_size(px(type_scale::XS))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(file.tone.color()),
-                        )
-                        .child(
-                            text(name)
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .number_of_lines(1)
-                                .font_family(MONO)
-                                .text_size(px(type_scale::XS))
-                                .text_color(if file.marked {
-                                    colors::TEXT
-                                } else {
-                                    colors::MUTED
-                                }),
-                        );
-                    if !file.stats.is_empty() {
-                        row = row.child(
-                            text(file.stats.clone())
-                                .font_family(MONO)
-                                .text_size(px(type_scale::XS))
-                                .text_color(colors::FAINT),
-                        );
-                    }
-                    if file.marked {
-                        row = row.child(icon(Glyph::Dot).text_color(colors::ACCENT));
-                    }
-                    row
-                })
-                .size_full(),
+            })
+            .role(AccessibilityRole::TreeItem)
+            .accessibility_label(item.label.clone())
+            .child(icon(Glyph::Folder).text_color(colors::FAINT))
+            .child(
+                text(item.label.clone())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .number_of_lines(1)
+                    .font_family(MONO)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::MUTED),
+            ),
         )
+    }
+
+    fn file_row(&self, item: &nsh_base::TreeItem, depth: usize) -> View {
+        use super::controls::{Glyph, icon};
+        use super::theme::colors;
+
+        let path = item.id.strip_prefix("f:").unwrap_or(&item.id).to_owned();
+        let Some(file) = self.files.iter().find(|f| f.path == path) else {
+            return view();
+        };
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let open = self.open.clone();
+        let mut row = Self::shell(depth, move || open(path.clone()))
+            .role(AccessibilityRole::TreeItem)
+            .accessibility_label(file.label.clone())
+            .child(
+                text(file.letter)
+                    .w(px(14.0))
+                    .font_family(MONO)
+                    .text_size(px(type_scale::XS))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(file.tone.color()),
+            )
+            .child(
+                text(name)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .number_of_lines(1)
+                    .font_family(MONO)
+                    .text_size(px(type_scale::XS))
+                    .text_color(if file.marked {
+                        colors::TEXT
+                    } else {
+                        colors::MUTED
+                    }),
+            );
+        if !file.stats.is_empty() {
+            row = row.child(
+                text(file.stats.clone())
+                    .font_family(MONO)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+            );
+        }
+        if file.marked {
+            row = row.child(icon(Glyph::Dot).text_color(colors::ACCENT));
+        }
+        view().child(row)
+    }
 }
 
 /// The tree of `files`' paths: folders (`d:` ids) before files (`f:`
@@ -540,23 +580,9 @@ fn folder_ids(items: &[nsh_base::TreeItem], out: &mut Vec<SharedString>) {
     }
 }
 
-/// How many rows show with `expanded` open.
-fn visible_rows(items: &[nsh_base::TreeItem], expanded: &[SharedString]) -> usize {
-    items
-        .iter()
-        .map(|item| {
-            1 + if !item.children.is_empty() && expanded.contains(&item.id) {
-                visible_rows(&item.children, expanded)
-            } else {
-                0
-            }
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tree_tests {
-    use super::{TreeFile, tree_items, visible_rows};
+    use super::{TreeFile, tree_items};
     use crate::ui::Tone;
 
     fn file(path: &str) -> TreeFile {
@@ -582,8 +608,6 @@ mod tree_tests {
         assert_eq!(labels, ["crates/core/src", "src/ui", "README.md"]);
         assert_eq!(items[1].children.len(), 2);
         assert_eq!(items[1].children[0].id.as_ref(), "f:src/ui/kit.rs");
-        assert_eq!(visible_rows(&items, &[]), 3);
-        assert_eq!(visible_rows(&items, &[items[1].id.clone()]), 5);
     }
 }
 

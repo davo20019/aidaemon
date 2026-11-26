@@ -2374,3 +2374,67 @@ fn composer_addresses_specific_agent_sessions_and_card_reply_sets_target() -> Re
     app.wait_for("text:To: Antigravity CLI 2 · working")?;
     Ok(())
 }
+
+#[test]
+fn the_changed_files_tree_takes_presses_on_folders_and_files() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-3","channel":"app","title":"Tidy the bots","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Tidy the bots")?;
+    app.press("Tidy the bots >> nth=0")?;
+    feed([
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-3","event":{"type":"turn_started","turn_id":"t3","session_id":"app:synthetic-3","origin":"app"}}"#,
+        ),
+        frame(
+            r#"{"type":"event","at_ms":2,"session_id":"app:synthetic-3","event":{"type":"turn_status","turn_id":"t3","status":{"kind":"tool_completed","name":"edit_file","summary":"crates/a/src/bot.rs"}}}"#,
+        ),
+    ]);
+    let id = wait_sent("get_changes")?;
+    let file = |p: &str| {
+        format!(r#"{{"path":"{p}","status":"modified","added":1,"removed":0,"by_session":true}}"#)
+    };
+    let files = [
+        "app/src/one.rs",
+        "app/tests/app.rs",
+        "crates/a/src/bot.rs",
+        "crates/b/src/bot.rs",
+        "crates/c/src/bot.rs",
+        "crates/d/src/lib.rs",
+    ]
+    .map(file)
+    .join(",");
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"changes","changes":{{"repos":[{{"root":"/home/synthetic/acme","branch":"main","files":[{files}],"patch":""}}]}}}}}}"#
+    ))]);
+    app.wait_for("acme")?;
+    // Folders close and open again, many presses in a row (nsh's
+    // virtualized tree panicked here and the page stopped answering).
+    for _ in 0..3 {
+        app.press("crates")?;
+        app.press("app")?;
+        settle(&mut app)?;
+        assert!(!app.screen().texts().contains(&"b/src"));
+        app.press("crates")?;
+        app.press("app")?;
+        settle(&mut app)?;
+        assert!(app.screen().texts().contains(&"b/src"));
+    }
+    app.press("b/src")?;
+    app.press("a/src")?;
+    app.press("b/src")?;
+    app.press("a/src")?;
+    app.press("crates/a/src/bot.rs, modified, written in this conversation")?;
+    app.wait_for("All files")?;
+    app.press("All files")?;
+    app.wait_for("acme")?;
+    app.press("app/tests/app.rs, modified, written in this conversation")?;
+    app.wait_for("All files")?;
+    Ok(())
+}
