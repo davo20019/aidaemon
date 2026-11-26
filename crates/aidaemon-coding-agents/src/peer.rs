@@ -822,9 +822,8 @@ mod mcp_bridge {
             if files.is_empty() {
                 return Ok(message);
             }
-            if recipients.is_empty() {
-                return Err("no other peer to share files with".to_string());
-            }
+            // A broadcast before any other peer has started still names the
+            // files: a peer that joins later reads them on the board.
             let note = self
                 .launcher
                 .share_files(&self.caller_peer_id, &files, recipients)
@@ -1476,6 +1475,29 @@ mod mcp_bridge {
         }
 
         async fn call_tool(&self, name: &str, arguments: Value) -> ServerToolResult {
+            let result = self.dispatch(name, arguments).await;
+            if result.is_error {
+                // The agent sees why; the daemon's log keeps it too, since
+                // the run's record only says the step failed.
+                let why = result
+                    .content
+                    .first()
+                    .and_then(|block| block.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                tracing::info!(
+                    peer_id = %self.caller_peer_id,
+                    tool = %name,
+                    error = %why,
+                    "A coordination tool call failed"
+                );
+            }
+            result
+        }
+    }
+
+    impl PeerMcpHandler {
+        async fn dispatch(&self, name: &str, arguments: Value) -> ServerToolResult {
             match name {
                 "list_peers" => self.handle_list_peers().await,
                 "delegate_cli" => self.handle_delegate_cli(arguments).await,
@@ -1623,7 +1645,7 @@ mod tests {
             Some("/synthetic/repo".into()),
             PeerLimits::default(),
         );
-        let root = PeerMcpHandler::new(tree.clone(), "peer-root", launcher.clone(), ctx);
+        let root = PeerMcpHandler::new(tree.clone(), "peer-root", launcher.clone(), ctx.clone());
         let (peer, _, _) = tree
             .reserve_child("peer-root", "codex", "Review", PeerWorkspaceMode::ReadOnly)
             .unwrap();
@@ -1650,6 +1672,20 @@ mod tests {
         assert_eq!(
             posted["posted"]["body"],
             format!("Reviews\n\n[shared by peer-root with {peer}: a.md,b.md]")
+        );
+        // A broadcast before anyone else joined still names its files.
+        let alone = PeerTree::new("claude", "Solo", None, PeerLimits::default());
+        let solo = PeerMcpHandler::new(alone, "peer-root", launcher.clone(), ctx);
+        let early = parse_text(
+            solo.call_tool(
+                "post_board",
+                json!({ "message": "Shots", "files": ["s.png"] }),
+            )
+            .await,
+        );
+        assert_eq!(
+            early["posted"]["body"],
+            "Shots\n\n[shared by peer-root with : s.png]"
         );
         // No files: the message is unchanged.
         let plain = parse_text(
