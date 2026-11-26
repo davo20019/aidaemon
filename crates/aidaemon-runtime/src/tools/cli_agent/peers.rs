@@ -390,6 +390,22 @@ impl ActivePeerBinding {
             .peer("peer-root")
             .is_some_and(|root| root.working_dir == plan.root_ctx.working_dir);
         if !same_folder || !kept.continue_root(plan.continuity.run_id.clone()) {
+            // It stays on its own tree; once the conversation's lead has
+            // ended, that tree is the one the next exchange continues.
+            let kept_lead_ended = kept
+                .peer("peer-root")
+                .is_none_or(|root| root.state.is_terminal());
+            if kept_lead_ended {
+                PeerCoordinator::keep_conversation_tree(
+                    &mut plan
+                        .coord
+                        .conversation_trees
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    plan.continuity.lead.clone(),
+                    self.tree.clone(),
+                );
+            }
             return false;
         }
         let (launcher, handler, permit_slots) = plan.coord.lead_on(&kept, plan.root_ctx.clone());

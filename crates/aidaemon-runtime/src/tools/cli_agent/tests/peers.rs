@@ -714,6 +714,48 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
     assert_ne!(other.tree.id(), moved.tree.id());
     end(&other.tree);
 
+    // A follow-up queued in another folder can't take the conversation's
+    // tree; once that lead ended, its own tree is the conversation's.
+    let in_a = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/d"),
+        &[],
+        continuity(true, "run-9"),
+    );
+    let elsewhere = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/e"),
+        &[],
+        continuity(false, "run-10"),
+    );
+    let mut elsewhere_binding = peer_mod::ActivePeerBinding {
+        tree: elsewhere.tree.clone(),
+        peer_id: "peer-root".into(),
+        permit_slots: elsewhere.permit_slots.clone(),
+        is_root: true,
+        launcher: Some(elsewhere.launcher.clone()),
+        branch: None,
+        rebind: elsewhere.rebind.clone(),
+    };
+    end(&in_a.tree);
+    assert!(!elsewhere_binding.adopt_conversation_tree(&elsewhere.scoped));
+    end(&elsewhere.tree);
+    let next = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/e"),
+        &[],
+        continuity(false, "run-11"),
+    );
+    assert_eq!(
+        next.tree.id(),
+        elsewhere.tree.id(),
+        "the next exchange continues the run that ran last"
+    );
+    end(&next.tree);
+
     // A run ends (root marked done), the queued follow-up takes the tree
     // before the ended run's cleanup: that late cleanup leaves the new
     // run's root alone.
