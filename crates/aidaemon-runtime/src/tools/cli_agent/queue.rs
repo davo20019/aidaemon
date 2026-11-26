@@ -391,7 +391,7 @@ impl CliAgentTool {
             }
             let (completion_tx, _completion_rx) = tokio::sync::oneshot::channel();
             let coding_agent = prep.coding_agent.clone();
-            let keep_alive = prep.keep_alive.take();
+            let keep_alive = prep.take_keep_alive();
             let max_output = prep.max_output;
             let background_timeout = background_cap(handles.background_timeout, prep.timeout);
             let idle_timeout = handles.idle_timeout;

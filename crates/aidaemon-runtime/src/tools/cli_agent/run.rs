@@ -121,6 +121,10 @@ pub(super) struct PreparedRun {
     pub(super) signed: aidaemon_coding_agents::SignedIn,
     pub(super) host: Option<Box<dyn aidaemon_coding_agents::HostStarter>>,
     pub(super) keep_alive: Option<Box<dyn std::any::Any + Send>>,
+    /// The peer coordination endpoint's lifetime guard: dropping it revokes
+    /// the run's `aidaemon_peers` token. Kept apart from `keep_alive`, which a
+    /// re-prepared launch replaces with its new plan's.
+    pub(super) mcp_guard: Option<Box<dyn std::any::Any + Send>>,
     /// The agent keeps its session where a follow-up can continue it.
     pub(super) keeps_session: bool,
     /// The earlier run it continues.
@@ -161,6 +165,17 @@ pub(super) type SlotWait = std::pin::Pin<
             > + Send,
     >,
 >;
+
+impl PreparedRun {
+    /// Everything the running process must outlive: the plan's own guard and
+    /// the peer endpoint's, handed to the run's watcher together.
+    pub(super) fn take_keep_alive(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        match (self.keep_alive.take(), self.mcp_guard.take()) {
+            (Some(kept), Some(mcp)) => Some(Box::new((kept, mcp))),
+            (kept, mcp) => kept.or(mcp),
+        }
+    }
+}
 
 /// The longest task a run's record keeps of what it was asked.
 const ASKED_CHARS: usize = 2000;
@@ -663,12 +678,7 @@ impl CliAgentTool {
             Err(message) => return Ok(message),
         };
         prep.thread_wait = thread_wait;
-        if let Some(scoped_guard) = root_keep_alive {
-            prep.keep_alive = Some(match prep.keep_alive.take() {
-                Some(kept) => Box::new((kept, scoped_guard)),
-                None => scoped_guard,
-            });
-        }
+        prep.mcp_guard = root_keep_alive;
         let call = RunCall {
             tool_name: tool_name.to_string(),
             task_id: task_id.clone(),
@@ -829,7 +839,7 @@ impl CliAgentTool {
             max_output,
             background_timeout,
             idle_timeout,
-            prep.keep_alive.take(),
+            prep.take_keep_alive(),
             permit_slot,
             completion_tx,
         ));
@@ -1159,10 +1169,7 @@ impl CliAgentTool {
             .map_err(|error| error.to_string())??;
 
         if let Some(mcp_guard) = spec.mcp_keep_alive {
-            prep.keep_alive = Some(match prep.keep_alive.take() {
-                Some(kept) => Box::new((kept, mcp_guard)),
-                None => mcp_guard,
-            });
+            prep.mcp_guard = Some(mcp_guard as Box<dyn std::any::Any + Send>);
         }
 
         let slot_permit = tokio::select! {
@@ -1262,7 +1269,7 @@ impl CliAgentTool {
             max_output,
             background_timeout,
             idle_timeout,
-            prep.keep_alive.take(),
+            prep.take_keep_alive(),
             permit_slot,
             completion_tx,
         ));

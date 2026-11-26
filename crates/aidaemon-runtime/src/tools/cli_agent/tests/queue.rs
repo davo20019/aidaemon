@@ -728,6 +728,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         signed: aidaemon_coding_agents::SignedIn::default(),
         host: None,
         keep_alive: None,
+        mcp_guard: None,
         keeps_session: true,
         continues: None,
         mcp_servers: Vec::new(),
@@ -758,6 +759,16 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         peer_binding: None,
     };
 
+    // The peer endpoint's guard: dropping it revokes the run's MCP token.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let mcp_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    prep.mcp_guard = Some(Box::new(DropFlag(mcp_dropped.clone())));
+
     super::super::queue::refresh_direct_session(
         &tool.run_handles(),
         &tool.running,
@@ -765,6 +776,14 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         &mut prep,
     )
     .await;
+    assert!(
+        !mcp_dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "re-preparing a queued launch must keep its peer MCP endpoint alive"
+    );
+    let handed_off = prep.take_keep_alive();
+    assert!(handed_off.is_some(), "the watcher gets the peer guard");
+    drop(handed_off);
+    assert!(mcp_dropped.load(std::sync::atomic::Ordering::SeqCst));
 
     let continued = prep
         .continues

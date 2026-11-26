@@ -424,6 +424,7 @@ impl CliAgentTool {
             signed,
             host: host_starter,
             keep_alive,
+            mcp_guard: None,
             keeps_session,
             continues: spec.continues.clone(),
             mcp_servers: mcp_servers.to_vec(),
