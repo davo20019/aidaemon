@@ -487,6 +487,48 @@ async fn the_first_write_after_a_restart_keeps_the_stored_conversation() {
     );
 }
 
+/// A transcript reads the stored conversation, past the hot window's size:
+/// the app pages back through all of it.
+#[tokio::test]
+async fn the_stored_history_is_not_bounded_by_the_hot_window() {
+    let (store, _db) = setup_test_store_with_cap(5).await;
+    let session = "sess-long";
+    let now = Utc::now();
+    create_events_table_for_tests(&store).await;
+    for at in 0..12 {
+        let (event_type, role) = if at % 2 == 0 {
+            ("user_message", "u")
+        } else {
+            ("assistant_response", "a")
+        };
+        insert_conversation_event_for_tests(
+            &store,
+            session,
+            event_type,
+            serde_json::json!({
+                "content": format!("{role}{at}"),
+                "message_id": format!("msg-{at}"),
+                "has_attachments": false,
+                "model": "test",
+                "tool_calls": []
+            }),
+            now + chrono::Duration::seconds(at),
+        )
+        .await;
+    }
+    assert!(store.get_history(session, 100).await.unwrap().len() <= 5);
+    let stored = store.get_stored_history(session, 100).await.unwrap();
+    assert_eq!(stored.len(), 12);
+    assert_eq!(stored[0].id, "msg-0");
+    assert_eq!(stored[11].id, "msg-11");
+    // The newest `limit`, oldest first.
+    let newest = store.get_stored_history(session, 3).await.unwrap();
+    assert_eq!(
+        newest.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["msg-9", "msg-10", "msg-11"]
+    );
+}
+
 #[tokio::test]
 async fn test_get_history_hydrates_from_events_when_available() {
     let (store, _db) = setup_test_store().await;

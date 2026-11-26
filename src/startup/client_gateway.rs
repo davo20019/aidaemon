@@ -983,7 +983,10 @@ impl ClientHost for DaemonClientHost {
     }
 
     async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<HistoryMessage>> {
-        let messages = self.state.get_history(session_id, limit).await?;
+        // The stored conversation, not the model's hot window: that holds
+        // only its newest few dozen messages, so paging back past them
+        // found nothing.
+        let messages = self.state.get_stored_history(session_id, limit).await?;
         let reply_ids: Vec<&str> = messages
             .iter()
             .filter(|m| m.role == "assistant")

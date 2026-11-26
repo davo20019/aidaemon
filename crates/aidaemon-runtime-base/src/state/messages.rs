@@ -162,6 +162,18 @@ impl crate::state::types::MessageStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn get_stored_history(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        Ok(self
+            .hydrate_from_events(session_id, limit)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
     async fn get_history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>> {
         // Check working memory first
         {

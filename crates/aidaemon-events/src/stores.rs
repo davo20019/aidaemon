@@ -31,6 +31,18 @@ pub trait MessageStore: Send + Sync {
     /// Get recent messages for a session from working memory.
     async fn get_history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<Message>>;
 
+    /// The session's newest `limit` messages as stored (its canonical
+    /// events since the last `/clear`), oldest first: a transcript a person
+    /// reads and pages back through, not bounded by the hot window's size.
+    /// The default reads the hot window ([`Self::get_history`]).
+    async fn get_stored_history(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        self.get_history(session_id, limit).await
+    }
+
     /// Get context using Tri-Hybrid retrieval (Recency + Vector + Salience).
     /// Default implementation just calls `get_history`.
     ///
