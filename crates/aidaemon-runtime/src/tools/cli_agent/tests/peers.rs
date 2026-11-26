@@ -192,6 +192,84 @@ async fn worktree_provisioning_creates_isolated_branch_and_directory() {
     assert!(branches.stdout.is_empty());
 }
 
+/// A worktree peer resumed in a later exchange, after its lead's end
+/// released its worktree, gets its kept branch checked out again; a branch
+/// that held nothing (deleted) gives it a fresh worktree.
+#[tokio::test]
+async fn a_released_peer_worktree_is_restored_from_its_branch() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().to_string_lossy().into_owned();
+    let backend = aidaemon_tools::testing::active_execution_backend();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Alice Rivera")
+            .env("GIT_AUTHOR_EMAIL", "alice@example.com")
+            .env("GIT_COMMITTER_NAME", "Alice Rivera")
+            .env("GIT_COMMITTER_EMAIL", "alice@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init"]);
+    std::fs::write(repo.path().join("README.md"), "synthetic repo\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial"]);
+    let tree_id = format!("t{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+
+    let first = peer_mod::provision_peer_worktree(backend.as_ref(), &root, &tree_id, "peer-1")
+        .await
+        .unwrap();
+    std::fs::write(
+        std::path::Path::new(&first.path).join("notes.md"),
+        "peer work\n",
+    )
+    .unwrap();
+    peer_mod::release_peer_worktree(backend.as_ref(), &first)
+        .await
+        .unwrap();
+    assert!(!std::path::Path::new(&first.path).exists());
+
+    let restored =
+        peer_mod::restore_peer_worktree(backend.as_ref(), &root, &tree_id, "peer-1", &first.branch)
+            .await
+            .unwrap();
+    assert_eq!(restored.branch, first.branch);
+    assert_ne!(restored.path, first.path);
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&restored.path).join("notes.md")).unwrap(),
+        "peer work\n",
+        "the resumed peer finds its earlier work"
+    );
+    let released = peer_mod::release_peer_worktree(backend.as_ref(), &restored)
+        .await
+        .unwrap();
+    assert_eq!(released.kept_branch.as_deref(), Some(first.branch.as_str()));
+
+    // A branch that held nothing was deleted: a fresh worktree instead.
+    let idle = peer_mod::provision_peer_worktree(backend.as_ref(), &root, &tree_id, "peer-2")
+        .await
+        .unwrap();
+    peer_mod::release_peer_worktree(backend.as_ref(), &idle)
+        .await
+        .unwrap();
+    let fresh =
+        peer_mod::restore_peer_worktree(backend.as_ref(), &root, &tree_id, "peer-2", &idle.branch)
+            .await
+            .unwrap();
+    assert_ne!(fresh.branch, idle.branch);
+    assert!(
+        std::path::Path::new(&fresh.path)
+            .join("README.md")
+            .is_file()
+    );
+    peer_mod::release_peer_worktree(backend.as_ref(), &fresh)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn enable_peer_coordination_and_run_child_peer_in_direct_agent_session() {
     let (tool, _db) = setup_bash_tool().await;

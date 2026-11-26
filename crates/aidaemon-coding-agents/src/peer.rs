@@ -407,6 +407,10 @@ impl PeerTree {
             root.state = PeerState::Running;
             root.run_id = Some(run_id);
         }
+        // What carries over is bounded like one run's board: the newest
+        // posts, so reading it stays cheap however long the conversation.
+        let carried = inner.board.len().saturating_sub(self.limits.max_messages);
+        inner.board.drain(..carried);
         inner.epoch_peers = inner.peers.len() - 1;
         inner.epoch_board = inner.board.len();
         true
@@ -2000,6 +2004,14 @@ mod tests {
         assert!(!record.contains("peer-1"), "{record}");
         tree.reserve_child("peer-root", "claude", "Check", PeerWorkspaceMode::ReadOnly)
             .unwrap();
-        assert_eq!(tree.read_messages("peer-root", 0, false).len(), 2);
+        // A third run carries only the newest posts (max_messages = 1).
+        tree.cancel_subtree("peer-root");
+        for peer in tree.peers() {
+            ended(&tree, &peer.peer_id, PeerState::Completed);
+        }
+        assert!(tree.continue_root("run-3"));
+        let carried = tree.read_messages("peer-root", 0, false);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].body, "second exchange");
     }
 }

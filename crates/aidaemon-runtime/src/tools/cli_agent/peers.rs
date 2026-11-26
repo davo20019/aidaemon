@@ -616,21 +616,54 @@ impl PeerLauncher for RuntimePeerLauncher {
                         "lead CLI has no write authority; use workspace=\"read_only\"".to_string(),
                     );
                 }
-                if request.continue_run.is_some() {
-                    // Resuming an existing worktree peer keeps its existing working dir.
-                    let existing = self.tree.peer(&request.peer_id);
-                    let dir = existing
-                        .as_ref()
-                        .and_then(|p| p.working_dir.clone())
-                        .or_else(|| self.root.working_dir.clone());
+                let existing = request
+                    .continue_run
+                    .as_ref()
+                    .and_then(|_| self.tree.peer(&request.peer_id));
+                let kept_dir = existing
+                    .as_ref()
+                    .and_then(|p| p.working_dir.clone())
+                    .filter(|dir| Path::new(dir).is_dir());
+                if let Some(dir) = kept_dir {
+                    // Resuming a worktree peer whose worktree is still there.
                     let branch = existing.and_then(|p| p.branch);
-                    let writes = dir.iter().cloned().collect();
                     (
                         CliWorkspaceMode::ReadWrite,
-                        dir.clone(),
-                        dir.into_iter().collect(),
-                        writes,
+                        Some(dir.clone()),
+                        vec![dir.clone()],
+                        vec![dir],
                         branch,
+                    )
+                } else if let Some(earlier) = existing
+                    .as_ref()
+                    .and_then(|p| p.working_dir.clone().zip(p.branch.clone()))
+                {
+                    // Its worktree was released when an earlier lead run
+                    // ended: check its branch out again (fresh, when the
+                    // branch held nothing and was deleted).
+                    let base = self.root.working_dir.as_deref().ok_or_else(|| {
+                        "workspace=\"worktree\" requires the lead CLI to have a git working directory"
+                            .to_string()
+                    })?;
+                    let worktree = restore_peer_worktree(
+                        tool.backend.as_ref(),
+                        base,
+                        &request.tree_id,
+                        &request.peer_id,
+                        &earlier.1,
+                    )
+                    .await?;
+                    let (wt_path, branch_name) = (worktree.path.clone(), worktree.branch.clone());
+                    self.worktrees
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(worktree);
+                    (
+                        CliWorkspaceMode::ReadWrite,
+                        Some(wt_path.clone()),
+                        vec![wt_path.clone()],
+                        vec![wt_path],
+                        Some(branch_name),
                     )
                 } else {
                     let base = self.root.working_dir.as_deref().ok_or_else(|| {
@@ -1317,6 +1350,89 @@ pub(super) async fn provision_peer_worktree(
         git_root,
         path: worktree_path,
         branch: branch_name,
+        base: Some(head),
+        peer_id: peer_id.to_string(),
+    })
+}
+
+/// A worktree for resuming `peer_id` after its earlier one was released:
+/// its `branch` checked out again when the branch is still there (it held
+/// commits), else a fresh worktree as [`provision_peer_worktree`] makes one.
+pub(super) async fn restore_peer_worktree(
+    backend: &dyn ExecutionBackend,
+    base_dir: &str,
+    tree_id: &str,
+    peer_id: &str,
+    branch: &str,
+) -> Result<PeerWorktree, String> {
+    let git_root = git_cmd(
+        backend,
+        base_dir,
+        vec!["rev-parse".into(), "--show-toplevel".into()],
+    )
+    .await
+    .map_err(|_| {
+        format!("cannot restore the worktree: `{base_dir}` is not inside a git repository")
+    })?;
+    let kept = git_cmd(
+        backend,
+        &git_root,
+        vec![
+            "rev-parse".into(),
+            "--verify".into(),
+            "--quiet".into(),
+            format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .is_ok();
+    if !kept {
+        return provision_peer_worktree(backend, base_dir, tree_id, peer_id).await;
+    }
+    let head = git_cmd(backend, &git_root, vec!["rev-parse".into(), "HEAD".into()]).await?;
+    let safe_tree: String = tree_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(12)
+        .collect();
+    let safe_peer: String = peer_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(16)
+        .collect();
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let root = peer_worktrees_root();
+    aidaemon_coding_agents::private_files::private_dir(&root)
+        .map_err(|e| format!("failed to create the private worktree dir: {e}"))?;
+    let worktree_parent = root.join(&safe_tree);
+    std::fs::create_dir_all(&worktree_parent)
+        .map_err(|e| format!("failed to create worktree parent dir: {e}"))?;
+    let worktree_path = worktree_parent
+        .join(format!("{safe_peer}-{}", &unique[..6]))
+        .to_string_lossy()
+        .into_owned();
+    git_cmd(
+        backend,
+        &git_root,
+        vec![
+            "worktree".into(),
+            "add".into(),
+            worktree_path.clone(),
+            branch.to_string(),
+        ],
+    )
+    .await?;
+    info!(
+        tree_id = %safe_tree,
+        peer_id = %safe_peer,
+        branch = %branch,
+        worktree = %worktree_path,
+        "Checked a resumed peer's branch out into a new worktree"
+    );
+    Ok(PeerWorktree {
+        git_root,
+        path: worktree_path,
+        branch: branch.to_string(),
         base: Some(head),
         peer_id: peer_id.to_string(),
     })
