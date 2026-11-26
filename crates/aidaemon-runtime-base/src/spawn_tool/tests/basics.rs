@@ -90,6 +90,8 @@ pub(super) fn ended_run(
         continues: None,
         thread: None,
         keeps_session: false,
+        accepts_mid_run: false,
+        last_note_at: None,
         result: None,
         asked: None,
         steps: Vec::new(),

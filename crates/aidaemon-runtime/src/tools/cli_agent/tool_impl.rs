@@ -159,10 +159,22 @@ impl CliAgentTool {
             .runs
             .get(run)
             .is_some_and(|state| state.ended_at.is_none())
+            && found.output_summary.is_none()
         {
-            return Err(format!(
-                "run `{run}` is still working: wait for it to end, or stop it, before following up"
-            ));
+            let finished_in_table = if let Some(id) = cli_agent_task_id(run) {
+                self.running
+                    .lock()
+                    .await
+                    .get(id)
+                    .is_some_and(|agent| agent.finished.load(Ordering::Acquire))
+            } else {
+                false
+            };
+            if !finished_in_table {
+                return Err(format!(
+                    "run `{run}` is still working: wait for it to end, or stop it, before following up"
+                ));
+            }
         }
         let Some(agent_session) = found.agent_session.filter(|_| found.keeps_session) else {
             return Err(format!(
@@ -773,6 +785,7 @@ impl CliAgentTool {
                         .as_deref()
                         == args.tool.as_deref();
                 if args.continue_run.is_none()
+                    && !args.fresh_session
                     && direct_agent_conversation
                     && let Some(agent) = args.tool.clone()
                 {
@@ -798,9 +811,22 @@ impl CliAgentTool {
                         }
                     }
                 }
-                // A follow-up to an earlier run: the same agent, in its
-                // folder, going on in its own session.
+                // A follow-up to an earlier run or session thread:
+                // - if that thread currently has a working run and its live
+                //   host accepts mid-run notes (and the owner didn't explicitly
+                //   ask to queue), deliver the note straight into the running
+                //   work;
+                // - if that thread currently has a working run and cannot take
+                //   mid-run notes (or the steer was rejected while still
+                //   running), queue a follow-up that waits for that run to
+                //   finish and then resumes that thread's exact session;
+                // - if the thread is idle, continue its latest run directly.
+                let owner_follow_up_call = facts
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(crate::helper_run::is_owner_follow_up);
                 let mut unfinished = None;
+                let mut thread_wait: Option<ThreadWait> = None;
                 let continues = match args
                     .continue_run
                     .as_deref()
@@ -808,20 +834,151 @@ impl CliAgentTool {
                     .filter(|run| !run.is_empty())
                 {
                     None => None,
-                    Some(run) => match self.earlier_run(run, &session_id).await {
-                        Ok(earlier) => {
-                            args.tool = Some(earlier.agent);
-                            if args.working_dir.is_none() {
-                                args.working_dir = earlier.working_dir;
+                    Some(target) => {
+                        let handles = self.run_handles();
+                        let chat_runs = handles.runs.for_chat(&session_id);
+                        let canonical_thread =
+                            if let Some(found) = chat_runs.iter().find(|r| r.id == target) {
+                                found.thread.clone().unwrap_or_else(|| found.id.clone())
+                            } else if let Ok(Some(found)) = self.state.cli_agent_run(target).await
+                                && found.session_id == session_id
+                            {
+                                found.thread.unwrap_or_else(|| target.to_string())
+                            } else {
+                                target.to_string()
+                            };
+
+                        let live_run = chat_runs
+                            .iter()
+                            .filter(|r| {
+                                r.ended_at.is_none()
+                                    && (r.id == target
+                                        || r.id == canonical_thread
+                                        || r.thread.as_deref() == Some(canonical_thread.as_str()))
+                            })
+                            .max_by_key(|r| r.started_at)
+                            .cloned();
+
+                        let mut resolved_as_wait = false;
+                        if let Some(live) = live_run {
+                            let live_entry = if let Some(tid) = cli_agent_task_id(&live.id) {
+                                let table = self.running.lock().await;
+                                table.get(tid).map(|agent| {
+                                    (
+                                        agent.tool_name.clone(),
+                                        agent.process.host(),
+                                        agent.finished.load(Ordering::Acquire),
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some((live_tool, live_host, finished)) = live_entry {
+                                if !finished
+                                    && owner_follow_up_call
+                                    && !read_only_run
+                                    && !args.queue_only
+                                    && (!enforce_native_access
+                                        || self
+                                            .runnable(
+                                                &live_tool,
+                                                read_only_run,
+                                                self.can_host(facts),
+                                            )
+                                            .await)
+                                    && let Some(host) = live_host
+                                    && host.accepts_mid_run()
+                                    && let Some(note_prompt) = args.run_prompt()
+                                {
+                                    match host.send_note(&note_prompt).await {
+                                        Ok(()) => {
+                                            handles
+                                                .runs
+                                                .note_delivered(&live.id, chrono::Utc::now());
+                                            let display =
+                                                live.agent.as_deref().unwrap_or(live_tool.as_str());
+                                            return Ok(format!(
+                                                "Added your note to {display}'s running work."
+                                            ));
+                                        }
+                                        Err(why) => {
+                                            info!(
+                                                %session_id,
+                                                run = %live.id,
+                                                %why,
+                                                "Mid-run note could not be delivered to live run; falling back to follow-up"
+                                            );
+                                        }
+                                    }
+                                }
+                                // If the run is still active (or finished in
+                                // process but not yet durably persisted in
+                                // SQLite), queue a ThreadWait follow-up so we
+                                // never fail the settlement window.
+                                let durable_done = self
+                                    .state
+                                    .cli_agent_run(&live.id)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|rec| rec.output_summary.is_some());
+                                let still_active = (!finished || !durable_done)
+                                    && handles
+                                        .runs
+                                        .get(&live.id)
+                                        .is_some_and(|s| s.ended_at.is_none());
+                                if still_active {
+                                    args.tool = Some(live_tool.clone());
+                                    if args.working_dir.is_none() {
+                                        if let Ok(Some(rec)) =
+                                            self.state.cli_agent_run(&live.id).await
+                                            && rec.session_id == session_id
+                                        {
+                                            args.working_dir = rec.working_dir;
+                                        } else if let Ok(Some(rec)) =
+                                            self.state.cli_agent_run(&canonical_thread).await
+                                            && rec.session_id == session_id
+                                        {
+                                            args.working_dir = rec.working_dir;
+                                        }
+                                    }
+                                    let behind_agent = live.agent.unwrap_or(live_tool);
+                                    thread_wait = Some(ThreadWait {
+                                        thread: canonical_thread.clone(),
+                                        behind_run: live.id,
+                                        behind_agent,
+                                    });
+                                    resolved_as_wait = true;
+                                }
                             }
-                            unfinished = earlier.progress;
-                            Some(earlier.continues)
                         }
-                        Err(why) => {
-                            mark_refused_before_launch(PrelaunchRefusal::Policy);
-                            return Ok(format!("Blocked: {why}"));
+
+                        if resolved_as_wait {
+                            None
+                        } else {
+                            let latest_run = self
+                                .state
+                                .latest_cli_agent_run_in_thread(&session_id, &canonical_thread)
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| target.to_string());
+                            match self.earlier_run(&latest_run, &session_id).await {
+                                Ok(earlier) => {
+                                    args.tool = Some(earlier.agent);
+                                    if args.working_dir.is_none() {
+                                        args.working_dir = earlier.working_dir;
+                                    }
+                                    unfinished = earlier.progress;
+                                    Some(earlier.continues)
+                                }
+                                Err(why) => {
+                                    mark_refused_before_launch(PrelaunchRefusal::Policy);
+                                    return Ok(format!("Blocked: {why}"));
+                                }
+                            }
                         }
-                    },
+                    }
                 };
                 // An agent asked for by name runs when its owner-set mode
                 // lets it run this run here (`agent_mode`).
@@ -864,7 +1021,7 @@ impl CliAgentTool {
                     }
                 })?;
                 // Only the agent that kept the session can go on in it.
-                if continues.is_some()
+                if (continues.is_some() || thread_wait.is_some())
                     && args
                         .tool
                         .as_deref()
@@ -964,11 +1121,8 @@ impl CliAgentTool {
                     mission: String::new(),
                     new_folders: made_folders.clone(),
                     scope: args.scope.clone(),
-                    owner_follow_up: continues.is_some()
-                        && facts
-                            .tool_call_id
-                            .as_deref()
-                            .is_some_and(crate::helper_run::is_owner_follow_up),
+                    owner_follow_up: (continues.is_some() || thread_wait.is_some())
+                        && owner_follow_up_call,
                     continues,
                 };
                 let write_paths = helper_write_paths(&args, &spec, &session_id, facts);
@@ -986,7 +1140,10 @@ impl CliAgentTool {
                 // context or restart-recovery notes) for the run's recorded
                 // task so the UI displays what was actually asked.
                 let raw_task = prompt.trim().to_string();
-                let prompt = if direct_agent_conversation && spec.continues.is_none() {
+                let prompt = if direct_agent_conversation
+                    && spec.continues.is_none()
+                    && thread_wait.is_none()
+                {
                     self.prepend_direct_conversation_context(&session_id, &prompt)
                         .await
                 } else {
@@ -1041,6 +1198,8 @@ impl CliAgentTool {
                             facts.user_role == Some(aidaemon_tools::semantics::UserRole::Owner)
                                 && facts.channel_visibility
                                     == Some(aidaemon_core::ChannelVisibility::Private),
+                            args.fresh_session,
+                            thread_wait.clone(),
                         )
                         .await
                     {
@@ -1054,14 +1213,10 @@ impl CliAgentTool {
 
                             // A follow-up goes on in its own agent's
                             // session; another agent can't take it.
-                            let Some(next_tool) = spec
-                                .continues
-                                .is_none()
-                                .then(|| {
-                                    self.fallback_tool_name(enforce_native_access, read_only_run)
-                                })
-                                .flatten()
-                            else {
+                            let Some(next_tool) = (spec.continues.is_none()
+                                && thread_wait.is_none())
+                            .then(|| self.fallback_tool_name(enforce_native_access, read_only_run))
+                            .flatten() else {
                                 let mut message = String::from(
                                     "ERROR: CLI agent recovery exhausted before task execution. \
                                      No configured CLI agent was able to start the delegated task.",

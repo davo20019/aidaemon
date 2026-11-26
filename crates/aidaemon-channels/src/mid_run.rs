@@ -255,6 +255,7 @@ mod tests {
             continues: None,
             thread: None,
             keeps_session: false,
+            accepts_mid_run: false,
             result: None,
             asked: None,
             this_request,

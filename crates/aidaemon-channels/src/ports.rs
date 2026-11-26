@@ -164,6 +164,8 @@ pub struct ChatRun {
     pub thread: Option<String>,
     /// Its coding agent keeps its session where a follow-up can continue it.
     pub keeps_session: bool,
+    /// While running, its live host accepts mid-run notes directly.
+    pub accepts_mid_run: bool,
     /// What its coding agent ended with, once it ended ([`crate::turns::RunResult`]).
     pub result: Option<crate::turns::RunResult>,
     /// What it was asked, and by whom.

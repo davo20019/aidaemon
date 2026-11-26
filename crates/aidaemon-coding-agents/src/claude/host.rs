@@ -10,6 +10,7 @@
 //!
 //! Verified against Claude Code 2.1.327 (live probes, 2026-11-17/18).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -273,6 +274,8 @@ pub struct ClaudeHost {
     working_dir: Option<String>,
     trusted_mcp_servers: Arc<[String]>,
     answers: Arc<Mutex<HostAnswers>>,
+    /// Set once the turn's final `result` arrives or the host closes stdin.
+    finished: Arc<AtomicBool>,
 }
 
 impl ClaudeHost {
@@ -287,6 +290,7 @@ impl ClaudeHost {
             working_dir,
             trusted_mcp_servers: Arc::from(Vec::<String>::new()),
             answers: Arc::default(),
+            finished: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -336,7 +340,10 @@ impl AgentHost for ClaudeHost {
                 self.stdin.write(&unsupported_response(&request_id)).await;
             }
             // Its turn is over: closing stdin lets it exit.
-            HostLine::Result => self.stdin.close().await,
+            HostLine::Result => {
+                self.finished.store(true, Ordering::Release);
+                self.stdin.close().await;
+            }
             HostLine::Other => {}
         }
         vec![line.to_string()]
@@ -346,11 +353,33 @@ impl AgentHost for ClaudeHost {
         self.answers.lock().map(|a| a.clone()).unwrap_or_default()
     }
 
+    fn accepts_mid_run(&self) -> bool {
+        !self.finished.load(Ordering::Acquire)
+    }
+
+    async fn send_note(&self, note: &str) -> Result<(), String> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err("Claude Code's turn has already finished".to_string());
+        }
+        if !self.stdin.try_write(&prompt_line(note)).await {
+            self.finished.store(true, Ordering::Release);
+            return Err("Claude Code's input stream is closed".to_string());
+        }
+        // Re-check after flushing: if `HostLine::Result` raced and arrived
+        // while we were writing, report `Err` so the caller falls back to a
+        // queued resumed follow-up rather than assuming the turn consumed it.
+        if self.finished.load(Ordering::Acquire) {
+            return Err("Claude Code's turn finished while sending the note".to_string());
+        }
+        Ok(())
+    }
+
     async fn interrupt(&self) {
         self.stdin.write(&interrupt_line()).await;
     }
 
     async fn close(&self) {
+        self.finished.store(true, Ordering::Release);
         self.stdin.close().await;
     }
 }
@@ -628,6 +657,34 @@ if read more; then echo '{"type":"stdin_open"}'; else echo '{"type":"stdin_close
         assert_eq!(line["type"], "control_request");
         assert_eq!(line["request"]["subtype"], "interrupt");
         host.close().await;
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_note_writes_a_user_message_while_running_and_refuses_after_result() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = ClaudeHost::new(child.stdin.take().unwrap(), Arc::new(crate::AllowAll), None);
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(host.accepts_mid_run());
+        host.send_note("also update the synthetic test")
+            .await
+            .expect("note accepted");
+        let line: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(line["type"], "user");
+        assert_eq!(line["message"]["role"], "user");
+        assert_eq!(line["message"]["content"], "also update the synthetic test");
+
+        // Once the turn finishes, mid-run notes are refused.
+        host.on_line(r#"{"type":"result","result":"done"}"#).await;
+        assert!(!host.accepts_mid_run());
+        assert!(host.send_note("too late").await.is_err());
         let _ = child.wait().await;
     }
 }

@@ -1567,6 +1567,38 @@ impl Store {
         self.act(|c| c.set_session_model(session, model, effort));
     }
 
+    /// The composer's sticky recipient for `session`.
+    pub fn composer_target(&self, session: &str) -> aidaemon_client_core::ComposerTarget {
+        self.read(|c| c.composer_target(session))
+    }
+
+    /// Set the composer's sticky recipient for `session`.
+    pub fn set_composer_target(&self, session: &str, target: aidaemon_client_core::ComposerTarget) {
+        self.act(|c| c.set_composer_target(session, target));
+    }
+
+    /// How the composer displays its current recipient and what sending will do.
+    pub fn composer_target_view(
+        &self,
+        session: Option<&str>,
+        is_code: bool,
+    ) -> aidaemon_client_core::ComposerTargetView {
+        self.read(|c| c.composer_target_view(session, is_code))
+    }
+
+    /// Point the main composer at the coding-agent session `thread` of
+    /// `session` (e.g. from an agent card's "Reply" action) and focus it.
+    pub fn reply_to_agent(&self, session: &str, thread: &str) {
+        self.set_composer_target(
+            session,
+            aidaemon_client_core::ComposerTarget::Session {
+                thread: thread.to_owned(),
+            },
+        );
+        self.focus_composer();
+        self.composer_edit.update(|n| *n += 1);
+    }
+
     /// Remember who does the work in code conversations on this device
     /// (the owner's pick in a code conversation's picker).
     pub fn remember_code_worker(&self, model: &aidaemon_client_protocol::ModelChoice) {

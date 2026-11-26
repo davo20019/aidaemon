@@ -370,6 +370,8 @@ pub struct RunChange {
     pub thread: Option<String>,
     /// Its coding agent keeps its session where a follow-up can continue it.
     pub keeps_session: bool,
+    /// While running, its live host accepts mid-run notes directly.
+    pub accepts_mid_run: bool,
     /// What its coding agent ended with, once it ended ([`crate::turns::RunResult`]).
     pub result: Option<crate::turns::RunResult>,
     /// What it was asked, and by whom.
@@ -579,7 +581,10 @@ impl TurnRunner {
         let registry = &self.deps.task_registry;
         let session_id = turn.session_id.clone();
         let dedup_key = turn.dedup_key.as_deref();
-        if !registry.has_running_task(&session_id).await {
+        if !registry.has_running_task(&session_id).await
+            && turn.channel_ctx.in_run.is_none()
+            && !turn.channel_ctx.fresh_agent_session
+        {
             match self.read_between_runs(&turn).await {
                 Some(BetweenRuns::Stop { request, also_asks }) => {
                     if !registry.mark_seen(&session_id, &turn.text, dedup_key).await {
@@ -622,22 +627,31 @@ impl TurnRunner {
             }
         }
         if registry.has_running_task(&session_id).await {
-            let mut steerable = true;
+            // A message explicitly addressed to a coding-agent session or
+            // starting a fresh agent session must never be steered into
+            // AIDaemon's own running turn: queue it for its own turn instead.
+            let directed_to_agent =
+                turn.channel_ctx.in_run.is_some() || turn.channel_ctx.fresh_agent_session;
+            let mut steerable = !directed_to_agent;
             // The agent was asked to read it but gave no reading (its model
             // call failed): the owner still sees where the work stands.
             let mut unread = false;
-            let reading = match placement {
-                Some(MidRunPlacement::Steer) => None,
-                Some(MidRunPlacement::Queue) => {
-                    steerable = false;
-                    None
-                }
-                None => {
-                    let reading = self.read_mid_run(&turn).await;
-                    if reading.is_none() {
-                        unread = Self::mid_run_readable(&turn);
+            let reading = if directed_to_agent {
+                None
+            } else {
+                match placement {
+                    Some(MidRunPlacement::Steer) => None,
+                    Some(MidRunPlacement::Queue) => {
+                        steerable = false;
+                        None
                     }
-                    reading
+                    None => {
+                        let reading = self.read_mid_run(&turn).await;
+                        if reading.is_none() {
+                            unread = Self::mid_run_readable(&turn);
+                        }
+                        reading
+                    }
                 }
             };
             match reading {
@@ -1701,6 +1715,7 @@ mod tests {
                         continues: None,
                         thread: None,
                         keeps_session: false,
+                        accepts_mid_run: false,
                         result: None,
                         asked: None,
                         this_request: false,

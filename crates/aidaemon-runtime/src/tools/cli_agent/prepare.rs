@@ -33,6 +33,7 @@ impl CliAgentTool {
         detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
         spawn_family: Option<crate::authority::SpawnFamily>,
         waits_for_folder: bool,
+        defer_claim: bool,
         direct_agent: bool,
         mcp_servers: &[aidaemon_coding_agents::McpEndpoint],
         nests_in: &[String],
@@ -298,7 +299,7 @@ impl CliAgentTool {
         });
         let mut claim_guard: Option<WorkingDirClaimGuard> = None;
         let mut folder_wait: Option<FolderWait> = None;
-        if let Some(ref dir) = claim_dir {
+        if !defer_claim && let Some(ref dir) = claim_dir {
             let blocked_message: Option<String> = {
                 let running = self.running.lock().await;
                 let mut claims = lock_claims(&self.working_dir_claims);
@@ -420,6 +421,7 @@ impl CliAgentTool {
             final_prompt,
             claim: claim_guard,
             folder_wait,
+            thread_wait: None,
         }))
     }
 }

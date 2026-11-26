@@ -58,6 +58,10 @@ impl CliAgentTool {
         }
         handles.runs.keeps_session(&run_id, prep.keeps_session);
         let folder_wait = prep.folder_wait.take();
+        let thread_wait = prep.thread_wait.take();
+        if let Some(tw) = &thread_wait {
+            handles.runs.set_thread(&run_id, &tw.thread);
+        }
         let names: HashMap<String, String> = self
             .tools
             .read()
@@ -69,12 +73,14 @@ impl CliAgentTool {
             move |tool: &str| names.get(tool).cloned().unwrap_or_else(|| tool.to_string());
         let behind = folder_wait.as_ref().map(|wait| display(&wait.behind));
         *lock_folder_wait(&shared.folder_wait) = behind.clone();
-        handles.runs.activity(
-            &run_id,
+        let initial_activity = if let Some(tw) = &thread_wait {
+            format!("Waiting for {} to finish", tw.behind_agent)
+        } else {
             behind
                 .as_deref()
-                .map_or_else(|| WAITING_FOR_SLOT.to_string(), waiting_for_folder),
-        );
+                .map_or_else(|| WAITING_FOR_SLOT.to_string(), waiting_for_folder)
+        };
+        handles.runs.activity(&run_id, initial_activity);
         if let Some(ref tx) = call.status_tx {
             let _ = tx.try_send(StatusUpdate::ToolCancellable {
                 name: call.tool_name.clone(),
@@ -115,7 +121,8 @@ impl CliAgentTool {
         let label = call.label.clone();
         let tool_name = call.tool_name.clone();
         let dir = folder_wait.as_ref().map(|wait| wait.dir.clone());
-        let waited_for_folder = folder_wait.is_some();
+        let thread_behind = thread_wait.as_ref().map(|tw| tw.behind_agent.clone());
+        let waited_for_folder = folder_wait.is_some() || thread_wait.is_some();
         let mut shown = behind.clone();
         let limiter = self.concurrency_limiter.clone();
         let running = self.running.clone();
@@ -123,6 +130,105 @@ impl CliAgentTool {
         let claims_changed = self.claims_changed.clone();
         let claim_dir_for_cleanup = prep.claim_dir.clone();
         tokio::spawn(async move {
+            let mut folder_wait = folder_wait;
+            if let Some(tw) = thread_wait {
+                // Wait until the targeted thread's active run ends, then
+                // refresh to resume that exact thread's session.
+                let behind_task_id = cli_agent_task_id(&tw.behind_run).map(str::to_string);
+                loop {
+                    if shared.process.was_stopped() {
+                        end_unstarted(
+                            &handles,
+                            &call,
+                            &shared,
+                            claim_dir_for_cleanup.as_deref(),
+                            crate::run_state::RunEnd::Stopped(None),
+                            &format!(
+                                "CLI agent '{}' was stopped while waiting for {} to finish; it \
+                                 never started.",
+                                call.tool_name, tw.behind_agent
+                            ),
+                            false,
+                            prep.max_output,
+                        )
+                        .await;
+                        return;
+                    }
+                    let done_notify = if let Some(ref tid) = behind_task_id {
+                        let table = running.lock().await;
+                        match table.get(tid) {
+                            Some(agent) if !agent.finished.load(Ordering::Acquire) => {
+                                Some(agent.done_notify.clone())
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let still_running_in_runs = handles
+                        .runs
+                        .get(&tw.behind_run)
+                        .is_some_and(|state| state.ended_at.is_none());
+                    let durable_done = done_notify.is_none()
+                        && handles
+                            .state
+                            .cli_agent_run(&tw.behind_run)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|rec| rec.output_summary.is_some());
+                    if done_notify.is_none() && (!still_running_in_runs || durable_done) {
+                        break;
+                    }
+                    if let Some(notify) = done_notify {
+                        let notified = notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        tokio::select! {
+                            biased;
+                            () = shared.process.stopped() => {}
+                            () = notified => {}
+                            () = tokio::time::sleep(FOLDER_POLL_FALLBACK) => {}
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            () = shared.process.stopped() => {}
+                            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        }
+                    }
+                }
+                if let Err(why) =
+                    refresh_thread_session(&handles, &running, &call, &mut prep, &tw.thread).await
+                {
+                    end_unstarted(
+                        &handles,
+                        &call,
+                        &shared,
+                        claim_dir_for_cleanup.as_deref(),
+                        crate::run_state::RunEnd::Failed(crate::run_state::RunFailure::Errored {
+                            error: why.clone(),
+                        }),
+                        &why,
+                        true,
+                        prep.max_output,
+                    )
+                    .await;
+                    return;
+                }
+                // Now acquire this run's folder claim (waiting if another run
+                // took the folder in the meantime).
+                if let Some(dir) = prep.claim_dir.clone()
+                    && prep.claim.is_none()
+                {
+                    folder_wait = Some(FolderWait {
+                        dir,
+                        writes: prep.write_scope.clone(),
+                        prompt_summary: call.short_summary.clone(),
+                        behind: tw.behind_agent.clone(),
+                    });
+                }
+            }
             if let Some(wait) = folder_wait {
                 loop {
                     // Register notification BEFORE checking claims so no
@@ -184,7 +290,7 @@ impl CliAgentTool {
                     }
                 }
                 info!(task_id = %call.task_id, tool = %call.tool_name, "A CLI agent's folder is free");
-                if call.direct_agent {
+                if call.direct_agent && !call.fresh_session && prep.continues.is_none() {
                     refresh_direct_session(&handles, &running, &call, &mut prep).await;
                 }
             }
@@ -270,6 +376,14 @@ impl CliAgentTool {
                 .start(started.handle.clone(), started.host.clone())
             {
                 kill_process(&handles.backend, &started.handle).await;
+            } else if started
+                .host
+                .as_ref()
+                .is_some_and(|host| host.accepts_mid_run())
+            {
+                handles
+                    .runs
+                    .set_accepts_mid_run(&cli_run_id(&call.task_id), true);
             }
             // A folder waiter's claim: the reaper / cancel paths own it now.
             if let Some(guard) = prep.claim.as_mut() {
@@ -305,6 +419,14 @@ impl CliAgentTool {
         });
 
         mark_background_run(&label);
+        if let Some(behind_agent) = thread_behind {
+            return format!(
+                "{}\nCLI agent '{tool_name}' is queued (task_id={task_id}): waiting for \
+                 {behind_agent} to finish its current turn before continuing that session. It \
+                 starts by itself then, so do not start it again.",
+                crate::background_run::started_in_background(&label),
+            );
+        }
         if let (Some(behind), Some(dir)) = (behind, dir) {
             return format!(
                 "{}\nCLI agent '{tool_name}' is queued (task_id={task_id}): {behind} is already \
@@ -442,6 +564,108 @@ pub(super) async fn refresh_direct_session(
     let run_id = cli_run_id(&call.task_id);
     handles.runs.continues(&run_id, &run, &thread);
     handles.runs.keeps_session(&run_id, prep.keeps_session);
+}
+
+/// After waiting for a specific thread's active run to finish, resolve the
+/// latest run in `thread`, verify it kept its session, and re-prepare `prep`
+/// to resume that exact session. Returns `Err` if the session cannot be
+/// continued so the queued run ends cleanly instead of forking a cold session.
+async fn refresh_thread_session(
+    handles: &RunHandles,
+    running: &Mutex<HashMap<String, RunningCliAgent>>,
+    call: &RunCall,
+    prep: &mut PreparedRun,
+    thread: &str,
+) -> Result<(), String> {
+    let run = match handles
+        .state
+        .latest_cli_agent_run_in_thread(&call.session_id, thread)
+        .await
+    {
+        Ok(Some(run)) => run,
+        Ok(None) => thread.to_string(),
+        Err(error) => {
+            return Err(format!(
+                "Could not read thread `{thread}` after its run ended: {error}"
+            ));
+        }
+    };
+    let found = handles
+        .state
+        .cli_agent_run(&run)
+        .await
+        .map_err(|error| format!("Could not read run `{run}`: {error}"))?
+        .filter(|found| found.session_id == call.session_id)
+        .ok_or_else(|| format!("This conversation has no coding agent run `{run}`"))?;
+    let still_working_in_runs = handles
+        .runs
+        .get(&run)
+        .is_some_and(|state| state.ended_at.is_none());
+    if still_working_in_runs && found.output_summary.is_none() {
+        let finished_in_table = if let Some(id) = cli_agent_task_id(&run) {
+            running
+                .lock()
+                .await
+                .get(id)
+                .is_some_and(|agent| agent.finished.load(Ordering::Acquire))
+        } else {
+            false
+        };
+        if !finished_in_table {
+            return Err(format!(
+                "Run `{run}` is still working; cannot continue its session yet"
+            ));
+        }
+    }
+    let Some(agent_session) = found.agent_session.filter(|_| found.keeps_session) else {
+        return Err(format!(
+            "{} didn't keep run `{run}`'s session, so the queued follow-up couldn't continue it.",
+            found.agent_name
+        ));
+    };
+    let mut launch = prep.base_launch.clone();
+    let plan = prep
+        .coding_agent
+        .prepare(
+            &aidaemon_coding_agents::RunRequest {
+                mode: prep.mode,
+                enforce: prep.enforce_native_access,
+                read_only: prep.workspace_mode == CliWorkspaceMode::ReadOnly,
+                working_dir: prep.working_dir.as_deref(),
+                read_paths: &prep.read_paths,
+                write_paths: &prep.write_paths,
+                can_host: prep.can_host,
+                stdin_open: handles.backend.kind() == aidaemon_tools::backend::BackendKind::Local,
+                model: prep.model.as_deref(),
+                resume: Some(agent_session.as_str()),
+                report: !call.direct_agent,
+                mcp_servers: &prep.mcp_servers,
+            },
+            &mut launch,
+        )
+        .map_err(|why| format!("{} could not continue its session: {why}", found.agent_name))?;
+    let canonical_thread = found.thread.unwrap_or_else(|| thread.to_string());
+    let continues = crate::helper_run::Continues {
+        run: run.clone(),
+        agent_session,
+        thread: canonical_thread.clone(),
+    };
+    prep.args = launch.args;
+    prep.prompt_placement = plan.prompt;
+    prep.env = plan.env;
+    prep.env_remove = plan.env_remove;
+    prep.args.extend(prep.signed.args.iter().cloned());
+    prep.env.extend(prep.signed.env.iter().cloned());
+    prep.env_remove
+        .extend(prep.signed.env_remove.iter().cloned());
+    prep.host = plan.host;
+    prep.keep_alive = plan.keep_alive;
+    prep.keeps_session = plan.keeps_session;
+    prep.continues = Some(continues);
+    let run_id = cli_run_id(&call.task_id);
+    handles.runs.continues(&run_id, &run, &canonical_thread);
+    handles.runs.keeps_session(&run_id, prep.keeps_session);
+    Ok(())
 }
 
 /// End a queued run that never started: stopped while it waited, or its

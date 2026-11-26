@@ -223,6 +223,8 @@ fn run() -> RunSummary {
         continues: None,
         thread: None,
         can_continue: false,
+        accepts_mid_run: false,
+        keeps_session: None,
         result: None,
         asked: None,
     }
@@ -389,6 +391,7 @@ fn client_samples() -> Vec<ClientFrame> {
                 }),
                 effort: Some(Effort::High),
                 in_run: None,
+                fresh_agent_session: false,
             },
         ),
         command(

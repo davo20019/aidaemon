@@ -522,6 +522,7 @@ async fn folder_waiter_blocks_subfolder_waiter_but_allows_disjoint_write_paths()
         began: chrono::Utc::now(),
         owner_follow_up: false,
         direct_agent: true,
+        fresh_session: false,
         is_peer_run: false,
         peer_binding: None,
     };
@@ -735,6 +736,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         final_prompt: "second turn".to_string(),
         claim: None,
         folder_wait: None,
+        thread_wait: None,
     };
     let call = RunCall {
         task_id: "second456".to_string(),
@@ -751,6 +753,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         began: chrono::Utc::now(),
         owner_follow_up: false,
         direct_agent: true,
+        fresh_session: false,
         is_peer_run: false,
         peer_binding: None,
     };
@@ -779,5 +782,120 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         !prep.args.iter().any(|arg| arg == "--json-schema"),
         "direct_agent refresh must not attach the 3-sentence report schema: {:?}",
         prep.args
+    );
+}
+
+/// Addressing a live running session whose host accepts mid-run notes delivers
+/// the note directly to that host and records `last_note_at` on the run state.
+#[tokio::test]
+async fn continue_run_steers_live_host_that_accepts_mid_run_notes() {
+    use std::sync::Mutex as StdMutex;
+
+    struct SteerableHost {
+        notes: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl aidaemon_coding_agents::AgentHost for SteerableHost {
+        async fn on_line(&self, line: &str) -> Vec<String> {
+            vec![line.to_string()]
+        }
+        fn answers(&self) -> aidaemon_coding_agents::HostAnswers {
+            Default::default()
+        }
+        fn accepts_mid_run(&self) -> bool {
+            true
+        }
+        async fn send_note(&self, note: &str) -> Result<(), String> {
+            self.notes.lock().unwrap().push(note.to_string());
+            Ok(())
+        }
+        async fn close(&self) {}
+    }
+
+    let (tool, _runs, _watcher, _db) = one_slot_tool().await;
+    let chat = "app:synthetic-steer";
+    let task_id = "steer123";
+    let run_id = cli_run_id(task_id);
+    let notes = Arc::new(StdMutex::new(Vec::new()));
+    let host: Arc<dyn aidaemon_coding_agents::AgentHost> = Arc::new(SteerableHost {
+        notes: notes.clone(),
+    });
+
+    let handles = tool.run_handles();
+    handles.runs.begin(&run_id, chat, "Synthetic Codex", None);
+    handles.runs.set_agent(&run_id, "Codex");
+    handles.runs.set_accepts_mid_run(&run_id, true);
+
+    let shared = RunShared::default();
+    shared.process.start(
+        aidaemon_tools::backend::ProcessHandle::new(1, None, None),
+        Some(host),
+    );
+    let call = RunCall {
+        task_id: task_id.to_string(),
+        tool_name: "bash-agent".to_string(),
+        session_id: chat.to_string(),
+        goal_id: None,
+        delegated_task_id: None,
+        label: "Synthetic Codex".to_string(),
+        short_summary: "Synthetic Codex".to_string(),
+        async_mode: true,
+        status_tx: None,
+        grant_session: chat.to_string(),
+        new_folders: Vec::new(),
+        began: chrono::Utc::now(),
+        owner_follow_up: false,
+        direct_agent: false,
+        fresh_session: false,
+        is_peer_run: false,
+        peer_binding: None,
+    };
+    tool.running.lock().await.insert(
+        task_id.to_string(),
+        tracked(
+            &call,
+            &shared,
+            Instant::now(),
+            None,
+            WriteScope::ReadOnly,
+            10_000,
+        ),
+    );
+
+    let before = chrono::Utc::now();
+    let call_id = "follow-up-synthetic-steer";
+    crate::helper_run::mark_owner_follow_up(call_id);
+    let facts = ToolCallContext {
+        session_id: chat.to_string(),
+        tool_call_id: Some(call_id.to_string()),
+        ..Default::default()
+    };
+    let output = tool
+        .call_with_status_under_contract(
+            &json!({
+                "action": "run",
+                "continue_run": run_id,
+                "prompt": "also check the synthetic edge case",
+                "async_mode": true,
+            })
+            .to_string(),
+            None,
+            false,
+            false,
+            &facts,
+        )
+        .await
+        .expect("mid-run note should succeed");
+
+    assert!(output.contains("Added your note"), "{output}");
+    assert_eq!(
+        *notes.lock().unwrap(),
+        vec!["also check the synthetic edge case".to_string()]
+    );
+    let state_after = handles.runs.get(&run_id).expect("run still tracked");
+    assert!(
+        state_after.last_note_at.is_some_and(|at| at >= before),
+        "last_note_at should be stamped on the steered run"
     );
 }

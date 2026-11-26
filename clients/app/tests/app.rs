@@ -1043,7 +1043,7 @@ fn a_direct_agent_thread_marks_owner_prompts_collapses_verbose_replies_and_steps
     app.press("Collapse response")?;
     app.wait_for("Show full response (27 lines)")?;
     let before_run = sent("get_run");
-    app.press("Antigravity CLI, show what it did")?;
+    app.press("Antigravity CLI, show what it did >> nth=0")?;
     let run_id = wait_sent_new("get_run", before_run)?;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{run_id}","result":{{"type":"run","run":{{"run_id":"cli-agent-d1","can_continue":true,"task":"Review how synthetic coordination works","steps":[{{"words":"Reading files","state":"done"}}]}}}}}}"#
@@ -1897,33 +1897,33 @@ fn a_code_conversation_picks_who_does_the_work() -> Result<(), String> {
     // coding agent) and keeps AIDaemon's model choices while AIDaemon is
     // selected; picking a coding agent hides model choices.
     app.press("Code")?;
-    app.wait_for("Who does the work: AIDaemon")?;
-    app.press("Who does the work: AIDaemon")?;
-    app.wait_for("Claude Code")?;
+    app.wait_for("Send to: AIDaemon")?;
+    app.press("Send to: AIDaemon")?;
+    app.wait_for("New Claude Code")?;
     app.wait_for("synthetic-claude-small")?;
-    app.press("Codex")?;
-    app.wait_for("Who does the work: Codex")?;
-    app.press("Who does the work: Codex")?;
+    app.press("New Codex")?;
+    app.wait_for("Send to: New Codex")?;
+    app.press("Send to: New Codex")?;
     app.wait_for_gone("synthetic-claude-small", std::time::Duration::from_secs(2))?;
-    app.press("Codex")?;
+    app.press("New Codex")?;
     // A chat has no folder for an agent: it goes back to AIDaemon's model.
     app.press("Chat")?;
     app.wait_for("Model and effort: Auto")?;
     // Code again starts with the agent this device picked last.
     app.press("Code")?;
-    app.wait_for("Who does the work: Codex")?;
+    app.wait_for("Send to: New Codex")?;
     // AIDaemon picked is remembered too, and restores model choices in Code.
-    app.press("Who does the work: Codex")?;
+    app.press("Send to: New Codex")?;
     app.press("AIDaemon")?;
-    app.wait_for("Who does the work: AIDaemon")?;
-    app.press("Who does the work: AIDaemon")?;
+    app.wait_for("Send to: AIDaemon")?;
+    app.press("Send to: AIDaemon")?;
     app.wait_for("synthetic-claude-small")?;
     app.press("synthetic-claude-small")?;
-    app.wait_for("Who does the work: AIDaemon · synthetic-claude-small")?;
+    app.wait_for("Send to: AIDaemon · synthetic-claude-small")?;
     app.press("Chat")?;
     app.wait_for("Model and effort: synthetic-claude-small")?;
     app.press("Code")?;
-    app.wait_for("Who does the work: AIDaemon · synthetic-claude-small")?;
+    app.wait_for("Send to: AIDaemon · synthetic-claude-small")?;
     Ok(())
 }
 
@@ -2321,5 +2321,56 @@ fn a_new_conversation_on_a_phone_raises_the_keyboard() -> Result<(), String> {
     if app.shows("label:New conversation") {
         return Err("the conversation's header still offers New conversation".into());
     }
+    Ok(())
+}
+
+/// The composer names the exact coding-agent session with its state, keeps the
+/// chosen target sticky across other sessions finishing, shows what sending
+/// will do ("Added to Codex's work", "Sent when Antigravity CLI 2 finishes",
+/// "Reply"), and lets an agent card's "Reply" action point the composer at
+/// that session.
+#[test]
+fn composer_addresses_specific_agent_sessions_and_card_reply_sets_target() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let before_models = sent("list_models");
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":10,"state":{"sessions":[{"id":"app:synthetic-multi","channel":"app","title":"Multi-agent synthetic task","writable":true,"project_id":"project-acme"}],"projects":[{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-a1","session_id":"app:synthetic-multi","label":"First pass","agent":"Antigravity CLI","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999960000,"can_continue":true,"result":{"text":"First synthetic pass done."}},{"id":"cli-agent-a2","session_id":"app:synthetic-multi","label":"Second pass","agent":"Antigravity CLI","phase":"running","background":true,"started_at_ms":9999999970000},{"id":"cli-agent-c1","session_id":"app:synthetic-multi","label":"Write synthetic tests","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999980000,"accepts_mid_run":true}]}}"#,
+        ),
+    ]);
+    let models_id = wait_sent_new("list_models", before_models)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{models_id}","result":{{"type":"models","options":{{"providers":[],"agents":[{{"id":"claude","name":"Claude Code"}},{{"id":"codex","name":"Codex"}},{{"id":"agy","name":"Antigravity CLI"}}]}}}}}}"#
+    ))]);
+    settle(&mut app)?;
+    app.press("Multi-agent synthetic task >> nth=0")?;
+    app.wait_for("text:First synthetic pass done.")?;
+
+    // Card's "Reply" button points the composer at Antigravity CLI (idle).
+    app.press("Reply to Antigravity CLI")?;
+    app.wait_for("text:To: Antigravity CLI · idle")?;
+
+    // Tap the recipient chip to switch to working Codex (accepts_mid_run: true).
+    app.press("Send to: Antigravity CLI · idle")?;
+    app.wait_for("text:Antigravity CLI 2")?;
+    app.wait_for("text:New Claude Code")?;
+    app.wait_for("text:New Codex")?;
+    app.wait_for("text:New Antigravity CLI")?;
+    app.press("Codex >> nth=0")?;
+    app.wait_for("text:To: Codex · working")?;
+
+    // Sending routes directly to Codex's thread.
+    app.type_text("label:Message", "Check empty input too")?;
+    let before_send = sent("send_message");
+    app.press("label:Send")?;
+    wait_sent_new("send_message", before_send)?;
+
+    // Switch to working Antigravity CLI 2 (no mid-run steer): chip reflects it.
+    app.press("Send to: Codex · working")?;
+    app.press("Antigravity CLI 2")?;
+    app.wait_for("text:To: Antigravity CLI 2 · working")?;
     Ok(())
 }

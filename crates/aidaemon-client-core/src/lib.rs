@@ -47,7 +47,9 @@ mod ticketed;
 mod tls;
 pub mod tools;
 
-pub use client::{Client, Connection, Context, Effect, Felt, Read};
+pub use client::{
+    Client, ComposerTarget, ComposerTargetView, Connection, Context, Effect, Felt, Read,
+};
 #[cfg(target_os = "ios")]
 pub use keystore::KeychainKeyStore;
 pub use keystore::{FileKeyStore, KeyStore, StoredDevice};

@@ -926,6 +926,8 @@ mod tests {
             continues: None,
             thread: None,
             can_continue: false,
+            accepts_mid_run: false,
+            keeps_session: None,
             result: None,
             asked: None,
         }

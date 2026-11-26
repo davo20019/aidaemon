@@ -337,6 +337,42 @@ pub enum Effect {
 }
 
 /// The client, as [`crate::client`] describes it.
+/// Who the composer addresses when the owner sends a message in a conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerTarget {
+    /// AIDaemon itself (using the conversation's model and effort).
+    Aidaemon,
+    /// One existing coding-agent session in this conversation, by its stable
+    /// thread id (`Participant::thread`).
+    Session { thread: String },
+    /// Start a brand-new coding-agent session of this kind (its registry id,
+    /// e.g. `"claude"`, `"codex"`, `"agy"`).
+    NewAgent { agent: String },
+}
+
+/// How the composer displays its current target and what sending will do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerTargetView {
+    pub target: ComposerTarget,
+    /// Short chip label ("To: Antigravity CLI 3 · working", "To: Codex · idle",
+    /// "To: New Codex", "To: AIDaemon", or model name in plain chat).
+    pub chip: String,
+    /// Placeholder override describing what sending will do:
+    /// - `"Added to <name>'s work"` when the targeted session is working and
+    ///   accepts mid-run notes;
+    /// - `"Sent when <name> finishes"` when the targeted session is working
+    ///   and queues follow-ups;
+    /// - `"Reply"` when the targeted session is idle;
+    /// - `None` otherwise (use the default composer placeholder).
+    pub hint: Option<String>,
+    /// True when the targeted session is currently working.
+    pub working: bool,
+    /// True when the targeted session accepts mid-run notes right now.
+    pub accepts_mid_run: bool,
+    /// True when the chip is showing an explicit `"To: ..."` participant target.
+    pub shows_recipient: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Client {
     pub state: State,
@@ -383,6 +419,14 @@ pub struct Client {
     /// The model a new conversation's first message carried, until the
     /// daemon names the conversation.
     starting_model: Option<(ModelChoice, Effort)>,
+    /// The composer's sticky recipient per conversation: the session the
+    /// owner last addressed (or explicitly chose), kept until changed.
+    composer_targets: BTreeMap<String, ComposerTarget>,
+    /// When the owner starts a fresh coding-agent session (`"New <Agent>"`) in
+    /// a conversation, track its agent id and the threads that already
+    /// existed so the newly created session automatically becomes the sticky
+    /// target once its first `RunUpdated` arrives.
+    pending_new_sessions: BTreeMap<String, (String, BTreeSet<String>)>,
     /// Settings changes waiting for an approval, and whether another
     /// device must give it.
     pub settings_waiting: BTreeMap<String, bool>,
@@ -668,7 +712,50 @@ impl Client {
             } => session.agent.is_some(),
             _ => false,
         };
+        // Capture events we inspect for sticky composer target adoption before
+        // handing `frame` to the reducer.
+        let created_agent_session = match &frame {
+            ServerFrame::Event {
+                event: Event::SessionCreated { session },
+                ..
+            } => session
+                .agent
+                .as_ref()
+                .map(|agent| (session.id.clone(), agent.clone())),
+            _ => None,
+        };
+        let updated_run_info = match &frame {
+            ServerFrame::Event {
+                event: Event::RunUpdated { run },
+                ..
+            } if run.agent.is_some() => Some((
+                run.session_id.clone(),
+                run.thread.clone().unwrap_or_else(|| run.id.clone()),
+                run.agent.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        };
         self.state.apply(frame);
+        if let Some((session_id, agent)) = created_agent_session {
+            self.composer_targets.insert(
+                session_id.clone(),
+                ComposerTarget::NewAgent {
+                    agent: agent.clone(),
+                },
+            );
+            self.pending_new_sessions
+                .insert(session_id, (agent, BTreeSet::new()));
+        }
+        if let Some((session_id, thread, run_agent_name)) = updated_run_info
+            && let Some((wanted_agent, existing_threads)) =
+                self.pending_new_sessions.get(&session_id)
+            && !existing_threads.contains(&thread)
+            && self.agent_matches(wanted_agent, &run_agent_name)
+        {
+            self.pending_new_sessions.remove(&session_id);
+            self.composer_targets
+                .insert(session_id, ComposerTarget::Session { thread });
+        }
         if names_agent && matches!(self.models, Read::NotYet) {
             self.refresh_models();
         }
@@ -1987,6 +2074,21 @@ impl Client {
             self.new_model = (next_model, next_effort);
             return;
         };
+        match &next_model {
+            ModelChoice::Agent { agent } => {
+                self.composer_targets.insert(
+                    session.to_owned(),
+                    ComposerTarget::NewAgent {
+                        agent: agent.clone(),
+                    },
+                );
+            }
+            ModelChoice::Auto | ModelChoice::Pinned { .. } | ModelChoice::Unknown => {
+                self.composer_targets
+                    .insert(session.to_owned(), ComposerTarget::Aidaemon);
+            }
+        }
+        self.pending_new_sessions.remove(session);
         self.session_models.insert(
             session.to_owned(),
             Read::Ready(SessionModel {
@@ -2393,6 +2495,256 @@ impl Client {
         crate::participants::participants(&runs, &self.state.agent_names, &self.asking_runs())
     }
 
+    /// Display name for coding agent registry id `id` (falls back to `id`).
+    pub fn agent_display_name(&self, id: &str) -> String {
+        self.models
+            .ready()
+            .and_then(|options| {
+                options
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .map(|agent| agent.name.clone())
+            })
+            .unwrap_or_else(|| id.to_owned())
+    }
+
+    /// Whether coding agent registry id `agent_id` matches a run's agent
+    /// display name `run_agent_name`.
+    fn agent_matches(&self, agent_id: &str, run_agent_name: &str) -> bool {
+        if agent_id.eq_ignore_ascii_case(run_agent_name) {
+            return true;
+        }
+        self.models.ready().is_some_and(|options| {
+            options
+                .agents
+                .iter()
+                .find(|a| a.id == agent_id)
+                .is_some_and(|a| a.name.eq_ignore_ascii_case(run_agent_name))
+        })
+    }
+
+    /// Whether `session` currently has an active AIDaemon turn running (as
+    /// distinct from background coding-agent runs).
+    pub fn is_turn_running(&self, session: &str) -> bool {
+        self.state
+            .sessions
+            .get(session)
+            .is_some_and(|v| v.live.is_some())
+    }
+
+    /// Set the composer's sticky recipient for `session`.
+    ///
+    /// Addressing a specific session (`ComposerTarget::Session`) or starting a
+    /// fresh one (`ComposerTarget::NewAgent`) sticks on that conversation
+    /// until the owner changes it. Switching to `ComposerTarget::Aidaemon`
+    /// also clears any conversation-level coding-agent pin so AIDaemon answers
+    /// the next turn.
+    pub fn set_composer_target(&mut self, session: &str, target: ComposerTarget) {
+        self.pending_new_sessions.remove(session);
+        match &target {
+            ComposerTarget::Aidaemon => {
+                if matches!(self.model_of(Some(session)).0, ModelChoice::Agent { .. }) {
+                    self.set_session_model(Some(session), Some(ModelChoice::Auto), None);
+                }
+                self.composer_targets
+                    .insert(session.to_owned(), ComposerTarget::Aidaemon);
+            }
+            ComposerTarget::Session { .. } | ComposerTarget::NewAgent { .. } => {
+                self.composer_targets.insert(session.to_owned(), target);
+            }
+        }
+    }
+
+    /// Resolve the composer's current recipient for `session`.
+    ///
+    /// Sticks to the session the owner last addressed until they change it (or
+    /// that session ends without keeping a resumable session). If the owner
+    /// has not addressed one yet, a conversation pinned to a coding agent
+    /// defaults to that agent's most recently active addressable session (or a
+    /// new session of that kind if none exist yet), and any other conversation
+    /// defaults to AIDaemon.
+    pub fn composer_target(&self, session: &str) -> ComposerTarget {
+        let participants = self.participants(session);
+        if let Some(target) = self.composer_targets.get(session) {
+            match target {
+                ComposerTarget::Session { thread } => {
+                    if participants
+                        .iter()
+                        .any(|p| p.thread == *thread && p.can_address())
+                    {
+                        return target.clone();
+                    }
+                }
+                ComposerTarget::NewAgent { .. } | ComposerTarget::Aidaemon => {
+                    return target.clone();
+                }
+            }
+        }
+        if let ModelChoice::Agent { agent } = self.model_of(Some(session)).0 {
+            let matching = participants
+                .iter()
+                .filter(|p| p.can_address() && self.agent_matches(&agent, &p.agent))
+                .max_by_key(|p| (p.working(), p.last_activity_ms));
+            return match matching {
+                Some(p) => ComposerTarget::Session {
+                    thread: p.thread.clone(),
+                },
+                None => ComposerTarget::NewAgent { agent },
+            };
+        }
+        ComposerTarget::Aidaemon
+    }
+
+    /// How the composer displays its current recipient and what sending will
+    /// do, for `session` (`None`: a new conversation) in `is_code` mode.
+    pub fn composer_target_view(&self, session: Option<&str>, is_code: bool) -> ComposerTargetView {
+        let effort_suffix = |effort: Effort| match effort {
+            Effort::Low => Some("Low"),
+            Effort::Medium => Some("Medium"),
+            Effort::High => Some("High"),
+            _ => None,
+        };
+        let Some(session_id) = session else {
+            let (model, effort) = self.model_of(None);
+            return match model {
+                ModelChoice::Agent { agent } => {
+                    let name = self.agent_display_name(&agent);
+                    ComposerTargetView {
+                        target: ComposerTarget::NewAgent { agent },
+                        chip: format!("To: New {name}"),
+                        hint: None,
+                        working: false,
+                        accepts_mid_run: false,
+                        shows_recipient: true,
+                    }
+                }
+                ModelChoice::Pinned { model, .. } if is_code => {
+                    let mut chip = format!("To: AIDaemon · {model}");
+                    if let Some(word) = effort_suffix(effort) {
+                        chip.push_str(&format!(" · {word}"));
+                    }
+                    ComposerTargetView {
+                        target: ComposerTarget::Aidaemon,
+                        chip,
+                        hint: None,
+                        working: false,
+                        accepts_mid_run: false,
+                        shows_recipient: true,
+                    }
+                }
+                ModelChoice::Pinned { model, .. } => {
+                    let mut chip = model;
+                    if let Some(word) = effort_suffix(effort) {
+                        chip.push_str(&format!(" · {word}"));
+                    }
+                    ComposerTargetView {
+                        target: ComposerTarget::Aidaemon,
+                        chip,
+                        hint: None,
+                        working: false,
+                        accepts_mid_run: false,
+                        shows_recipient: false,
+                    }
+                }
+                _ if is_code => {
+                    let mut chip = "To: AIDaemon".to_owned();
+                    if let Some(word) = effort_suffix(effort) {
+                        chip.push_str(&format!(" · {word}"));
+                    }
+                    ComposerTargetView {
+                        target: ComposerTarget::Aidaemon,
+                        chip,
+                        hint: None,
+                        working: false,
+                        accepts_mid_run: false,
+                        shows_recipient: true,
+                    }
+                }
+                _ => {
+                    let mut chip = "Auto".to_owned();
+                    if let Some(word) = effort_suffix(effort) {
+                        chip.push_str(&format!(" · {word}"));
+                    }
+                    ComposerTargetView {
+                        target: ComposerTarget::Aidaemon,
+                        chip,
+                        hint: None,
+                        working: false,
+                        accepts_mid_run: false,
+                        shows_recipient: false,
+                    }
+                }
+            };
+        };
+
+        let participants = self.participants(session_id);
+        let has_sessions = participants.iter().any(|p| p.can_address());
+        let shows_recipient = is_code || has_sessions;
+        let target = self.composer_target(session_id);
+        match &target {
+            ComposerTarget::Session { thread } => {
+                if let Some(p) = participants.iter().find(|p| p.thread == *thread) {
+                    let state = if p.waiting {
+                        "needs approval"
+                    } else if p.working() {
+                        "working"
+                    } else {
+                        "idle"
+                    };
+                    let hint = if p.accepts_mid_run() {
+                        format!("Added to {}'s work", p.name)
+                    } else if p.working() {
+                        format!("Sent when {} finishes", p.name)
+                    } else {
+                        "Reply".to_owned()
+                    };
+                    return ComposerTargetView {
+                        target,
+                        chip: format!("To: {} · {state}", p.name),
+                        hint: Some(hint),
+                        working: p.working(),
+                        accepts_mid_run: p.accepts_mid_run(),
+                        shows_recipient: true,
+                    };
+                }
+            }
+            ComposerTarget::NewAgent { agent } => {
+                let name = self.agent_display_name(agent);
+                return ComposerTargetView {
+                    target: target.clone(),
+                    chip: format!("To: New {name}"),
+                    hint: None,
+                    working: false,
+                    accepts_mid_run: false,
+                    shows_recipient: true,
+                };
+            }
+            ComposerTarget::Aidaemon => {}
+        }
+
+        let (model, effort) = self.model_of(Some(session_id));
+        let mut chip = match model {
+            ModelChoice::Pinned { model, .. } if shows_recipient => {
+                format!("To: AIDaemon · {model}")
+            }
+            ModelChoice::Pinned { model, .. } => model,
+            _ if shows_recipient => "To: AIDaemon".to_owned(),
+            _ => "Auto".to_owned(),
+        };
+        if let Some(word) = effort_suffix(effort) {
+            chip.push_str(&format!(" · {word}"));
+        }
+        ComposerTargetView {
+            target: ComposerTarget::Aidaemon,
+            chip,
+            hint: None,
+            working: false,
+            accepts_mid_run: false,
+            shows_recipient,
+        }
+    }
+
     /// The runs an open approval card names: their agents wait on the owner.
     pub fn asking_runs(&self) -> std::collections::BTreeSet<String> {
         self.state
@@ -2614,30 +2966,70 @@ impl Client {
             (Some(session), Some(slash)) => self.run_slash(session, slash),
             _ => {
                 // A new conversation starts on the model picked for it; an
-                // existing one already answers with its own.
-                let (model, effort) = match session {
+                // existing one routes according to its sticky composer target
+                // (a specific agent session, a fresh agent session, or AIDaemon).
+                let (model, effort, in_run, fresh_agent_session, effective_mid_run) = match session
+                {
                     None => {
                         let pick = std::mem::take(&mut self.new_model);
                         self.starting_model = Some(pick.clone());
                         (
                             Some(pick.0).filter(|m| *m != ModelChoice::Auto),
                             Some(pick.1).filter(|e| *e != Effort::Auto),
+                            None,
+                            false,
+                            mid_run,
                         )
                     }
-                    Some(_) => (None, None),
+                    Some(session_id) => match self.composer_target(session_id) {
+                        ComposerTarget::Session { thread } => {
+                            // Keep the target stuck on the session the owner
+                            // just addressed. `TurnRunner` always queues
+                            // `in_run` turns behind any active AIDaemon turn
+                            // on its own, so `mid_run` here carries only the
+                            // owner's explicit choice (steer vs queue after).
+                            self.composer_targets.insert(
+                                session_id.to_owned(),
+                                ComposerTarget::Session {
+                                    thread: thread.clone(),
+                                },
+                            );
+                            (None, None, Some(thread), false, mid_run)
+                        }
+                        ComposerTarget::NewAgent { agent } => {
+                            let existing_threads: BTreeSet<String> = self
+                                .state
+                                .runs_for(session_id)
+                                .into_iter()
+                                .filter(|run| run.agent.is_some())
+                                .map(|run| run.thread.clone().unwrap_or_else(|| run.id.clone()))
+                                .collect();
+                            self.pending_new_sessions
+                                .insert(session_id.to_owned(), (agent.clone(), existing_threads));
+                            (
+                                Some(ModelChoice::Agent { agent }),
+                                None,
+                                None,
+                                true,
+                                mid_run,
+                            )
+                        }
+                        ComposerTarget::Aidaemon => (None, None, None, false, mid_run),
+                    },
                 };
                 // Sent while the work runs, either way: it waits (to be read
                 // or for its own turn) and the list shows it.
-                let queueing = mid_run.is_some();
+                let queueing = effective_mid_run.is_some() && in_run.is_none();
                 let id = self.send(Command::SendMessage {
                     session_id: session.map(str::to_owned),
                     text,
                     attachments,
-                    mid_run,
+                    mid_run: effective_mid_run,
                     project_id: session.is_none().then_some(project).flatten(),
                     model,
                     effort,
-                    in_run: None,
+                    in_run,
+                    fresh_agent_session,
                 });
                 if queueing {
                     self.queue_sends.insert(id.clone());
@@ -2652,10 +3044,12 @@ impl Client {
         Ok(true)
     }
 
-    /// Follow up on run `run_id` of `session`: `text` (and any attached draft
-    /// files) goes to its coding agent, which goes on in its own session
-    /// (protocol 1.48, `in_run`). While the conversation works it waits for a
-    /// turn of its own.
+    /// Follow up on run or thread `run_id` of `session`: `text` (and any
+    /// attached draft files) goes to its coding agent, which goes on in its
+    /// own session (protocol 1.48, `in_run`). While an AIDaemon turn works in
+    /// the conversation it waits for a turn of its own; while the coding agent
+    /// itself works, the daemon delivers a mid-run note when supported or
+    /// queues after that run.
     pub fn follow_up(&mut self, session: &str, run_id: &str, text: &str) -> Result<bool, String> {
         let text = text.trim();
         if self
@@ -2679,18 +3073,27 @@ impl Client {
         if !attachments.is_empty() {
             self.draft_files.clear();
         }
-        let queueing = self.is_running(session);
+        // Addressing this agent also updates the conversation's sticky target.
+        let thread = self
+            .state
+            .runs
+            .get(run_id)
+            .and_then(|run| run.thread.clone())
+            .unwrap_or_else(|| run_id.to_owned());
+        self.composer_targets
+            .insert(session.to_owned(), ComposerTarget::Session { thread });
         let id = self.send(Command::SendMessage {
             session_id: Some(session.to_owned()),
             text: text.to_owned(),
             attachments,
-            mid_run: queueing.then_some(MidRun::Queue),
+            mid_run: None,
             project_id: None,
             model: None,
             effort: None,
             in_run: Some(run_id.to_owned()),
+            fresh_agent_session: false,
         });
-        if queueing {
+        if self.is_turn_running(session) {
             self.queue_sends.insert(id);
         }
         Ok(true)
@@ -2707,6 +3110,7 @@ impl Client {
             model: None,
             effort: None,
             in_run: None,
+            fresh_agent_session: false,
         });
     }
 
@@ -2772,6 +3176,7 @@ impl Client {
                     model: None,
                     effort: None,
                     in_run: None,
+                    fresh_agent_session: false,
                 });
             }
         }
@@ -5149,5 +5554,140 @@ mod tests {
         );
         client.update(Update::Connected, &cx(Some("app:s1")));
         assert_eq!(history(&mut client), 1);
+    }
+
+    #[test]
+    fn composer_addresses_a_specific_session_sticks_and_shows_delivery_hint() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(Some("app:code1")));
+        let sent = client.take_outgoing();
+        let list_models_id = sent
+            .iter()
+            .find_map(|(id, cmd)| matches!(cmd, Command::ListModels).then(|| id.clone()))
+            .unwrap_or_else(|| {
+                client.refresh_models();
+                client.take_outgoing().pop().unwrap().0
+            });
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{list_models_id}","result":{{"type":"models","options":{{"providers":[],"agents":[{{"id":"claude","name":"Claude Code"}},{{"id":"codex","name":"Codex"}},{{"id":"agy","name":"Antigravity CLI"}}]}}}}}}"#
+            )),
+            &cx(Some("app:code1")),
+        );
+        // Conversation has two Antigravity sessions (1 idle, 2 working) and
+        // one Codex session (working, accepts_mid_run: true).
+        client.update(
+            frame(
+                r#"{"type":"snapshot","seq":5,"state":{"sessions":[{"id":"app:code1","channel":"app","title":"Fix parser","writable":true,"project_id":"proj-1","agent":"agy"}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"run-agy-1","session_id":"app:code1","label":"First pass","agent":"Antigravity CLI","phase":"succeeded","background":true,"started_at_ms":100,"ended_at_ms":150,"can_continue":true},{"id":"run-agy-2","session_id":"app:code1","label":"Second pass","agent":"Antigravity CLI","phase":"running","background":true,"started_at_ms":200},{"id":"run-codex-1","session_id":"app:code1","label":"Add tests","agent":"Codex","phase":"running","background":true,"started_at_ms":250,"accepts_mid_run":true}]}}"#,
+            ),
+            &cx(Some("app:code1")),
+        );
+        client.take_outgoing();
+
+        // Addressing Antigravity CLI 2 (working, no mid-run steer).
+        client.set_composer_target(
+            "app:code1",
+            ComposerTarget::Session {
+                thread: "run-agy-2".into(),
+            },
+        );
+        let view = client.composer_target_view(Some("app:code1"), true);
+        assert_eq!(view.chip, "To: Antigravity CLI 2 · working");
+        assert_eq!(
+            view.hint.as_deref(),
+            Some("Sent when Antigravity CLI 2 finishes")
+        );
+        assert!(view.working && !view.accepts_mid_run);
+
+        // Another session finishing must NOT hijack the sticky target.
+        client.update(
+            frame(
+                r#"{"type":"event","seq":6,"at_ms":300,"session_id":"app:code1","event":{"type":"run_updated","run":{"id":"run-codex-1","session_id":"app:code1","label":"Add tests","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":250,"ended_at_ms":300,"can_continue":true}}}"#,
+            ),
+            &cx(Some("app:code1")),
+        );
+        assert_eq!(
+            client.composer_target("app:code1"),
+            ComposerTarget::Session {
+                thread: "run-agy-2".into()
+            }
+        );
+
+        // Sending addresses run-agy-2 directly.
+        assert_eq!(
+            client.submit(Some("app:code1"), "Check error paths", None, None),
+            Ok(true)
+        );
+        let sent = client.take_outgoing();
+        assert!(matches!(
+            &sent[..],
+            [(_, Command::SendMessage { in_run: Some(thread), fresh_agent_session: false, text, .. })]
+                if thread == "run-agy-2" && text == "Check error paths"
+        ));
+
+        // Switching to Codex (now idle) shows idle chip and "Reply" hint.
+        client.set_composer_target(
+            "app:code1",
+            ComposerTarget::Session {
+                thread: "run-codex-1".into(),
+            },
+        );
+        let view = client.composer_target_view(Some("app:code1"), true);
+        assert_eq!(view.chip, "To: Codex · idle");
+        assert_eq!(view.hint.as_deref(), Some("Reply"));
+
+        // When Codex resumes working with accepts_mid_run: true, hint reflects mid-run steer.
+        client.update(
+            frame(
+                r#"{"type":"event","seq":7,"at_ms":350,"session_id":"app:code1","event":{"type":"run_updated","run":{"id":"run-codex-2","session_id":"app:code1","label":"Follow up","agent":"Codex","phase":"running","background":true,"started_at_ms":350,"continues":"run-codex-1","thread":"run-codex-1","accepts_mid_run":true}}}"#,
+            ),
+            &cx(Some("app:code1")),
+        );
+        let view = client.composer_target_view(Some("app:code1"), true);
+        assert_eq!(view.chip, "To: Codex · working");
+        assert_eq!(view.hint.as_deref(), Some("Added to Codex's work"));
+        assert!(view.working && view.accepts_mid_run);
+
+        // Picking "New Codex" sends fresh_agent_session: true and adopts the new thread.
+        client.set_composer_target(
+            "app:code1",
+            ComposerTarget::NewAgent {
+                agent: "codex".into(),
+            },
+        );
+        assert_eq!(
+            client.composer_target_view(Some("app:code1"), true).chip,
+            "To: New Codex"
+        );
+        assert_eq!(
+            client.submit(Some("app:code1"), "Start a fresh task", None, None),
+            Ok(true)
+        );
+        let sent = client.take_outgoing();
+        assert!(matches!(
+            &sent[..],
+            [(_, Command::SendMessage {
+                in_run: None,
+                fresh_agent_session: true,
+                model: Some(ModelChoice::Agent { agent }),
+                ..
+            })] if agent == "codex"
+        ));
+        client.update(
+            frame(
+                r#"{"type":"event","seq":8,"at_ms":400,"session_id":"app:code1","event":{"type":"run_updated","run":{"id":"run-codex-fresh","session_id":"app:code1","label":"Fresh task","agent":"Codex","phase":"running","background":true,"started_at_ms":400,"accepts_mid_run":true}}}"#,
+            ),
+            &cx(Some("app:code1")),
+        );
+        assert_eq!(
+            client.composer_target("app:code1"),
+            ComposerTarget::Session {
+                thread: "run-codex-fresh".into()
+            }
+        );
+        assert_eq!(
+            client.composer_target_view(Some("app:code1"), true).chip,
+            "To: Codex 2 · working"
+        );
     }
 }

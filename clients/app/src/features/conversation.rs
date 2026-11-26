@@ -152,7 +152,18 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             .into_iter()
             .map(|a| Row::Approval(a.id)),
     );
-    threaded(rows, &runs)
+    // In a direct coding-agent conversation the center column IS the thread
+    // with the coding agent(s), so owner-addressed follow-ups stay inline
+    // instead of being folded into a side drawer.
+    let is_direct = matches!(
+        store.model_of(Some(session)).0,
+        aidaemon_client_protocol::ModelChoice::Agent { .. }
+    );
+    if is_direct {
+        rows
+    } else {
+        threaded(rows, &runs)
+    }
 }
 
 /// `rows` without each launch line ("Started in the background: …") that
@@ -996,8 +1007,15 @@ fn direct_agent_answer(
                 ));
             }
 
-            // Quiet action bar: Copy, Read aloud, and Steps & details.
+            // Quiet action bar: Copy, Read aloud, Reply, and Steps & details.
             let open_id = id.clone();
+            let reply_session = r.session_id.clone();
+            let reply_thread = r.thread.clone().unwrap_or_else(|| r.id.clone());
+            let can_reply = store
+                .participants()
+                .into_iter()
+                .find(|p| p.thread == reply_thread)
+                .is_some_and(|p| p.can_address());
             let mut actions = view().flex_row().items_center().gap_3().pt_1();
             if !reply_text.is_empty() {
                 let copied = reply_text.clone();
@@ -1008,6 +1026,15 @@ fn direct_agent_answer(
                         store.say("Copied the reply");
                     }))
                     .child(read_aloud(store, move || spoken.clone()));
+            }
+            if can_reply {
+                let reply_head = head.get_untracked();
+                actions = actions.child(
+                    ui::btn("Reply", Variant::Ghost, Size::Sm, move || {
+                        store.reply_to_agent(&reply_session, &reply_thread);
+                    })
+                    .accessibility_label(format!("Reply to {reply_head}")),
+                );
             }
             let details_btn = button()
                 .accessibility_label(move || {
@@ -1141,74 +1168,109 @@ fn delegated_agent_card(
                 .accessibility_elements_hidden(true),
         )
     };
+    let reply_info = computed(move || {
+        let r = run.get()?;
+        let thread = r.thread.clone().unwrap_or_else(|| r.id.clone());
+        let addressable = store
+            .participants()
+            .into_iter()
+            .find(|p| p.thread == thread)
+            .is_some_and(|p| p.can_address());
+        addressable.then_some((r.session_id, thread))
+    });
     view().w_full().px_1().child(
-        button()
+        view()
             .w_full()
-            .accessibility_label(move || {
-                Some(SharedString::from(format!(
-                    "{}, show what it did",
-                    head.get()
-                )))
+            .rounded(px(ui::radius::CONTROL))
+            .bg(colors::SURFACE)
+            .border_1()
+            .border_color(move || {
+                if selected.get() {
+                    colors::ACCENT
+                } else {
+                    colors::EDGE
+                }
             })
-            .on_press(move || store.open_run(&open))
             .child(
-                view()
+                button()
                     .w_full()
-                    .gap_1()
-                    .p_3()
-                    .rounded(px(ui::radius::CONTROL))
-                    .bg(colors::SURFACE)
-                    .border_1()
-                    .border_color(move || {
-                        if selected.get() {
-                            colors::ACCENT
-                        } else {
-                            colors::EDGE
-                        }
+                    .accessibility_label(move || {
+                        Some(SharedString::from(format!(
+                            "{}, show what it did",
+                            head.get()
+                        )))
                     })
+                    .on_press(move || store.open_run(&open))
                     .child(
                         view()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
+                            .w_full()
+                            .gap_1()
+                            .p_3()
                             .child(
-                                text(move || head.get())
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .number_of_lines(1)
-                                    .text_size(px(ui::fit::small()))
-                                    .font_weight(FontWeight::SEMIBOLD),
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
+                                    .child(
+                                        text(move || head.get())
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .number_of_lines(1)
+                                            .text_size(px(ui::fit::small()))
+                                            .font_weight(FontWeight::SEMIBOLD),
+                                    )
+                                    .child(
+                                        text(move || {
+                                            run.with(|r| {
+                                                r.as_ref()
+                                                    .and_then(|r| {
+                                                        r.ended_at_ms
+                                                            .map(|end| (r.started_at_ms, end))
+                                                    })
+                                                    .map(|(start, end)| {
+                                                        ui::time::span(
+                                                            end.saturating_sub(start) / 1000,
+                                                        )
+                                                    })
+                                                    .unwrap_or_default()
+                                            })
+                                        })
+                                        .tabular_nums()
+                                        .text_size(px(type_scale::XS))
+                                        .text_color(colors::FAINT),
+                                    ),
                             )
                             .child(
-                                text(move || {
-                                    run.with(|r| {
-                                        r.as_ref()
-                                            .and_then(|r| {
-                                                r.ended_at_ms.map(|end| (r.started_at_ms, end))
-                                            })
-                                            .map(|(start, end)| {
-                                                ui::time::span(end.saturating_sub(start) / 1000)
-                                            })
-                                            .unwrap_or_default()
-                                    })
-                                })
-                                .tabular_nums()
-                                .text_size(px(type_scale::XS))
-                                .text_color(colors::FAINT),
-                            ),
-                    )
-                    .child(
-                        text(move || task.get())
-                            .number_of_lines(1)
-                            .text_size(px(type_scale::XS))
-                            .text_color(colors::FAINT),
-                    )
-                    .child(dynamic(move || {
-                        let _ = run.get();
-                        Some(untracked(body))
-                    })),
-            ),
+                                text(move || task.get())
+                                    .number_of_lines(1)
+                                    .text_size(px(type_scale::XS))
+                                    .text_color(colors::FAINT),
+                            )
+                            .child(dynamic(move || {
+                                let _ = run.get();
+                                Some(untracked(body))
+                            })),
+                    ),
+            )
+            .child(dynamic(move || {
+                let (reply_session, reply_thread) = reply_info.get()?;
+                let reply_head = head.get();
+                Some(untracked(move || {
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .px_2()
+                        .pb_2()
+                        .child(
+                            ui::btn("Reply", Variant::Ghost, Size::Sm, move || {
+                                store.reply_to_agent(&reply_session, &reply_thread);
+                            })
+                            .accessibility_label(format!("Reply to {reply_head}")),
+                        )
+                }))
+            })),
     )
 }
 
@@ -2833,6 +2895,17 @@ fn composer(store: Store, session: Option<String>) -> View {
         let session = session.clone();
         computed(move || session.as_deref().is_some_and(|id| store.is_running(id)))
     };
+    let is_code = {
+        let session = session.clone();
+        computed(move || match &session {
+            Some(id) => store.is_coding(id),
+            None => store.new_is_code(),
+        })
+    };
+    let target_view = {
+        let session = session.clone();
+        computed(move || store.composer_target_view(session.as_deref(), is_code.get()))
+    };
     let ongoing = session.is_some();
     let field = element_ref();
     let dragging = signal(false);
@@ -2854,7 +2927,15 @@ fn composer(store: Store, session: Option<String>) -> View {
             ..KeyOptions::default()
         },
         move |_| {
-            if running.get_untracked() {
+            let tv = target_view.get_untracked();
+            if tv.working {
+                steer_pending.replace(false);
+                if tv.accepts_mid_run {
+                    store.submit_placed(Some(MidRun::Queue));
+                } else {
+                    store.submit();
+                }
+            } else if running.get_untracked() {
                 // The field's own submit (see `on_submit`) does not send it.
                 steer_pending.replace(false);
                 store.submit_placed(Some(other_placement(store)));
@@ -3017,7 +3098,21 @@ fn composer(store: Store, session: Option<String>) -> View {
                             SubmitBehavior::Submit
                         })
                         .on_submit(move |_: &str| {
-                            if running.get_untracked() {
+                            let tv = target_view.get_untracked();
+                            if tv.working {
+                                // A browser's field submits on ⌘↩ too, before
+                                // the Queue shortcut hears it: wait a moment
+                                // for the shortcut to claim it.
+                                steer_pending.replace(true);
+                                owner.run(|| {
+                                    spawn(async move {
+                                        timer(std::time::Duration::from_millis(40)).await;
+                                        if steer_pending.replace(false) {
+                                            store.submit();
+                                        }
+                                    })
+                                });
+                            } else if running.get_untracked() {
                                 // A browser's field submits on ⌘↩ too, before
                                 // the Queue shortcut hears it: wait a moment
                                 // for the shortcut to claim it.
@@ -3044,25 +3139,30 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 "Choose a project first".to_owned()
                             }
                             Felt::Online => {
-                                // The field says what to write here.
+                                // The field says what to write here (and, when
+                                // addressing a coding-agent session, what
+                                // sending will do).
                                 let files = store.draft_files();
+                                let tv = target_view.get();
                                 let ask = if files.iter().any(|f| f.marked_from.is_some()) {
-                                    "Say what to do with the marked part"
+                                    "Say what to do with the marked part".to_owned()
                                 } else if !files.is_empty() {
-                                    "Say what to do with it, or just send"
+                                    "Say what to do with it, or just send".to_owned()
+                                } else if let Some(hint) = tv.hint {
+                                    hint
                                 } else if running.get() {
-                                    "Add to the work or queue what's next"
+                                    "Add to the work or queue what's next".to_owned()
                                 } else if ongoing {
-                                    "Reply"
+                                    "Reply".to_owned()
                                 } else if store.new_is_code() {
-                                    "Describe the change, fix or task"
+                                    "Describe the change, fix or task".to_owned()
                                 } else {
-                                    "Ask anything, or tell it what to do"
+                                    "Ask anything, or tell it what to do".to_owned()
                                 };
                                 // A phone's field is narrow: the hint about
                                 // commands is the list that `/` brings.
                                 if touch {
-                                    ask.to_owned()
+                                    ask
                                 } else {
                                     format!("{ask} (/ for commands)")
                                 }
@@ -3098,12 +3198,16 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .gap_1()
                         .child(attach_button(store, terminal))
                         .child(dictation(store, terminal))
-                        // Model and effort, in the same row; a phone's row
-                        // has no room for them beside the working hint.
-                        .child(when(move || !(touch && running.get()), {
-                            let session = session.clone();
-                            move || super::model_picker::model_picker(store, session.clone())
-                        }))
+                        // Recipient / model chip: keep visible on phones too
+                        // whenever addressing a session so the owner always
+                        // sees who gets their message.
+                        .child(when(
+                            move || !(touch && running.get() && !target_view.get().shows_recipient),
+                            {
+                                let session = session.clone();
+                                move || super::model_picker::model_picker(store, session.clone())
+                            },
+                        ))
                         .child(when(
                             move || chat_glyph.is_some() && !running.get() && !terminal,
                             move || {
@@ -3114,39 +3218,52 @@ fn composer(store: Store, session: Option<String>) -> View {
                             },
                         ))
                         .child(
-                            text(move || match (running.get(), touch) {
-                                // A phone's buttons say it: Stop while the
-                                // box is empty; Send and Queue once typed.
-                                (true, true) => String::new(),
-                                (true, false) => {
-                                    let (enter, other) = if store.enter_queues() {
-                                        ("after", "now")
-                                    } else {
-                                        ("now", "after")
-                                    };
-                                    let stops = if terminal {
-                                        format!("Esc or {} stops", key_label("mod+c"))
-                                    } else {
-                                        "Esc stops".to_owned()
-                                    };
-                                    format!(
-                                        "Enter sends {enter} · {} {other} · {stops}",
-                                        key_label("mod+enter")
-                                    )
+                            text(move || {
+                                let tv = target_view.get();
+                                match (running.get(), touch) {
+                                    // A phone's buttons say it: Stop while the
+                                    // box is empty; Send and Queue once typed.
+                                    (true, true) => String::new(),
+                                    (true, false) if tv.working && !tv.accepts_mid_run => {
+                                        let stops = if terminal {
+                                            format!("Esc or {} stops", key_label("mod+c"))
+                                        } else {
+                                            "Esc stops".to_owned()
+                                        };
+                                        format!("Enter queues after it finishes · {stops}")
+                                    }
+                                    (true, false) => {
+                                        let (enter, other) = if store.enter_queues() {
+                                            ("after", "now")
+                                        } else {
+                                            ("now", "after")
+                                        };
+                                        let stops = if terminal {
+                                            format!("Esc or {} stops", key_label("mod+c"))
+                                        } else {
+                                            "Esc stops".to_owned()
+                                        };
+                                        format!(
+                                            "Enter sends {enter} · {} {other} · {stops}",
+                                            key_label("mod+enter")
+                                        )
+                                    }
+                                    (false, true) => chat_note.clone().unwrap_or_default(),
+                                    // Terminals rarely send Shift+Enter; Alt+Enter
+                                    // works in all of them.
+                                    (false, false) if terminal => {
+                                        format!(
+                                            "Enter to send · {} for a new line",
+                                            key_label("alt+enter")
+                                        )
+                                    }
+                                    (false, false) => match &chat_note {
+                                        Some(note) => format!("{note} · Enter to send"),
+                                        None => {
+                                            "Enter to send · Shift+Enter for a new line".to_owned()
+                                        }
+                                    },
                                 }
-                                (false, true) => chat_note.clone().unwrap_or_default(),
-                                // Terminals rarely send Shift+Enter; Alt+Enter
-                                // works in all of them.
-                                (false, false) if terminal => {
-                                    format!(
-                                        "Enter to send · {} for a new line",
-                                        key_label("alt+enter")
-                                    )
-                                }
-                                (false, false) => match &chat_note {
-                                    Some(note) => format!("{note} · Enter to send"),
-                                    None => "Enter to send · Shift+Enter for a new line".to_owned(),
-                                },
                             })
                             .flex_1()
                             .px(px(8.0))
@@ -3154,12 +3271,19 @@ fn composer(store: Store, session: Option<String>) -> View {
                             .text_color(colors::FAINT),
                         )
                         .child(when(
-                            // Once there is something to send.
-                            move || running.get() && can_send(),
+                            // Once there is something to send (hidden when
+                            // addressing a working agent that always queues).
+                            move || {
+                                let tv = target_view.get();
+                                can_send()
+                                    && ((tv.working && tv.accepts_mid_run)
+                                        || (!tv.working && running.get()))
+                            },
                             move || {
                                 // The other way: Queue, or Now when Enter queues.
                                 view().child(dynamic(move || {
-                                    let queues = store.enter_queues();
+                                    let tv = target_view.get();
+                                    let queues = !tv.working && store.enter_queues();
                                     Some(untracked(move || {
                                         let (label, name) = if queues {
                                             ("Now", "Now: the running work reads it")
@@ -3167,7 +3291,11 @@ fn composer(store: Store, session: Option<String>) -> View {
                                             ("Queue", "Queue: send after the running work")
                                         };
                                         ui::btn(label, Variant::Ghost, ui::Size::Sm, move || {
-                                            store.submit_placed(Some(other_placement(store)))
+                                            if tv.working {
+                                                store.submit_placed(Some(MidRun::Queue));
+                                            } else {
+                                                store.submit_placed(Some(other_placement(store)));
+                                            }
                                         })
                                         .disabled(move || !can_send())
                                         .accessibility_label(name)
@@ -3221,7 +3349,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                                         haptic(nsh_core::Haptic::Impact(
                                             nsh_core::HapticImpact::Light,
                                         ));
-                                        if running.get_untracked() {
+                                        if target_view.get_untracked().working {
+                                            store.submit();
+                                        } else if running.get_untracked() {
                                             store.submit_placed(Some(enter_placement(store)));
                                         } else {
                                             store.submit();

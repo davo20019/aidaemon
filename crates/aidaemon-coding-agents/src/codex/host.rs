@@ -44,11 +44,14 @@
 use crate::jsonrpc::{error_line as error_reply_line, reply_line, request_line};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::process::ChildStdin;
+use tokio::sync::{Notify, oneshot};
 
 use crate::stdin::Stdin;
 use crate::{ActionJudge, AgentAction, AgentHost, HostAnswers, HostStarter, Verdict};
@@ -76,6 +79,14 @@ const INITIALIZE_ID: u64 = 1;
 /// `thread/start`, or `thread/resume` for a run that continues a thread.
 const THREAD_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
+/// Starting JSON-RPC request id for `turn/steer` mid-run notes (distinct from
+/// handshake/interrupt ids).
+const STEER_ID_BASE: u64 = 10_000;
+/// Maximum wait for `turn/started` when a mid-run note arrives while the run
+/// is still completing its handshake.
+const STEER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum wait for Codex's JSON-RPC reply to a `turn/steer` request.
+const STEER_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The launch settings a resumed thread would otherwise take back from its
 /// last run (live probe, 0.170.0: a thread last run with full access came
@@ -413,6 +424,17 @@ struct HostState {
     completed: Option<bool>,
     /// The last message it reported (an `agentMessage` item completed).
     last_message: Option<String>,
+    /// Pending `turn/steer` requests waiting on their JSON-RPC response,
+    /// keyed by request id.
+    pending_steers: HashMap<u64, oneshot::Sender<Result<(), String>>>,
+}
+
+impl HostState {
+    fn fail_pending_steers(&mut self, reason: &str) {
+        for (_, tx) in self.pending_steers.drain() {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
 }
 
 /// Starts a [`CodexHost`].
@@ -472,6 +494,8 @@ pub struct CodexHost {
     thread: Arc<ThreadRequest>,
     output_schema: Option<Arc<Value>>,
     state: Arc<Mutex<HostState>>,
+    next_steer_id: Arc<AtomicU64>,
+    turn_ready: Arc<Notify>,
 }
 
 impl CodexHost {
@@ -491,6 +515,8 @@ impl CodexHost {
             thread: Arc::default(),
             output_schema: None,
             state: Arc::default(),
+            next_steer_id: Arc::new(AtomicU64::new(STEER_ID_BASE)),
+            turn_ready: Arc::new(Notify::new()),
         }
     }
 
@@ -534,6 +560,30 @@ impl CodexHost {
     }
 
     async fn on_response(&self, id: &Value, message: &Value) -> Vec<String> {
+        // Resolve any pending `turn/steer` request first: a rejected or late
+        // steer response (any id >= STEER_ID_BASE) affects only that note and
+        // must never abort the active Codex turn.
+        if let Some(req_id) = id.as_u64()
+            && req_id >= STEER_ID_BASE
+        {
+            let waiter = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|mut state| state.pending_steers.remove(&req_id));
+            if let Some(tx) = waiter {
+                let outcome = match message.get("error") {
+                    Some(error) => Err(error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex refused the mid-run note")
+                        .to_string()),
+                    None => Ok(()),
+                };
+                let _ = tx.send(outcome);
+            }
+            return Vec::new();
+        }
         if let Some(error) = message.get("error") {
             let text = error
                 .get("message")
@@ -541,7 +591,9 @@ impl CodexHost {
                 .unwrap_or("Codex refused the request");
             if let Ok(mut state) = self.state.lock() {
                 state.completed = Some(false);
+                state.fail_pending_steers(text);
             }
+            self.turn_ready.notify_waiters();
             self.stdin.close().await;
             return vec![json!({"type": "error", "message": text}).to_string()];
         }
@@ -590,6 +642,7 @@ impl CodexHost {
                 {
                     state.turn_id = Some(turn_id.to_string());
                 }
+                self.turn_ready.notify_waiters();
             }
             _ => {}
         }
@@ -622,6 +675,7 @@ impl CodexHost {
                 {
                     state.turn_id = Some(id);
                 }
+                self.turn_ready.notify_waiters();
                 event(json!({"type": "turn.started"}))
             }
             "item/started" | "item/completed" => {
@@ -663,11 +717,13 @@ impl CodexHost {
                         return Vec::new();
                     };
                     state.completed = Some(completed);
+                    state.fail_pending_steers("Codex's turn ended before the note was accepted");
                     let final_message = final_message(params)
                         .or_else(|| state.last_message.clone())
                         .unwrap_or_default();
                     (state.usage.clone(), final_message)
                 };
+                self.turn_ready.notify_waiters();
                 // Its turn is over: closing stdin lets it exit.
                 self.stdin.close().await;
                 if completed {
@@ -859,6 +915,76 @@ impl AgentHost for CodexHost {
             .is_ok_and(|state| state.completed == Some(true))
     }
 
+    fn accepts_mid_run(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.completed.is_none())
+    }
+
+    async fn send_note(&self, note: &str) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + STEER_READY_TIMEOUT;
+        let (thread_id, turn_id) = loop {
+            let notified = self.turn_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| "Codex host state is unavailable".to_string())?;
+                if state.completed.is_some() {
+                    return Err("Codex's turn has already finished".to_string());
+                }
+                if let (Some(thread_id), Some(turn_id)) =
+                    (state.thread_id.clone(), state.turn_id.clone())
+                {
+                    break (thread_id, turn_id);
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Err("Codex's turn did not become ready for mid-run notes".to_string());
+            }
+        };
+
+        let id = self.next_steer_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Codex host state is unavailable".to_string())?;
+            if state.completed.is_some() {
+                return Err("Codex's turn has already finished".to_string());
+            }
+            state.pending_steers.insert(id, tx);
+        }
+        let line = request_line(
+            id,
+            "turn/steer",
+            json!({
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{"type": "text", "text": note}],
+            }),
+        );
+        if !self.stdin.try_write(&line).await {
+            if let Ok(mut state) = self.state.lock() {
+                state.pending_steers.remove(&id);
+            }
+            return Err("Codex's input stream is closed".to_string());
+        }
+        match tokio::time::timeout(STEER_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("Codex exited before acknowledging the mid-run note".to_string()),
+            Err(_) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.pending_steers.remove(&id);
+                }
+                Err("Codex did not acknowledge the mid-run note in time".to_string())
+            }
+        }
+    }
+
     async fn interrupt(&self) {
         let ids = self
             .state
@@ -877,6 +1003,13 @@ impl AgentHost for CodexHost {
     }
 
     async fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.completed.is_none() {
+                state.completed = Some(false);
+            }
+            state.fail_pending_steers("Codex host closed");
+        }
+        self.turn_ready.notify_waiters();
         self.stdin.close().await;
     }
 }
@@ -1524,6 +1657,84 @@ mod tests {
         assert_eq!(cancel["params"]["threadId"], "thr_synthetic");
         assert_eq!(cancel["params"]["turnId"], "turn_synthetic");
         host.close().await;
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_note_uses_turn_steer_and_handles_rejection_without_aborting_turn() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = CodexHost::new(
+            child.stdin.take().unwrap(),
+            Arc::new(crate::AllowAll),
+            None,
+            "do work",
+            Asks::BeyondSandbox,
+        );
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(host.accepts_mid_run());
+        host.on_line(r#"{"id":2,"result":{"thread":{"id":"thr_synthetic"}}}"#)
+            .await;
+        let _turn_start = sent.next_line().await.unwrap().unwrap();
+        host.on_line(r#"{"id":3,"result":{"turn":{"id":"turn_synthetic"}}}"#)
+            .await;
+
+        // Accepted steer.
+        let steer_host = host.clone();
+        let steer_task =
+            tokio::spawn(async move { steer_host.send_note("also check edge cases").await });
+        let steer_line: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(steer_line["method"], "turn/steer");
+        assert_eq!(steer_line["params"]["threadId"], "thr_synthetic");
+        assert_eq!(steer_line["params"]["expectedTurnId"], "turn_synthetic");
+        assert_eq!(steer_line["params"]["input"][0]["type"], "text");
+        assert_eq!(
+            steer_line["params"]["input"][0]["text"],
+            "also check edge cases"
+        );
+        let steer_id = steer_line["id"].as_u64().unwrap();
+        host.on_line(&json!({"id": steer_id, "result": {}}).to_string())
+            .await;
+        steer_task.await.unwrap().expect("steer accepted");
+        assert!(host.accepts_mid_run());
+
+        // Rejected steer leaves the active turn alive and returns Err.
+        let steer_host2 = host.clone();
+        let steer_task2 = tokio::spawn(async move { steer_host2.send_note("bad steer").await });
+        let steer_line2: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        let steer_id2 = steer_line2["id"].as_u64().unwrap();
+        let out = host
+            .on_line(
+                &json!({"id": steer_id2, "error": {"code": -32000, "message": "turn not steerable"}})
+                    .to_string(),
+            )
+            .await;
+        assert!(
+            out.is_empty(),
+            "rejected steer must not emit fatal turn error"
+        );
+        let err = steer_task2.await.unwrap().unwrap_err();
+        assert!(err.contains("turn not steerable"), "{err}");
+        assert!(
+            host.accepts_mid_run(),
+            "active turn remains alive after a rejected steer"
+        );
+
+        // After turn completion, accepts_mid_run is false and send_note fails.
+        host.on_line(
+            r#"{"method":"turn/completed","params":{"turn":{"status":"completed","items":[]}}}"#,
+        )
+        .await;
+        assert!(!host.accepts_mid_run());
+        assert!(host.send_note("too late").await.is_err());
         let _ = child.wait().await;
     }
 }

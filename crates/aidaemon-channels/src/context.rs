@@ -110,6 +110,10 @@ pub struct ChannelContext {
     /// showed the thread, from its typed field; `None` for a message in the
     /// conversation itself.
     pub in_run: Option<RunThread>,
+    /// Start a fresh coding-agent session instead of continuing an earlier
+    /// one of the same kind (set when the owner explicitly picks `"New <Agent>"`
+    /// in the composer).
+    pub fresh_agent_session: bool,
     /// The coding agent sessions working in this conversation, as the
     /// owner sees them (a client that shows them names them); empty where
     /// none are known.
@@ -149,11 +153,14 @@ pub enum AgentState {
 /// it named it, with what its record says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunThread {
-    /// The run's id.
+    /// The run or thread id.
     pub run: String,
     /// The folder its agent worked in, from the run's record: where a
     /// follow-up goes on, and the only place it may write.
     pub working_dir: Option<String>,
+    /// Queue after the active run rather than steering mid-run, even when
+    /// the live host accepts mid-run notes (set when the owner chose Queue).
+    pub queue_only: bool,
 }
 
 impl ChannelContext {
@@ -173,6 +180,7 @@ impl ChannelContext {
             workspace_grant: None,
             trusted: false,
             in_run: None,
+            fresh_agent_session: false,
             agents: Vec::new(),
         }
     }
@@ -192,6 +200,7 @@ impl ChannelContext {
             workspace_grant: None,
             trusted: false,
             in_run: None,
+            fresh_agent_session: false,
             agents: Vec::new(),
         }
     }
@@ -211,6 +220,7 @@ impl ChannelContext {
             workspace_grant: None,
             trusted: true,
             in_run: None,
+            fresh_agent_session: false,
             agents: Vec::new(),
         }
     }
@@ -280,6 +290,7 @@ mod workspace_grant_tests {
             workspace_grant: Some(workspace_grant),
             trusted: false,
             in_run: None,
+            fresh_agent_session: false,
             agents: Vec::new(),
         }
     }

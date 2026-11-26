@@ -1031,6 +1031,7 @@ impl ClientGateway {
                 model,
                 effort,
                 in_run,
+                fresh_agent_session,
             } => {
                 let placement = match mid_run {
                     Some(MidRun::Steer) => Some(MidRunPlacement::Steer),
@@ -1047,6 +1048,7 @@ impl ClientGateway {
                     project_id,
                     (model, effort),
                     in_run,
+                    fresh_agent_session,
                 )
                 .await
             }
@@ -1645,6 +1647,7 @@ impl ClientGateway {
                     None,
                     (None, None),
                     None,
+                    false,
                 )
                 .await
             }
@@ -2267,6 +2270,7 @@ impl ClientGateway {
             Option<aidaemon_client_protocol::Effort>,
         ),
         in_run: Option<String>,
+        fresh_agent_session: bool,
     ) -> Result<CommandResult, ProtocolError> {
         let files = self.message_files(&attachments)?;
         if text.trim().is_empty() && files.is_empty() {
@@ -2370,6 +2374,7 @@ impl ClientGateway {
         if !new_session {
             channel_ctx.agents = self.conversation_agents(&session_id).await;
         }
+        channel_ctx.fresh_agent_session = fresh_agent_session;
         channel_ctx.in_run = match in_run.filter(|_| !new_session) {
             Some(run) => {
                 // Where its agent worked, from the run's record: the
@@ -2381,7 +2386,11 @@ impl ClientGateway {
                         None
                     }
                 };
-                Some(aidaemon_channels::context::RunThread { run, working_dir })
+                Some(aidaemon_channels::context::RunThread {
+                    run,
+                    working_dir,
+                    queue_only: placement == Some(MidRunPlacement::Queue),
+                })
             }
             None => None,
         };
@@ -2647,6 +2656,7 @@ impl ClientGateway {
                     continues: run.continues.as_deref(),
                     thread: run.thread.as_deref(),
                     keeps_session: run.keeps_session,
+                    accepts_mid_run: run.accepts_mid_run,
                     result: run.result.as_ref(),
                     asked: run.asked.as_ref(),
                     started_at: run.started_at,
@@ -2733,6 +2743,7 @@ impl ClientGateway {
                         continues: run.continues.as_deref(),
                         thread: run.thread.as_deref(),
                         keeps_session: run.keeps_session,
+                        accepts_mid_run: run.accepts_mid_run,
                         result: run.result.as_ref(),
                         asked: run.asked.as_ref(),
                         started_at: run.started_at,

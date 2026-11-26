@@ -284,6 +284,7 @@ async fn session_static_roster_limits_scoped_guest_to_granted_file_tools() {
         workspace_grant: Some(grant),
         trusted: false,
         in_run: None,
+        fresh_agent_session: false,
         agents: Vec::new(),
     };
 

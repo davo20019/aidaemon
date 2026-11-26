@@ -1,10 +1,11 @@
-//! The composer's model and effort: what this conversation (or the next
-//! new one) answers with. Only the app's own conversations show it; a chat
-//! bot's conversations answer with that chat's model. A conversation on
-//! code picks who does the work instead: AIDaemon, or a coding agent that
-//! takes each message straight, with no model call.
+//! The composer's recipient, model and effort: who this message goes to
+//! (a specific coding-agent session with its live state, a fresh coding-agent
+//! session, or AIDaemon with its model and effort). Only the app's own
+//! conversations show it; a chat bot's conversations answer with that chat's
+//! model.
 
-use aidaemon_client_protocol::{Effort, ModelChoice, ModelOptions};
+use aidaemon_client_core::ComposerTarget;
+use aidaemon_client_protocol::{Effort, ModelChoice, ModelOptions, RunPhase};
 use nsh_core::prelude::*;
 
 use crate::store::{Read, Store};
@@ -37,15 +38,6 @@ fn decode(value: &str) -> ModelChoice {
 
 /// The list value's mark for a coding agent (a provider id never has a tab).
 const AGENT: &str = "agent";
-
-/// The name the picker shows for coding agent `id` (the id when unknown).
-fn agent_name(options: &ModelOptions, id: &str) -> String {
-    options
-        .agents
-        .iter()
-        .find(|agent| agent.id == id)
-        .map_or_else(|| id.to_owned(), |agent| agent.name.clone())
-}
 
 fn effort_value(effort: Effort) -> &'static str {
     match effort {
@@ -98,15 +90,14 @@ fn model_items(options: &ModelOptions) -> Vec<(String, String)> {
     items
 }
 
-/// One chip in the composer's row: the model (Auto or the one pinned) and
-/// the effort when it is not Auto. A press opens one picker with the
-/// models (their provider under each when there are several) and, for a
-/// model that takes one, the efforts, each with what is in effect checked.
+/// One chip in the composer's row: who the message goes to (a specific agent
+/// session with its state, a new agent session, or AIDaemon with its model
+/// and effort).
 pub fn model_picker(store: Store, session: Option<String>) -> View {
     if !untracked(|| store.can_pick_model(session.as_deref())) {
         return view();
     }
-    // On code, who does the work: AIDaemon or a coding agent.
+    // On code, who does the work: a session, a new coding agent, or AIDaemon.
     let code = {
         let session = session.clone();
         computed(move || match &session {
@@ -147,46 +138,38 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
             }
         });
     }
-    let label = computed(move || {
-        let (model, effort) = current.get();
-        let is_code = code.get();
-        let model = match model {
-            ModelChoice::Pinned { model, .. } if is_code => format!("AIDaemon · {model}"),
-            ModelChoice::Pinned { model, .. } => model,
-            ModelChoice::Agent { agent } => match store.model_options() {
-                Read::Ready(options) => agent_name(&options, &agent),
-                _ => agent,
-            },
-            _ if is_code => "AIDaemon".to_owned(),
-            _ => "Auto".to_owned(),
-        };
-        match effort {
-            Effort::Auto => model,
-            effort => format!("{model} · {}", effort_word(effort)),
+    let target_view = {
+        let session = session.clone();
+        computed(move || store.composer_target_view(session.as_deref(), code.get()))
+    };
+    let label = computed(move || target_view.get().chip);
+    let shown = computed(move || {
+        if target_view.get().shows_recipient {
+            return true;
         }
-    });
-    let shown = computed(move || match store.model_options() {
-        Read::Ready(options) if code.get() => {
-            !options.agents.is_empty()
-                || matches!(current.get().0, ModelChoice::Agent { .. })
-                || options
+        match store.model_options() {
+            Read::Ready(options) if code.get() => {
+                !options.agents.is_empty()
+                    || matches!(current.get().0, ModelChoice::Agent { .. })
+                    || options
+                        .providers
+                        .iter()
+                        .map(|p| p.models.len())
+                        .sum::<usize>()
+                        >= 2
+                    || !store.efforts_of(&current.get().0).is_empty()
+            }
+            Read::Ready(options) => {
+                options
                     .providers
                     .iter()
                     .map(|p| p.models.len())
                     .sum::<usize>()
                     >= 2
-                || !store.efforts_of(&current.get().0).is_empty()
+                    || !store.efforts_of(&current.get().0).is_empty()
+            }
+            _ => false,
         }
-        Read::Ready(options) => {
-            options
-                .providers
-                .iter()
-                .map(|p| p.models.len())
-                .sum::<usize>()
-                >= 2
-                || !store.efforts_of(&current.get().0).is_empty()
-        }
-        _ => false,
     });
     let chip = view()
         .h(px(if ui::touch() { 44.0 } else { 26.0 }))
@@ -197,7 +180,7 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         .child(
             text(move || label.get())
                 .number_of_lines(1)
-                .max_w(px(180.0))
+                .max_w(px(240.0))
                 .text_size(px(ui::type_scale::XS))
                 .text_color(ui::colors::MUTED),
         )
@@ -211,22 +194,66 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         move || shown.get(),
         move || {
             let session = pick_session.clone();
+            let has_session = session.is_some();
             ui::pick_list(
                 ui::Picker {
-                    title: if code.get_untracked() {
-                        "Who does the work"
+                    title: if target_view.get_untracked().shows_recipient {
+                        "Send to"
                     } else {
                         "Model and effort"
                     },
                     items: move || {
-                        if code.get_untracked() {
-                            code_choices(store, current.get_untracked())
+                        let view = target_view.get_untracked();
+                        if view.shows_recipient {
+                            recipient_choices(
+                                store,
+                                has_session,
+                                view.target,
+                                current.get_untracked(),
+                            )
                         } else {
                             choices(store, current.get_untracked())
                         }
                     },
                     pick: move |id: String| {
-                        if let Some(model) = id.strip_prefix("model:") {
+                        if let Some(thread) = id.strip_prefix("session:") {
+                            if let Some(session_id) = session.as_deref() {
+                                store.set_composer_target(
+                                    session_id,
+                                    ComposerTarget::Session {
+                                        thread: thread.to_owned(),
+                                    },
+                                );
+                            }
+                        } else if let Some(agent) = id.strip_prefix("new_agent:") {
+                            let agent_model = ModelChoice::Agent {
+                                agent: agent.to_owned(),
+                            };
+                            if code.get_untracked() {
+                                store.remember_code_worker(&agent_model);
+                            }
+                            match session.as_deref() {
+                                Some(session_id) => store.set_composer_target(
+                                    session_id,
+                                    ComposerTarget::NewAgent {
+                                        agent: agent.to_owned(),
+                                    },
+                                ),
+                                None => store.set_session_model(None, Some(agent_model), None),
+                            }
+                        } else if id == "aidaemon" {
+                            if code.get_untracked() {
+                                store.remember_code_worker(&ModelChoice::Auto);
+                            }
+                            match session.as_deref() {
+                                Some(session_id) => {
+                                    store.set_composer_target(session_id, ComposerTarget::Aidaemon)
+                                }
+                                None => {
+                                    store.set_session_model(None, Some(ModelChoice::Auto), None)
+                                }
+                            }
+                        } else if let Some(model) = id.strip_prefix("model:") {
                             let model = decode(model);
                             if code.get_untracked() {
                                 store.remember_code_worker(&model);
@@ -243,10 +270,12 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
                     action: None,
                 },
                 move || {
-                    if code.get() {
-                        format!("Who does the work: {}", label.get())
+                    let current_label = label.get();
+                    if target_view.get().shows_recipient {
+                        let clean = current_label.strip_prefix("To: ").unwrap_or(&current_label);
+                        format!("Send to: {clean}")
                     } else {
-                        format!("Model and effort: {}", label.get())
+                        format!("Model and effort: {current_label}")
                     }
                 },
                 chip.clone(),
@@ -256,22 +285,70 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
     ))
 }
 
-fn effort_word(effort: Effort) -> &'static str {
-    match effort {
-        Effort::Low => "Low",
-        Effort::Medium => "Medium",
-        Effort::High => "High",
-        _ => "Auto",
+/// Recipient picker for conversations with coding agents (or Code mode):
+/// 1. Every addressable session in the conversation, working/waiting first;
+/// 2. `"New <Agent>"` for each ready coding agent;
+/// 3. AIDaemon (plus its model & effort options when AIDaemon is selected).
+fn recipient_choices(
+    store: Store,
+    has_session: bool,
+    target: ComposerTarget,
+    (model, effort): (ModelChoice, Effort),
+) -> Vec<ui::PickItem> {
+    let mut items = Vec::new();
+    if has_session {
+        for p in untracked(|| store.participants())
+            .into_iter()
+            .filter(|p| p.can_address())
+        {
+            let state = if p.waiting {
+                "needs approval".to_owned()
+            } else if p.working() {
+                if !p.latest.step.is_empty() {
+                    format!("working · {}", p.latest.step)
+                } else {
+                    "working".to_owned()
+                }
+            } else {
+                match p.latest.phase {
+                    RunPhase::Failed => "idle · last run failed".to_owned(),
+                    RunPhase::Stopped => "idle · stopped".to_owned(),
+                    _ if p.runs > 1 => format!("idle · {} runs", p.runs),
+                    _ => "idle".to_owned(),
+                }
+            };
+            let checked =
+                matches!(&target, ComposerTarget::Session { thread } if *thread == p.thread);
+            items.push(
+                ui::PickItem::new(format!("session:{}", p.thread), p.title())
+                    .detail(state)
+                    .group("Sessions")
+                    .checked(checked),
+            );
+        }
     }
-}
-
-/// In a code conversation: the `Agent` group (AIDaemon and each ready coding
-/// agent), plus AIDaemon's `Model` and `Effort` groups whenever AIDaemon is
-/// selected so the owner can still pin a model or effort for AIDaemon in Code.
-fn code_choices(store: Store, (model, effort): (ModelChoice, Effort)) -> Vec<ui::PickItem> {
-    let is_agent = matches!(model, ModelChoice::Agent { .. });
-    let mut items = agent_choices(store, model.clone());
-    if !is_agent {
+    if let Read::Ready(options) = untracked(|| store.model_options()) {
+        for agent in &options.agents {
+            let checked =
+                matches!(&target, ComposerTarget::NewAgent { agent: id } if *id == agent.id);
+            items.push(
+                ui::PickItem::new(
+                    format!("new_agent:{}", agent.id),
+                    format!("New {}", agent.name),
+                )
+                .detail("Start a fresh session")
+                .group("New session")
+                .checked(checked),
+            );
+        }
+    }
+    items.push(
+        ui::PickItem::new("aidaemon", "AIDaemon")
+            .detail("Plans and works with its own model")
+            .group("Assistant")
+            .checked(target == ComposerTarget::Aidaemon),
+    );
+    if target == ComposerTarget::Aidaemon {
         let model_and_effort = choices(store, (model, effort));
         let has_models = matches!(
             untracked(|| store.model_options()),
@@ -289,32 +366,6 @@ fn code_choices(store: Store, (model, effort): (ModelChoice, Effort)) -> Vec<ui:
                 .any(|item| item.id.starts_with("effort:"));
         if has_models || has_efforts {
             items.extend(model_and_effort);
-        }
-    }
-    items
-}
-
-/// AIDaemon (its own model, picked for each message), then each coding
-/// agent ready on the daemon's computer.
-fn agent_choices(store: Store, model: ModelChoice) -> Vec<ui::PickItem> {
-    let mut items = vec![
-        ui::PickItem::new("model:auto", "AIDaemon")
-            .detail("Plans and works with its own model")
-            .group("Agent")
-            .checked(!matches!(model, ModelChoice::Agent { .. })),
-    ];
-    if let Read::Ready(options) = untracked(|| store.model_options()) {
-        let current = encode(&model);
-        for agent in &options.agents {
-            let value = encode(&ModelChoice::Agent {
-                agent: agent.id.clone(),
-            });
-            items.push(
-                ui::PickItem::new(format!("model:{value}"), agent.name.clone())
-                    .detail("Each message goes straight to it")
-                    .group("Agent")
-                    .checked(value == current),
-            );
         }
     }
     items

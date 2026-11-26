@@ -256,6 +256,27 @@ impl crate::tools::traits::DynamicCliAgentStore for TestStore {
         }
         Ok(None)
     }
+
+    async fn latest_cli_agent_run_in_thread(
+        &self,
+        session_id: &str,
+        thread: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let log = self.invocations.lock().unwrap();
+        let meta = self.run_meta.lock().unwrap();
+        for inv in log.iter().rev() {
+            if inv.session_id != session_id {
+                continue;
+            }
+            let Some((Some(rid), _, _, inv_thread)) = meta.get(&inv.id) else {
+                continue;
+            };
+            if rid == thread || inv_thread.as_deref() == Some(thread) {
+                return Ok(Some(rid.clone()));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn extract_task_id_from_background_message(msg: &str) -> String {

@@ -54,6 +54,21 @@ impl Participant {
     pub fn can_continue(&self) -> bool {
         self.latest.can_continue
     }
+
+    /// While working, its live host accepts mid-run notes directly into the
+    /// active run rather than queuing a follow-up until it finishes.
+    pub fn accepts_mid_run(&self) -> bool {
+        self.working() && self.latest.accepts_mid_run
+    }
+
+    /// Whether the owner can address this session from the composer: either
+    /// it accepts mid-run notes now, it is working and keeps its session so a
+    /// follow-up can queue after it, or it ended and kept its session.
+    pub fn can_address(&self) -> bool {
+        self.accepts_mid_run()
+            || (self.working() && self.latest.keeps_session != Some(false))
+            || self.can_continue()
+    }
 }
 
 /// The participants among `runs` (one conversation's): those waiting on the

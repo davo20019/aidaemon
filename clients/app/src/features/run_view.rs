@@ -1121,7 +1121,7 @@ fn follow_up(
         }
         latest.with(|run| {
             run.as_ref()
-                .is_some_and(|run| run.can_continue && run.phase != RunPhase::Running)
+                .is_some_and(|run| run.can_continue || run.phase == RunPhase::Running)
         })
     });
     let name = computed(move || who.with(|(name, _, _)| name.clone()));
@@ -1288,13 +1288,24 @@ fn follow_up(
                                     .placeholder(move || {
                                         let files = store.draft_files();
                                         if files.iter().any(|f| f.marked_from.is_some()) {
-                                            "Say what to do with the marked part"
+                                            "Say what to do with the marked part".to_owned()
                                         } else if !files.is_empty() {
-                                            "Say what to do with it, or just send"
+                                            "Say what to do with it, or just send".to_owned()
                                         } else {
-                                            "Reply…"
+                                            let who = name.get();
+                                            latest.with(|run| match run.as_ref() {
+                                                Some(r)
+                                                    if r.phase == RunPhase::Running
+                                                        && r.accepts_mid_run =>
+                                                {
+                                                    format!("Added to {who}'s work")
+                                                }
+                                                Some(r) if r.phase == RunPhase::Running => {
+                                                    format!("Sent when {who} finishes")
+                                                }
+                                                _ => "Reply".to_owned(),
+                                            })
                                         }
-                                        .to_owned()
                                     })
                                     .placeholder_color(|| color(colors::FAINT))
                                     .caret_color(|| color(colors::ACCENT))
@@ -1478,6 +1489,8 @@ mod tests {
             continues: None,
             thread: None,
             can_continue: true,
+            accepts_mid_run: false,
+            keeps_session: None,
             result: None,
             asked,
         }

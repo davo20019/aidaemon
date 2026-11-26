@@ -139,6 +139,18 @@ pub(super) struct PreparedRun {
     /// refused (a launch the owner sent to the agent directly): it has no
     /// claim until then.
     pub(super) folder_wait: Option<FolderWait>,
+    /// This queued follow-up targets an active session thread and waits for
+    /// that thread's running run to finish before resuming its session.
+    pub(super) thread_wait: Option<ThreadWait>,
+}
+
+/// Waiting for an active run in a specific coding-agent session thread to
+/// finish before resuming that thread's session.
+#[derive(Debug, Clone)]
+pub(super) struct ThreadWait {
+    pub(super) thread: String,
+    pub(super) behind_run: String,
+    pub(super) behind_agent: String,
 }
 
 /// A concurrency slot being waited for, in line.
@@ -188,6 +200,9 @@ pub(super) struct RunCall {
     pub(super) owner_follow_up: bool,
     /// Conversation pinned directly to a coding agent (no model reads the tool output).
     pub(super) direct_agent: bool,
+    /// Explicitly started as a brand-new coding-agent session (`"New <Agent>"`):
+    /// never folded into an earlier session after waiting for its folder.
+    pub(super) fresh_session: bool,
     /// Run spawned by another CLI via the peer-coordination MCP server.
     pub(super) is_peer_run: bool,
     /// Tree binding for permit parking, completion updates, and cascading cancel.
@@ -528,17 +543,20 @@ impl CliAgentTool {
         detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
         spawn_family: Option<crate::authority::SpawnFamily>,
         may_send_files: bool,
+        fresh_session: bool,
+        thread_wait: Option<ThreadWait>,
     ) -> anyhow::Result<String> {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
-        // A background launch in a conversation set to a coding agent is
-        // the owner's own message to it: one that finds its folder taken
-        // waits for it rather than being refused.
+        // A background launch the owner sent directly (a direct-agent
+        // conversation, an explicit session follow-up, or "New <Agent>") waits
+        // for its folder rather than being refused.
         let direct_agent = !session_id.trim().is_empty()
             && crate::session_model::get(self.state.as_ref(), session_id)
                 .await
                 .agent
                 .is_some();
-        let waits_for_folder = async_mode && direct_agent;
+        let waits_for_folder =
+            async_mode && (direct_agent || spec.owner_follow_up || fresh_session);
 
         // When peer coordination is enabled on a local backend, mint a tree and
         // scoped MCP server endpoint for this root CLI run so it can delegate to
@@ -633,6 +651,7 @@ impl CliAgentTool {
                 detached_judge,
                 spawn_family,
                 waits_for_folder,
+                thread_wait.is_some(),
                 direct_agent,
                 &root_mcp,
                 &[],
@@ -643,6 +662,7 @@ impl CliAgentTool {
             Ok(prep) => prep,
             Err(message) => return Ok(message),
         };
+        prep.thread_wait = thread_wait;
         if let Some(scoped_guard) = root_keep_alive {
             prep.keep_alive = Some(match prep.keep_alive.take() {
                 Some(kept) => Box::new((kept, scoped_guard)),
@@ -664,11 +684,12 @@ impl CliAgentTool {
             began: chrono::Utc::now(),
             owner_follow_up: spec.owner_follow_up,
             direct_agent,
+            fresh_session,
             is_peer_run: false,
             peer_binding: root_peer_binding,
         };
 
-        if prep.folder_wait.is_some() {
+        if prep.thread_wait.is_some() || prep.folder_wait.is_some() {
             return Ok(self.queue_run(call, prep, None).await);
         }
 
@@ -781,6 +802,15 @@ impl CliAgentTool {
         handles
             .runs
             .keeps_session(&cli_run_id(&task_id), prep.keeps_session);
+        if started
+            .host
+            .as_ref()
+            .is_some_and(|host| host.accepts_mid_run())
+        {
+            handles
+                .runs
+                .set_accepts_mid_run(&cli_run_id(&task_id), true);
+        }
 
         let background_timeout = handles.background_timeout.max(timeout);
         let idle_timeout = handles.idle_timeout;
@@ -1120,6 +1150,7 @@ impl CliAgentTool {
                 spec.spawn_family,
                 false,
                 false,
+                false,
                 &spec.mcp_endpoints,
                 &spec.nests_in,
                 spec.mode_cap,
@@ -1158,6 +1189,7 @@ impl CliAgentTool {
             began: chrono::Utc::now(),
             owner_follow_up: false,
             direct_agent: false,
+            fresh_session: false,
             is_peer_run: true,
             peer_binding: Some(spec.peer_binding),
         };

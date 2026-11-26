@@ -1369,8 +1369,12 @@
               ],
               "description": "How hard it thinks from this message on (protocol 1.16);\nabsent: as it was."
             },
+            "fresh_agent_session": {
+              "description": "Start a fresh coding-agent session instead of continuing an\nearlier one of the same kind (protocol 1.55): set when the owner\nexplicitly picks `\"New <Agent>\"` in the composer.",
+              "type": "boolean"
+            },
             "in_run": {
-              "description": "The run whose thread it was posted in (protocol 1.48): the owner\nfollows up with that run's coding agent, which goes on in its\nown session ([`RunSummary::continues`]). Only the app's own\nconversations take one.",
+              "description": "The run or session thread this message addresses (protocol 1.48,\nextended in 1.55): the owner addresses that coding-agent session\ndirectly (continuing an idle session, steering a working one that\naccepts mid-run notes, or queuing after a working one that does\nnot). Accepts either a thread id ([`RunSummary::thread`]) or a run\nid. Only the app's own conversations take one.",
               "type": [
                 "string",
                 "null"
@@ -6353,6 +6357,10 @@
     "RunSummary": {
       "description": "One helper run as the daemon records it (protocol 1.46): a sub-agent, a\ncoding agent it launched (Claude Code, Codex, ...) or a background\ncommand. Every field comes from the run's typed record, never from what\na model wrote.",
       "properties": {
+        "accepts_mid_run": {
+          "description": "While running, its live host accepts mid-run notes (protocol 1.55:\ne.g. Codex `turn/steer`, Claude Code `stream-json` stdin). `false`\nonce ended or when follow-ups wait for the current run to finish.",
+          "type": "boolean"
+        },
         "agent": {
           "description": "The coding agent it is (\"Claude Code\"), for a run that launched one.",
           "type": [
@@ -6411,6 +6419,13 @@
         "id": {
           "description": "Stable while the daemon runs; the key every update finds it by.\n`cancel_task` takes it while the run runs.",
           "type": "string"
+        },
+        "keeps_session": {
+          "description": "While running, whether its agent keeps its session so a queued\nfollow-up can continue it once this run finishes (protocol 1.55).\n`None` from older daemons or once ended (use `can_continue` then).",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "label": {
           "description": "The name the owner reads for it.",

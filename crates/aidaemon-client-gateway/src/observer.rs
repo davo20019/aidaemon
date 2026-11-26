@@ -453,6 +453,7 @@ impl TurnObserver for GatewayObserver {
                 continues: change.continues.as_deref(),
                 thread: change.thread.as_deref(),
                 keeps_session: change.keeps_session,
+                accepts_mid_run: change.accepts_mid_run,
                 result: change.result.as_ref(),
                 asked: change.asked.as_ref(),
                 started_at: change.started_at,
@@ -527,6 +528,7 @@ pub(crate) struct RunRecord<'a> {
     pub continues: Option<&'a str>,
     pub thread: Option<&'a str>,
     pub keeps_session: bool,
+    pub accepts_mid_run: bool,
     pub result: Option<&'a aidaemon_channels::turns::RunResult>,
     pub asked: Option<&'a aidaemon_channels::turns::RunAsk>,
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -547,6 +549,7 @@ pub(crate) fn run_summary(
         continues,
         thread,
         keeps_session,
+        accepts_mid_run,
         result,
         asked,
         started_at,
@@ -579,6 +582,8 @@ pub(crate) fn run_summary(
         thread: thread.map(str::to_string),
         // A follow-up goes on from an ended run whose agent kept its session.
         can_continue: keeps_session && ended_at.is_some(),
+        accepts_mid_run: accepts_mid_run && ended_at.is_none(),
+        keeps_session: ended_at.is_none().then_some(keeps_session),
         result: result.map(run_result),
         asked: asked.map(|asked| aidaemon_client_protocol::RunAsked {
             text: asked.text.clone(),

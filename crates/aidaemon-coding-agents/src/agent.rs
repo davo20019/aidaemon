@@ -324,6 +324,23 @@ pub trait AgentHost: Send + Sync {
         false
     }
 
+    /// Whether this live host can accept mid-run notes while the agent works
+    /// (for example Codex `turn/steer` or Claude Code `stream-json` user
+    /// messages on stdin). `false` for agents whose protocol only takes a
+    /// follow-up after the current turn ends.
+    fn accepts_mid_run(&self) -> bool {
+        false
+    }
+
+    /// Send a mid-run note to the running agent. `Ok(())` means the note was
+    /// accepted by the running turn; `Err` explains why it could not be
+    /// delivered (e.g. turn already finished or protocol does not support
+    /// mid-run steering), so the caller can fall back to queuing a resumed
+    /// follow-up.
+    async fn send_note(&self, _note: &str) -> Result<(), String> {
+        Err("this agent does not accept mid-run notes".to_string())
+    }
+
     /// Ask the agent to stop its current turn cooperatively through its own
     /// protocol (for example ACP `session/cancel`, Codex `turn/interrupt`,
     /// or Claude Code's `interrupt` control request) before falling back to

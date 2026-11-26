@@ -334,6 +334,16 @@ pub trait DynamicCliAgentStore: Send + Sync {
         Ok(None)
     }
 
+    /// The latest run id in conversation `session_id` belonging to `thread`
+    /// (matching either `run_id = thread` or `thread_id = thread`).
+    async fn latest_cli_agent_run_in_thread(
+        &self,
+        _session_id: &str,
+        _thread: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// The latest run of conversation `session_id` by agent `agent_name`
     /// that kept its agent's session (a follow-up can go on from it).
     async fn latest_kept_cli_agent_run(

@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 54;
+pub const PROTOCOL_MINOR: u16 = 55;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -258,12 +258,19 @@ pub enum Command {
         /// absent: as it was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
-        /// The run whose thread it was posted in (protocol 1.48): the owner
-        /// follows up with that run's coding agent, which goes on in its
-        /// own session ([`RunSummary::continues`]). Only the app's own
-        /// conversations take one.
+        /// The run or session thread this message addresses (protocol 1.48,
+        /// extended in 1.55): the owner addresses that coding-agent session
+        /// directly (continuing an idle session, steering a working one that
+        /// accepts mid-run notes, or queuing after a working one that does
+        /// not). Accepts either a thread id ([`RunSummary::thread`]) or a run
+        /// id. Only the app's own conversations take one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         in_run: Option<String>,
+        /// Start a fresh coding-agent session instead of continuing an
+        /// earlier one of the same kind (protocol 1.55): set when the owner
+        /// explicitly picks `"New <Agent>"` in the composer.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fresh_agent_session: bool,
     },
     /// Stop everything the session has running (`/cancel all`).
     StopTurn { session_id: String },
@@ -3137,6 +3144,16 @@ pub struct RunSummary {
     /// the session id too).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_continue: bool,
+    /// While running, its live host accepts mid-run notes (protocol 1.55:
+    /// e.g. Codex `turn/steer`, Claude Code `stream-json` stdin). `false`
+    /// once ended or when follow-ups wait for the current run to finish.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accepts_mid_run: bool,
+    /// While running, whether its agent keeps its session so a queued
+    /// follow-up can continue it once this run finishes (protocol 1.55).
+    /// `None` from older daemons or once ended (use `can_continue` then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeps_session: Option<bool>,
     /// What its coding agent ended with (protocol 1.48): its reply, its
     /// typed report and where the report disagrees with what it was seen
     /// doing. Set once it ended.

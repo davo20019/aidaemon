@@ -276,6 +276,7 @@ mod client_gateway {
                 model: None,
                 effort: None,
                 in_run: None,
+                fresh_agent_session: false,
             },
         )
         .await;

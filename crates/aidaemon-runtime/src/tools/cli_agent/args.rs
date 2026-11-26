@@ -34,6 +34,14 @@ pub(super) struct CliAgentArgs {
     /// continues its own session, in its folder.
     #[serde(default)]
     pub(super) continue_run: Option<String>,
+    /// Start a fresh coding-agent session instead of continuing an earlier
+    /// one of the same kind (set when the owner picks `"New <Agent>"`).
+    #[serde(default)]
+    pub(super) fresh_session: bool,
+    /// Queue after a working run rather than steering mid-run, even when the
+    /// live host accepts mid-run notes (set when the owner chose Queue).
+    #[serde(default)]
+    pub(super) queue_only: bool,
     /// Files or directories the run will change.
     #[serde(default)]
     pub(super) scope: Vec<String>,

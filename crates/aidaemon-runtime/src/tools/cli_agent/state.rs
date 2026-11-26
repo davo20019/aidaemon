@@ -144,6 +144,14 @@ impl RunProcess {
         }
     }
 
+    /// Its protocol host, once started (when hosted).
+    pub(super) fn host(&self) -> Option<Arc<dyn aidaemon_coding_agents::AgentHost>> {
+        match &*self.lock() {
+            ProcessState::Started(_, host, _) => host.clone(),
+            _ => None,
+        }
+    }
+
     /// When its process started.
     pub(super) fn started_at(&self) -> Option<Instant> {
         match &*self.lock() {

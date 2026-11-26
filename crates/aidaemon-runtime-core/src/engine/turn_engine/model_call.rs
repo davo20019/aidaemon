@@ -909,6 +909,9 @@ fn direct_agent_response(
             "prompt": scope.user_text,
             "async_mode": true,
         });
+        if scope.channel_ctx.fresh_agent_session {
+            arguments["fresh_session"] = serde_json::Value::Bool(true);
+        }
         if let Some(root) = scope
             .project
             .as_ref()

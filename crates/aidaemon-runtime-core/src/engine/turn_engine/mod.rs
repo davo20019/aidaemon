@@ -110,6 +110,9 @@ fn follow_up_script(
         "workspace_mode": "read_write",
         "async_mode": true,
     });
+    if thread.queue_only {
+        arguments["queue_only"] = serde_json::Value::Bool(true);
+    }
     if let Some(working_dir) = thread
         .working_dir
         .as_deref()
@@ -132,15 +135,36 @@ fn follow_up_script(
     Some(Arc::new(crate::engine::provider::ScriptedSteps::new(
         call,
         move || {
-            // A run that continues it started in this turn: the agent has
-            // it. Typed state, never the call's words.
-            runs.for_chat(&chat)
-                .into_iter()
+            let chat_runs = runs.for_chat(&chat);
+            let target_thread = chat_runs
+                .iter()
+                .find(|run| run.id == earlier)
+                .and_then(|run| run.thread.as_deref())
+                .unwrap_or(earlier.as_str());
+            // A mid-run note was delivered directly into the live run's host.
+            if let Some(run) = chat_runs.iter().find(|run| {
+                (run.id == earlier
+                    || run.id == target_thread
+                    || run.thread.as_deref() == Some(target_thread))
+                    && run.last_note_at.is_some_and(|at| at >= since)
+            }) {
+                let agent = run.agent.clone().unwrap_or_else(|| "The agent".to_string());
+                return Some(format!(
+                    "You sent this note directly to {agent} while it was working; I didn't \
+                     delegate it."
+                ));
+            }
+            // A run that continues it (or queued behind its thread) started in
+            // this turn: the agent has it. Typed state, never the call's words.
+            chat_runs
+                .iter()
                 .find(|run| {
-                    run.continues.as_deref() == Some(earlier.as_str()) && run.started_at >= since
+                    run.started_at >= since
+                        && (run.continues.as_deref() == Some(earlier.as_str())
+                            || run.thread.as_deref() == Some(target_thread))
                 })
                 .map(|run| {
-                    let agent = run.agent.unwrap_or_else(|| "The agent".to_string());
+                    let agent = run.agent.clone().unwrap_or_else(|| "The agent".to_string());
                     // The owner's own message to the agent, not this agent's
                     // delegation: said so, for every later turn reading it.
                     format!(
@@ -1387,13 +1411,14 @@ impl TurnEngine<'_> {
             )
             .await;
         }
-        let direct_agent = if self.host.depth() == 0 && !internal_continuation {
-            crate::session_model::get(self.host.settings(), session_id)
-                .await
-                .agent
-        } else {
-            None
-        };
+        let direct_agent =
+            if self.host.depth() == 0 && !internal_continuation && channel_ctx.in_run.is_none() {
+                crate::session_model::get(self.host.settings(), session_id)
+                    .await
+                    .agent
+            } else {
+                None
+            };
         if direct_agent.is_some() {
             verdict.direct_agent.store(true, Ordering::Relaxed);
         }

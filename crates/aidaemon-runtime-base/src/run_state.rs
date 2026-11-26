@@ -458,6 +458,11 @@ pub struct RunState {
     pub thread: Option<String>,
     /// Its coding agent keeps its session where a follow-up can continue it.
     pub keeps_session: bool,
+    /// While running, its live host accepts mid-run notes directly.
+    pub accepts_mid_run: bool,
+    /// When the owner's latest mid-run note was delivered directly to this
+    /// live run's host (typed receipt for `follow_up_script`).
+    pub last_note_at: Option<DateTime<Utc>>,
     /// What its coding agent ended with, once it ended ([`aidaemon_channels::turns::RunResult`]).
     pub result: Option<aidaemon_channels::turns::RunResult>,
     /// What it was asked, and whether the owner sent it directly.
@@ -784,6 +789,8 @@ impl RunStates {
             continues: None,
             thread: None,
             keeps_session: false,
+            accepts_mid_run: false,
+            last_note_at: None,
             result: None,
             asked: None,
             steps: Vec::new(),
@@ -902,6 +909,7 @@ impl RunStates {
             continues: state.continues.clone(),
             thread: state.thread.clone(),
             keeps_session: state.keeps_session,
+            accepts_mid_run: state.accepts_mid_run && state.ended_at.is_none(),
             result: state.result.clone(),
             asked: state.asked.clone(),
             started_at: state.started_at,
@@ -1132,6 +1140,46 @@ impl RunStates {
         }
     }
 
+    /// Whether run `id`'s live host accepts mid-run notes while working.
+    pub fn set_accepts_mid_run(&self, id: &str, accepts: bool) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry)
+                if entry.state.phase == RunPhase::Running
+                    && entry.state.accepts_mid_run != accepts =>
+            {
+                entry.state.accepts_mid_run = accepts;
+                true
+            }
+            _ => false,
+        };
+        if set {
+            self.report(id, false);
+        }
+    }
+
+    /// Record run `id`'s thread id (e.g. a queued follow-up waiting behind an
+    /// active run in `thread`, before `continues` is resolved).
+    pub fn set_thread(&self, id: &str, thread: &str) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry) if entry.state.thread.as_deref() != Some(thread) => {
+                entry.state.thread = Some(thread.to_string());
+                true
+            }
+            _ => false,
+        };
+        if set {
+            self.report(id, false);
+        }
+    }
+
+    /// Record that a mid-run note was delivered directly to run `id`'s live
+    /// host at `at`.
+    pub fn note_delivered(&self, id: &str, at: DateTime<Utc>) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.state.last_note_at = Some(at);
+        }
+    }
+
     /// Run `id` is coding agent `agent` ("Claude Code").
     pub fn set_agent(&self, id: &str, agent: &str) {
         let set = match self.lock().get_mut(id) {
@@ -1206,6 +1254,7 @@ impl RunStates {
                 return None;
             }
             entry.state.phase = phase;
+            entry.state.accepts_mid_run = false;
             entry.state.ended_at = Some(measured.ended_at);
             entry.state.work_began = measured.work_began;
             entry.state.waited = measured.waited;
@@ -1795,6 +1844,8 @@ mod tests {
             continues: None,
             thread: None,
             keeps_session: false,
+            accepts_mid_run: false,
+            last_note_at: None,
             result: None,
             asked: None,
             steps: Vec::new(),

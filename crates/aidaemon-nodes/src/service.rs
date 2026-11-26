@@ -51,6 +51,7 @@ pub fn node_channel_context(
         workspace_grant: None,
         trusted: false,
         in_run: None,
+        fresh_agent_session: false,
         agents: Vec::new(),
     }
 }
