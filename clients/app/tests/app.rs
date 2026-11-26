@@ -867,10 +867,12 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.press("Claude Code · Finished · changed 2 files, show its steps")?;
     let id = wait_sent("get_run")?;
     feed([frame(&format!(
-        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Editing slug.py","state":"done"}},{{"words":"Running pytest","state":"failed"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}}]}}}}}}"#
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Editing slug.py","state":"done"}},{{"words":"Running pytest","state":"failed"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}},{{"label":"write: /w/synthetic/test_slug.py","outcome":"allowed"}},{{"label":"command: rm -rf /w/synthetic/build","outcome":"refused","reason":"outside its folder"}}]}}}}}}"#
     ))]);
     app.wait_for("text:Add truncate_slug on branch a")?;
-    app.wait_for("text:write: /w/synthetic/slug.py · allowed")?;
+    // Only what was not simply allowed gets a line; the rest is a count.
+    app.wait_for("text:command: rm -rf /w/synthetic/build · refused: outside its folder")?;
+    app.wait_for("text:2 other actions allowed")?;
     // What it changed (a conversation with no Changes tab names them).
     app.wait_for("text:test_slug.py")?;
     app.press("Back")?;

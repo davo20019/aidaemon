@@ -88,6 +88,8 @@ fn tool_call_line(update: &Value) -> String {
         "id": update.get("toolCallId"),
         "title": update.get("title").and_then(Value::as_str).unwrap_or_default(),
         "kind": update.get("kind"),
+        // The tool's own name, where the agent gives one (an MCP tool's).
+        "name": update.get("name").and_then(Value::as_str),
         "status": update.get("status"),
         "paths": locations(update),
         "command": text_of(input, COMMAND_KEYS),

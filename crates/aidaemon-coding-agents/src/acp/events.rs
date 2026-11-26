@@ -41,11 +41,10 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
                 },
                 // Its own thinking is not a step.
                 Some("think") => return Vec::new(),
-                Some(other) => StepTool::Other {
-                    name: other.to_string(),
-                },
-                None => StepTool::Other {
-                    name: "a tool".to_string(),
+                // Anything else: the tool's own name where the agent gives
+                // one (an MCP tool's), never the protocol's catch-all kind.
+                _ => StepTool::Other {
+                    name: text(&event, "/name").unwrap_or_else(|| "a tool".to_string()),
                 },
             };
             vec![AgentEvent::Step(AgentStep {

@@ -137,7 +137,9 @@ impl StepTool {
             }
             Self::Delegate { .. } => "Asking a helper".into(),
             Self::Plan => "Updating its plan".into(),
-            Self::Other { name } => format!("Using {name}"),
+            Self::Other { name } => {
+                coordination_words(name).map_or_else(|| format!("Using {name}"), str::to_string)
+            }
         }
     }
 }
@@ -230,6 +232,33 @@ fn tool_record(tool: &StepTool) -> Value {
 }
 
 /// A path's last component.
+/// A call to the daemon's own coordination tools ([`crate::peer`]) in
+/// plain words, by the tool's name as each agent spells an MCP tool:
+/// `mcp__<server>__<tool>` (Claude Code), `<server>.<tool>` (Codex) and
+/// `mcp_<server>_<tool>` (Antigravity). Exact tool-call protocol names of
+/// the daemon's own server, never prose.
+fn coordination_words(name: &str) -> Option<&'static str> {
+    let server = crate::peer::COORD_MCP_SERVER_NAME;
+    let tool = [
+        format!("mcp__{server}__"),
+        format!("{server}."),
+        format!("mcp_{server}_"),
+    ]
+    .iter()
+    .find_map(|prefix| name.strip_prefix(prefix.as_str()))?;
+    Some(match tool {
+        "list_peers" => "Looking at the other agents",
+        "delegate_cli" => "Handing work to another agent",
+        "message_peer" => "Messaging another agent",
+        "check_peer" => "Checking on another agent",
+        "cancel_peer" => "Stopping another agent",
+        "post_board" => "Posting to the agents' board",
+        "read_board" => "Reading the agents' board",
+        "send_file" => "Sending you a file",
+        _ => return None,
+    })
+}
+
 fn file_name(path: &str) -> String {
     let trimmed = path.trim_end_matches(['/', '\\']);
     trimmed
@@ -458,6 +487,31 @@ pub(crate) fn text(value: &Value, pointer: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calls_to_the_coordination_tools_read_as_plain_words_for_every_agent() {
+        let words = |name: &str| StepTool::Other { name: name.into() }.words();
+        for name in [
+            "mcp__aidaemon_peers__delegate_cli",
+            "aidaemon_peers.delegate_cli",
+            "mcp_aidaemon_peers_delegate_cli",
+        ] {
+            assert_eq!(words(name), "Handing work to another agent", "{name}");
+        }
+        assert_eq!(
+            words("mcp_aidaemon_peers_read_board"),
+            "Reading the agents' board"
+        );
+        // Another server's tool, or one the server does not serve, keeps its name.
+        assert_eq!(
+            words("mcp__synthetic__lookup"),
+            "Using mcp__synthetic__lookup"
+        );
+        assert_eq!(
+            words("mcp_aidaemon_peers_run_shell"),
+            "Using mcp_aidaemon_peers_run_shell"
+        );
+    }
 
     #[test]
     fn a_command_keeps_only_its_program() {

@@ -1388,21 +1388,38 @@ fn body(detail: RunDetail) -> View {
         }
         page = page.child(steps);
     }
-    if !detail.permissions.is_empty() {
+    // Only what was not simply allowed is worth a line: a run that may do
+    // anything has every action allowed, which its steps already show.
+    let allowed = detail
+        .permissions
+        .iter()
+        .filter(|permission| permission.outcome == RunPermissionOutcome::Allowed)
+        .count();
+    if allowed < detail.permissions.len() {
         let mut asked = view().gap_1();
-        for permission in &detail.permissions {
+        for permission in detail
+            .permissions
+            .iter()
+            .filter(|permission| permission.outcome != RunPermissionOutcome::Allowed)
+        {
             let (glyph, tone, outcome) = match permission.outcome {
-                RunPermissionOutcome::Allowed => (Glyph::Check, Tone::Success, "allowed"),
                 RunPermissionOutcome::Refused => (Glyph::Warning, Tone::Danger, "refused"),
                 RunPermissionOutcome::Declined => (Glyph::Warning, Tone::Warning, "declined"),
                 RunPermissionOutcome::Unanswered => (Glyph::Warning, Tone::Warning, "not answered"),
-                RunPermissionOutcome::Unknown => (Glyph::Dot, Tone::Neutral, ""),
+                _ => (Glyph::Dot, Tone::Neutral, ""),
             };
             let mut words = format!("{} · {outcome}", permission.label);
             if let Some(why) = &permission.reason {
                 words.push_str(&format!(": {why}"));
             }
             asked = asked.child(line(glyph, tone, words, false));
+        }
+        if allowed > 0 {
+            let words = match allowed {
+                1 => "1 other action allowed".to_string(),
+                n => format!("{n} other actions allowed"),
+            };
+            asked = asked.child(line(Glyph::Check, Tone::Neutral, words, false));
         }
         page = page.child(section("Permissions", asked));
     }
