@@ -1433,7 +1433,7 @@ mod mcp_bridge {
                         "properties": {
                             "agent": { "type": "string", "description": "Target CLI agent name (see list_peers)" },
                             "title": { "type": "string", "description": "Short plain-English title for the subtask" },
-                            "prompt": { "type": "string", "description": "Full instructions for the peer CLI" },
+                            "prompt": { "type": "string", "description": "Everything the peer needs, since it sees only this prompt and the files you list: not your conversation, the owner's request or what you found. State the goal, what you already know that bears on it, constraints, and what to report back; leave out what it does not need." },
                             "workspace": {
                                 "type": "string",
                                 "enum": ["read_only", "worktree", "subpath"],
