@@ -310,6 +310,8 @@ pub enum Effect {
     /// A message sent from a new conversation started it: show it (the
     /// new conversation's draft is spent).
     Started(String),
+    /// The open conversation was erased: leave it.
+    Gone(String),
     /// The greeting's conversation the setup asked to open.
     OpenGreeting(String),
     /// `session` was just found to work on code: its details belong
@@ -685,6 +687,16 @@ impl Client {
             self.live = None;
             self.live_request = None;
             effects.push(Effect::CloseLive);
+        }
+        // The open conversation was erased (deleted, or wiped): the screen
+        // leaves it.
+        if let ServerFrame::Event {
+            event: Event::SessionDeleted { session_id },
+            ..
+        } = &frame
+            && cx.selected.as_deref() == Some(session_id.as_str())
+        {
+            effects.push(Effect::Gone(session_id.clone()));
         }
         // An open run's record is read again as it moves.
         if let ServerFrame::Event {
@@ -4055,6 +4067,17 @@ mod tests {
                 if run == "cli-agent-1" && text.is_empty() && attachments.len() == 1
         ));
         assert!(client.draft_files.is_empty());
+    }
+
+    /// The open conversation's erase says to leave it; another's does not.
+    #[test]
+    fn an_erased_open_conversation_is_left() {
+        let mut client = Client::default();
+        let erased = r#"{"type":"event","seq":1,"at_ms":1,"event":{"type":"session_deleted","session_id":"app:s1"}}"#;
+        let effects = client.update(frame(erased), &cx(Some("app:s1")));
+        assert!(effects.contains(&Effect::Gone("app:s1".into())), "{effects:?}");
+        let effects = client.update(frame(erased), &cx(Some("app:s2")));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Gone(_))));
     }
 
     /// A delete goes only to a daemon that deletes conversations.

@@ -1641,6 +1641,18 @@ fn a_conversation_is_deleted_after_asking_and_only_on_a_daemon_that_deletes() ->
     )]);
     app.wait_for_gone("HERON plan", std::time::Duration::from_secs(5))?;
     app.wait_for("Kept notes")?;
+    // Erased while open (a `/wipe` sent in it, or deleted from another
+    // device): the screen leaves it for a new conversation.
+    app.press("Kept notes >> nth=0")?;
+    app.wait_for_gone(
+        "What can I help you with?",
+        std::time::Duration::from_secs(5),
+    )?;
+    feed([frame(
+        r#"{"type":"event","seq":4,"at_ms":4,"event":{"type":"session_deleted","session_id":"app:synthetic-22"}}"#,
+    )]);
+    app.wait_for("What can I help you with?")?;
+    app.wait_for_gone("Kept notes", std::time::Duration::from_secs(5))?;
     Ok(())
 }
 

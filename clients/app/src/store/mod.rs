@@ -850,6 +850,13 @@ impl Store {
     fn effect(&self, effect: Effect) {
         match effect {
             Effect::Say(text) => self.say(text),
+            // Erased while open (deleted elsewhere, or `/wipe` here): a new
+            // conversation instead; the daemon's note says what happened.
+            Effect::Gone(session) => {
+                if self.selected.get_untracked().as_deref() == Some(session.as_str()) {
+                    self.select(None);
+                }
+            }
             Effect::Started(session) => {
                 // The draft was sent: the new conversation starts empty.
                 Self::keep_draft(NEW, "");
@@ -3634,8 +3641,8 @@ impl Store {
                 let _ = nsh_core::storage::Storage::set_item(PINS_KEY, text);
             }
         });
+        // The daemon's reply ("Deleted", or why not) is the note.
         self.act(|c| c.delete_session(id));
-        self.say("Deleted");
     }
 
     /// Take back archiving conversation `id`: it is in the list again,
