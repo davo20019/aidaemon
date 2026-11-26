@@ -47,8 +47,12 @@ impl crate::state::types::MessageStore for SqliteStateStore {
                 .entry(msg.session_id.clone())
                 .or_insert_with(|| stored.unwrap_or_default());
             // The message's event is written before it is appended, so the
-            // stored conversation may already hold it.
-            if !deque.iter().any(|m| m.id == msg.id) {
+            // stored conversation may already hold it. The message appended
+            // replaces that copy: its event may hold less than the window
+            // should (a tool result persisted as a summary, kept raw here).
+            if let Some(stored) = deque.iter_mut().find(|m| m.id == msg.id) {
+                *stored = msg.clone();
+            } else {
                 deque.push_back(msg.clone());
             }
 
