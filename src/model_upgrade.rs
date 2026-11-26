@@ -667,7 +667,7 @@ impl ModelUpgrader {
         let (backend, _) = crate::providers::factory::build_provider(provider)?;
         aidaemon_runtime::llm::trial::trial(&*backend, model)
             .await
-            .map_err(anyhow::Error::msg)
+            .map_err(|failure| anyhow::anyhow!("{model}: {failure}"))
     }
 
     /// Queue `message` for the owner (their chats, or their latest app

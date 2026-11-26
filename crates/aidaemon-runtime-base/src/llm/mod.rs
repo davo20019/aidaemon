@@ -394,6 +394,10 @@ struct LlmRuntimeState {
     /// Models a trial showed can run a turn, by backend ([`backend_key`]);
     /// a swap forgets them.
     tried: std::collections::HashSet<(usize, String)>,
+    /// Providers whose account the last refresh's trial was refused (no
+    /// credit, a rejected key, a used-up quota), by backend, until when the
+    /// refusal is trusted without a newer trial; a swap forgets them.
+    account_refused: std::collections::HashMap<usize, std::time::Instant>,
 }
 
 /// A backend's identity while the runtime holds it.
@@ -440,7 +444,26 @@ impl SharedLlmRuntime {
             offered_models: Vec::new(),
             offered_listed_at: std::collections::HashMap::new(),
             tried: std::collections::HashSet::new(),
+            account_refused: std::collections::HashMap::new(),
         })))
+    }
+
+    /// Whether `model` of the provider `provider_id` will not answer for
+    /// now: its quota guard holds a cooldown for it, or the last trial of
+    /// the provider's account was refused.
+    pub fn unavailable(&self, provider_id: &str, model: &str) -> bool {
+        let snapshot = self.snapshot();
+        let Some(backend) = snapshot.backend_of(provider_id) else {
+            return false;
+        };
+        backend.unavailable_until(model).is_some()
+            || self
+                .0
+                .read()
+                .expect("llm runtime lock poisoned")
+                .account_refused
+                .get(&backend_key(&backend))
+                .is_some_and(|until| *until > std::time::Instant::now())
     }
 
     /// One real call showing `model` of the provider `provider_id` can run
@@ -461,7 +484,9 @@ impl SharedLlmRuntime {
         {
             return Ok(());
         }
-        trial::trial(&*backend, model).await?;
+        trial::trial(&*backend, model)
+            .await
+            .map_err(|failure| failure.to_string())?;
         let mut guard = self.0.write().expect("llm runtime lock poisoned");
         // Kept only while the runtime still holds that backend.
         if Arc::ptr_eq(&guard.provider, &backend)
@@ -542,11 +567,25 @@ impl SharedLlmRuntime {
                     tracing::debug!(provider = backend.name(), %error, "A provider could not list its models");
                 }
             }
-            if !cheapest.is_empty()
-                && backend.unavailable_until(&cheapest).is_none()
-                && let Err(error) = trial::trial(&*backend, &cheapest).await
-            {
-                tracing::info!(provider = backend.name(), model = %cheapest, %error, "A provider's trial call failed");
+            if cheapest.is_empty() || backend.unavailable_until(&cheapest).is_some() {
+                return;
+            }
+            let refused = match trial::trial(&*backend, &cheapest).await {
+                Ok(()) => false,
+                Err(failure) => {
+                    tracing::info!(provider = backend.name(), model = %cheapest, %failure, "A provider's trial call failed");
+                    failure.account_refused()
+                }
+            };
+            let mut guard = self.0.write().expect("llm runtime lock poisoned");
+            let key = backend_key(&backend);
+            if refused {
+                // Trusted until the next refresh can try it again.
+                guard
+                    .account_refused
+                    .insert(key, std::time::Instant::now() + 2 * max_age);
+            } else {
+                guard.account_refused.remove(&key);
             }
         });
         futures::future::join_all(asks).await;
@@ -634,6 +673,7 @@ impl SharedLlmRuntime {
         guard.failover_targets = failover_targets;
         guard.offered_listed_at.clear();
         guard.tried.clear();
+        guard.account_refused.clear();
         old
     }
 }

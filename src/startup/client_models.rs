@@ -73,7 +73,7 @@ pub(crate) async fn options(llm: &SharedLlmRuntime) -> ModelOptions {
             .map(|mut provider| {
                 provider
                     .models
-                    .retain(|model| snapshot.unavailable_until(&provider.id, model).is_none());
+                    .retain(|model| !llm.unavailable(&provider.id, model));
                 provider
             })
             .filter(|provider| !provider.models.is_empty())
@@ -87,11 +87,10 @@ pub(crate) async fn options(llm: &SharedLlmRuntime) -> ModelOptions {
 /// already; any other makes one trial call the first time it is picked.
 async fn usable(
     llm: &SharedLlmRuntime,
-    snapshot: &aidaemon_runtime::llm::LlmRuntimeSnapshot,
     provider: &PickableProvider,
     model: &str,
 ) -> Result<(), String> {
-    if snapshot.unavailable_until(&provider.id, model).is_some() {
+    if llm.unavailable(&provider.id, model) {
         return Err(format!(
             "{model} can't answer right now: its provider refused the last call"
         ));
@@ -394,7 +393,7 @@ pub(crate) async fn set(
                     pin.model
                 ));
             };
-            usable(llm, &snapshot, &offered, &pin.model).await?;
+            usable(llm, &offered, &pin.model).await?;
             setting.pinned = Some(pin);
         }
         Some(ModelChoice::Unknown) => return Err("Unknown model choice".to_string()),
@@ -772,16 +771,16 @@ mod tests {
         assert!(report.contains("automatic model routing"), "{report}");
     }
 
-    /// A provider whose account cannot pay (its quota guard learned it
-    /// from the trial call the listing refresh makes) is left out until it
-    /// can answer again.
+    /// A provider whose account cannot pay (the trial call the listing
+    /// refresh makes was refused) is left out until a trial passes, even
+    /// when it says it could still afford a little output.
     #[tokio::test]
     async fn a_provider_that_cannot_pay_is_left_out() {
-        let broke: aidaemon_runtime::llm::ModelBackend = Arc::new(aidaemon_core::QuotaGuard::new(
-            ScriptedProvider::with_results([Err(aidaemon_core::ProviderError::Billing {
-                message: "synthetic: no credits left".into(),
-                affordable_tokens: None,
-            })]),
+        let broke: aidaemon_runtime::llm::ModelBackend = Arc::new(ScriptedProvider::with_results(
+            [Err(aidaemon_core::ProviderError::Billing {
+                message: "synthetic: can only afford a little".into(),
+                affordable_tokens: Some(1_000),
+            })],
         ));
         let choices = options(&runtime_with(broke)).await;
         assert_eq!(choices.providers.len(), 1, "{choices:?}");
