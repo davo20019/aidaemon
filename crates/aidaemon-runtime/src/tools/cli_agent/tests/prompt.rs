@@ -280,3 +280,31 @@ async fn a_coding_agents_result_is_untrusted_inside_trusted_roots_too() {
         );
     }
 }
+
+/// A new agent session gets the conversation's last turns, without the
+/// current message twice, however long that message is.
+#[test]
+fn prior_conversation_leaves_out_the_current_message_even_when_long() {
+    let message = |role: &str, content: &str| Message {
+        role: role.to_string(),
+        content: Some(content.to_string()),
+        ..Message::default()
+    };
+    let long = format!("HERON-30 {}", "check the docs and the codebase ".repeat(30));
+    assert!(long.len() > 400);
+    let history = vec![
+        message("user", "earlier question"),
+        message("assistant", "earlier answer"),
+        message("user", &long),
+    ];
+    let prompt = crate::tools::cli_agent::prompt::with_prior_conversation(&history, &long);
+    assert_eq!(prompt.matches("HERON-30").count(), 1, "{prompt}");
+    assert!(prompt.contains("user: earlier question\nassistant: earlier answer"));
+    assert!(prompt.ends_with(&format!("## Current request\n{long}")));
+    // Nothing before it: the message alone.
+    let alone = crate::tools::cli_agent::prompt::with_prior_conversation(
+        &[message("user", "only this")],
+        "only this",
+    );
+    assert_eq!(alone, "only this");
+}

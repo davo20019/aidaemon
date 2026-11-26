@@ -14,45 +14,7 @@ impl CliAgentTool {
         let Ok(history) = self.state.get_history(session_id, 10).await else {
             return prompt.to_string();
         };
-        let mut lines: Vec<String> = Vec::new();
-        let trimmed_prompt = prompt.trim();
-        for msg in &history {
-            if !matches!(msg.role.as_str(), "user" | "assistant") {
-                continue;
-            }
-            let Some(content) = msg.content.as_deref().map(str::trim) else {
-                continue;
-            };
-            if content.is_empty() {
-                continue;
-            }
-            // Skip background-launch handoff notices; they add noise, not context.
-            if msg.role == "assistant" && crate::background_run::is_launch_line(content) {
-                continue;
-            }
-            let snippet: String = content.chars().take(400).collect();
-            lines.push(format!("{}: {snippet}", msg.role));
-        }
-        // Drop the trailing entry if it is the current message itself.
-        if lines.last().is_some_and(|last| {
-            last.strip_prefix("user: ")
-                .is_some_and(|u| u == trimmed_prompt)
-        }) {
-            lines.pop();
-        }
-        if lines.is_empty() {
-            return prompt.to_string();
-        }
-        let prior = lines
-            .into_iter()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("## Prior conversation\n{prior}\n\n## Current request\n{prompt}")
+        with_prior_conversation(&history, prompt)
     }
 
     /// Build an enriched prompt with context from memory and conversation history.
@@ -504,4 +466,50 @@ impl CliAgentTool {
 pub(super) struct DiffBase {
     pub(super) dir: String,
     pub(super) head: Option<String>,
+}
+
+/// `prompt` after a compact transcript of the conversation's last turns
+/// (`history`, oldest first; the current message itself left out), for an
+/// agent that starts a new session and so has none of it.
+pub(super) fn with_prior_conversation(history: &[Message], prompt: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    // Whether the newest entry is the current message itself, judged
+    // on the whole message (a snippet of a long one never matches).
+    let mut last_is_current = false;
+    let trimmed_prompt = prompt.trim();
+    for msg in history {
+        if !matches!(msg.role.as_str(), "user" | "assistant") {
+            continue;
+        }
+        let Some(content) = msg.content.as_deref().map(str::trim) else {
+            continue;
+        };
+        if content.is_empty() {
+            continue;
+        }
+        // Skip background-launch handoff notices; they add noise, not context.
+        if msg.role == "assistant" && crate::background_run::is_launch_line(content) {
+            continue;
+        }
+        let snippet: String = content.chars().take(400).collect();
+        lines.push(format!("{}: {snippet}", msg.role));
+        last_is_current = msg.role == "user" && content == trimmed_prompt;
+    }
+    // Drop the trailing entry if it is the current message itself.
+    if last_is_current {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return prompt.to_string();
+    }
+    let prior = lines
+        .into_iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("## Prior conversation\n{prior}\n\n## Current request\n{prompt}")
 }
