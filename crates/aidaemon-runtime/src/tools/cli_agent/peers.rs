@@ -112,6 +112,29 @@ pub(super) struct PeerCoordinator {
     /// screenshot in a temp folder) is staged for delivery; unset, no peer
     /// can send files.
     pub(super) file_inbox: std::sync::OnceLock<PathBuf>,
+    /// Each conversation's coordination tree for its lead agent, which the
+    /// conversation's next run of that lead continues: its board and finished
+    /// peers carry over from one exchange to the next.
+    conversation_trees: StdMutex<HashMap<ConversationLead, Arc<PeerTree>>>,
+}
+
+/// The most conversations whose trees are kept for a later exchange.
+const KEPT_CONVERSATION_TREES: usize = 64;
+
+/// A conversation and the lead agent its runs coordinate from.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct ConversationLead {
+    pub(super) session_id: String,
+    pub(super) agent: String,
+}
+
+/// Whether a root run continues its conversation's tree.
+pub(super) struct TreeContinuity {
+    pub(super) lead: ConversationLead,
+    /// The owner asked for a fresh start: a new tree takes the old one's place.
+    pub(super) fresh: bool,
+    /// The run's id, recorded on the continued tree's root.
+    pub(super) run_id: String,
 }
 
 impl PeerCoordinator {
@@ -135,10 +158,14 @@ impl PeerCoordinator {
             mcp,
             limits,
             file_inbox: std::sync::OnceLock::new(),
+            conversation_trees: StdMutex::new(HashMap::new()),
         }))
     }
 
-    /// Create a fresh [`PeerTree`] and scoped MCP endpoint for a root CLI run.
+    /// The [`PeerTree`] and a scoped MCP endpoint for a root CLI run: its
+    /// conversation's tree for this lead when `continuity` says the run
+    /// continues it and that tree can continue (same folder, nothing of it
+    /// still running), else a fresh one, kept for the conversation's next run.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_root_tree(
         &self,
@@ -146,13 +173,52 @@ impl PeerCoordinator {
         root_title: &str,
         root_ctx: PeerRootContext,
         available_agents: &[String],
+        continuity: Option<TreeContinuity>,
     ) -> RootPeerSession {
-        let tree = PeerTree::new(
-            root_agent,
-            root_title,
-            root_ctx.working_dir.clone(),
-            self.limits,
-        );
+        let continued = continuity.as_ref().filter(|c| !c.fresh).and_then(|c| {
+            let kept = self
+                .conversation_trees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&c.lead)
+                .cloned()?;
+            let same_folder = kept
+                .peer("peer-root")
+                .is_some_and(|root| root.working_dir == root_ctx.working_dir);
+            (same_folder && kept.continue_root(c.run_id.clone())).then_some(kept)
+        });
+        if let Some(tree) = &continued {
+            info!(tree_id = %tree.id(), session_id = %root_ctx.session_id, agent = %root_agent, "A lead run continues its conversation's peer tree");
+        }
+        let tree = continued.unwrap_or_else(|| {
+            PeerTree::new(
+                root_agent,
+                root_title,
+                root_ctx.working_dir.clone(),
+                self.limits,
+            )
+        });
+        if let Some(continuity) = continuity {
+            let mut kept = self
+                .conversation_trees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if kept.len() >= KEPT_CONVERSATION_TREES && !kept.contains_key(&continuity.lead) {
+                // Drop one whose lead is not running; failing that, any.
+                let idle = kept
+                    .iter()
+                    .find(|(_, tree)| {
+                        tree.peer("peer-root")
+                            .is_none_or(|root| root.state.is_terminal())
+                    })
+                    .or_else(|| kept.iter().next())
+                    .map(|(lead, _)| lead.clone());
+                if let Some(idle) = idle {
+                    kept.remove(&idle);
+                }
+            }
+            kept.insert(continuity.lead, tree.clone());
+        }
         let permit_slots: Arc<StdMutex<HashMap<String, PermitSlot>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let launcher = Arc::new(RuntimePeerLauncher {

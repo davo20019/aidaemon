@@ -243,6 +243,7 @@ async fn enable_peer_coordination_and_run_child_peer_in_direct_agent_session() {
             may_send_files: false,
         },
         &["bash-agent".into()],
+        None,
     );
 
     // Launch a read-only child peer synchronously via the RuntimePeerLauncher.
@@ -326,7 +327,7 @@ async fn a_peer_sends_files_only_to_a_private_owner_chat_from_its_folders() {
         may_send_files,
     };
 
-    let shared = coord.start_root_tree("bash-agent", "Lead", root(false), &[]);
+    let shared = coord.start_root_tree("bash-agent", "Lead", root(false), &[], None);
     let refused = shared
         .launcher
         .send_file("peer-root", "shot.png", None)
@@ -334,7 +335,7 @@ async fn a_peer_sends_files_only_to_a_private_owner_chat_from_its_folders() {
         .unwrap_err();
     assert!(refused.contains("private conversation"), "{refused}");
 
-    let private = coord.start_root_tree("bash-agent", "Lead", root(true), &[]);
+    let private = coord.start_root_tree("bash-agent", "Lead", root(true), &[], None);
     let unset = private
         .launcher
         .send_file("peer-root", "shot.png", None)
@@ -402,6 +403,7 @@ async fn a_peer_shares_files_into_the_recipients_folder() {
             may_send_files: false,
         },
         &[],
+        None,
     );
     // A peer working in its own folder, as a worktree peer does.
     let (peer_id, _, _) = session
@@ -475,4 +477,141 @@ async fn a_peer_shares_files_into_the_recipients_folder() {
         .await
         .unwrap_err();
     assert!(refused.contains("outside your folders"), "{refused}");
+}
+
+/// An owner's conversation keeps one tree for its lead agent: the next run
+/// continues it (board and finished peers), unless the owner asked for a
+/// fresh session, the folder changed, or the earlier run still runs.
+#[tokio::test]
+async fn a_conversations_next_lead_run_continues_its_tree() {
+    use aidaemon_coding_agents::peer::{PeerState, PeerUpdate};
+    let (tool, _db) = setup_bash_tool().await;
+    let tool = Arc::new(tool);
+    tool.enable_peer_coordination_with_limits("echo", vec![], PeerLimits::default())
+        .await
+        .unwrap();
+    let coord = tool.peer_coord.get().expect("peer_coord enabled");
+    let root = |dir: &str| peer_mod::PeerRootContext {
+        lead_mode: Some(aidaemon_coding_agents::PermissionMode::FullAccess),
+        session_id: "app:synthetic-continue".into(),
+        grant_session: "app:synthetic-continue".into(),
+        working_dir: Some(dir.to_string()),
+        read_paths: vec![dir.to_string()],
+        write_paths: Vec::new(),
+        enforce_native_access: false,
+        project: None,
+        detached_judge: None,
+        spawn_family: None,
+        status_tx: None,
+        may_send_files: false,
+    };
+    let continuity = |fresh: bool, run: &str| {
+        Some(peer_mod::TreeContinuity {
+            lead: peer_mod::ConversationLead {
+                session_id: "app:synthetic-continue".into(),
+                agent: "bash-agent".into(),
+            },
+            fresh,
+            run_id: run.into(),
+        })
+    };
+    let end = |tree: &aidaemon_coding_agents::peer::PeerTree| {
+        tree.cancel_subtree("peer-root");
+        tree.update_peer(
+            "peer-root",
+            PeerUpdate {
+                state: PeerState::Completed,
+                run_id: None,
+                working_dir: None,
+                branch: None,
+                output: None,
+                resumable: None,
+            },
+        );
+    };
+
+    let first = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/a"),
+        &[],
+        continuity(false, "run-1"),
+    );
+    first
+        .tree
+        .post_message("peer-root", None, "plan", "HERON note")
+        .unwrap();
+    // While the first run still runs, a second gets its own tree.
+    let overlapping = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/a"),
+        &[],
+        continuity(false, "run-x"),
+    );
+    assert_ne!(overlapping.tree.id(), first.tree.id());
+    end(&overlapping.tree);
+    // The overlapping run's tree is now the conversation's: the next run
+    // continues it.
+    let second = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/a"),
+        &[],
+        continuity(false, "run-2"),
+    );
+    assert_eq!(second.tree.id(), overlapping.tree.id());
+    end(&second.tree);
+
+    // The real case: one run ends, the next continues its tree.
+    let a = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/a"),
+        &[],
+        continuity(true, "run-3"),
+    );
+    a.tree
+        .post_message("peer-root", None, "plan", "HERON first")
+        .unwrap();
+    end(&a.tree);
+    let b = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/a"),
+        &[],
+        continuity(false, "run-4"),
+    );
+    assert_eq!(b.tree.id(), a.tree.id(), "the follow-up continues the tree");
+    let board = b.tree.read_messages("peer-root", 0, false);
+    assert_eq!(board.len(), 1);
+    assert_eq!(board[0].body, "HERON first");
+    assert_eq!(
+        b.tree.peer("peer-root").unwrap().run_id.as_deref(),
+        Some("run-4")
+    );
+    end(&b.tree);
+
+    // A fresh session or another folder starts over.
+    let fresh = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/a"),
+        &[],
+        continuity(true, "run-5"),
+    );
+    assert_ne!(fresh.tree.id(), b.tree.id());
+    end(&fresh.tree);
+    let moved = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root("/w/b"),
+        &[],
+        continuity(false, "run-6"),
+    );
+    assert_ne!(moved.tree.id(), fresh.tree.id());
+    // Without continuity (a delegation from a regular chat) it is always new.
+    end(&moved.tree);
+    let other = coord.start_root_tree("bash-agent", "Lead", root("/w/b"), &[], None);
+    assert_ne!(other.tree.id(), moved.tree.id());
 }

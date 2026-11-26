@@ -608,11 +608,24 @@ impl CliAgentTool {
                 status_tx: status_tx.clone(),
                 may_send_files,
             };
+            // An owner's conversation with its agent keeps one tree from
+            // exchange to exchange: a follow-up reads the board and resumes
+            // the peers of the runs before it.
+            let continuity =
+                (direct_agent || spec.owner_follow_up).then(|| peers::TreeContinuity {
+                    lead: peers::ConversationLead {
+                        session_id: session_id.to_string(),
+                        agent: tool_name.to_string(),
+                    },
+                    fresh: fresh_session,
+                    run_id: cli_run_id(&task_id),
+                });
             let root_session = coord.start_root_tree(
                 tool_name,
                 &spec.label(&format!("{tool_name} coding agent")),
                 root_ctx,
                 &available,
+                continuity,
             );
             root_session
                 .tree

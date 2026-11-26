@@ -292,6 +292,13 @@ struct TreeInner {
     board: Vec<BoardMessage>,
     next_peer_num: usize,
     next_seq: u64,
+    /// Where the current lead run's part of the tree starts: `peers[0]` is
+    /// the root, and the peers after `epoch_peers` and the board from
+    /// `epoch_board` on are this run's. A tree a later run of the same lead
+    /// continues ([`PeerTree::continue_root`]) keeps what came before for
+    /// its peers to read, while limits and the run's record count only its own.
+    epoch_peers: usize,
+    epoch_board: usize,
 }
 
 /// Shared coordination state for one top-level CLI request and all peer CLIs it
@@ -342,6 +349,8 @@ impl PeerTree {
                 board: Vec::new(),
                 next_peer_num: 1,
                 next_seq: 1,
+                epoch_peers: 0,
+                epoch_board: 0,
             }),
         })
     }
@@ -365,6 +374,42 @@ impl PeerTree {
     pub fn cancel_all(&self) {
         self.cancel.cancel();
         self.board_notify.notify_waiters();
+    }
+
+    /// Continue this tree under a new run (`run_id`) of the lead that ended:
+    /// its board and finished peers stay (a peer it resumes keeps its
+    /// session), the root runs again, and every peer gets a fresh
+    /// cancellation token in place of the one its ended lead cancelled.
+    /// The limits and the run's record count only what this run adds.
+    /// `false`, and nothing changes, while any peer still runs or once the
+    /// whole tree was cancelled.
+    pub fn continue_root(&self, run_id: impl Into<String>) -> bool {
+        if self.cancel.is_cancelled() {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.peers.iter().any(|peer| !peer.state.is_terminal()) {
+            return false;
+        }
+        let mut tokens: HashMap<String, CancellationToken> = HashMap::new();
+        for peer in &inner.peers {
+            let parent = peer
+                .parent_peer_id
+                .as_ref()
+                .and_then(|parent| tokens.get(parent))
+                .unwrap_or(&self.cancel);
+            let token = parent.child_token();
+            tokens.insert(peer.peer_id.clone(), token);
+        }
+        inner.tokens = tokens;
+        let run_id = run_id.into();
+        if let Some(root) = inner.peers.iter_mut().find(|p| p.peer_id == "peer-root") {
+            root.state = PeerState::Running;
+            root.run_id = Some(run_id);
+        }
+        inner.epoch_peers = inner.peers.len() - 1;
+        inner.epoch_board = inner.board.len();
+        true
     }
 
     /// Record the host `run_id` for `peer_id` (for example on `peer-root` once
@@ -419,7 +464,7 @@ impl PeerTree {
                 self.limits.max_depth
             ));
         }
-        if inner.peers.len() >= self.limits.max_peers {
+        if inner.peers.len() - inner.epoch_peers >= self.limits.max_peers {
             return Err(format!(
                 "peer limit ({}) reached for this coordination tree",
                 self.limits.max_peers
@@ -549,7 +594,7 @@ impl PeerTree {
             return Err("message body must not be empty".to_string());
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.board.len() >= self.limits.max_messages {
+        if inner.board.len() - inner.epoch_board >= self.limits.max_messages {
             return Err(format!(
                 "board message limit ({}) reached for this coordination tree",
                 self.limits.max_messages
@@ -593,16 +638,26 @@ impl PeerTree {
     /// its root or a message was posted to its board.
     pub fn acted(&self) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.peers.len() > 1 || !inner.board.is_empty()
+        inner.peers.len() - inner.epoch_peers > 1 || inner.board.len() > inner.epoch_board
     }
 
     pub fn record(&self, max_body_chars: usize, max_board_chars: usize) -> Option<String> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.peers.len() <= 1 && inner.board.is_empty() {
+        // This run's part: the root, the peers after `epoch_peers`, the
+        // board from `epoch_board` on.
+        let peers: Vec<&PeerRecord> = inner
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index == 0 || *index > inner.epoch_peers)
+            .map(|(_, peer)| peer)
+            .collect();
+        let board = &inner.board[inner.epoch_board..];
+        if peers.len() <= 1 && board.is_empty() {
             return None;
         }
         let mut out = String::from("Peer tree:\n");
-        for peer in &inner.peers {
+        for peer in peers {
             let state = serde_json::to_value(peer.state)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
@@ -616,11 +671,11 @@ impl PeerTree {
             }
             out.push('\n');
         }
-        if !inner.board.is_empty() {
-            let share = (max_board_chars / inner.board.len()).max(200);
+        if !board.is_empty() {
+            let share = (max_board_chars / board.len()).max(200);
             let max_body_chars = max_body_chars.min(share);
             out.push_str("Board:\n");
-            for msg in &inner.board {
+            for msg in board {
                 let to = msg.to_peer.as_deref().unwrap_or("all");
                 out.push_str(&format!(
                     "[{}] {} -> {} ({}):\n{}\n",
@@ -1869,5 +1924,82 @@ mod tests {
         );
         assert!(record.contains("… [cut]"), "{record}");
         assert!(record.len() < 2_500, "{}", record.len());
+    }
+
+    fn ended(tree: &PeerTree, peer_id: &str, state: PeerState) {
+        tree.update_peer(
+            peer_id,
+            PeerUpdate {
+                state,
+                run_id: None,
+                working_dir: None,
+                branch: None,
+                output: None,
+                resumable: None,
+            },
+        );
+    }
+
+    #[test]
+    fn a_later_run_of_the_lead_continues_its_tree() {
+        let limits = PeerLimits {
+            max_peers: 2,
+            max_messages: 1,
+            ..PeerLimits::default()
+        };
+        let tree = PeerTree::new("agy", "Lead", None, limits);
+        tree.post_message("peer-root", None, "plan", "first exchange")
+            .unwrap();
+        let (child, _, child_token) = tree
+            .reserve_child("peer-root", "codex", "Review", PeerWorkspaceMode::ReadOnly)
+            .unwrap();
+        assert!(
+            !tree.continue_root("run-2"),
+            "not while the first run's peers still run"
+        );
+        ended(&tree, &child, PeerState::Completed);
+        assert!(!tree.continue_root("run-2"), "not while the lead runs");
+        // The lead ends: its subtree's tokens are cancelled.
+        tree.cancel_subtree("peer-root");
+        ended(&tree, "peer-root", PeerState::Completed);
+        assert!(child_token.is_cancelled());
+
+        assert!(tree.continue_root("run-2"));
+        let root = tree.peer("peer-root").unwrap();
+        assert_eq!(root.state, PeerState::Running);
+        assert_eq!(root.run_id.as_deref(), Some("run-2"));
+        // The earlier board and peer stay for this run to read and resume.
+        let board = tree.read_messages("peer-root", 0, false);
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].body, "first exchange");
+        assert_eq!(tree.peers().len(), 2);
+        let resumed = tree
+            .inner
+            .lock()
+            .unwrap()
+            .tokens
+            .get(&child)
+            .cloned()
+            .unwrap();
+        assert!(
+            !resumed.is_cancelled(),
+            "a resumed earlier peer is not born cancelled"
+        );
+        // This run counts only its own: nothing acted yet, fresh limits.
+        assert!(!tree.acted());
+        assert!(tree.record(2_000, 16_000).is_none());
+        tree.post_message("peer-root", None, "plan", "second exchange")
+            .unwrap();
+        assert!(
+            tree.post_message("peer-root", None, "plan", "over")
+                .is_err()
+        );
+        let record = tree.record(2_000, 16_000).unwrap();
+        assert!(record.contains("second exchange"), "{record}");
+        assert!(!record.contains("first exchange"), "{record}");
+        assert!(!record.contains("peer-1"), "{record}");
+        tree.reserve_child("peer-root", "claude", "Check", PeerWorkspaceMode::ReadOnly)
+            .unwrap();
+        assert_eq!(tree.read_messages("peer-root", 0, false).len(), 2);
     }
 }
