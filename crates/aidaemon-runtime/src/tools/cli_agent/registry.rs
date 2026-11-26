@@ -193,7 +193,7 @@ impl CliAgentTool {
         state: Arc<dyn CliAgentStore>,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
-        let background_timeout = Duration::from_secs(config.background_timeout_secs.max(1));
+        let background_timeout = Duration::from_secs(config.background_timeout_secs);
         let idle_timeout = Duration::from_secs(config.idle_timeout_secs.max(1));
         let default_max_output = config.max_output_chars;
         let max_concurrent = config.max_concurrent.max(1);

@@ -88,8 +88,10 @@ pub struct CliAgentsConfig {
     /// Max concurrent CLI agent processes across every conversation.
     #[serde(default = "default_cli_agents_max_concurrent")]
     pub max_concurrent: usize,
-    /// Hard wall-clock limit for a CLI agent running in the background
-    /// (paused while waiting on an owner approval card).
+    /// An optional total-time cap for a CLI agent running in the background
+    /// (paused while waiting on an owner approval card); 0, the default, is
+    /// none: work that still makes output may run for hours, and
+    /// `idle_timeout_secs` stops a stalled one.
     #[serde(default = "default_cli_agents_background_timeout_secs")]
     pub background_timeout_secs: u64,
     /// Maximum silent interval without stdout/stderr output before a
@@ -189,7 +191,14 @@ const LOOP_DETECTION_THRESHOLD: usize = 50;
 const DEFAULT_MAX_CONCURRENT: usize = 6;
 
 /// Default hard wall-clock limit for a background CLI agent (30 minutes).
-const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 0;
+
+/// The total-time cap on one background run: none unless the owner set
+/// `background_timeout_secs`, and then never shorter than the call's own
+/// timeout.
+pub(super) fn background_cap(configured: Duration, call: Duration) -> Option<Duration> {
+    (!configured.is_zero()).then(|| configured.max(call))
+}
 
 /// Default silent-idle limit for a background CLI agent (10 minutes).
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;

@@ -393,7 +393,7 @@ impl CliAgentTool {
             let coding_agent = prep.coding_agent.clone();
             let keep_alive = prep.keep_alive.take();
             let max_output = prep.max_output;
-            let background_timeout = handles.background_timeout.max(prep.timeout);
+            let background_timeout = background_cap(handles.background_timeout, prep.timeout);
             let idle_timeout = handles.idle_timeout;
             let permit_slot = peers::PermitSlot::new(
                 permit,

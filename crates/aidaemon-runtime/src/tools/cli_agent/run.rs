@@ -812,7 +812,7 @@ impl CliAgentTool {
                 .set_accepts_mid_run(&cli_run_id(&task_id), true);
         }
 
-        let background_timeout = handles.background_timeout.max(timeout);
+        let background_timeout = background_cap(handles.background_timeout, timeout);
         let idle_timeout = handles.idle_timeout;
         let permit_slot = peers::PermitSlot::new(
             slot_permit,
@@ -1208,7 +1208,10 @@ impl CliAgentTool {
         let started_at_instant = started.started_at;
         let max_output = prep.max_output;
         let keeps_session = prep.keeps_session;
-        let background_timeout = handles.background_timeout.max(prep.timeout);
+        let background_timeout = background_cap(handles.background_timeout, prep.timeout);
+        // How long a caller that asked to wait waits before hearing the
+        // peer is still running (a bound on the wait, not on the work).
+        let wait_for = background_timeout.unwrap_or(prep.timeout);
         let idle_timeout = handles.idle_timeout;
 
         self.start_background_run(
@@ -1287,7 +1290,7 @@ impl CliAgentTool {
             });
         }
 
-        let wait_deadline = tokio::time::Instant::now() + background_timeout;
+        let wait_deadline = tokio::time::Instant::now() + wait_for;
         loop {
             let notified = shared.done_notify.notified();
             tokio::pin!(notified);

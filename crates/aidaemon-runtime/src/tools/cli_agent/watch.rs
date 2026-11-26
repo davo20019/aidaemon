@@ -16,7 +16,7 @@ pub(super) async fn watch_run(
     started: StartedRun,
     coding_agent: Arc<dyn aidaemon_coding_agents::CodingAgent>,
     max_output: usize,
-    background_timeout: Duration,
+    background_timeout: Option<Duration>,
     idle_timeout: Duration,
     keep_alive: Option<Box<dyn std::any::Any + Send>>,
     permit_slot: peers::PermitSlot,
@@ -197,11 +197,13 @@ pub(super) async fn watch_run(
                     last_output_at = now;
                 } else {
                     active_elapsed = active_elapsed.saturating_add(tick_delta);
-                    let reason = if active_elapsed >= background_timeout {
+                    let reason = if let Some(cap) =
+                        background_timeout.filter(|cap| active_elapsed >= *cap)
+                    {
                         Some(format!(
                             "CLI agent '{}' exceeded its {}s background execution limit and was stopped.",
                             tool_name_owned,
-                            background_timeout.as_secs()
+                            cap.as_secs()
                         ))
                     } else if now.saturating_duration_since(last_output_at) >= idle_timeout {
                         Some(format!(

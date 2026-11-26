@@ -667,6 +667,27 @@ fn cli_agents_config_deserializes_custom_limits_and_timeouts() {
     assert_eq!(custom.idle_timeout_secs, 120);
 }
 
+/// Work is bounded by inactivity, not elapsed time: a background run has no
+/// total-time cap unless the owner sets one, and a set one never undercuts
+/// the call's own timeout.
+#[test]
+fn background_runs_have_no_total_time_cap_by_default() {
+    let defaults: CliAgentsConfig = toml::from_str("").unwrap();
+    let call = Duration::from_secs(600);
+    assert_eq!(
+        background_cap(Duration::from_secs(defaults.background_timeout_secs), call),
+        None
+    );
+    assert_eq!(
+        background_cap(Duration::from_secs(300), call),
+        Some(Duration::from_secs(600))
+    );
+    assert_eq!(
+        background_cap(Duration::from_secs(3600), call),
+        Some(Duration::from_secs(3600))
+    );
+}
+
 // -----------------------------------------------------------------------
 // Prompt similarity tests
 // -----------------------------------------------------------------------
