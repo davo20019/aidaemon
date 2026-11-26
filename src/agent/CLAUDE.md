@@ -123,7 +123,8 @@ Owner level `unrestricted` records these calls instead of checking them.
   three clean rewrites.
 - A turn starts tainted from explicit facts only (`starts_tainted`): role,
   channel visibility, trigger session, a tainted turn still in the projected
-  prefix, or a tainted parent.
+  prefix, or a tainted parent. What the prompt holds counts only when a model
+  reads it: a direct coding-agent turn hands the owner's message as written.
 - Never key trust, egress or taint on tool names or on request/content
   wording.
 

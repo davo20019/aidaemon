@@ -48,6 +48,11 @@ pub struct TaintFacts<'a> {
     /// Project instructions in the prompt came from outside the turn's
     /// trusted roots (`project_instructions::untrusted_instruction_sources`).
     pub instructions_untrusted: bool,
+    /// A model reads the turn's prompt (its transcript, summary and project
+    /// instructions). `false` for a turn of a conversation set to a coding
+    /// agent: no model runs, and its one call hands the owner's message as
+    /// written to that agent, so nothing it could have read shapes the call.
+    pub reads_history: bool,
 }
 
 /// Whether the turn starts as if it had already read untrusted content:
@@ -55,6 +60,8 @@ pub struct TaintFacts<'a> {
 /// chat, the input is a trigger's, the transcript still holds a turn that
 /// read untrusted content (an unreadable record counts), the parent was
 /// tainted, or project instructions came from outside the trusted roots.
+/// What the prompt holds (transcript, summary, instructions) counts only
+/// when a model reads it ([`TaintFacts::reads_history`]).
 pub fn starts_tainted(facts: &TaintFacts<'_>) -> bool {
     let prefix_tainted = match facts.tainted_turns {
         None => true,
@@ -63,13 +70,13 @@ pub fn starts_tainted(facts: &TaintFacts<'_>) -> bool {
             .iter()
             .any(|turn| tainted.contains(turn)),
     };
+    let history_tainted = facts.reads_history
+        && (prefix_tainted || facts.summary_tainted || facts.instructions_untrusted);
     facts.inherited
-        || facts.summary_tainted
-        || facts.instructions_untrusted
         || facts.user_role != UserRole::Owner
         || shared_chat(facts.visibility)
         || aidaemon_work::triggers::is_trigger_session(facts.session_id)
-        || prefix_tainted
+        || history_tainted
 }
 
 /// Whether other people can write into a chat with `visibility`.
@@ -1623,6 +1630,7 @@ mod tests {
             inherited: false,
             summary_tainted: false,
             instructions_untrusted: false,
+            reads_history: true,
         }
     }
 
@@ -1663,6 +1671,44 @@ mod tests {
             instructions_untrusted: true,
             ..owner_private(&none, Some(&none))
         }));
+    }
+
+    /// A turn no model reads (a conversation set to a coding agent hands
+    /// the owner's message as written to it) is not tainted by what its
+    /// prompt holds, only by who is asking and where.
+    #[test]
+    fn a_turn_no_model_reads_is_tainted_only_by_who_asks_and_where() {
+        let projected = vec!["turn-a".to_string()];
+        let tainted = vec!["turn-a".to_string()];
+        fn direct(facts: TaintFacts<'_>) -> TaintFacts<'_> {
+            TaintFacts {
+                reads_history: false,
+                ..facts
+            }
+        }
+        assert!(starts_tainted(&owner_private(&projected, Some(&tainted))));
+        assert!(!starts_tainted(&direct(owner_private(
+            &projected,
+            Some(&tainted)
+        ))));
+        assert!(!starts_tainted(&direct(owner_private(&projected, None))));
+        assert!(!starts_tainted(&direct(TaintFacts {
+            summary_tainted: true,
+            instructions_untrusted: true,
+            ..owner_private(&projected, Some(&tainted))
+        })));
+        assert!(starts_tainted(&direct(TaintFacts {
+            user_role: UserRole::Guest,
+            ..owner_private(&projected, Some(&tainted))
+        })));
+        assert!(starts_tainted(&direct(TaintFacts {
+            visibility: ChannelVisibility::PrivateGroup,
+            ..owner_private(&projected, Some(&tainted))
+        })));
+        assert!(starts_tainted(&direct(TaintFacts {
+            session_id: "event_synthetic",
+            ..owner_private(&projected, Some(&tainted))
+        })));
     }
 
     #[test]

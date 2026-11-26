@@ -1286,6 +1286,19 @@ impl TurnEngine<'_> {
                 "Project instructions from outside the trusted roots: the turn starts tainted"
             );
         }
+        // A conversation set to a coding agent: no model runs, the owner's
+        // message goes to that agent as written.
+        let direct_agent =
+            if self.host.depth() == 0 && !internal_continuation && channel_ctx.in_run.is_none() {
+                crate::session_model::get(self.host.settings(), session_id)
+                    .await
+                    .agent
+            } else {
+                None
+            };
+        if direct_agent.is_some() {
+            verdict.direct_agent.store(true, Ordering::Relaxed);
+        }
         let starts_tainted = crate::untrusted::starts_tainted(&crate::untrusted::TaintFacts {
             user_role,
             visibility: channel_ctx.visibility,
@@ -1294,6 +1307,7 @@ impl TurnEngine<'_> {
             tainted_turns: tainted_turns.as_deref(),
             summary_tainted,
             instructions_untrusted: !untrusted_instructions.is_empty(),
+            reads_history: direct_agent.is_none(),
             inherited: self
                 .inherited_authority()
                 .as_ref()
@@ -1410,17 +1424,6 @@ impl TurnEngine<'_> {
                 origin_request,
             )
             .await;
-        }
-        let direct_agent =
-            if self.host.depth() == 0 && !internal_continuation && channel_ctx.in_run.is_none() {
-                crate::session_model::get(self.host.settings(), session_id)
-                    .await
-                    .agent
-            } else {
-                None
-            };
-        if direct_agent.is_some() {
-            verdict.direct_agent.store(true, Ordering::Relaxed);
         }
         let untrusted_seen = Arc::new(AtomicBool::new(starts_tainted));
         let detached_mission = self
