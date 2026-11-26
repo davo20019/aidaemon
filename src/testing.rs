@@ -690,12 +690,20 @@ pub fn test_project_notes() -> anyhow::Result<(
 /// Each call creates an isolated database, so tests can run in parallel.
 pub use aidaemon_tools::testing::{CallWithFacts, call_facts, call_with_facts};
 
-/// The `fake_mcp_server` test binary of `aidaemon-mcp`: built once per test
-/// process into its own target directory (so it never waits on the build
-/// lock of the running `cargo test`).
+/// The `fake_mcp_server` test binary of `aidaemon-mcp`: the prebuilt one
+/// `AIDAEMON_FAKE_MCP_SERVER` names (CI's Windows shards run archived tests,
+/// where a cold build of it outlasts a test's time limit), else built once
+/// per test process into its own target directory (so it never waits on the
+/// build lock of the running `cargo test`).
 pub fn fake_mcp_server_path() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
+        if let Some(prebuilt) = std::env::var_os("AIDAEMON_FAKE_MCP_SERVER")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+        {
+            return prebuilt;
+        }
         let exe = std::env::current_exe().expect("test binary path");
         // target/<profile>/deps/<test binary>
         let target = exe

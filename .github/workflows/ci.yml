@@ -444,20 +444,28 @@ jobs:
       - name: Build
         run: cargo build --locked --keep-going
 
+      # From crates.io, not install-action, whose bash step fails to start
+      # on some Windows runners (actions/partner-runner-images#169).
       - name: Install cargo-nextest
         if: always()
-        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
-        with:
-          tool: cargo-nextest
+        run: cargo install cargo-nextest --locked --version 0.9.152
 
       - name: Archive the tests
         if: always()
         run: cargo nextest archive --lib --locked --archive-file windows-tests.tar.zst
 
+      # The MCP tests' fake server, built here once: built cold inside a test
+      # it outlasts the test's time limit on the shards.
+      - name: Build the fake MCP server
+        if: always()
+        run: cargo build --locked -p aidaemon-mcp --features test-server --bin fake_mcp_server
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-tests
-          path: windows-tests.tar.zst
+          path: |
+            windows-tests.tar.zst
+            target/debug/fake_mcp_server.exe
           retention-days: 1
 
   windows-app:
@@ -516,6 +524,8 @@ jobs:
           name: windows-tests
 
       - name: Test
+        env:
+          AIDAEMON_FAKE_MCP_SERVER: ${{ github.workspace }}\target\debug\fake_mcp_server.exe
         run: cargo nextest run --archive-file windows-tests.tar.zst --workspace-remap . --profile windows-ci --partition hash:${{ matrix.partition }}/3
 
   # The Linux and macOS suites: one job per OS compiles every test binary once
