@@ -188,6 +188,7 @@ impl PeerCoordinator {
             (same_folder && kept.continue_root(c.run_id.clone())).then_some(kept)
         });
         let continued_any = continued.is_some();
+        let conversation_lead = continuity.as_ref().map(|c| c.lead.clone());
         if let Some(tree) = &continued {
             info!(tree_id = %tree.id(), session_id = %root_ctx.session_id, agent = %root_agent, "A lead run continues its conversation's peer tree");
         }
@@ -242,6 +243,7 @@ impl PeerCoordinator {
             permit_slots,
             launcher,
             rebind,
+            conversation: conversation_lead.map(|lead| (self.clone(), lead)),
         }
     }
 
@@ -266,6 +268,95 @@ impl PeerCoordinator {
             }
         }
         kept.insert(lead, tree);
+    }
+
+    /// The settings key `lead`'s kept tree is saved under.
+    fn conversation_tree_key(lead: &ConversationLead) -> String {
+        format!("peer_tree:{}:{}", lead.session_id, lead.agent)
+    }
+
+    /// Bring `lead`'s saved tree back after a restart, when none is kept in
+    /// memory: a later run of the lead continues it.
+    pub(super) async fn load_conversation_tree(&self, lead: &ConversationLead) {
+        let kept = self
+            .conversation_trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(lead);
+        if kept {
+            return;
+        }
+        let Some(tool) = self.tool.upgrade() else {
+            return;
+        };
+        let saved = match tool
+            .state
+            .get_setting(&Self::conversation_tree_key(lead))
+            .await
+        {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "Could not read a conversation's saved peer tree");
+                return;
+            }
+        };
+        let Some(tree) =
+            serde_json::from_str::<aidaemon_coding_agents::peer::PeerTreeSnapshot>(&saved)
+                .ok()
+                .and_then(|snapshot| PeerTree::restore(snapshot, self.limits))
+        else {
+            tracing::warn!(session_id = %lead.session_id, "A conversation's saved peer tree could not be read back");
+            return;
+        };
+        info!(tree_id = %tree.id(), session_id = %lead.session_id, agent = %lead.agent, "Restored a conversation's peer tree");
+        let mut kept = self
+            .conversation_trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !kept.contains_key(lead) {
+            Self::keep_conversation_tree(&mut kept, lead.clone(), tree);
+        }
+    }
+
+    /// Save `tree` as `lead`'s, when it is the one the conversation keeps,
+    /// so a restart does not lose it.
+    pub(super) async fn save_conversation_tree(
+        &self,
+        lead: &ConversationLead,
+        tree: &Arc<PeerTree>,
+    ) {
+        let current = self
+            .conversation_trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(lead)
+            .is_some_and(|kept| Arc::ptr_eq(kept, tree));
+        if !current {
+            return;
+        }
+        let Some(tool) = self.tool.upgrade() else {
+            return;
+        };
+        let Ok(body) = serde_json::to_string(&tree.snapshot()) else {
+            return;
+        };
+        if let Err(error) = tool
+            .state
+            .set_setting(&Self::conversation_tree_key(lead), &body)
+            .await
+        {
+            tracing::warn!(%error, "Could not save a conversation's peer tree");
+        }
+    }
+
+    /// Drop every tree kept in memory, as a restart does.
+    #[cfg(test)]
+    pub(super) fn forget_conversation_trees(&self) {
+        self.conversation_trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// The lead's launcher and MCP handler on `tree`.
@@ -341,6 +432,8 @@ pub(super) struct RootPeerSession {
     pub(super) launcher: Arc<RuntimePeerLauncher>,
     /// Set when the run may still take its conversation's tree at start.
     pub(super) rebind: Option<Arc<RootRebind>>,
+    /// The conversation whose tree this run leads, saved when it ends.
+    pub(super) conversation: Option<(Arc<PeerCoordinator>, ConversationLead)>,
 }
 
 /// Active peer metadata carried by a running CLI (root or child) so its
@@ -356,6 +449,8 @@ pub(super) struct ActivePeerBinding {
     pub(super) branch: Option<String>,
     /// A lead run's way onto its conversation's tree at start.
     pub(super) rebind: Option<Arc<RootRebind>>,
+    /// The conversation whose tree a lead run leads, saved when it ends.
+    pub(super) conversation: Option<(Arc<PeerCoordinator>, ConversationLead)>,
 }
 
 /// How much of each board post a lead run's result keeps.
@@ -493,6 +588,13 @@ impl ActivePeerBinding {
             .remove(&self.peer_id)
         {
             slot.release();
+        }
+    }
+
+    /// A lead run ended: keep its conversation's tree across a restart.
+    pub(super) async fn save_conversation_tree(&self) {
+        if let Some((coord, lead)) = &self.conversation {
+            coord.save_conversation_tree(lead, &self.tree).await;
         }
     }
 
@@ -932,6 +1034,7 @@ impl PeerLauncher for RuntimePeerLauncher {
             launcher: None,
             branch: branch.clone(),
             rebind: None,
+            conversation: None,
         };
 
         // A subpath child writes inside its ancestors' folder by their own

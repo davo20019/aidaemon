@@ -301,6 +301,17 @@ struct TreeInner {
     epoch_board: usize,
 }
 
+/// A tree's state as kept across a host restart, for a later run of its
+/// lead to continue ([`PeerTree::restore`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTreeSnapshot {
+    pub id: String,
+    pub peers: Vec<PeerRecord>,
+    pub board: Vec<BoardMessage>,
+    pub next_peer_num: usize,
+    pub next_seq: u64,
+}
+
 /// Shared coordination state for one top-level CLI request and all peer CLIs it
 /// spawns.
 pub struct PeerTree {
@@ -374,6 +385,65 @@ impl PeerTree {
     pub fn cancel_all(&self) {
         self.cancel.cancel();
         self.board_notify.notify_waiters();
+    }
+
+    /// The tree's peers and board, to keep across a host restart.
+    pub fn snapshot(&self) -> PeerTreeSnapshot {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        PeerTreeSnapshot {
+            id: self.id.clone(),
+            peers: inner.peers.clone(),
+            board: inner.board.clone(),
+            next_peer_num: inner.next_peer_num,
+            next_seq: inner.next_seq,
+        }
+    }
+
+    /// A tree from `snapshot`, for a later run of its lead to continue
+    /// ([`Self::continue_root`]). A peer the snapshot shows running did not
+    /// survive the restart: it reads as cancelled. `None` without a root.
+    pub fn restore(snapshot: PeerTreeSnapshot, limits: PeerLimits) -> Option<Arc<Self>> {
+        if !snapshot
+            .peers
+            .iter()
+            .any(|peer| peer.peer_id == "peer-root")
+        {
+            return None;
+        }
+        let cancel = CancellationToken::new();
+        let mut peers = snapshot.peers;
+        let mut tokens: HashMap<String, CancellationToken> = HashMap::new();
+        for peer in &mut peers {
+            if !peer.state.is_terminal() {
+                peer.state = PeerState::Cancelled;
+            }
+            let parent = peer
+                .parent_peer_id
+                .as_ref()
+                .and_then(|parent| tokens.get(parent))
+                .unwrap_or(&cancel);
+            let token = parent.child_token();
+            tokens.insert(peer.peer_id.clone(), token);
+        }
+        let next_peer_num = snapshot.next_peer_num.max(peers.len());
+        let next_seq = snapshot
+            .next_seq
+            .max(snapshot.board.iter().map(|m| m.seq + 1).max().unwrap_or(1));
+        Some(Arc::new(Self {
+            id: snapshot.id,
+            limits,
+            cancel,
+            board_notify: Notify::new(),
+            inner: Mutex::new(TreeInner {
+                peers,
+                tokens,
+                board: snapshot.board,
+                next_peer_num,
+                next_seq,
+                epoch_peers: 0,
+                epoch_board: 0,
+            }),
+        }))
     }
 
     /// Continue this tree under a new run (`run_id`) of the lead that ended:
@@ -2013,5 +2083,37 @@ mod tests {
         let carried = tree.read_messages("peer-root", 0, false);
         assert_eq!(carried.len(), 1);
         assert_eq!(carried[0].body, "second exchange");
+
+        // Across a restart: the snapshot restores board and peers, a peer
+        // that was running reads as cancelled, and the tree goes on.
+        tree.reserve_child("peer-root", "codex", "Late", PeerWorkspaceMode::ReadOnly)
+            .unwrap();
+        let snapshot = tree.snapshot();
+        let restored = PeerTree::restore(snapshot.clone(), limits).unwrap();
+        assert_eq!(restored.id(), tree.id());
+        assert_eq!(restored.read_messages("peer-root", 0, false), carried);
+        assert!(restored.peers().iter().all(|peer| peer.state.is_terminal()));
+        assert!(restored.continue_root("run-4"));
+        let next = restored
+            .post_message("peer-root", None, "plan", "after restart")
+            .unwrap();
+        assert!(next.seq > carried[0].seq);
+        let (late, _, _) = restored
+            .reserve_child("peer-root", "claude", "New", PeerWorkspaceMode::ReadOnly)
+            .unwrap();
+        assert!(
+            snapshot.peers.iter().all(|peer| peer.peer_id != late),
+            "ids never repeat"
+        );
+        assert!(
+            PeerTree::restore(
+                PeerTreeSnapshot {
+                    peers: Vec::new(),
+                    ..snapshot
+                },
+                limits
+            )
+            .is_none()
+        );
     }
 }

@@ -637,6 +637,7 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         launcher: Some(queued.launcher.clone()),
         branch: None,
         rebind: queued.rebind.clone(),
+        conversation: None,
     };
     // Still running at start: it stays on its own tree.
     let mut early = binding.clone();
@@ -738,6 +739,7 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         launcher: Some(elsewhere.launcher.clone()),
         branch: None,
         rebind: elsewhere.rebind.clone(),
+        conversation: None,
     };
     end(&in_a.tree);
     assert!(!elsewhere_binding.adopt_conversation_tree(&elsewhere.scoped));
@@ -775,6 +777,7 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         launcher: Some(ending.launcher.clone()),
         branch: None,
         rebind: None,
+        conversation: None,
     };
     let follow = coord.start_root_tree(
         "bash-agent",
@@ -791,6 +794,7 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         launcher: Some(follow.launcher.clone()),
         branch: None,
         rebind: follow.rebind.clone(),
+        conversation: None,
     };
     ending.tree.update_peer(
         "peer-root",
@@ -818,4 +822,101 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         PeerState::Cancelled,
         "its own run's cleanup still ends it"
     );
+}
+
+/// A conversation's tree survives a daemon restart: saved when its lead
+/// run ends, read back for the next exchange.
+#[tokio::test]
+async fn a_conversations_tree_survives_a_restart() {
+    use aidaemon_coding_agents::peer::{PeerState, PeerUpdate};
+    let (tool, _db) = setup_bash_tool().await;
+    let tool = Arc::new(tool);
+    tool.enable_peer_coordination_with_limits("echo", vec![], PeerLimits::default())
+        .await
+        .unwrap();
+    let coord = tool.peer_coord.get().expect("peer_coord enabled");
+    let root = || peer_mod::PeerRootContext {
+        lead_mode: Some(aidaemon_coding_agents::PermissionMode::FullAccess),
+        session_id: "app:synthetic-restart".into(),
+        grant_session: "app:synthetic-restart".into(),
+        working_dir: Some("/w/r".into()),
+        read_paths: vec!["/w/r".into()],
+        write_paths: Vec::new(),
+        enforce_native_access: false,
+        project: None,
+        detached_judge: None,
+        spawn_family: None,
+        status_tx: None,
+        may_send_files: false,
+    };
+    let lead = peer_mod::ConversationLead {
+        session_id: "app:synthetic-restart".into(),
+        agent: "bash-agent".into(),
+    };
+    let continuity = |run: &str| {
+        Some(peer_mod::TreeContinuity {
+            lead: lead.clone(),
+            fresh: false,
+            run_id: run.into(),
+        })
+    };
+    let first = coord.start_root_tree("bash-agent", "Lead", root(), &[], continuity("run-1"));
+    first
+        .tree
+        .post_message("peer-root", None, "plan", "HERON before restart")
+        .unwrap();
+    let binding = peer_mod::ActivePeerBinding {
+        tree: first.tree.clone(),
+        peer_id: "peer-root".into(),
+        permit_slots: first.permit_slots.clone(),
+        is_root: true,
+        launcher: Some(first.launcher.clone()),
+        branch: None,
+        rebind: None,
+        conversation: first.conversation.clone(),
+    };
+    first.tree.update_peer(
+        "peer-root",
+        PeerUpdate {
+            state: PeerState::Completed,
+            run_id: None,
+            working_dir: None,
+            branch: None,
+            output: None,
+            resumable: None,
+        },
+    );
+    binding.cleanup_children("run-1").await;
+    binding.save_conversation_tree().await;
+
+    coord.forget_conversation_trees();
+    coord.load_conversation_tree(&lead).await;
+    let next = coord.start_root_tree("bash-agent", "Lead", root(), &[], continuity("run-2"));
+    assert_eq!(next.tree.id(), first.tree.id());
+    let board = next.tree.read_messages("peer-root", 0, false);
+    assert_eq!(board.len(), 1);
+    assert_eq!(board[0].body, "HERON before restart");
+    assert_eq!(
+        next.tree.peer("peer-root").unwrap().run_id.as_deref(),
+        Some("run-2")
+    );
+
+    // Nothing saved for another conversation: a fresh tree.
+    let other = peer_mod::ConversationLead {
+        session_id: "app:synthetic-other".into(),
+        agent: "bash-agent".into(),
+    };
+    coord.load_conversation_tree(&other).await;
+    let fresh = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        root(),
+        &[],
+        Some(peer_mod::TreeContinuity {
+            lead: other,
+            fresh: false,
+            run_id: "run-3".into(),
+        }),
+    );
+    assert_ne!(fresh.tree.id(), first.tree.id());
 }

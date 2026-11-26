@@ -651,6 +651,9 @@ impl CliAgentTool {
                     fresh: fresh_session,
                     run_id: cli_run_id(&task_id),
                 });
+            if let Some(continuity) = &continuity {
+                coord.load_conversation_tree(&continuity.lead).await;
+            }
             let root_session = coord.start_root_tree(
                 tool_name,
                 &spec.label(&format!("{tool_name} coding agent")),
@@ -669,6 +672,7 @@ impl CliAgentTool {
                 launcher: Some(root_session.launcher),
                 branch: None,
                 rebind: root_session.rebind,
+                conversation: root_session.conversation,
             };
             let has_known_agent = self
                 .tools

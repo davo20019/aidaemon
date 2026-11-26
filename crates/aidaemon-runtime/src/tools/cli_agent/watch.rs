@@ -589,6 +589,7 @@ pub(super) async fn watch_run(
                 },
             );
             binding.cleanup_children(&cli_run_id(&call.task_id)).await;
+            binding.save_conversation_tree().await;
         }
         permit_slot.release();
         shared.done_notify.notify_waiters();
