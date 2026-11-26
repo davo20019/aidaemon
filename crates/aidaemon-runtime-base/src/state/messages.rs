@@ -5,6 +5,36 @@ impl crate::state::types::MessageStore for SqliteStateStore {
     async fn append_message(&self, msg: &Message) -> anyhow::Result<()> {
         // Canonical persistence is event-sourced (events table). Keep only an
         // in-memory hot window here for low-latency context assembly.
+        //
+        // A session with no window yet (the first write since a restart)
+        // starts from its stored conversation, not from nothing: a window
+        // holding only what came after the restart is what every reader
+        // then sees as the whole conversation (live 2026-11-26: a chat
+        // resumed after a restart showed only its last reply in the app).
+        let cold = {
+            let wm = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.working_memory.read(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("append_message: working_memory read lock timed out"))?;
+            !wm.contains_key(&msg.session_id)
+        };
+        let stored = if cold {
+            match self.hydrate(&msg.session_id).await {
+                Ok(stored) => Some(stored),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %msg.session_id,
+                        %error,
+                        "append_message: could not read the stored conversation; starting its window empty"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         {
             let mut wm = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -12,10 +42,15 @@ impl crate::state::types::MessageStore for SqliteStateStore {
             )
             .await
             .map_err(|_| anyhow::anyhow!("append_message: working_memory write lock timed out"))?;
+            // Another reader may have filled it meanwhile: that one stands.
             let deque = wm
                 .entry(msg.session_id.clone())
-                .or_insert_with(VecDeque::new);
-            deque.push_back(msg.clone());
+                .or_insert_with(|| stored.unwrap_or_default());
+            // The message's event is written before it is appended, so the
+            // stored conversation may already hold it.
+            if !deque.iter().any(|m| m.id == msg.id) {
+                deque.push_back(msg.clone());
+            }
 
             // Evict old messages but ALWAYS preserve the first user message (anchor)
             // This is critical for Gemini which requires tool_calls to follow user/tool messages

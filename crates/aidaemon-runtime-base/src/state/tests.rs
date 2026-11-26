@@ -423,6 +423,70 @@ async fn test_working_memory_cap() {
     );
 }
 
+/// The first message written after a restart joins the stored
+/// conversation: the hot window starts from the events, not from nothing,
+/// and a message whose event is already stored is not added twice.
+#[tokio::test]
+async fn the_first_write_after_a_restart_keeps_the_stored_conversation() {
+    let (store, _db) = setup_test_store().await;
+    let session = "sess-restart";
+    let now = Utc::now();
+    create_events_table_for_tests(&store).await;
+    for (at, (event_type, id, content)) in [
+        ("user_message", "msg-user-1", "Review the docs"),
+        ("assistant_response", "msg-assistant-1", "Reviewed"),
+        ("user_message", "msg-user-2", "Did you check them all?"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        insert_conversation_event_for_tests(
+            &store,
+            session,
+            event_type,
+            serde_json::json!({
+                "content": content,
+                "message_id": id,
+                "has_attachments": false,
+                "model": "test",
+                "tool_calls": []
+            }),
+            now + chrono::Duration::seconds(at as i64),
+        )
+        .await;
+    }
+    // The restart: nothing in the hot window. The resumed turn's message
+    // is stored as an event, then appended.
+    store.working_memory.write().await.clear();
+    let mut reply = make_message(session, "assistant", "Yes");
+    reply.id = "msg-assistant-2".into();
+    insert_conversation_event_for_tests(
+        &store,
+        session,
+        "assistant_response",
+        serde_json::json!({
+            "content": "Yes",
+            "message_id": "msg-assistant-2",
+            "model": "test",
+            "tool_calls": []
+        }),
+        now + chrono::Duration::seconds(3),
+    )
+    .await;
+    store.append_message(&reply).await.unwrap();
+
+    let history = store.get_history(session, 100).await.unwrap();
+    assert_eq!(
+        history.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        [
+            "msg-user-1",
+            "msg-assistant-1",
+            "msg-user-2",
+            "msg-assistant-2"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn test_get_history_hydrates_from_events_when_available() {
     let (store, _db) = setup_test_store().await;
