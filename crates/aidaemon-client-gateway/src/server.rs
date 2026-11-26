@@ -499,6 +499,9 @@ async fn open_session(
         .await;
     match &result {
         Ok(grant) => tracing::info!(device = %grant.device_id, "Device signed in"),
+        // A daemon-written refusal (exact constant) pairing logs itself,
+        // hourly: an old app retries it every few seconds.
+        Err(error) if error.message == crate::pairing::UNBOUND_SIGN_IN => {}
         Err(error) => tracing::warn!(reason = %error.message, "Device sign-in refused"),
     }
     reply(result)

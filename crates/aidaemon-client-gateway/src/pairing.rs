@@ -222,7 +222,20 @@ pub struct Pairing {
     /// The ceiling a watch gets unless the owner sets another.
     watch_ceiling: Risk,
     admission: Mutex<Admission>,
+    /// Per device, when its refused unbound remote sign-in was last
+    /// logged and how many came since: an old app retries every few
+    /// seconds, and the log says so once an hour.
+    unbound_logged: Mutex<HashMap<String, (u64, u64)>>,
 }
+
+/// The refusal of a remote sign-in not bound to this daemon (an old app).
+/// The daemon's own text: [`crate::server`] knows it by this constant and
+/// leaves its logging to [`Pairing`], which logs it once an hour.
+pub(crate) const UNBOUND_SIGN_IN: &str =
+    "Update the app: signing in from another computer needs a sign-in bound to this daemon";
+
+/// How often one device's refused unbound sign-in is logged.
+const UNBOUND_LOG_EVERY_MS: u64 = 60 * 60 * 1000;
 
 fn scopes_text(scopes: &[Scope]) -> String {
     scopes
@@ -333,6 +346,24 @@ fn percent(text: &str) -> String {
 }
 
 impl Pairing {
+    /// A refused unbound sign-in of `device_id` at `now`: the tries to log
+    /// (this one and those since the last logged), or `None` when one was
+    /// logged within the hour.
+    fn unbound_sign_in(&self, device_id: &str, now: u64) -> Option<u64> {
+        let mut logged = self
+            .unbound_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = logged.entry(device_id.to_string()).or_insert((0, 0));
+        entry.1 += 1;
+        if entry.0 != 0 && now.saturating_sub(entry.0) < UNBOUND_LOG_EVERY_MS {
+            return None;
+        }
+        let tries = entry.1;
+        *entry = (now, 0);
+        Some(tries)
+    }
+
     pub(crate) fn new(
         log: SqliteClientEventLog,
         approvals: Option<mpsc::Sender<ApprovalRequest>>,
@@ -358,6 +389,7 @@ impl Pairing {
             files: Mutex::default(),
             watch_ceiling,
             admission: Mutex::default(),
+            unbound_logged: Mutex::default(),
         }
     }
 
@@ -860,17 +892,17 @@ impl Pairing {
             }
             None if local => challenge_message(challenge_id, &challenge.nonce),
             None => {
-                // Which device, so its owner can find it and update its app.
-                tracing::warn!(
-                    device = %device.device_id,
-                    name = %device.name,
-                    "A device signs in remotely with an app too old to bind its sign-in"
-                );
-                return Err(ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "Update the app: signing in from another computer needs a sign-in \
-                     bound to this daemon",
-                ));
+                // Which device, so its owner can find it and update its app;
+                // once an hour, with how many tries came since.
+                if let Some(tries) = self.unbound_sign_in(&device.device_id, now_ms()) {
+                    tracing::warn!(
+                        device = %device.device_id,
+                        name = %device.name,
+                        tries,
+                        "A device signs in remotely with an app too old to bind its sign-in"
+                    );
+                }
+                return Err(ProtocolError::new(ErrorCode::Unauthorized, UNBOUND_SIGN_IN));
             }
         };
         verify(&device, &message, signature)?;
@@ -1173,6 +1205,21 @@ impl Pairing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An old app retrying an unbound remote sign-in is logged once an
+    /// hour per device, with the tries since; another device has its own.
+    #[tokio::test]
+    async fn an_old_apps_retries_are_logged_once_an_hour() {
+        let pairing = pairing().await;
+        let hour = super::UNBOUND_LOG_EVERY_MS;
+        assert_eq!(pairing.unbound_sign_in("dv-a", 1_000), Some(1));
+        for at in [3_000, 5_000, 7_000] {
+            assert_eq!(pairing.unbound_sign_in("dv-a", at), None);
+        }
+        assert_eq!(pairing.unbound_sign_in("dv-b", 8_000), Some(1));
+        assert_eq!(pairing.unbound_sign_in("dv-a", 1_000 + hour), Some(4));
+        assert_eq!(pairing.unbound_sign_in("dv-a", 2_000 + hour), None);
+    }
 
     async fn pairing() -> Pairing {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
