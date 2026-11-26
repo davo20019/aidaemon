@@ -322,6 +322,15 @@ impl ActivePeerBinding {
     }
 }
 
+/// A launch one peer asked for, as the asker's run records it.
+struct HandOff {
+    requested_by: String,
+    /// The launched agent's name in plain words ("Codex").
+    agent: String,
+    /// It resumes a peer that had finished (`message_peer` with `resume`).
+    follow_up: bool,
+}
+
 /// Host [`PeerLauncher`] implementation bridging [`PeerMcpHandler`] directly
 /// onto [`CliAgentTool`].
 pub(super) struct RuntimePeerLauncher {
@@ -385,6 +394,43 @@ impl RuntimePeerLauncher {
                 .map(|worktree| PathBuf::from(&worktree.path)),
         );
         roots
+    }
+
+    /// Keep `hand_off`, which started run `run_id`, in the record of the
+    /// run that asked for it (a `peer_run` event): its steps show the
+    /// hand-off by the agent's name and open that run.
+    async fn record_hand_off(&self, tool: &CliAgentTool, hand_off: &HandOff, run_id: &str) {
+        let Some(asker_run) = self
+            .tree
+            .peer(&hand_off.requested_by)
+            .and_then(|peer| peer.run_id)
+        else {
+            return;
+        };
+        let Ok(Some(asker)) = tool.state.cli_agent_run(&asker_run).await else {
+            return;
+        };
+        // After the asker's latest event: events are read by `seq`, then
+        // in the order they were kept.
+        let seq = tool
+            .state
+            .get_cli_agent_events(asker.invocation)
+            .await
+            .ok()
+            .and_then(|events| events.iter().map(|event| event.seq).max())
+            .unwrap_or(0);
+        let data = serde_json::json!({
+            "run_id": run_id,
+            "agent": hand_off.agent,
+            "follow_up": hand_off.follow_up,
+        });
+        if let Err(error) = tool
+            .state
+            .record_cli_agent_event(asker.invocation, seq, "peer_run", &data.to_string())
+            .await
+        {
+            tracing::warn!(%error, "Could not keep a hand-off in the asking run's record");
+        }
     }
 
     /// `agent` as a recipient of shared files, working in `folder`: the
@@ -594,6 +640,21 @@ impl PeerLauncher for RuntimePeerLauncher {
                     .map(|entry| tool.entry_agent(entry))
             })
             .is_some_and(|agent| agent.launch_arguments().is_some());
+        // The hand-off as the asking peer's run records it, once launched.
+        let handed_off = HandOff {
+            requested_by: request.requested_by.clone(),
+            agent: tool
+                .tools
+                .read()
+                .ok()
+                .and_then(|tools| {
+                    tools
+                        .get(&request.agent)
+                        .map(|entry| tool.entry_agent(entry).name().to_string())
+                })
+                .unwrap_or_else(|| request.agent.clone()),
+            follow_up: request.continue_run.is_some(),
+        };
         let full_prompt = if has_known_agent && request.mcp_endpoint.is_some() {
             let hint =
                 coordination_prompt_hint(&request.peer_id, Some(&request.parent_peer_id), &[]);
@@ -662,6 +723,8 @@ impl PeerLauncher for RuntimePeerLauncher {
                 ),
             })
             .await?;
+        self.record_hand_off(&tool, &handed_off, &launched.run_id)
+            .await;
 
         Ok(PeerLaunchResult {
             run_id: launched.run_id,

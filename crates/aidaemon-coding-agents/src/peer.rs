@@ -126,6 +126,9 @@ pub struct PeerLaunchRequest {
     pub tree_id: String,
     pub peer_id: String,
     pub parent_peer_id: String,
+    /// The peer whose call asked for this launch (`delegate_cli`, or a
+    /// `message_peer` that resumes a peer): its run records the hand-off.
+    pub requested_by: String,
     pub depth: usize,
     pub agent: String,
     pub title: String,
@@ -895,6 +898,7 @@ mod mcp_bridge {
                 tree_id: self.tree.id().to_string(),
                 peer_id: peer_id.clone(),
                 parent_peer_id: self.caller_peer_id.clone(),
+                requested_by: self.caller_peer_id.clone(),
                 depth,
                 agent: parsed.agent.trim().to_string(),
                 title: parsed.title.trim().to_string(),
@@ -1127,6 +1131,7 @@ mod mcp_bridge {
                     .parent_peer_id
                     .clone()
                     .unwrap_or_else(|| self.caller_peer_id.clone()),
+                requested_by: self.caller_peer_id.clone(),
                 depth: target.depth,
                 agent: target.agent.clone(),
                 title: format!("Follow-up: {}", target.title),

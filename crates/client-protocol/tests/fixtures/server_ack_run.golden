@@ -26,6 +26,14 @@
           "path": "/w/synthetic/release.md",
           "state": "done",
           "words": "Editing release.md"
+        },
+        {
+          "agent": "Codex",
+          "at_ms": 1767225680000,
+          "kind": "hand_off",
+          "run": "cli-agent-7c1d2e3f",
+          "state": "done",
+          "words": "Handed work to Codex"
         }
       ],
       "task": "Prepare the synthetic release notes",

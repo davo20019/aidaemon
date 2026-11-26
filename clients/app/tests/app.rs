@@ -867,7 +867,7 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.press("Claude Code · Finished · changed 2 files, show its steps")?;
     let id = wait_sent("get_run")?;
     feed([frame(&format!(
-        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Reading slug.py","state":"done","kind":"read","path":"/w/synthetic/slug.py"}},{{"words":"Reading test_slug.py","state":"done","kind":"read","path":"/w/synthetic/test_slug.py"}},{{"words":"Running ls","state":"done","kind":"run"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing test_slug.py","state":"done","kind":"edit","path":"/w/synthetic/test_slug.py"}},{{"words":"Running pytest","state":"failed","kind":"run"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}},{{"label":"write: /w/synthetic/test_slug.py","outcome":"allowed"}},{{"label":"command: rm -rf /w/synthetic/build","outcome":"refused","reason":"outside its folder"}}]}}}}}}"#
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Reading slug.py","state":"done","kind":"read","path":"/w/synthetic/slug.py"}},{{"words":"Reading test_slug.py","state":"done","kind":"read","path":"/w/synthetic/test_slug.py"}},{{"words":"Running ls","state":"done","kind":"run"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing test_slug.py","state":"done","kind":"edit","path":"/w/synthetic/test_slug.py"}},{{"words":"Running pytest","state":"failed","kind":"run"}},{{"words":"Checking on another agent","state":"done","kind":"coordinate"}},{{"words":"Handed work to Claude Code","state":"done","kind":"hand_off","run":"cli-agent-a","agent":"Claude Code"}},{{"words":"Handed work to Codex","state":"done","kind":"hand_off","run":"cli-agent-b","agent":"Codex"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}},{{"label":"write: /w/synthetic/test_slug.py","outcome":"allowed"}},{{"label":"command: rm -rf /w/synthetic/build","outcome":"refused","reason":"outside its folder"}}]}}}}}}"#
     ))]);
     app.wait_for("text:Add truncate_slug on branch a")?;
     // Routine steps fold into one line that opens them; edits in a row are
@@ -880,6 +880,12 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.wait_for("text:Editing test_slug.py")?;
     app.press("Read 2 files · ran a command")?;
     app.wait_for("text:Reading test_slug.py")?;
+    // Hand-offs in a row are one row naming each agent, which opens its
+    // run; checking on one is bookkeeping (alone, a plain line).
+    app.wait_for("text:Handed work to")?;
+    app.wait_for("label:Claude Code, open its run")?;
+    app.wait_for("label:Codex, open its run")?;
+    app.wait_for("text:Checking on another agent")?;
     // Only what was not simply allowed gets a line; the rest is a count.
     app.wait_for("text:command: rm -rf /w/synthetic/build · refused: outside its folder")?;
     app.wait_for("text:2 other actions allowed")?;

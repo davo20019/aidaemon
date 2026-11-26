@@ -1391,6 +1391,7 @@ fn body(store: Store, detail: RunDetail, coding: bool) -> View {
             _ if group.is_empty() => steps,
             RowKind::Routine => steps.child(folded(std::mem::take(group))),
             RowKind::Edits => steps.child(edits(store, std::mem::take(group), coding)),
+            RowKind::HandOffs => steps.child(hand_offs(store, std::mem::take(group))),
             RowKind::Alone => steps,
         };
         for step in &detail.steps {
@@ -1486,7 +1487,12 @@ enum RowKind {
     Alone,
     /// A finished edit: edits in a row are one row per file.
     Edits,
-    /// A finished read, search, command, lookup or other tool: folded.
+    /// Work handed to another agent: hand-offs in a row are one row naming
+    /// each agent, which opens its run.
+    HandOffs,
+    /// A finished read, search, command, lookup, other tool, or a call to
+    /// the tools the agents work together by (checking on one, the board):
+    /// folded.
     Routine,
 }
 
@@ -1496,12 +1502,73 @@ fn row_kind(step: &RunStepItem) -> RowKind {
     }
     match step.kind {
         RunStepKind::Edit if step.path.is_some() => RowKind::Edits,
-        RunStepKind::Edit
-        | RunStepKind::Delegate
-        | RunStepKind::Coordinate
-        | RunStepKind::Unknown => RowKind::Alone,
+        RunStepKind::HandOff if step.run.is_some() => RowKind::HandOffs,
+        RunStepKind::Edit | RunStepKind::HandOff | RunStepKind::Delegate | RunStepKind::Unknown => {
+            RowKind::Alone
+        }
         _ => RowKind::Routine,
     }
+}
+
+/// Hand-offs in a row: one row, "Handed work to Claude Code and Codex",
+/// each name opening the run it started; a lone one keeps its own words.
+fn hand_offs(store: Store, steps: Vec<RunStepItem>) -> View {
+    let mut runs: Vec<(String, String)> = Vec::new();
+    for step in &steps {
+        let (Some(run), Some(agent)) = (step.run.clone(), step.agent.clone()) else {
+            continue;
+        };
+        if !runs.iter().any(|(seen, _)| *seen == run) {
+            runs.push((run, agent));
+        }
+    }
+    // A lone hand-off keeps the daemon's own words ("Sent a follow-up to
+    // Codex"), its agent's name, which ends them, made the link.
+    let lead = if steps.len() == 1 {
+        let words = &steps[0].words;
+        let agent = steps[0].agent.as_deref().unwrap_or_default();
+        words
+            .strip_suffix(agent)
+            .unwrap_or(words)
+            .trim_end()
+            .to_string()
+    } else {
+        "Handed work to".to_string()
+    };
+    let mut row = view()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .child(
+            view()
+                .pr_1()
+                .child(ui::icon(Glyph::Check).text_color(Tone::Success.color())),
+        )
+        .child(text(lead).text_size(px(type_scale::SM)));
+    let count = runs.len();
+    for (index, (run, agent)) in runs.into_iter().enumerate() {
+        if index > 0 && index + 1 == count {
+            row = row.child(text("and").text_size(px(type_scale::SM)));
+        }
+        // "Claude Code, Codex and Gemini": a comma after each but the last two.
+        let agent = if index + 2 < count {
+            format!("{agent},")
+        } else {
+            agent
+        };
+        row = row.child(
+            button()
+                .accessibility_label(format!("{}, open its run", agent.trim_end_matches(',')))
+                .on_press(move || store.open_run(&run))
+                .child(
+                    text(agent)
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::ACCENT),
+                ),
+        );
+    }
+    row
 }
 
 /// Finished edits in a row: one row per file, with how many edits it took
@@ -1623,6 +1690,7 @@ fn routine_summary(steps: &[RunStepItem]) -> String {
             RunStepKind::Run => format!("ran {}", plural(n, "a command", "commands")),
             RunStepKind::Fetch => format!("looked up {}", plural(n, "a page", "pages")),
             RunStepKind::Plan => "updated its plan".to_string(),
+            RunStepKind::Coordinate => format!("coordinated {}", plural(n, "once", "times")),
             _ => format!("used {}", plural(n, "another tool", "other tools")),
         })
         .collect();
@@ -1673,19 +1741,21 @@ mod tests {
             by_helper: false,
             kind,
             path: None,
+            run: None,
+            agent: None,
         }
     }
 
     #[test]
     fn routine_steps_are_summed_up_by_kind_in_their_order() {
         use RunStepKind::*;
-        let steps: Vec<RunStepItem> = [Run, Read, Read, Run, Other, Search]
+        let steps: Vec<RunStepItem> = [Run, Read, Read, Run, Other, Search, Coordinate, Coordinate]
             .into_iter()
             .map(|kind| step(kind, RunStepState::Done))
             .collect();
         assert_eq!(
             routine_summary(&steps),
-            "Ran 2 commands · read 2 files · used another tool · searched once"
+            "Ran 2 commands · read 2 files · used another tool · searched once · coordinated 2 times"
         );
     }
 
@@ -1696,7 +1766,13 @@ mod tests {
         assert_eq!(kind(Read, RunStepState::Done), RowKind::Routine);
         assert_eq!(kind(Read, RunStepState::Failed), RowKind::Alone);
         assert_eq!(kind(Run, RunStepState::Started), RowKind::Alone);
-        assert_eq!(kind(Coordinate, RunStepState::Done), RowKind::Alone);
+        // Checking on another agent or reading the board is bookkeeping.
+        assert_eq!(kind(Coordinate, RunStepState::Done), RowKind::Routine);
+        // A hand-off the daemon recorded goes with its neighbours.
+        let mut hand_off = step(HandOff, RunStepState::Done);
+        assert_eq!(row_kind(&hand_off), RowKind::Alone);
+        hand_off.run = Some("cli-agent-5e6f".into());
+        assert_eq!(row_kind(&hand_off), RowKind::HandOffs);
         // A finished edit goes with its neighbours when it names its file;
         // a failed one stands out.
         let mut edit = step(Edit, RunStepState::Done);

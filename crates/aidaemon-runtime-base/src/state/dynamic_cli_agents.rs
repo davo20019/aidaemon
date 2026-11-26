@@ -266,7 +266,9 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
     ) -> anyhow::Result<Vec<aidaemon_tools::services::CliAgentEvent>> {
         use sqlx::Row;
         let rows = sqlx::query(
-            "SELECT seq, at, kind, data FROM cli_agent_events WHERE invocation_id = ? ORDER BY seq",
+            // By `seq`, then in the order kept: the daemon's own record of a
+            // hand-off takes the asker's latest `seq` and goes after it.
+            "SELECT seq, at, kind, data FROM cli_agent_events WHERE invocation_id = ? ORDER BY seq, id",
         )
         .bind(id)
         .fetch_all(&self.pool)

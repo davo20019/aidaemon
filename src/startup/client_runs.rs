@@ -98,6 +98,28 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool
                     by_helper: data.get("parent").is_some_and(|parent| !parent.is_null()),
                     kind,
                     path,
+                    run: None,
+                    agent: None,
+                });
+            }
+            // The daemon's own record of a run this one's agent handed work
+            // to (`peer_run`, kept when it launched it).
+            "peer_run" => {
+                let agent = text("agent").unwrap_or_else(|| "another agent".to_string());
+                let follow_up = data.get("follow_up").and_then(Value::as_bool) == Some(true);
+                detail.steps.push(RunStepItem {
+                    words: if follow_up {
+                        format!("Sent a follow-up to {agent}")
+                    } else {
+                        format!("Handed work to {agent}")
+                    },
+                    state: RunStepState::Done,
+                    at_ms: at_ms(&event.at),
+                    by_helper: false,
+                    kind: RunStepKind::HandOff,
+                    path: None,
+                    run: text("run_id"),
+                    agent: Some(agent),
                 });
             }
             "step_ended" => {
@@ -446,6 +468,11 @@ mod tests {
                 "step",
                 r#"{"id":"i4","parent":null,"tool":{"kind":"other","name":"mcp__synthetic__lookup"},"words":"Using mcp__synthetic__lookup"}"#,
             ),
+            event(
+                9,
+                "peer_run",
+                r#"{"run_id":"cli-agent-5e6f","agent":"Codex","follow_up":false}"#,
+            ),
             event(10, "turn_ended", r#"{"failed":false}"#),
         ];
         let detail = detail("cli-agent-1", run, &events, false);
@@ -453,7 +480,7 @@ mod tests {
         assert!(detail.can_continue, "its agent kept the session it named");
         assert_eq!(detail.model.as_deref(), Some("synthetic-large"));
         assert_eq!(detail.task, "Review the slug module");
-        assert_eq!(detail.steps.len(), 4);
+        assert_eq!(detail.steps.len(), 5);
         assert_eq!(detail.steps[0].words, "Running pytest");
         // Each step's kind and, for a file it changed, the file.
         let kinds: Vec<RunStepKind> = detail.steps.iter().map(|step| step.kind).collect();
@@ -463,9 +490,13 @@ mod tests {
                 RunStepKind::Run,
                 RunStepKind::Edit,
                 RunStepKind::Coordinate,
-                RunStepKind::Other
+                RunStepKind::Other,
+                RunStepKind::HandOff
             ]
         );
+        // A hand-off names its agent and the run it started.
+        assert_eq!(detail.steps[4].words, "Handed work to Codex");
+        assert_eq!(detail.steps[4].run.as_deref(), Some("cli-agent-5e6f"));
         assert_eq!(detail.steps[0].path, None);
         assert_eq!(
             detail.steps[1].path.as_deref(),

@@ -6311,6 +6311,13 @@
     "RunStepItem": {
       "description": "One step of a run, in plain words from its typed event.",
       "properties": {
+        "agent": {
+          "description": "A hand-off's agent, in plain words (\"Codex\"; protocol 1.57).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "at_ms": {
           "description": "When it started, ms since the epoch.",
           "format": "uint64",
@@ -6330,6 +6337,13 @@
         },
         "path": {
           "description": "The file it read or changed, where it names one (protocol 1.56).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "description": "A hand-off's run (protocol 1.57): the run it started, which a client\nopens from the step.",
           "type": [
             "string",
             "null"
@@ -6382,7 +6396,12 @@
         },
         {
           "const": "coordinate",
-          "description": "Worked with the other agents of its run (handing work over,\nmessaging, the shared board).",
+          "description": "Called one of the tools it works with the other agents of its run\nby (messaging, checking on them, the shared board).",
+          "type": "string"
+        },
+        {
+          "const": "hand_off",
+          "description": "Handed work to another agent (protocol 1.57): the daemon started\nthat agent's run ([`RunStepItem::run`]) or a follow-up of it.",
           "type": "string"
         },
         {

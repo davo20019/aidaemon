@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 56;
+pub const PROTOCOL_MINOR: u16 = 57;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3288,6 +3288,13 @@ pub struct RunStepItem {
     /// The file it read or changed, where it names one (protocol 1.56).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// A hand-off's run (protocol 1.57): the run it started, which a client
+    /// opens from the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// A hand-off's agent, in plain words ("Codex"; protocol 1.57).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// What a run's step did, by its typed event (protocol 1.56).
@@ -3305,9 +3312,12 @@ pub enum RunStepKind {
     Delegate,
     /// Updated its plan.
     Plan,
-    /// Worked with the other agents of its run (handing work over,
-    /// messaging, the shared board).
+    /// Called one of the tools it works with the other agents of its run
+    /// by (messaging, checking on them, the shared board).
     Coordinate,
+    /// Handed work to another agent (protocol 1.57): the daemon started
+    /// that agent's run ([`RunStepItem::run`]) or a follow-up of it.
+    HandOff,
     /// Any other tool.
     Other,
     #[default]

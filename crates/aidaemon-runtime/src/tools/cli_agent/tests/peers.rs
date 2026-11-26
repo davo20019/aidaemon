@@ -262,6 +262,7 @@ async fn enable_peer_coordination_and_run_child_peer_in_direct_agent_session() {
             tree_id: session.tree.id().to_string(),
             peer_id,
             parent_peer_id: "peer-root".into(),
+            requested_by: "peer-root".into(),
             depth,
             agent: "bash-agent".into(),
             title: "Inspect dir".into(),

@@ -1485,6 +1485,17 @@ fn server_samples() -> Vec<ServerFrame> {
                     by_helper: false,
                     kind: RunStepKind::Edit,
                     path: Some("/w/synthetic/release.md".into()),
+                    run: None,
+                    agent: None,
+                }, RunStepItem {
+                    words: "Handed work to Codex".into(),
+                    state: RunStepState::Done,
+                    at_ms: Some(1_767_225_680_000),
+                    by_helper: false,
+                    kind: RunStepKind::HandOff,
+                    path: None,
+                    run: Some("cli-agent-7c1d2e3f".into()),
+                    agent: Some("Codex".into()),
                 }],
                 plan: vec![RunPlanItem {
                     text: "Write the notes".into(),
