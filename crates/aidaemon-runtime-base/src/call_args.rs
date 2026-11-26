@@ -60,10 +60,7 @@ pub fn strip_model_arguments(
     }
 }
 
-pub fn drop_unset_optional_arguments(
-    map: &mut serde_json::Map<String, Value>,
-    schema: &Value,
-) {
+pub fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schema: &Value) {
     let parameters = schema.get("parameters").unwrap_or(schema);
     let required: Vec<&str> = parameters
         .get("required")
