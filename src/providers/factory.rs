@@ -154,7 +154,14 @@ pub(crate) fn build_provider(
     let config_error = |error: backends::ConfigError| anyhow::anyhow!("{error}");
     let base_override = provider_specific_base_url_override(config);
     let headers = config.extra_headers.clone().unwrap_or_default();
-    let mut models = ModelList::Fixed(configured_models(config));
+    // The provider's own listing; a backup left at the default address
+    // lists at the provider's own.
+    let mut models = ModelList::Catalog {
+        kind: config.kind,
+        base_url: base_override.unwrap_or_default().to_string(),
+        api_key: config.api_key.clone(),
+        known: configured_models(config),
+    };
     let backend: Arc<dyn aidaemon_core::Provider> = match config.kind {
         ProviderKind::OpenaiCompatible => {
             if config.llama_cpp_thinking

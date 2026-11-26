@@ -32,9 +32,51 @@ pub enum ModelList {
         backend: std::sync::Arc<aidaemon_providers::ChatGpt>,
         known: Vec<String>,
     },
+    /// The provider's own listing ([`aidaemon_providers::catalog::list_models`]);
+    /// `known` (its configured models) when it fails.
+    Catalog {
+        kind: aidaemon_providers::routing::ProviderKind,
+        /// Empty: the provider's own.
+        base_url: String,
+        api_key: String,
+        known: Vec<String>,
+    },
 }
 
 impl ModelList {
+    /// The models the provider itself lists now, those that can run a turn
+    /// where its listing says so (`Err`: it has no listing, or could not
+    /// give one). Unlike [`ModelList::list`], nothing configured or known
+    /// is added.
+    pub async fn live(&self) -> anyhow::Result<Vec<String>> {
+        use aidaemon_providers::{catalog, routing::ProviderKind};
+        match self {
+            ModelList::Fixed(_) => anyhow::bail!("this provider has no model listing"),
+            ModelList::ChatGpt { backend, .. } => Ok(backend
+                .list_models()
+                .await?
+                .into_iter()
+                .filter(|m| m.listed)
+                .map(|m| m.id)
+                .collect()),
+            ModelList::OpenAiModels { base_url, api_key } => catalog::list_models(
+                ProviderKind::OpenaiCompatible,
+                base_url,
+                api_key.as_deref().unwrap_or_default(),
+            )
+            .await
+            .map_err(anyhow::Error::msg),
+            ModelList::Catalog {
+                kind,
+                base_url,
+                api_key,
+                ..
+            } => catalog::list_models(*kind, base_url, api_key)
+                .await
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     pub async fn list(&self) -> anyhow::Result<Vec<String>> {
         match self {
             ModelList::Fixed(models) => Ok(models.clone()),
@@ -56,6 +98,21 @@ impl ModelList {
                 }
                 Err(error) => {
                     tracing::warn!(%error, "ChatGPT model listing failed; offering the known models");
+                    Ok(known.clone())
+                }
+            },
+            ModelList::Catalog { known, .. } => match self.live().await {
+                Ok(listed) => {
+                    let mut models = listed;
+                    for model in known {
+                        if !models.contains(model) {
+                            models.push(model.clone());
+                        }
+                    }
+                    Ok(models)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Model listing failed; offering the configured models");
                     Ok(known.clone())
                 }
             },

@@ -622,9 +622,26 @@ fn model_ids(kind: ProviderKind, body: &str) -> Vec<String> {
             .as_array()
             .into_iter()
             .flatten()
+            .filter(|m| runs_a_turn(m))
             .filter_map(|m| m["id"].as_str().map(str::to_string))
             .collect(),
     }
+}
+
+/// Whether a listed model can run an agent turn, by the fields a listing
+/// that has them gives (OpenRouter's): it takes tools, answers in text and
+/// is served on chat completions (not only as a batch). A listing without
+/// a field (OpenAI's, a local server's) says nothing against it.
+fn runs_a_turn(model: &Value) -> bool {
+    let lacks = |field: &Value, wanted: &dyn Fn(&str) -> bool| {
+        field
+            .as_array()
+            .is_some_and(|items| !items.iter().filter_map(Value::as_str).any(wanted))
+    };
+    !lacks(&model["supported_parameters"], &|p| p == "tools")
+        && !lacks(&model["architecture"]["output_modalities"], &|m| m == "text")
+        // An endpoint path the listing names (a machine format).
+        && !lacks(&model["endpoints"], &|e| e.ends_with("/chat/completions"))
 }
 
 /// Of `offered`, the one to preselect: `preferred` when offered, else none
@@ -772,6 +789,24 @@ mod tests {
                 r#"{"models":[{"name":"models/synthetic-chat","supportedGenerationMethods":["generateContent"]},{"name":"models/synthetic-embed","supportedGenerationMethods":["embedContent"]}]}"#
             ),
             ["synthetic-chat"]
+        );
+        // A listing that says what a model takes (OpenRouter's) keeps only
+        // the ones that can run a turn: tools, text out, chat served.
+        assert_eq!(
+            model_ids(
+                ProviderKind::OpenaiCompatible,
+                r#"{"data":[
+                    {"id":"synthetic/agent","supported_parameters":["tools","temperature"],
+                     "architecture":{"output_modalities":["text"]},
+                     "endpoints":["/api/v1/chat/completions","/api/v1/responses"]},
+                    {"id":"synthetic/no-tools","supported_parameters":["temperature"]},
+                    {"id":"synthetic/painter","supported_parameters":["tools"],
+                     "architecture":{"output_modalities":["image"]}},
+                    {"id":"synthetic/agent:batch","supported_parameters":["tools"],
+                     "endpoints":["/api/v1/batches"]}
+                ]}"#
+            ),
+            ["synthetic/agent"]
         );
         let offered = vec!["a".to_string(), "b".to_string()];
         assert_eq!(preselect(&offered, "b").as_deref(), Some("b"));

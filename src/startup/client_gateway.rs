@@ -694,7 +694,7 @@ impl ClientHost for DaemonClientHost {
 
     async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
         let mut options = super::client_models::named(
-            super::client_models::options(&self.llm),
+            super::client_models::options(&self.llm).await,
             self.config_table().as_ref(),
         );
         options.agents = super::client_settings::direct_agents(&self.settings.permissions).await;

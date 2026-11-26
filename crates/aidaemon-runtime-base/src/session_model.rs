@@ -3,7 +3,8 @@
 //!
 //! Absent (or unreadable): the daemon picks as it does for every chat. A
 //! pin names a provider of the live runtime (`main`, `failover-N`) and one
-//! of its configured or catalog-offered models; a pin the runtime no longer has reads as
+//! of its configured or offered models (the ones it lists, the catalog's
+//! until it has listed them); a pin the runtime no longer has reads as
 //! automatic, so a config change never strands a conversation.
 
 use aidaemon_providers::routing::ProviderKind;
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::llm::LlmRuntimeSnapshot;
 
 /// The provider id of the runtime's main provider.
-pub const MAIN_PROVIDER: &str = "main";
+pub use crate::llm::MAIN_PROVIDER;
 
 /// The efforts the daemon sends, lowest first.
 pub const EFFORTS: [&str; 3] = ["low", "medium", "high"];
@@ -117,9 +118,11 @@ pub fn provider_name(kind: ProviderKind) -> &'static str {
 pub struct PickableProvider {
     pub id: String,
     pub kind: ProviderKind,
-    /// Its configured models followed by catalog offers, each listed under
-    /// the first provider that has it (the one a request for it goes to).
+    /// Its configured models followed by its offers, each listed under the
+    /// first provider that has it (the one a request for it goes to).
     pub models: Vec<String>,
+    /// Of `models`, the configured ones (the turns already use them).
+    pub configured: Vec<String>,
 }
 
 /// The providers of `snapshot`, the main one first, then each failover.
@@ -129,22 +132,26 @@ pub fn pickable(snapshot: &LlmRuntimeSnapshot) -> Vec<PickableProvider> {
         .map(|router| router.all_models_ordered())
         .filter(|models| !models.is_empty())
         .unwrap_or_else(|| vec![snapshot.primary_model()]);
+    let configured = main_models.clone();
     let mut main_models = main_models;
     main_models.extend(snapshot.offered_models().iter().cloned());
     let mut out = vec![PickableProvider {
         id: MAIN_PROVIDER.to_string(),
         kind: snapshot.provider_kind(),
         models: main_models,
+        configured,
     }];
     for (index, target) in snapshot.failover_targets().into_iter().enumerate() {
+        let configured = target.all_models_ordered();
         out.push(PickableProvider {
-            id: format!("failover-{index}"),
+            id: crate::llm::failover_id(index),
             kind: target.provider_kind(),
-            models: target
-                .all_models_ordered()
-                .into_iter()
+            models: configured
+                .iter()
+                .cloned()
                 .chain(target.offered_models().iter().cloned())
                 .collect(),
+            configured,
         });
     }
     let mut seen: Vec<String> = Vec::new();

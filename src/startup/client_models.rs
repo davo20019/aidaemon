@@ -47,16 +47,61 @@ fn option_of(provider: PickableProvider) -> ModelProvider {
     }
 }
 
-/// Every provider of the live runtime with a model to pin, main first.
-pub(crate) fn options(llm: &SharedLlmRuntime) -> ModelOptions {
+/// How long a provider's listing (and its trial call) is trusted before
+/// the picker asks it again.
+const LISTING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Every provider of the live runtime with a model to pin, main first: its
+/// configured models and the ones it lists now (asked once, then again in
+/// the background when older than [`LISTING_MAX_AGE`]), without the ones
+/// that will not answer for now (an account that cannot pay, a rejected
+/// key, a used-up quota).
+pub(crate) async fn options(llm: &SharedLlmRuntime) -> ModelOptions {
+    let refresh = {
+        let llm = llm.clone();
+        async move { llm.refresh_offered_models(LISTING_MAX_AGE).await }
+    };
+    if llm.offered_never_listed() {
+        refresh.await;
+    } else {
+        tokio::spawn(refresh);
+    }
+    let snapshot = llm.snapshot();
     ModelOptions {
-        providers: pickable(&llm.snapshot())
+        providers: pickable(&snapshot)
             .into_iter()
+            .map(|mut provider| {
+                provider
+                    .models
+                    .retain(|model| snapshot.unavailable_until(&provider.id, model).is_none());
+                provider
+            })
             .filter(|provider| !provider.models.is_empty())
             .map(option_of)
             .collect(),
         agents: Vec::new(),
     }
+}
+
+/// Whether `model` of `provider` can run a turn: a configured one is in use
+/// already; any other makes one trial call the first time it is picked.
+async fn usable(
+    llm: &SharedLlmRuntime,
+    snapshot: &aidaemon_runtime::llm::LlmRuntimeSnapshot,
+    provider: &PickableProvider,
+    model: &str,
+) -> Result<(), String> {
+    if snapshot.unavailable_until(&provider.id, model).is_some() {
+        return Err(format!(
+            "{model} can't answer right now: its provider refused the last call"
+        ));
+    }
+    if provider.configured.iter().any(|known| known == model) {
+        return Ok(());
+    }
+    llm.trial_once(&provider.id, model)
+        .await
+        .map_err(|why| format!("{model} can't be used here: {why}"))
 }
 
 /// The connected provider that offers `model`, named as Settings names it
@@ -217,7 +262,7 @@ pub(crate) async fn slash(
                 return Some(match current.model {
                     ModelChoice::Pinned { provider, model } => {
                         let provider =
-                            provider_name(&named(options(llm), config), &provider).to_owned();
+                            provider_name(&named(options(llm).await, config), &provider).to_owned();
                         format!("This conversation uses `{model}` ({provider}).")
                     }
                     ModelChoice::Agent { agent } => {
@@ -226,7 +271,7 @@ pub(crate) async fn slash(
                     _ => "This conversation uses automatic model routing.".to_string(),
                 });
             }
-            let choices = named(options(llm), config);
+            let choices = named(options(llm).await, config);
             let selected = choices.providers.iter().find_map(|provider| {
                 provider
                     .models
@@ -343,12 +388,13 @@ pub(crate) async fn set(
         Some(ModelChoice::Pinned { provider, model }) => {
             setting.agent = None;
             let pin = PinnedModel { provider, model };
-            if session_model::resolve(&snapshot, &pin).is_none() {
+            let Some(offered) = session_model::resolve(&snapshot, &pin) else {
                 return Err(format!(
                     "{} is not a model this daemon is set up with",
                     pin.model
                 ));
-            }
+            };
+            usable(llm, &snapshot, &offered, &pin.model).await?;
             setting.pinned = Some(pin);
         }
         Some(ModelChoice::Unknown) => return Err("Unknown model choice".to_string()),
@@ -400,12 +446,26 @@ pub(crate) async fn set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_core::testing::ScriptedProvider;
+    use aidaemon_core::testing::{ScriptedProvider, call, text, tool_calls};
     use aidaemon_runtime::llm::ProviderRuntimeTarget;
     use std::sync::Arc;
 
+    /// A backend whose every model passes a trial (it calls the tool).
+    fn ready() -> aidaemon_runtime::llm::ModelBackend {
+        Arc::new(ScriptedProvider::new([]).then_repeat(tool_calls([call(
+            "c1",
+            "ready",
+            serde_json::json!({"ok": true}),
+        )])))
+    }
+
     fn runtime() -> SharedLlmRuntime {
-        let backend = || Arc::new(ScriptedProvider::new([])) as aidaemon_runtime::llm::ModelBackend;
+        runtime_with(ready())
+    }
+
+    /// [`runtime`] with `failover` as its failover provider's backend.
+    fn runtime_with(failover: aidaemon_runtime::llm::ModelBackend) -> SharedLlmRuntime {
+        let backend = ready;
         SharedLlmRuntime::new_with_failovers(
             backend(),
             None,
@@ -413,7 +473,7 @@ mod tests {
             "synthetic-claude".into(),
             vec![
                 ProviderRuntimeTarget::new(
-                    backend(),
+                    failover,
                     None,
                     ProviderKind::GoogleGenai,
                     "synthetic-gemini".into(),
@@ -451,9 +511,9 @@ mod tests {
         assert!(served.preset.is_empty());
     }
 
-    #[test]
-    fn options_append_catalog_models_per_provider_and_deduplicate() {
-        let choices = options(&runtime());
+    #[tokio::test]
+    async fn options_append_catalog_models_per_provider_and_deduplicate() {
+        let choices = options(&runtime()).await;
         let ids = |provider: usize| {
             choices.providers[provider]
                 .models
@@ -472,8 +532,8 @@ mod tests {
         assert_eq!(ids(1), ["synthetic-gemini", "synthetic-gemini-catalog"]);
     }
 
-    #[test]
-    fn providers_are_named_as_settings_names_them() {
+    #[tokio::test]
+    async fn providers_are_named_as_settings_names_them() {
         let config: toml::Table = r#"
             [provider]
             kind = "anthropic"
@@ -483,12 +543,15 @@ mod tests {
         "#
         .parse()
         .unwrap();
-        let mut choices = options(&runtime());
+        let mut choices = options(&runtime()).await;
         choices.providers[1].name = "OpenAI-compatible".into();
         let choices = named(choices, Some(&config));
         assert_eq!(choices.providers[0].name, "Anthropic");
         assert_eq!(choices.providers[1].name, "OpenRouter");
-        assert_eq!(named(options(&runtime()), None), options(&runtime()));
+        assert_eq!(
+            named(options(&runtime()).await, None),
+            options(&runtime()).await
+        );
     }
 
     #[test]
@@ -518,9 +581,9 @@ mod tests {
         assert_eq!(served_by(&llm, Some(&config), "system"), None);
     }
 
-    #[test]
-    fn unknown_model_response_groups_by_display_name_and_suggests_only_close_names() {
-        let choices = options(&runtime());
+    #[tokio::test]
+    async fn unknown_model_response_groups_by_display_name_and_suggests_only_close_names() {
+        let choices = options(&runtime()).await;
         assert_eq!(
             available_models(&choices),
             "Available models:\nAnthropic: synthetic-claude, synthetic-claude-catalog, synthetic-shared\nGoogle Gemini: synthetic-gemini, synthetic-gemini-catalog"
@@ -566,7 +629,7 @@ mod tests {
         let settings = harness.state.as_ref();
         let llm = runtime();
 
-        let options = options(&llm);
+        let options = options(&llm).await;
         assert_eq!(options.providers.len(), 2);
         assert_eq!(options.providers[0].models[0].efforts.len(), 3);
         assert!(options.providers[1].models[0].efforts.is_empty());
@@ -707,5 +770,57 @@ mod tests {
             .await
             .unwrap();
         assert!(report.contains("automatic model routing"), "{report}");
+    }
+
+    /// A provider whose account cannot pay (its quota guard learned it
+    /// from the trial call the listing refresh makes) is left out until it
+    /// can answer again.
+    #[tokio::test]
+    async fn a_provider_that_cannot_pay_is_left_out() {
+        let broke: aidaemon_runtime::llm::ModelBackend = Arc::new(aidaemon_core::QuotaGuard::new(
+            ScriptedProvider::with_results([Err(aidaemon_core::ProviderError::Billing {
+                message: "synthetic: no credits left".into(),
+                affordable_tokens: None,
+            })]),
+        ));
+        let choices = options(&runtime_with(broke)).await;
+        assert_eq!(choices.providers.len(), 1, "{choices:?}");
+        assert_eq!(choices.providers[0].id, session_model::MAIN_PROVIDER);
+    }
+
+    /// A model the provider offers but no turn uses yet must call a tool
+    /// once before a conversation is set to it; a configured one need not.
+    #[tokio::test]
+    async fn an_offered_model_is_tried_before_it_is_picked() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let settings = harness.state.as_ref();
+        let talks: aidaemon_runtime::llm::ModelBackend =
+            Arc::new(ScriptedProvider::new([]).then_repeat(text("hello")));
+        let llm = runtime_with(talks);
+        let refused = set(
+            settings,
+            &llm,
+            "app:synthetic-trial",
+            pin("failover-0", "synthetic-gemini-catalog"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("can't be used"), "{refused}");
+        let configured = set(
+            settings,
+            &llm,
+            "app:synthetic-trial",
+            pin("failover-0", "synthetic-gemini"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            configured.model,
+            pin("failover-0", "synthetic-gemini").unwrap()
+        );
     }
 }

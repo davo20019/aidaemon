@@ -7,6 +7,7 @@ pub mod decide;
 pub mod decisions;
 pub mod gateway;
 pub mod side_calls;
+pub mod trial;
 
 /// A model backend: any SDK provider.
 pub type ModelBackend = Arc<dyn aidaemon_core::Provider>;
@@ -164,6 +165,29 @@ impl LlmRuntimeSnapshot {
 
     pub fn failover_targets(&self) -> Vec<ProviderRuntimeTarget> {
         self.failover_targets.clone()
+    }
+
+    /// The backend of the provider the picker names `provider_id`.
+    fn backend_of(&self, provider_id: &str) -> Option<ModelBackend> {
+        if provider_id == MAIN_PROVIDER {
+            return Some(self.provider.clone());
+        }
+        // The picker's own id format ([`failover_id`]).
+        let index: usize = provider_id.strip_prefix("failover-")?.parse().ok()?;
+        self.failover_targets
+            .get(index)
+            .map(ProviderRuntimeTarget::provider)
+    }
+
+    /// Until when `model` of the provider `provider_id` will not answer (a
+    /// used-up quota, an account that cannot pay, a rejected key, as its
+    /// quota guard learned from a call); `None`: it may answer now.
+    pub fn unavailable_until(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> Option<std::time::SystemTime> {
+        self.backend_of(provider_id)?.unavailable_until(model)
     }
 
     /// When some configured model (the primary provider's, then every
@@ -364,6 +388,26 @@ struct LlmRuntimeState {
     failover_targets: Vec<ProviderRuntimeTarget>,
     models: ModelList,
     offered_models: Vec<String>,
+    /// When each provider (by its backend, [`backend_key`]) was last asked
+    /// for its models; a swap forgets them all.
+    offered_listed_at: std::collections::HashMap<usize, std::time::Instant>,
+    /// Models a trial showed can run a turn, by backend ([`backend_key`]);
+    /// a swap forgets them.
+    tried: std::collections::HashSet<(usize, String)>,
+}
+
+/// A backend's identity while the runtime holds it.
+fn backend_key(backend: &ModelBackend) -> usize {
+    Arc::as_ptr(backend) as *const () as usize
+}
+
+/// The picker's id of the runtime's main provider; a failover is
+/// `failover-N` ([`failover_id`]).
+pub const MAIN_PROVIDER: &str = "main";
+
+/// The picker's id of the `index`th failover provider.
+pub fn failover_id(index: usize) -> String {
+    format!("failover-{index}")
 }
 
 #[derive(Clone)]
@@ -394,13 +438,147 @@ impl SharedLlmRuntime {
             primary_model,
             failover_targets,
             offered_models: Vec::new(),
+            offered_listed_at: std::collections::HashMap::new(),
+            tried: std::collections::HashSet::new(),
         })))
+    }
+
+    /// One real call showing `model` of the provider `provider_id` can run
+    /// a turn ([`trial::trial`]; `Err`: why not, in plain words), once: a model that passed is not tried again until
+    /// the providers change.
+    pub async fn trial_once(&self, provider_id: &str, model: &str) -> Result<(), String> {
+        let snapshot = self.snapshot();
+        let backend = snapshot
+            .backend_of(provider_id)
+            .ok_or_else(|| format!("There is no provider {provider_id}"))?;
+        let key = (backend_key(&backend), model.to_string());
+        if self
+            .0
+            .read()
+            .expect("llm runtime lock poisoned")
+            .tried
+            .contains(&key)
+        {
+            return Ok(());
+        }
+        trial::trial(&*backend, model).await?;
+        let mut guard = self.0.write().expect("llm runtime lock poisoned");
+        // Kept only while the runtime still holds that backend.
+        if Arc::ptr_eq(&guard.provider, &backend)
+            || guard
+                .failover_targets
+                .iter()
+                .any(|target| Arc::ptr_eq(&target.provider, &backend))
+        {
+            guard.tried.insert(key);
+        }
+        Ok(())
+    }
+
+    /// Whether some provider has not been asked for its models yet.
+    pub fn offered_never_listed(&self) -> bool {
+        let guard = self.0.read().expect("llm runtime lock poisoned");
+        std::iter::once(&guard.provider)
+            .chain(guard.failover_targets.iter().map(|target| &target.provider))
+            .any(|backend| !guard.offered_listed_at.contains_key(&backend_key(backend)))
+    }
+
+    /// Ask each provider not asked within `max_age` for the models it
+    /// offers now, and offer those (in place of the catalog's), and make one
+    /// trial call on its cheapest configured model, so an account that
+    /// cannot answer (no credit, a rejected key, a used-up quota) is known
+    /// to its quota guard before anyone picks it. One that cannot list keeps
+    /// what it offered; each is asked again after `max_age`, by one caller
+    /// at a time.
+    pub async fn refresh_offered_models(&self, max_age: std::time::Duration) {
+        let due: Vec<(ModelBackend, ModelList, String)> = {
+            let mut guard = self.0.write().expect("llm runtime lock poisoned");
+            let now = std::time::Instant::now();
+            let main_cheapest = cheap_first(
+                guard.router.as_ref(),
+                guard
+                    .router
+                    .as_ref()
+                    .map(Router::all_models_ordered)
+                    .filter(|models| !models.is_empty())
+                    .unwrap_or_else(|| vec![guard.primary_model.clone()]),
+            )
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+            let mut providers = vec![(guard.provider.clone(), guard.models.clone(), main_cheapest)];
+            providers.extend(guard.failover_targets.iter().map(|target| {
+                (
+                    target.provider.clone(),
+                    target.models.clone(),
+                    target
+                        .models_cheap_first()
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default(),
+                )
+            }));
+            providers
+                .into_iter()
+                .filter(|(backend, _, _)| {
+                    let key = backend_key(backend);
+                    let due = guard
+                        .offered_listed_at
+                        .get(&key)
+                        .is_none_or(|at| now.saturating_duration_since(*at) >= max_age);
+                    if due {
+                        guard.offered_listed_at.insert(key, now);
+                    }
+                    due
+                })
+                .collect()
+        };
+        let asks = due.into_iter().map(|(backend, listing, cheapest)| async move {
+            match listing.live().await {
+                Ok(models) => {
+                    self.set_offered_models(&backend, models);
+                }
+                Err(error) => {
+                    tracing::debug!(provider = backend.name(), %error, "A provider could not list its models");
+                }
+            }
+            if !cheapest.is_empty()
+                && backend.unavailable_until(&cheapest).is_none()
+                && let Err(error) = trial::trial(&*backend, &cheapest).await
+            {
+                tracing::info!(provider = backend.name(), model = %cheapest, %error, "A provider's trial call failed");
+            }
+        });
+        futures::future::join_all(asks).await;
     }
 
     /// How the primary provider's models are listed.
     pub fn with_models(self, models: ModelList) -> Self {
         self.0.write().expect("llm runtime lock poisoned").models = models;
         self
+    }
+
+    /// The models the provider whose backend is `backend` (the primary or
+    /// a failover) offers beyond its configured ones: what it listed. `false`
+    /// when no provider of the runtime has that backend now (it was swapped
+    /// since the listing was asked for).
+    pub fn set_offered_models(&self, backend: &ModelBackend, models: Vec<String>) -> bool {
+        let mut guard = self.0.write().expect("llm runtime lock poisoned");
+        if Arc::ptr_eq(&guard.provider, backend) {
+            guard.offered_models = models;
+            return true;
+        }
+        match guard
+            .failover_targets
+            .iter_mut()
+            .find(|target| Arc::ptr_eq(&target.provider, backend))
+        {
+            Some(target) => {
+                target.offered_models = models;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Catalog models the configured primary provider also accepts.
@@ -454,6 +632,8 @@ impl SharedLlmRuntime {
         guard.provider_kind = provider_kind;
         guard.primary_model = primary_model;
         guard.failover_targets = failover_targets;
+        guard.offered_listed_at.clear();
+        guard.tried.clear();
         old
     }
 }

@@ -32,13 +32,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aidaemon_core::{Message, ModelRequest, RequestOptions, ToolChoice, ToolSpec};
 use aidaemon_providers::model_upgrade::successor;
 use aidaemon_providers::routing::ProviderKind;
 use aidaemon_runtime::policy::trust_tier::{TrustTierSetting, classify_model_trust};
 use aidaemon_runtime::settings::{VisionConfig, known_context_budget};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tracing::{info, warn};
 
 use crate::config::{AppConfig, ProviderConfig};
@@ -48,7 +46,6 @@ use crate::traits::StateStore;
 /// The first check waits for channels to connect.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(120);
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
-const TRIAL_WITHIN: Duration = Duration::from_secs(90);
 /// How long the Settings page mentions a switch or a suggestion.
 const NOTICE_FOR_MS: u64 = 7 * 24 * 3600 * 1000;
 /// The notification type of the messages this job queues.
@@ -668,37 +665,9 @@ impl ModelUpgrader {
     /// One real call with a tool, as the agent makes them.
     async fn trial(provider: &ProviderConfig, model: &str) -> anyhow::Result<()> {
         let (backend, _) = crate::providers::factory::build_provider(provider)?;
-        let request = ModelRequest {
-            model: model.to_string(),
-            messages: vec![Message::user(
-                "This checks that a model works with this app. Call the `ready` tool \
-                 with ok set to true.",
-            )],
-            tools: vec![ToolSpec {
-                name: "ready".to_string(),
-                description: "Report that you are ready.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {"ok": {"type": "boolean"}},
-                    "required": ["ok"],
-                    "additionalProperties": false
-                }),
-            }],
-            tool_choice: ToolChoice::Auto,
-            options: RequestOptions {
-                single_attempt: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let response = tokio::time::timeout(TRIAL_WITHIN, backend.complete(&request))
+        aidaemon_runtime::llm::trial::trial(&*backend, model)
             .await
-            .map_err(|_| anyhow::anyhow!("{model} did not answer within {TRIAL_WITHIN:?}"))??;
-        anyhow::ensure!(
-            response.tool_calls.iter().any(|call| call.name == "ready"),
-            "{model} answered without calling the tool"
-        );
-        Ok(())
+            .map_err(anyhow::Error::msg)
     }
 
     /// Queue `message` for the owner (their chats, or their latest app
