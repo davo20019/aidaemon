@@ -545,6 +545,26 @@ The default build includes Slack, Discord, the headless browser, database encryp
 
 See [CLAUDE.md](CLAUDE.md) for architecture details, module map, and contributor guidance.
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+The Windows release binaries (`aidaemon.exe`, `aidaemon-app.exe`) are built by GitHub Actions from this repository's source (`.github/workflows/release.yml`) and signed only after a maintainer approves each release.
+
+Team roles:
+
+- Committers and reviewers: [the repository's collaborators](https://github.com/davo20019/aidaemon/graphs/contributors); every outside contribution is reviewed by the maintainer before it is merged.
+- Approvers: [David Loor](https://github.com/davo20019).
+
+## Privacy
+
+AIdaemon runs on your own computer and keeps its data there. It sends data only to services you configure, such as your model provider, chat channels, MCP servers and the sites you ask it to use. In addition it contacts:
+
+- **GitHub Releases**, to check for updates (`[updates] mode = "disable"` turns this off).
+- **relay.aidaemon.ai and dns.aidaemon.ai**, for remote access from your phone and other devices. Traffic is end-to-end encrypted, and the relay sees only this computer's network address. Set your own relays under `[client_gateway.remote]`, or `enabled = false` to turn remote access off.
+
+The project collects no telemetry or analytics.
+
 ## License
 
 [MIT](LICENSE)
