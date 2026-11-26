@@ -1641,6 +1641,23 @@ fn a_conversation_is_deleted_after_asking_and_only_on_a_daemon_that_deletes() ->
     )]);
     app.wait_for_gone("HERON plan", std::time::Duration::from_secs(5))?;
     app.wait_for("Kept notes")?;
+    // Deleting the open one leaves it at once, before the daemon's erase
+    // comes back.
+    feed([frame(
+        r#"{"type":"event","seq":4,"at_ms":4,"event":{"type":"session_created","session":{"id":"app:synthetic-23","channel":"app","title":"Open plan","writable":true}}}"#,
+    )]);
+    app.wait_for("Open plan")?;
+    app.press("Open plan >> nth=0")?;
+    app.wait_for_gone(
+        "What can I help you with?",
+        std::time::Duration::from_secs(5),
+    )?;
+    open_menu(&mut app, "Open plan >> nth=0", "Delete…")?;
+    let before = sent("delete_session");
+    app.press("Delete…")?;
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Delete".into()))?;
+    wait_sent_new("delete_session", before)?;
+    app.wait_for("What can I help you with?")?;
     // Erased while open (a `/wipe` sent in it, or deleted from another
     // device): the screen leaves it for a new conversation.
     app.press("Kept notes >> nth=0")?;
@@ -1649,7 +1666,7 @@ fn a_conversation_is_deleted_after_asking_and_only_on_a_daemon_that_deletes() ->
         std::time::Duration::from_secs(5),
     )?;
     feed([frame(
-        r#"{"type":"event","seq":4,"at_ms":4,"event":{"type":"session_deleted","session_id":"app:synthetic-22"}}"#,
+        r#"{"type":"event","seq":5,"at_ms":5,"event":{"type":"session_deleted","session_id":"app:synthetic-22"}}"#,
     )]);
     app.wait_for("What can I help you with?")?;
     app.wait_for_gone("Kept notes", std::time::Duration::from_secs(5))?;
