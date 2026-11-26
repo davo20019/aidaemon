@@ -72,6 +72,12 @@ pub fn otlp_header(header_name: &str) -> String {
     format!("otlp_header_{}", header_name.to_ascii_lowercase())
 }
 
+/// The key coding agent `agent` signs in with when the owner chose one for
+/// it (`cli_agent_agy_sign_in_key`), its name normalized like a header's.
+pub fn cli_agent_sign_in_key(agent: &str) -> String {
+    format!("cli_agent_{}_sign_in_key", normalized_header(agent))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,10 +112,4 @@ mod tests {
         assert_eq!(oauth("github", "client_id"), "oauth_github_client_id");
         assert_eq!(otlp_header("X-Honeycomb"), "otlp_header_x-honeycomb");
     }
-}
-
-/// The key coding agent `agent` signs in with when the owner chose one for
-/// it (`cli_agent_agy_sign_in_key`), its name normalized like a header's.
-pub fn cli_agent_sign_in_key(agent: &str) -> String {
-    format!("cli_agent_{}_sign_in_key", normalized_header(agent))
 }

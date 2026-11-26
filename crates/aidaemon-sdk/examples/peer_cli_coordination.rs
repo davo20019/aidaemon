@@ -71,6 +71,7 @@ impl PeerLauncher for CustomFrameworkLauncher {
             working_dir: None,
             branch: None,
             resumable: true,
+            out_of_usage: None,
         })
     }
 
