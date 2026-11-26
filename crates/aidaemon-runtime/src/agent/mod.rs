@@ -5,7 +5,7 @@
 //! the [`TurnHost`](crate::host::TurnHost) the turn engine runs on. The
 //! daemon builds one from its config ([`AgentParts`] plus the host's own
 //! [`HostPorts`]); every child is built from its parent
-//! ([`TurnHost::create_child`](crate::host::TurnHost::create_child)).
+//! (`TurnHost::create_child`).
 //!
 //! What only the host can supply comes in through [`HostPorts`]: its memory,
 //! its file policy, its trace export and computer-use state. A provider

@@ -1,6 +1,7 @@
 //! Run-ending tool results on SDK turns: what each path ships, with which
 //! task status and outcome, and what the ledger closeout records.
 
+use aidaemon_runtime::turn::run_outcome::TurnVerdictReply as _;
 use std::sync::Arc;
 
 use crate::events::{TaskEndData, TaskOutcome, TaskStatus};

@@ -1,6 +1,7 @@
 //! Forced text replies, budget stops and stuck notices through the kernel's
 //! hooks, run against the real loop.
 
+use aidaemon_runtime::turn::run_outcome::TurnVerdictReply as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

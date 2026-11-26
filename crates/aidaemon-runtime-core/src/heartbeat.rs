@@ -1,6 +1,6 @@
 //! The agent's background work: its periodic jobs and services, and the
 //! goal cycle from `aidaemon_work::scheduler`, run on one [`ServiceHost`].
-//! The host gives the cycle its agent (any [`TurnHost`]), its channels and
+//! The host gives the cycle its agent (any `TurnHost`), its channels and
 //! its presentation.
 //!
 //! The job telemetry, its observer and the database health gate are

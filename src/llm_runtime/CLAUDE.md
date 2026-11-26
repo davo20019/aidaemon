@@ -6,15 +6,15 @@ Scoped guide for `src/llm_runtime/`; the repository guide is the root
 ## Side Call Rule
 
 A model call outside the agent loop is a side call. Declare it as a
-`SideCall` in `crates/aidaemon-runtime-core/src/llm/side_calls.rs` (purpose, class, model, total
+`SideCall` in `crates/aidaemon-runtime-base/src/llm/side_calls.rs` (purpose, class, model, total
 deadline, failure policy) and make it through `SideCallGateway`
-(`crates/aidaemon-runtime-core/src/llm/gateway.rs`): `ask` for a prompt you own, `provider` for
+(`crates/aidaemon-runtime-base/src/llm/gateway.rs`): `ask` for a prompt you own, `provider` for
 library code that takes a provider. Do not hold a raw provider or record a
 call by hand anywhere else; `llm_runtime::door_tests` fails if you do.
 
 A closed question for the optional decision backend (`[decisions]`,
 `aidaemon_decisions::Decider`) is a `Decision` in
-`crates/aidaemon-runtime-core/src/llm/decisions.rs`, asked through `SideCallGateway::decide`; it
+`crates/aidaemon-runtime-base/src/llm/decisions.rs`, asked through `SideCallGateway::decide`; it
 may skip optional work, pick between equal-authority paths or make a check
 stricter, never grant authority or decide completion. One exception, kept
 narrow: `UntrustedEgressClear` may clear an egress call after untrusted

@@ -2,15 +2,22 @@
 //! below it, never the ones above. A cycle between modules makes the compiler
 //! re-check all of them on any edit, and blocks splitting them into crates.
 //!
-//! These tests read `aidaemon-runtime-core`'s source (not test code) for
-//! `crate::<module>` paths and fail when the module graph has a cycle or a
+//! The runtime is two crates: `aidaemon-runtime-base` (the lower half) and
+//! `aidaemon-runtime-core` (the turn and the engine, which re-exports the
+//! base's modules at its root, so their paths read the same). The compiler
+//! keeps the base from naming the core; within and across them these tests
+//! read the source (not test code) for `crate::<module>` paths and fail when the module graph has a cycle or a
 //! layered module uses one above it. To share something between layers, move
 //! the shared item down, or define a trait below and implement it above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const CORE_SRC: &str = "crates/aidaemon-runtime-core/src";
+/// The runtime's crates, lower first.
+const RUNTIME_SRC: &[&str] = &[
+    "crates/aidaemon-runtime-base/src",
+    "crates/aidaemon-runtime-core/src",
+];
 
 /// The layered modules, top (uses the others) to bottom.
 const LAYERS: &[&str] = &[
@@ -37,8 +44,11 @@ const LAYERS: &[&str] = &[
     "known_resources",
 ];
 
-fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(CORE_SRC)
+fn roots() -> Vec<PathBuf> {
+    RUNTIME_SRC
+        .iter()
+        .map(|src| Path::new(env!("CARGO_MANIFEST_DIR")).join(src))
+        .collect()
 }
 
 /// Source text with comments, string and char literals blanked out, so that
@@ -301,13 +311,15 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 
 /// `(module, referenced module)` -> the files making that reference.
 fn module_graph() -> BTreeMap<(String, String), BTreeSet<String>> {
-    let root = root();
+    let roots = roots();
     let mut modules = BTreeMap::new();
-    for entry in std::fs::read_dir(&root).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-        if name != "lib" && (path.is_dir() || path.extension().is_some_and(|e| e == "rs")) {
-            modules.entry(name).or_insert_with(Vec::new).push(path);
+    for root in &roots {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            if name != "lib" && (path.is_dir() || path.extension().is_some_and(|e| e == "rs")) {
+                modules.entry(name).or_insert_with(Vec::new).push(path);
+            }
         }
     }
     let mut sources = Vec::new();
@@ -334,11 +346,15 @@ fn module_graph() -> BTreeMap<(String, String), BTreeSet<String>> {
         if test_files.iter().any(|t| file.starts_with(t)) {
             continue;
         }
+        let root = roots
+            .iter()
+            .find(|root| file.starts_with(root))
+            .expect("every scanned file is under a runtime crate");
         let top_level = file.parent() == Some(root.as_path());
         for target in referenced_modules(&code, top_level) {
             if target != module && modules.contains_key(&target) {
                 let rel = file
-                    .strip_prefix(&root)
+                    .strip_prefix(root)
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");

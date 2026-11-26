@@ -3,8 +3,8 @@
 use aidaemon_core as sdk;
 use aidaemon_events::{TaskOutcome, TaskStatus};
 
-use super::budgets::{GOAL_BUDGET_EXHAUSTED, MANDATE_BUDGET_EXHAUSTED};
-use super::stop::finalize_reply;
+use super::final_reply::finalize_reply;
+use crate::budget_policy::{GOAL_BUDGET_EXHAUSTED, MANDATE_BUDGET_EXHAUSTED};
 pub use crate::memory_port::TurnVerdict;
 
 /// How the kernel writes a used-up quota into `RunStatus::ProviderFailed`
@@ -179,32 +179,27 @@ fn reads_an_edited_file(receipt: &sdk::Receipt, edited: &[String]) -> bool {
 /// The coding-agent launcher's tool name, as its receipts carry it.
 const CLI_AGENT_TOOL: &str = "cli_agent";
 
-impl TurnVerdict {
-    /// The run ends on a used-up budget: the next model call fails with the
-    /// budget's marker, and the turn ships `reply` with `outcome`.
-    pub fn record_budget_stop(&self, reply: String, outcome: TaskOutcome) {
-        if let Ok(mut stop) = self.budget_stop.lock() {
-            *stop = Some((reply, outcome));
-        }
-    }
-
-    pub fn record_handoff_reply(&self, reply: String) {
-        if let Ok(mut handoff) = self.handoff_reply.lock() {
-            *handoff = Some(reply);
-        }
-    }
-
-    pub fn record_interrupted_answer(&self, answer: String) {
-        if let Ok(mut interrupted) = self.interrupted_answer.lock() {
-            *interrupted = Some(answer);
-        }
-    }
-
+/// How the turn resolves its run into the reply the user gets. The record is
+/// [`TurnVerdict`] (in the memory port, below the engine); resolving it reads
+/// the engine's reply checks.
+pub trait TurnVerdictReply {
     /// The reply the user gets, with its status and outcome: [`Self::resolve`],
     /// then for a completed run the interrupted-answer fallback and the final
     /// reply checks (reply sanitization alone for a stopped run), and for
     /// every run secret redaction on public channels.
-    pub fn final_reply(
+    fn final_reply(
+        &self,
+        outcome: &sdk::RunOutcome,
+        tool_calls: &[crate::turn::post_task::LearnedCall],
+        visibility: aidaemon_core::ChannelVisibility,
+    ) -> (String, TaskStatus, TaskOutcome);
+
+    /// The turn's reply, status and outcome for a finished run.
+    fn resolve(&self, outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome);
+}
+
+impl TurnVerdictReply for TurnVerdict {
+    fn final_reply(
         &self,
         outcome: &sdk::RunOutcome,
         tool_calls: &[crate::turn::post_task::LearnedCall],
@@ -295,15 +290,7 @@ impl TurnVerdict {
         (reply, status, task_outcome)
     }
 
-    pub fn run_failure(&self) -> Option<String> {
-        self.run_failure
-            .lock()
-            .ok()
-            .and_then(|failure| failure.clone())
-    }
-
-    /// The turn's reply, status and outcome for a finished run.
-    pub fn resolve(&self, outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
+    fn resolve(&self, outcome: &sdk::RunOutcome) -> (String, TaskStatus, TaskOutcome) {
         let (reply, status, task_outcome) = reply_for(outcome);
         let external_ack = self
             .external_action_ack

@@ -52,52 +52,19 @@
 use workspace_hack as _;
 
 pub mod approvals;
-pub mod authority;
-pub mod background_run;
 pub mod background_task_lead;
-pub mod budget_policy;
-pub mod call_args;
-pub mod chat_bridge;
-pub mod consolidation;
-pub mod context_budget;
-pub mod coordination;
-pub mod decisions;
 pub mod engine;
-pub mod eval;
 pub mod goal_dispatch;
 pub mod heartbeat;
-pub mod helper_run;
-pub mod history;
-pub mod host;
-pub mod known_resources;
-pub mod llm;
-pub mod markers;
-pub mod media;
-pub mod memory;
-pub mod memory_port;
-pub mod message_content;
-pub mod mid_run;
-pub mod opt_out;
-pub mod owed_reports;
-pub mod owner_level;
-pub mod permissions;
-pub mod policy;
-pub mod prompt;
-pub mod render;
-pub mod run_state;
-pub mod session_model;
-pub mod settings;
-pub mod spawn;
-pub mod spawn_tool;
 pub mod specialists;
-pub mod state;
-pub mod steering;
-pub mod stores;
-pub mod terminal_grants;
-pub mod text_cut;
-pub mod tool_manifest;
 pub mod turn;
-pub mod turn_project;
-pub mod turn_runtime;
-pub mod untrusted;
-pub mod untrusted_writes;
+
+// The lower half of the runtime, below the turn and the engine.
+pub use aidaemon_runtime_base::{
+    authority, background_run, budget_policy, call_args, chat_bridge, consolidation,
+    context_budget, coordination, decisions, eval, helper_run, history, host, known_resources, llm,
+    markers, media, memory, memory_port, message_content, mid_run, opt_out, owed_reports,
+    owner_level, permissions, policy, prompt, render, run_state, session_model, settings, spawn,
+    spawn_tool, state, steering, stores, terminal_grants, text_cut, tool_manifest, turn_project,
+    turn_runtime, untrusted, untrusted_writes,
+};

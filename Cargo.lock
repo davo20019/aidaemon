@@ -811,6 +811,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-runtime-base"
+version = "0.25.0"
+dependencies = [
+ "aidaemon-agents",
+ "aidaemon-channels",
+ "aidaemon-coding-agents",
+ "aidaemon-core",
+ "aidaemon-decisions",
+ "aidaemon-events",
+ "aidaemon-exposure",
+ "aidaemon-mcp",
+ "aidaemon-memory",
+ "aidaemon-nodes",
+ "aidaemon-policies",
+ "aidaemon-providers",
+ "aidaemon-runtime-base",
+ "aidaemon-secrets",
+ "aidaemon-shells",
+ "aidaemon-skills",
+ "aidaemon-store-sqlite",
+ "aidaemon-surfaces",
+ "aidaemon-tools",
+ "aidaemon-work",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "dirs 7.0.0",
+ "dunce",
+ "futures",
+ "hex",
+ "proptest",
+ "regex",
+ "reqwest 0.13.5",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "sha2 0.11.1",
+ "shellexpand",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "aidaemon-runtime-core"
 version = "0.25.0"
 dependencies = [
@@ -826,6 +878,7 @@ dependencies = [
  "aidaemon-nodes",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-runtime-base",
  "aidaemon-runtime-core",
  "aidaemon-secrets",
  "aidaemon-shells",

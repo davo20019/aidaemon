@@ -60,7 +60,7 @@ pub fn strip_model_arguments(
     }
 }
 
-pub(crate) fn drop_unset_optional_arguments(
+pub fn drop_unset_optional_arguments(
     map: &mut serde_json::Map<String, Value>,
     schema: &Value,
 ) {

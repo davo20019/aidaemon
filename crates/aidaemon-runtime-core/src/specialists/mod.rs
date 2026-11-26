@@ -103,3 +103,6 @@ impl SpecialistRegistry {
         out
     }
 }
+
+#[cfg(test)]
+mod spawn_arg_tests;

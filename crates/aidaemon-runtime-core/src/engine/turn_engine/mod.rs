@@ -39,7 +39,7 @@ use crate::engine::calls::{
     AfterCallCheck, GateRequest, HostCall as DaemonCall, KernelCall, KernelNotice, ModelCall,
     ModelErrorCheck, StopCheck, ToolRequest,
 };
-use crate::engine::outcome::TurnVerdict;
+use crate::engine::outcome::{TurnVerdict, TurnVerdictReply as _};
 use crate::engine::provider::{
     HostProvider, RunMessage, fit_request, from_provider_response, prefix_with_notes,
     split_injected_notes, to_chat_options, to_daemon_tools, values_to_sdk,

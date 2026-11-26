@@ -82,7 +82,7 @@ pub fn render_cache_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::turn_render::RENDERER_VERSION;
+    use crate::render::RENDERER_VERSION;
     use aidaemon_events::TerminalState;
     use aidaemon_events::conversation::Message;
     use chrono::Utc;

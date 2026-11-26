@@ -2,7 +2,7 @@
 //! claims the goal's run, spawns its task lead (and, when the lead leaves
 //! work behind, the executors and a recovery), keeps the owner's progress
 //! surface current, finalizes mandate reviews and scheduled runs, and
-//! delivers the result. It runs on any [`TurnHost`].
+//! delivers the result. It runs on any `TurnHost`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};

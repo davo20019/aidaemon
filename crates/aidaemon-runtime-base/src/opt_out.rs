@@ -2,7 +2,7 @@
 //!
 //! A turn is opted out in one of two typed ways, never by matching words:
 //! - the user sends `/private` first: the chat's next message is opted out
-//!   when its turn starts ([`take_next_message_private`]);
+//!   when its turn starts (`take_next_message_private`);
 //! - the model, reading that the user does not want the turn remembered,
 //!   calls [`SKIP_LEARNING_TOOL`] during the turn.
 //!

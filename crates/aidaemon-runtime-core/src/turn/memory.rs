@@ -103,13 +103,6 @@ pub fn memory_project_allowed(
     user_role == UserRole::Owner && channel_ctx.should_inject_personal_memory() && !mandate
 }
 
-impl MemoryTurn {
-    /// Worker sessions keep summaries but never learn owner facts.
-    pub fn memory_isolated(&self) -> bool {
-        self.depth > 0 || aidaemon_events::is_memory_isolated_worker_session(&self.session_id)
-    }
-}
-
 /// The parts `plugin` adds to `turn`. A mandate worker gets none, whatever
 /// the plugin: its authority envelope excludes owner memory.
 pub async fn memory_parts(plugin: &dyn MemoryPlugin, turn: &MemoryTurn) -> MemoryParts {

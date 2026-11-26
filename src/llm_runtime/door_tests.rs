@@ -7,11 +7,11 @@ use std::path::Path;
 /// Files allowed to reach a provider without the gateway, each with its reason.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "crates/aidaemon-runtime-core/src/llm/",
+        "crates/aidaemon-runtime-base/src/llm/",
         "defines the runtime and the gateway",
     ),
     (
-        "crates/aidaemon-runtime-core/src/chat_bridge/",
+        "crates/aidaemon-runtime-base/src/chat_bridge/",
         "calls providers",
     ),
     ("src/llm_runtime/door_tests.rs", "these tests"),
@@ -65,6 +65,7 @@ fn rust_files_under(dir: &str) -> impl Iterator<Item = String> + use<> {
 /// The daemon's code and the runtime crate's.
 const SCANNED: &[&str] = &[
     "src",
+    "crates/aidaemon-runtime-base/src",
     "crates/aidaemon-runtime-core/src",
     "crates/aidaemon-runtime/src",
 ];
@@ -95,7 +96,7 @@ fn nothing_outside_the_gateway_reaches_a_provider() {
 #[test]
 fn the_scan_sees_the_gateway() {
     assert!(scanned_files().any(
-        |path| path == "crates/aidaemon-runtime-core/src/llm/gateway.rs"
+        |path| path == "crates/aidaemon-runtime-base/src/llm/gateway.rs"
             && reaches_a_provider(&path)
     ));
 }
@@ -115,7 +116,7 @@ const RAW_DECIDER: &[&str] = &[
 #[test]
 fn nothing_outside_the_gateway_holds_a_decider() {
     let offenders = scanned_files()
-        .filter(|path| !path.starts_with("crates/aidaemon-runtime-core/src/llm/"))
+        .filter(|path| !path.starts_with("crates/aidaemon-runtime-base/src/llm/"))
         .filter(|path| path != "src/llm_runtime/door_tests.rs")
         .filter(|path| {
             let text =

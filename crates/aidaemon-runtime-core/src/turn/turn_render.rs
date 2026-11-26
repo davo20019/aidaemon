@@ -18,10 +18,7 @@ use aidaemon_events::conversation::AttachmentProvenance;
 use aidaemon_events::conversation::{Message, ToolCall};
 use serde_json::{Value, json};
 
-/// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
-/// v6: a structurally referenced parent turn retains bounded receipt-bearing
-/// tool evidence; ordinary archived turns remain aggressively compact.
-pub const RENDERER_VERSION: u32 = 6;
+pub use crate::render::RENDERER_VERSION;
 const MAX_ADJACENT_TOOL_RESULT_CHARS: usize = 4_000;
 /// The adjacent prior assistant answer is recent transcript, not generic
 /// archive. Keep ordinary answers verbatim up to roughly 3k tokens; only

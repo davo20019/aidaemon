@@ -26,7 +26,7 @@ pub struct MemoryWarmup {
     pub channel_ctx: ChannelContext,
     pub depth: usize,
     /// The project the conversation is placed in, when it may keep project
-    /// memory ([`memory_project`](crate::turn::memory::memory_project)).
+    /// memory (`memory_project`).
     pub project: Option<aidaemon_core::ProjectRef>,
 }
 
@@ -60,7 +60,7 @@ pub struct MemoryTurn {
     /// with whatever memory system serves the turn.
     pub learning_consent: aidaemon_policies::TurnLearning,
     /// The project the turn works in, when it may keep project memory
-    /// ([`memory_project`](crate::turn::memory::memory_project)); `None` otherwise.
+    /// (`memory_project`); `None` otherwise.
     pub project: Option<aidaemon_core::ProjectRef>,
 }
 
@@ -84,7 +84,7 @@ pub trait MemoryPlugin: Send + Sync {
     /// that turn may read memory and recalls for the same inputs.
     fn warm(&self, _warmup: &MemoryWarmup) {}
 
-    /// The daemon memory tools ([`DAEMON_MEMORY_TOOLS`](crate::turn::memory::DAEMON_MEMORY_TOOLS)) this plugin owns.
+    /// The daemon memory tools (`DAEMON_MEMORY_TOOLS`) this plugin owns.
     fn owned_daemon_tools(&self) -> &'static [&'static str] {
         &[]
     }
@@ -229,4 +229,95 @@ pub struct ExecutionBudget {
     pub max_tool_calls: usize,
     pub max_validation_rounds: usize,
     pub max_wall_clock_ms: u64,
+}
+
+impl MemoryTurn {
+    /// Worker sessions keep summaries but never learn owner facts.
+    pub fn memory_isolated(&self) -> bool {
+        self.depth > 0 || aidaemon_events::is_memory_isolated_worker_session(&self.session_id)
+    }
+}
+
+impl LearnedCall {
+    pub fn new(
+        name: &str,
+        summary: String,
+        recap: aidaemon_tools::semantics::RecapKind,
+        rejected: bool,
+        failed: bool,
+    ) -> Self {
+        let line = format!("{name}({summary})");
+        let line = if rejected {
+            format!("{line} [REJECTED]")
+        } else if failed {
+            format!("{line} [FAILED]")
+        } else {
+            line
+        };
+        Self {
+            line,
+            summary,
+            recap,
+            rejected,
+            failed,
+        }
+    }
+
+    /// The call ran to completion: activity a recap may claim.
+    pub fn completed(&self) -> bool {
+        !self.rejected && !self.failed
+    }
+}
+
+impl LearningContext {
+    /// What the full memory system learns from: this run, with the first
+    /// error stripped of the daemon's scaffolding lines.
+    pub fn into_run_learning(self) -> aidaemon_memory::full::writer::RunLearning {
+        aidaemon_memory::full::writer::RunLearning {
+            user_text: self.user_text,
+            persistence_allowed: self.memory_persistence_allowed,
+            intent_domains: self.intent_domains,
+            tool_calls: self.tool_calls.into_iter().map(|call| call.line).collect(),
+            errors: self.errors,
+            first_error: self.first_error.map(|error| {
+                error
+                    .lines()
+                    .filter(|line| !crate::message_content::is_internal_scaffolding_line(line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+            recovery_actions: self.recovery_actions,
+            completed_naturally: self.completed_naturally,
+            succeeded: self.task_outcome.map(|outcome| outcome.task_success()),
+        }
+    }
+}
+
+impl TurnVerdict {
+    /// The run ends on a used-up budget: the next model call fails with the
+    /// budget's marker, and the turn ships `reply` with `outcome`.
+    pub fn record_budget_stop(&self, reply: String, outcome: TaskOutcome) {
+        if let Ok(mut stop) = self.budget_stop.lock() {
+            *stop = Some((reply, outcome));
+        }
+    }
+
+    pub fn record_handoff_reply(&self, reply: String) {
+        if let Ok(mut handoff) = self.handoff_reply.lock() {
+            *handoff = Some(reply);
+        }
+    }
+
+    pub fn record_interrupted_answer(&self, answer: String) {
+        if let Ok(mut interrupted) = self.interrupted_answer.lock() {
+            *interrupted = Some(answer);
+        }
+    }
+
+    pub fn run_failure(&self) -> Option<String> {
+        self.run_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+    }
 }

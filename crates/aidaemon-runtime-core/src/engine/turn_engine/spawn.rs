@@ -3,12 +3,12 @@
 //! [`TurnEngine::spawn_child`] decides the child from a typed request (its
 //! role, specialist, tools, prompt, budgets and the authority it inherits,
 //! narrowed by [`narrow_for_child`](crate::authority::narrow_for_child)),
-//! asks the host to build it ([`TurnHost::create_child`]), runs it on its own
+//! asks the host to build it ([`EngineHost::create_child`]), runs it on its own
 //! task under its idle limit and the owner's stop, and settles how it ended
 //! from typed records: its task-end event, its run's aggregate and, for an
 //! executor, its durable task.
 //!
-//! [`TurnHost::create_child`]: crate::host::TurnHost::create_child
+//! [`EngineHost::create_child`]: crate::engine::engine_host::EngineHost::create_child
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;

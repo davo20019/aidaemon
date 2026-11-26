@@ -473,7 +473,6 @@ impl From<CostSnapshot> for aidaemon_events::CostEvalPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::completion_contract::CompletionContract;
     use aidaemon_events::{
         ContractFulfillmentPayload, CostEvalPayload, HarnessScoresPayload, ProgressEvalPayload,
         QualityEvalPayload, RoutingEvalPayload,
@@ -612,12 +611,10 @@ mod tests {
     /// contract is not a violation.
     #[test]
     fn owner_mutation_under_assessed_read_only_contract_is_not_penalized() {
-        let contract = CompletionContract {
-            forbids_mutation: true,
-            ..Default::default()
-        };
+        // The assessed contract forbade mutation; it expects none.
+        let contract = ContractExpectations::default();
         let mut acc = HarnessEvalAccumulator::new(seed());
-        acc.record_completion_contract(contract.eval_expectations(), false);
+        acc.record_completion_contract(contract, false);
         acc.contract.mutation_count = 1;
         let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
         assert!(!snap.quality.contract.forbids_mutation);
@@ -628,12 +625,12 @@ mod tests {
     /// expected one, so its authority denial scores as a forbidden attempt.
     #[test]
     fn readonly_authority_denial_scores_as_forbidden_mutation() {
-        let contract = CompletionContract {
+        let contract = ContractExpectations {
             expects_mutation: true,
             ..Default::default()
         };
         let mut acc = HarnessEvalAccumulator::new(seed());
-        acc.record_completion_contract(contract.eval_expectations(), true);
+        acc.record_completion_contract(contract, true);
         acc.record_forbidden_mutation_attempt();
         let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
         assert!(snap.quality.contract.forbids_mutation);

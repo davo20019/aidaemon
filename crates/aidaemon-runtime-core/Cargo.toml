@@ -19,12 +19,13 @@ exclude = ["tests/", "benches/"]
 [features]
 # Test-only helpers that dependents' test builds need, as `cfg(test)` cannot
 # reach across a crate boundary.
-testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing", "aidaemon-tools/testing"]
+testing = ["aidaemon-runtime-base/testing", "dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing", "aidaemon-tools/testing"]
 # SQLCipher: `state::SqliteStateStore` applies a database's encryption key.
 # The host links SQLite with SQLCipher (`libsqlite3-sys/bundled-sqlcipher`).
-encryption = []
+encryption = ["aidaemon-runtime-base/encryption"]
 
 [dependencies]
+aidaemon-runtime-base = { version = "0.25.0", path = "../aidaemon-runtime-base" }
 dunce = "1.0"
 aidaemon-agents = { version = "0.25.0", path = "../aidaemon-agents" }
 aidaemon-channels = { version = "0.25.0", path = "../aidaemon-channels" }

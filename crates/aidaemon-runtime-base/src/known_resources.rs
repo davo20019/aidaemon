@@ -17,7 +17,7 @@
 //!
 //! [`KnownResources`] is that handoff, in one form for both boundaries: a
 //! child inherits it from the run that spawned it
-//! ([`InheritedAuthority::known_resources`]), and a turn
+//! ([`InheritedAuthority::known_resources`](crate::authority::InheritedAuthority::known_resources)), and a turn
 //! receives it from the earlier turns projected into its own transcript. It
 //! holds only targets of operations that succeeded. It grants nothing: tool
 //! authority and trust still come only from the explicit authority.

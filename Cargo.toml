@@ -47,6 +47,7 @@ members = [
     "crates/aidaemon-memory",
     "crates/aidaemon-events",
     "crates/aidaemon-work",
+    "crates/aidaemon-runtime-base",
     "crates/aidaemon-runtime-core",
     "crates/aidaemon-runtime",
     "crates/aidaemon-skills",

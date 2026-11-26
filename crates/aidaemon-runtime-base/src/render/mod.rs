@@ -9,6 +9,11 @@ use crate::settings::{AudioConfig, SttConfig, VisionConfig};
 
 pub mod cache;
 
+/// Bump when the rendering ALGORITHM changes; invalidates all cached renders.
+/// v6: a structurally referenced parent turn retains bounded receipt-bearing
+/// tool evidence; ordinary archived turns remain aggressively compact.
+pub const RENDERER_VERSION: u32 = 6;
+
 #[derive(Clone, Debug)]
 pub struct RenderOptions {
     pub vision: VisionConfig,

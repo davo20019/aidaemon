@@ -2448,7 +2448,7 @@ async fn new_work_never_starts_in_a_folder_that_already_exists() {
         ..Default::default()
     };
     let check = |path: &str| {
-        crate::turn::tool_dispatch::access_manifest_scope_check(
+        crate::scope_check::access_manifest_scope_check(
             "write_file",
             &writes(path),
             Some(&child_access),

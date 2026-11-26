@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use super::memory::MemoryTurn;
 use super::post_task::LearningContext;
+use super::run_outcome::TurnVerdictReply as _;
 use aidaemon_core as sdk;
 use aidaemon_events::TaskStatus;
 

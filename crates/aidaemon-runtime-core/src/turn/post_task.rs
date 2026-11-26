@@ -10,61 +10,6 @@ use std::sync::LazyLock;
 pub use crate::memory_port::{LearnedCall, LearningContext};
 use crate::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 
-impl LearnedCall {
-    pub fn new(
-        name: &str,
-        summary: String,
-        recap: aidaemon_tools::semantics::RecapKind,
-        rejected: bool,
-        failed: bool,
-    ) -> Self {
-        let line = format!("{name}({summary})");
-        let line = if rejected {
-            format!("{line} [REJECTED]")
-        } else if failed {
-            format!("{line} [FAILED]")
-        } else {
-            line
-        };
-        Self {
-            line,
-            summary,
-            recap,
-            rejected,
-            failed,
-        }
-    }
-
-    /// The call ran to completion: activity a recap may claim.
-    pub fn completed(&self) -> bool {
-        !self.rejected && !self.failed
-    }
-}
-
-impl LearningContext {
-    /// What the full memory system learns from: this run, with the first
-    /// error stripped of the daemon's scaffolding lines.
-    pub fn into_run_learning(self) -> aidaemon_memory::full::writer::RunLearning {
-        aidaemon_memory::full::writer::RunLearning {
-            user_text: self.user_text,
-            persistence_allowed: self.memory_persistence_allowed,
-            intent_domains: self.intent_domains,
-            tool_calls: self.tool_calls.into_iter().map(|call| call.line).collect(),
-            errors: self.errors,
-            first_error: self.first_error.map(|error| {
-                error
-                    .lines()
-                    .filter(|line| !crate::message_content::is_internal_scaffolding_line(line))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
-            recovery_actions: self.recovery_actions,
-            completed_naturally: self.completed_naturally,
-            succeeded: self.task_outcome.map(|outcome| outcome.task_success()),
-        }
-    }
-}
-
 /// Process learning from a completed task - runs in background.
 pub async fn process_learning(
     state: &Arc<dyn aidaemon_memory::stores::MemoryStores>,

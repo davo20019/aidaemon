@@ -102,12 +102,17 @@ background tasks`.
 - `src/startup/`: subsystem setup (stores, provider/router, tools, skills, MCP,
   memory, channels, DB security, wiring).
 - `src/agent/`: the daemon's `Agent` (construction, host ports) and the
-  runtime's tests on it. The runtime is `crates/aidaemon-runtime-core/src/`
-  (everything but the built-in tools and the agent, which are
-  `crates/aidaemon-runtime/src/{tools,agent}`; that crate re-exports core's
-  modules, so `aidaemon_runtime::turn` paths are unchanged):
-  `turn/` (bootstrap, closeout, completion, memory), `engine/` (tool roster,
-  gate, dispatch) and `engine/turn_engine/`, one turn on the SDK kernel.
+  runtime's tests on it. The runtime is two crates in layers:
+  `crates/aidaemon-runtime-base/src/` (host traits, llm, authority,
+  coordination, spawn and runs, untrusted, prompt, memory, history, state)
+  and `crates/aidaemon-runtime-core/src/` on top of it (`turn/`: bootstrap,
+  closeout, completion, memory, reply; `engine/`: gate, dispatch and
+  `engine/turn_engine/`, one turn on the SDK kernel; approvals, specialists,
+  task leads). Core re-exports base's modules at its root, and
+  `crates/aidaemon-runtime` (built-in tools and the agent) re-exports core's,
+  so `aidaemon_runtime::turn` and `crate::state` paths are unchanged. Neither
+  crate's modules may form a cycle (`src/layering_tests.rs`): share an item
+  by moving it down, or by a trait defined below and implemented above.
 - Tools: `crates/aidaemon-tools` and `crates/aidaemon-runtime/src/tools/`
   (terminal, cli_agent, ...); `src/tools/` holds the app-assembled ones and
   re-exports.
@@ -115,7 +120,7 @@ background tasks`.
   traits, which live in the crates that own them; `src/traits/state_store.rs`
   keeps only what the app assembles itself (`StateStore`, `MandateToolStore`,
   `SkillsStore`, `HealthCheckStore`).
-- State: `crates/aidaemon-runtime-core/src/state/` (the SQLite `StateStore` and
+- State: `crates/aidaemon-runtime-base/src/state/` (the SQLite `StateStore` and
   its schema; `src/state/` re-exports). Goals, mandates, tasks, work
   coordination and notifications: `crates/aidaemon-work/src/sqlite/`; task
   plans: `crates/aidaemon-work/src/plans/`. Memory: `crates/aidaemon-memory`
@@ -136,10 +141,10 @@ background tasks`.
   `~/.aidaemon/specialists/`, code in `crates/aidaemon-runtime-core/src/specialists/`, exposed via
   `spawn_agent`.
 - MCP: `src/startup/mcp.rs`, `crates/aidaemon-mcp` (`manage_mcp` is
-  `registry/manage.rs`), `crates/aidaemon-runtime-core/src/state/dynamic_mcp.rs`.
+  `registry/manage.rs`), `crates/aidaemon-runtime-base/src/state/dynamic_mcp.rs`.
 - Project memory: notes per project id in `aidaemon_memory::project`
   (files, never the database); a turn's project is resolved from typed state
-  in `aidaemon-runtime-core/src/turn/turn_project.rs` and gated by
+  in `aidaemon-runtime-base/src/turn_project.rs` and gated by
   `turn::memory::memory_project` (owner, private/internal, no mandate).
   Personal-only categories never become notes (`project::route`).
 
