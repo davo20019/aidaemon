@@ -989,8 +989,10 @@ fn note_body(
 
 /// A pane at an edge of a narrow window: it slides in from `side` over the
 /// page, which dims behind it, and back out (in place when the owner asked
-/// for less motion). A press on the dimmed page or the back button close
-/// it (`close`); `gone` hears it once it has slid out. Its content's own
+/// for less motion). A press on the dimmed page, the back button or (the
+/// left one) a swipe toward its edge close it (`close`): the panel follows the finger,
+/// and a swipe past a third of its width, or a flick, closes it, else it
+/// springs back. `gone` hears it once it has slid out. Its content's own
 /// heading names it.
 ///
 /// Its content is made once and stays: closed, the drawer is only out of
@@ -1097,7 +1099,41 @@ pub fn drawer(
         .max_w(px(380.0))
         .bg(colors::SIDEBAR)
         .shadow_lg()
-        .bind_translate_x(&x)
+        // Never past its open place: a drag back the other way stops there.
+        .bind_translate_x(&if left {
+            x.interpolate(&[-4000.0, 0.0], &[-4000.0, 0.0])
+        } else {
+            x.interpolate(&[0.0, 4000.0], &[0.0, 4000.0])
+        })
+        // A swipe toward its edge moves it with the finger; vertical drags
+        // (its list's scrolling) and presses stay its content's. Only the
+        // left one (the conversations): a right one holds diffs and a
+        // terminal, whose sideways drags are their own scrolling.
+        .pan_enabled(left)
+        .pan_values(Some(&x), None)
+        .pan_activation(PanActivation::default().direction(if left {
+            PanDirection::Left
+        } else {
+            PanDirection::Right
+        }))
+        .on_pan_end({
+            let close = close.clone();
+            move |e: &PanEvent| {
+                let out = if left {
+                    -e.value_x.unwrap_or(0.0)
+                } else {
+                    e.value_x.unwrap_or(0.0)
+                };
+                let flick = if left { -e.velocity_x } else { e.velocity_x };
+                if !e.cancelled && (out > width.get() / 3.0 || flick > SWIPE_FLICK) {
+                    close();
+                } else if reduce_motion() {
+                    x.set(0.0);
+                } else {
+                    x.timing(0.0, motion::ENTER, Easing::EaseOut);
+                }
+            }
+        })
         .on_layout(move |frame: &Bounds<Points>| {
             width.replace(frame.size.width.0);
             // Out of sight, it stays as far as its new width.
@@ -1121,6 +1157,10 @@ pub fn drawer(
         )
         .child(panel)
 }
+
+/// How fast a swipe toward a drawer's edge closes it however short, in
+/// points per second.
+const SWIPE_FLICK: f32 = 500.0;
 
 /// Side-by-side panes the owner resizes by dragging the line between them.
 pub fn split() -> nsh_base::ResizablePanelGroupElement {

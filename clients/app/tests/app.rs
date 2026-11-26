@@ -264,12 +264,26 @@ fn a_dropped_connection_does_not_keep_a_turn_spinning() -> Result<(), String> {
 }
 
 #[test]
-fn the_name_carries_the_connection_as_a_dot() -> Result<(), String> {
+fn the_name_carries_the_connection_as_a_dot_only_when_something_is_wrong() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
+    // Connected: the name stands alone.
     feed([Update::Connected]);
-    app.wait_for("label:Connected to the daemon, open System")?;
-    app.press("label:Connected to the daemon, open System")?;
+    app.wait_for("AIDaemon")?;
+    assert!(
+        app.wait_for("label:Connected to the daemon, open System")
+            .is_err()
+    );
+    // The daemon refuses the app (down at once; a brief drop reads as
+    // connected for a few seconds): the dot says so and opens System.
+    feed([Update::Disconnected(aidaemon_client_core::Disconnect {
+        kind: aidaemon_client_core::DropKind::Unauthorized,
+        reason: "synthetic key revoked".into(),
+        retry_in: std::time::Duration::from_secs(30),
+    })]);
+    let dot = "label:The daemon refused this app: synthetic key revoked, open System";
+    app.wait_for(dot)?;
+    app.press(dot)?;
     app.wait_for("Reading the daemon's status…")?;
     Ok(())
 }
@@ -2484,5 +2498,25 @@ fn the_changed_files_tree_takes_presses_on_folders_and_files() -> Result<(), Str
     app.wait_for("acme")?;
     app.press("app/tests/app.rs, modified, written in this conversation")?;
     app.wait_for("All files")?;
+    Ok(())
+}
+
+/// On a phone the drawer closes with a swipe toward its edge (past a third
+/// of its width, or a flick), so it has no close button.
+#[test]
+fn the_drawer_closes_with_a_swipe_and_has_no_close_button() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_at(390.0, 844.0);
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    app.press("label:Conversations")?;
+    app.wait_for("Search conversations")?;
+    assert!(app.wait_for("label:Close").is_err());
+    let left = nsh_engine::Point {
+        x: Points(-220.0),
+        y: Points(0.0),
+    };
+    app.drag("id:drawer", left, nsh_testing::DragOptions::default())?;
+    app.wait_for_gone("Search conversations", std::time::Duration::from_secs(3))?;
     Ok(())
 }

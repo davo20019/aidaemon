@@ -10,8 +10,9 @@ use crate::ui::{self, Glyph, Size, colors};
 
 /// Top header bar shared across `Settings`, `Automations`, `Memory` and
 /// `System`: sidebar toggle (when compact or closed) and the four page links
-/// in a horizontally scrollable pill strip. Refresh lives on pull-to-refresh
-/// and the keyboard/command palette.
+/// in a horizontally scrollable pill strip. No refresh button: each page
+/// refreshes when pulled down (`ui::refreshable`), and on desktop with
+/// ⌘R / Ctrl+R and the palette's Refresh.
 pub fn header(store: Store) -> View {
     let action_size = if ui::touch() { Size::Sm } else { Size::Md };
     view()
@@ -43,6 +44,9 @@ pub fn header(store: Store) -> View {
                         .flex_row()
                         .items_center()
                         .gap(px(4.0))
+                        // On a phone the four share the bar evenly; on a
+                        // desktop's wide bar they stay together on the left.
+                        .style_when(ui::touch(), |s| s.min_w(percentage(1.0)).justify_evenly())
                         .child(ui::page_nav_item(
                             Glyph::Settings,
                             "Settings",

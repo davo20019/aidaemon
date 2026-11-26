@@ -157,7 +157,6 @@ pub fn sidebar(store: Store) -> View {
             move || store.pull_refreshing(),
             move || store.pull_refresh(),
         ))
-        .child(settings_footer(store))
         // The connection line shows only when something is wrong: the dot by
         // the name opens System when healthy.
         .child(
@@ -602,13 +601,23 @@ fn top_line(store: Store, query: Signal<String>) -> View {
                                 store.show_sidebar_view(SidebarView::Home);
                                 store.leave_drawer(move || store.select(None));
                             }))
-                            .child(ui::status_dot(
-                                move || felt_status(&store.felt()).0,
-                                move || format!("{}, open System", felt_status(&store.felt()).1),
-                                move || store.leave_drawer(move || store.open_system()),
+                            // Only when something is wrong: connected needs no
+                            // mark, and the dot then opens System.
+                            .child(when(
+                                move || !matches!(store.felt(), Felt::Online),
+                                move || {
+                                    ui::status_dot(
+                                        move || felt_status(&store.felt()).0,
+                                        move || {
+                                            format!("{}, open System", felt_status(&store.felt()).1)
+                                        },
+                                        move || store.leave_drawer(move || store.open_system()),
+                                    )
+                                },
                             )),
                     )
                     .child(view().flex_1())
+                    .child(settings_button(store, header_action_size))
                     .child(ui::icon_btn(
                         Glyph::Search,
                         "Search conversations",
@@ -623,17 +632,12 @@ fn top_line(store: Store, query: Signal<String>) -> View {
                             move || new_here(store),
                         )
                     }))
-                    .child(
-                        when(
-                            move || store.is_compact(),
-                            move || {
-                                ui::icon_btn(Glyph::Close, "Close", header_action_size, move || {
-                                    store.close_panes()
-                                })
-                            },
-                        )
-                        .otherwise(|| ui::kbd(key_label("mod+k"))),
-                    )
+                    // In a drawer it closes with a swipe toward its edge, a
+                    // press beside it or the back button: no close button.
+                    .child(when(
+                        move || !store.is_compact(),
+                        || ui::kbd(key_label("mod+k")),
+                    ))
             }),
         )
 }
@@ -1908,39 +1912,26 @@ enum RowState {
     Quiet,
 }
 
-/// One quiet Settings icon button anchored at the foot of the sidebar on both
-/// touch and desktop: opens the configuration hub (Settings, Automations,
-/// Memory and System, switched from their shared 4-link top bar). Stays
-/// highlighted while any of the four config pages is open, and carries an
-/// accent dot when automations have unseen news.
-fn settings_footer(store: Store) -> View {
+/// Settings as one icon in the sidebar's header, beside search: opens the
+/// configuration hub (Settings, Automations, Memory and System, switched
+/// from their shared top bar). Highlighted while any of the four is open,
+/// with an accent dot when automations have unseen news. No row of its own:
+/// the drawer's height is the conversations'.
+fn settings_button(store: Store, size: ui::Size) -> impl IntoElement {
     let active = move || {
         matches!(
             store.page(),
             Page::Settings | Page::Automations | Page::Memory | Page::System
         )
     };
-    let action_size = if ui::touch() {
-        ui::Size::Sm
-    } else {
-        ui::Size::Md
-    };
-    view()
-        .border_t_1()
-        .border_color(colors::LINE)
-        .flex_row()
-        .items_center()
-        .justify_start()
-        .px(px(if ui::touch() { 2.0 } else { 8.0 }))
-        .py_1()
-        .child(ui::icon_nav_btn(
-            Glyph::Settings,
-            "Settings: change how the daemon runs",
-            action_size,
-            active,
-            move || store.automation_news() > 0,
-            move || store.leave_drawer(move || store.open_settings()),
-        ))
+    ui::icon_nav_btn(
+        Glyph::Settings,
+        "Settings: change how the daemon runs",
+        size,
+        active,
+        move || store.automation_news() > 0,
+        move || store.leave_drawer(move || store.open_settings()),
+    )
 }
 
 /// A titled group of conversations, shown only when it has any.
