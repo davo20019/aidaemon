@@ -782,6 +782,8 @@ impl Agent {
     /// Gateway) is told, so it drops its own copy of the conversation.
     pub async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
         self.state.clear_session(session_id).await?;
+        // Its runs' records in memory hold what they were asked and answered.
+        self.running_children.runs().forget_chat(session_id);
         if let Some(observer) = self.turn_watch().and_then(|watch| watch.observer()) {
             observer.session_erased(session_id);
         }

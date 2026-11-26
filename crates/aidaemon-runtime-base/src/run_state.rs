@@ -1368,6 +1368,12 @@ impl RunStates {
             .collect()
     }
 
+    /// Drop every run record of conversation `chat` (it was erased): an
+    /// update to one of them after this finds nothing to change.
+    pub fn forget_chat(&self, chat: &str) {
+        self.lock().retain(|_, entry| entry.state.chat != chat);
+    }
+
     /// Drop an ended run's record.
     pub fn forget(&self, id: &str) {
         let mut runs = self.lock();
@@ -1530,6 +1536,20 @@ pub struct RunMeasure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An erased conversation's run records go, another's stay, and a late
+    /// update to an erased run brings nothing back.
+    #[test]
+    fn an_erased_conversations_runs_are_forgotten() {
+        let runs = RunStates::default();
+        runs.begin("cli-agent-a", "app:synthetic-erased", "HERON run", None);
+        runs.begin("cli-agent-b", "app:synthetic-kept", "Kept run", None);
+        runs.forget_chat("app:synthetic-erased");
+        assert!(runs.for_chat("app:synthetic-erased").is_empty());
+        assert_eq!(runs.for_chat("app:synthetic-kept").len(), 1);
+        runs.set_agent("cli-agent-a", "Codex");
+        assert!(runs.get("cli-agent-a").is_none());
+    }
 
     /// A helper its turn waits on has the same record as a background one:
     /// two attempts under one label are two records, each read by its id,
