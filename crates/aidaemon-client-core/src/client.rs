@@ -688,6 +688,31 @@ impl Client {
             self.live_request = None;
             effects.push(Effect::CloseLive);
         }
+        // The open conversation is gone from the daemon: erased while this
+        // client was away (it was reopened from where it was left). Every
+        // conversation holds the message that started it and the daemon
+        // lists it; an empty history of one never listed is none.
+        // (An older page that came back empty comes after lines the client
+        // holds, so it never counts.)
+        if let ServerFrame::Ack {
+            result:
+                CommandResult::History {
+                    session_id,
+                    messages,
+                    ..
+                },
+            ..
+        } = &frame
+            && messages.is_empty()
+            && cx.selected.as_deref() == Some(session_id.as_str())
+            && self
+                .state
+                .sessions
+                .get(session_id)
+                .is_none_or(|view| view.summary.is_none() && view.lines.is_empty())
+        {
+            effects.push(Effect::Gone(session_id.clone()));
+        }
         // The open conversation was erased (deleted, or wiped): the screen
         // leaves it.
         if let ServerFrame::Event {
@@ -4075,9 +4100,29 @@ mod tests {
         let mut client = Client::default();
         let erased = r#"{"type":"event","seq":1,"at_ms":1,"event":{"type":"session_deleted","session_id":"app:s1"}}"#;
         let effects = client.update(frame(erased), &cx(Some("app:s1")));
-        assert!(effects.contains(&Effect::Gone("app:s1".into())), "{effects:?}");
+        assert!(
+            effects.contains(&Effect::Gone("app:s1".into())),
+            "{effects:?}"
+        );
         let effects = client.update(frame(erased), &cx(Some("app:s2")));
         assert!(!effects.iter().any(|e| matches!(e, Effect::Gone(_))));
+        // Reopened after it was erased elsewhere: its history is empty and
+        // the daemon never listed it.
+        let empty = r#"{"type":"ack","request_id":"h1","result":{"type":"history","session_id":"app:s3","messages":[]}}"#;
+        let effects = client.update(frame(empty), &cx(Some("app:s3")));
+        assert!(
+            effects.contains(&Effect::Gone("app:s3".into())),
+            "{effects:?}"
+        );
+        // A listed conversation with an empty page stays.
+        let listed = r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:s4","channel":"app","title":"Listed","writable":true}]}}"#;
+        client.update(frame(listed), &cx(Some("app:s4")));
+        let empty = r#"{"type":"ack","request_id":"h2","result":{"type":"history","session_id":"app:s4","messages":[]}}"#;
+        let effects = client.update(frame(empty), &cx(Some("app:s4")));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Gone(_))),
+            "{effects:?}"
+        );
     }
 
     /// A delete goes only to a daemon that deletes conversations.
