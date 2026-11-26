@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::info;
 
+use super::shared_files;
 use super::{CliAgentTool, CliWorkspaceMode, StatusUpdate, cli_agent_task_id, cli_run_id};
 
 /// Shared permit holder for a running CLI so a blocking peer wait can park its
@@ -356,6 +357,67 @@ impl RuntimePeerLauncher {
             .upgrade()
             .ok_or_else(|| "CLI agent runtime is no longer available".to_string())
     }
+
+    /// The folder `peer_id` works in: its own, else the root run's.
+    fn peer_dir(&self, peer_id: &str) -> Option<String> {
+        self.tree
+            .peer(peer_id)
+            .and_then(|peer| peer.working_dir)
+            .or_else(|| self.root.working_dir.clone())
+    }
+
+    /// What this tree's runs may read: the root run's folders and its
+    /// peers' worktrees.
+    fn run_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = self
+            .root
+            .working_dir
+            .iter()
+            .chain(self.root.read_paths.iter())
+            .chain(self.root.write_paths.iter())
+            .map(PathBuf::from)
+            .collect();
+        roots.extend(
+            self.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|worktree| PathBuf::from(&worktree.path)),
+        );
+        roots
+    }
+
+    /// Check `paths`, which `caller_peer_id` shares, and copy them into
+    /// each of `folders` ([`shared_files`]): the note for the recipients.
+    /// A peer may share what its tree may read, the owner's uploads (the
+    /// daemon's inbox) and scratch files in a temp folder.
+    async fn share_into(
+        &self,
+        caller_peer_id: &str,
+        paths: &[String],
+        folders: Vec<PathBuf>,
+    ) -> Result<String, String> {
+        let mut roots = self.run_roots();
+        if let Some(inbox) = self
+            .upgrade_tool()?
+            .peer_coord
+            .get()
+            .and_then(|coord| coord.file_inbox.get().cloned())
+        {
+            roots.push(inbox);
+        }
+        let cwd = self.peer_dir(caller_peer_id).map(PathBuf::from);
+        let sources = shared_files::check_sources(paths, cwd.as_deref(), Some(&roots))?;
+        let note = tokio::task::spawn_blocking(move || shared_files::stage(&sources, &folders))
+            .await
+            .map_err(|error| format!("sharing the files failed: {error}"))??;
+        info!(
+            peer_id = %caller_peer_id,
+            files = paths.len(),
+            "Peer shared files"
+        );
+        Ok(note)
+    }
 }
 
 #[async_trait]
@@ -482,6 +544,24 @@ impl PeerLauncher for RuntimePeerLauncher {
             }
         };
 
+        // Files the caller gives the new peer go into its own folder, which
+        // its sandbox reaches, and its prompt says where.
+        let prompt = if request.files.is_empty() {
+            request.prompt.clone()
+        } else {
+            let folder = working_dir.clone().ok_or(
+                "the new peer has no working folder to put the files in; name their paths instead",
+            )?;
+            let note = self
+                .share_into(
+                    &request.parent_peer_id,
+                    &request.files,
+                    vec![PathBuf::from(folder)],
+                )
+                .await?;
+            format!("{}\n\n{note}", request.prompt.trim_end())
+        };
+
         // Optional session continuation when `message_peer(resume=true)` resumes a peer.
         let continues = match request.continue_run.as_deref() {
             Some(earlier_run_id) => match tool
@@ -507,9 +587,9 @@ impl PeerLauncher for RuntimePeerLauncher {
         let full_prompt = if has_known_agent && request.mcp_endpoint.is_some() {
             let hint =
                 coordination_prompt_hint(&request.peer_id, Some(&request.parent_peer_id), &[]);
-            format!("{}\n\n{hint}", request.prompt.trim_end())
+            format!("{}\n\n{hint}", prompt.trim_end())
         } else {
-            request.prompt.clone()
+            prompt.clone()
         };
 
         let spec = crate::helper_run::HelperSpec {
@@ -518,7 +598,7 @@ impl PeerLauncher for RuntimePeerLauncher {
             } else {
                 request.title.clone()
             }),
-            mission: request.prompt.clone(),
+            mission: prompt.clone(),
             new_folders: Vec::new(),
             scope: write_paths.clone(),
             continues,
@@ -546,7 +626,7 @@ impl PeerLauncher for RuntimePeerLauncher {
             .launch_peer_run(PeerLaunchSpec {
                 tool_name: request.agent,
                 prompt: full_prompt,
-                task_prompt: request.prompt,
+                task_prompt: prompt,
                 working_dir: working_dir.clone(),
                 session_id: self.root.session_id.clone(),
                 grant_session: self.root.grant_session.clone(),
@@ -694,6 +774,25 @@ impl PeerLauncher for RuntimePeerLauncher {
             .map_err(|error| error.to_string())
     }
 
+    async fn share_files(
+        &self,
+        caller_peer_id: &str,
+        paths: &[String],
+        recipients: &[String],
+    ) -> Result<String, String> {
+        let mut folders = Vec::new();
+        for recipient in recipients {
+            if self.tree.peer(recipient).is_none() {
+                return Err(format!("unknown peer `{recipient}`"));
+            }
+            let folder = self.peer_dir(recipient).ok_or_else(|| {
+                format!("peer `{recipient}` has no working folder to put the files in")
+            })?;
+            folders.push(PathBuf::from(folder));
+        }
+        self.share_into(caller_peer_id, paths, folders).await
+    }
+
     async fn send_file(
         &self,
         caller_peer_id: &str,
@@ -734,21 +833,7 @@ impl PeerLauncher for RuntimePeerLauncher {
         // What the run may read: its folders and its peers' worktrees. A file
         // elsewhere in a temp folder is staged through the inbox; anything
         // else, and secrets anywhere, is refused (`prepare_delivery`).
-        let mut roots: Vec<PathBuf> = self
-            .root
-            .working_dir
-            .iter()
-            .chain(self.root.read_paths.iter())
-            .chain(self.root.write_paths.iter())
-            .map(PathBuf::from)
-            .collect();
-        roots.extend(
-            self.worktrees
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .map(|worktree| PathBuf::from(&worktree.path)),
-        );
+        let roots = self.run_roots();
         let cwd = caller_dir.map(PathBuf::from).unwrap_or_default();
         use aidaemon_tools::file_delivery::{DeliveryError, prepare_delivery};
         let ready = prepare_delivery(&requested, &cwd, &inbox, &roots).map_err(|error| match error {

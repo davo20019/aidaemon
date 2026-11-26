@@ -268,6 +268,7 @@ async fn enable_peer_coordination_and_run_child_peer_in_direct_agent_session() {
             prompt: "echo peer-hello".into(),
             workspace: PeerWorkspaceMode::ReadOnly,
             write_paths: Vec::new(),
+            files: Vec::new(),
             continue_run: None,
             wait: true,
             mcp_endpoint: None,
@@ -361,4 +362,116 @@ async fn a_peer_sends_files_only_to_a_private_owner_chat_from_its_folders() {
         .await
         .unwrap_err();
     assert!(channel.contains("not connected"), "{channel}");
+}
+
+/// A peer's `share_files` copies what its tree may read (and the owner's
+/// uploads in the inbox) into each recipient's own folder, where a
+/// confined recipient's sandbox reaches it; anything else is refused.
+#[tokio::test]
+async fn a_peer_shares_files_into_the_recipients_folder() {
+    use aidaemon_coding_agents::peer::{PeerLauncher, PeerState, PeerUpdate};
+    let (tool, _db) = setup_bash_tool().await;
+    let tool = Arc::new(tool);
+    tool.enable_peer_coordination_with_limits("echo", vec![], PeerLimits::default())
+        .await
+        .unwrap();
+    let lead = tempfile::tempdir().unwrap();
+    let lead_dir = std::fs::canonicalize(lead.path()).unwrap();
+    std::fs::write(lead_dir.join("review.md"), b"synthetic review").unwrap();
+    let inbox = tempfile::tempdir().unwrap();
+    std::fs::write(inbox.path().join("shot.png"), b"synthetic png").unwrap();
+    tool.enable_peer_file_delivery(inbox.path());
+    let lead_str = lead_dir.to_string_lossy().into_owned();
+    let coord = tool.peer_coord.get().expect("peer_coord enabled");
+    let session = coord.start_root_tree(
+        "bash-agent",
+        "Lead",
+        peer_mod::PeerRootContext {
+            lead_mode: Some(aidaemon_coding_agents::PermissionMode::FullAccess),
+            session_id: "app:share-files-test".into(),
+            grant_session: "app:share-files-test".into(),
+            working_dir: Some(lead_str.clone()),
+            read_paths: vec![lead_str.clone()],
+            write_paths: Vec::new(),
+            enforce_native_access: false,
+            project: None,
+            detached_judge: None,
+            spawn_family: None,
+            status_tx: None,
+            may_send_files: false,
+        },
+        &[],
+    );
+    // A peer working in its own folder, as a worktree peer does.
+    let (peer_id, _, _) = session
+        .tree
+        .reserve_child(
+            "peer-root",
+            "bash-agent",
+            "Review",
+            PeerWorkspaceMode::ReadOnly,
+        )
+        .unwrap();
+    let own = tempfile::tempdir().unwrap();
+    session.tree.update_peer(
+        &peer_id,
+        PeerUpdate {
+            state: PeerState::Running,
+            run_id: None,
+            working_dir: Some(own.path().to_string_lossy().into_owned()),
+            branch: None,
+            output: None,
+            resumable: None,
+        },
+    );
+
+    let inbox_shot = inbox.path().join("shot.png").to_string_lossy().into_owned();
+    let note = session
+        .launcher
+        .share_files(
+            "peer-root",
+            &["review.md".to_string(), inbox_shot],
+            std::slice::from_ref(&peer_id),
+        )
+        .await
+        .unwrap();
+    let copies: Vec<std::path::PathBuf> = note
+        .lines()
+        .skip(1)
+        .map(|line| {
+            line.trim_start_matches("- `")
+                .trim_end_matches(['`', ']'])
+                .into()
+        })
+        .collect();
+    assert_eq!(copies.len(), 2, "{note}");
+    assert!(
+        copies.iter().all(|copy| copy.starts_with(own.path())),
+        "{note}"
+    );
+    assert_eq!(std::fs::read(&copies[0]).unwrap(), b"synthetic review");
+    assert_eq!(std::fs::read(&copies[1]).unwrap(), b"synthetic png");
+
+    let unknown = session
+        .launcher
+        .share_files("peer-root", &["review.md".to_string()], &["peer-9".into()])
+        .await
+        .unwrap_err();
+    assert!(unknown.contains("unknown peer"), "{unknown}");
+    // Neither the tree's folders, the inbox nor a temp folder.
+    let home = dirs::home_dir().unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("aidaemon-share-test")
+        .tempfile_in(&home)
+        .unwrap();
+    let refused = session
+        .launcher
+        .share_files(
+            "peer-root",
+            &[outside.path().to_string_lossy().into_owned()],
+            std::slice::from_ref(&peer_id),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("outside your folders"), "{refused}");
 }

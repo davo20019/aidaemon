@@ -55,6 +55,7 @@ mod queue;
 mod receipts;
 mod registry;
 mod run;
+mod shared_files;
 mod state;
 #[cfg(test)]
 mod tests;

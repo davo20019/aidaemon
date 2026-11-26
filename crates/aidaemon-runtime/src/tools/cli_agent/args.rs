@@ -54,6 +54,11 @@ pub(super) struct CliAgentArgs {
     /// legacy single-root runs grant writes only to `working_dir`.
     #[serde(default)]
     pub(super) write_paths: Vec<String>,
+    /// Files to give the run (the owner's screenshot, a report): copied
+    /// into its working folder, which its sandbox reaches, and named in
+    /// its prompt ([`super::shared_files`]).
+    #[serde(default)]
+    pub(super) files: Vec<String>,
     /// Typed delegation authority. Prompt prose never narrows the sandbox.
     #[serde(default)]
     pub(super) workspace_mode: CliWorkspaceMode,

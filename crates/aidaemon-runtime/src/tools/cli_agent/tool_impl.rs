@@ -83,6 +83,11 @@ impl Tool for CliAgentTool {
                         "items": { "type": "string" },
                         "description": "Exact writable files/directories for read_write run. Required and non-empty for read_write; working_dir never implies write authority."
                     },
+                    "files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "For run: files the agent needs to see (the owner's screenshot, a report, a log), when they are outside working_dir: copied into its working folder, where its sandbox reaches, and named in its prompt. Use this rather than only naming their paths."
+                    },
                     "workspace_mode": {
                         "type": "string",
                         "enum": ["read_only", "read_write"],
@@ -469,11 +474,11 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
         {
             read_targets.push(target);
         }
-        for path in parsed
-            .as_ref()
-            .and_then(|value| value.get("read_paths"))
-            .and_then(Value::as_array)
+        // Shared files are read too: the daemon copies them for the run.
+        for path in ["read_paths", "files"]
             .into_iter()
+            .filter_map(|key| parsed.as_ref().and_then(|value| value.get(key)))
+            .filter_map(Value::as_array)
             .flatten()
             .filter_map(Value::as_str)
         {
@@ -1155,6 +1160,46 @@ impl CliAgentTool {
                 let prompt = match unfinished {
                     Some(note) => format!("{note}\n\n{prompt}"),
                     None => prompt,
+                };
+                // Files it needs to see go into its own folder, which its
+                // sandbox reaches. Their reads were judged with the call
+                // (`call_access_manifest`), so only secrets are refused here.
+                let prompt = if args.files.iter().all(|path| path.trim().is_empty()) {
+                    prompt
+                } else {
+                    let Some(folder) = working_dir.clone() else {
+                        mark_refused_before_launch(PrelaunchRefusal::Policy);
+                        return Ok(
+                            "Blocked: `files` needs a working_dir to copy them into.".to_string()
+                        );
+                    };
+                    let shared = super::shared_files::check_sources(
+                        &args.files,
+                        Some(std::path::Path::new(&folder)),
+                        None,
+                    )
+                    .map(|sources| {
+                        tokio::task::spawn_blocking(move || {
+                            super::shared_files::stage(
+                                &sources,
+                                &[std::path::PathBuf::from(folder)],
+                            )
+                        })
+                    });
+                    let note = match shared {
+                        Ok(staging) => staging
+                            .await
+                            .map_err(|error| format!("sharing the files failed: {error}"))
+                            .and_then(|staged| staged),
+                        Err(error) => Err(error),
+                    };
+                    match note {
+                        Ok(note) => format!("{}\n\n{note}", prompt.trim_end()),
+                        Err(error) => {
+                            mark_refused_before_launch(PrelaunchRefusal::Policy);
+                            return Ok(format!("Blocked: {error}"));
+                        }
+                    }
                 };
                 let detached_judge = facts
                     .extensions
