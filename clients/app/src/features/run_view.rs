@@ -1382,22 +1382,29 @@ fn body(store: Store, detail: RunDetail, coding: bool) -> View {
     }
     if !detail.steps.is_empty() {
         let mut steps = view().gap_1();
-        // Routine steps in a row fold into one line that opens them; what
-        // the owner looks for keeps its own ([`stands_alone`]).
-        let mut routine: Vec<RunStepItem> = Vec::new();
+        // Steps in a row of one kind go together ([`row_kind`]): routine
+        // ones fold into a line that opens them, finished edits into one
+        // row per file; the rest keep a row each.
+        let mut group: Vec<RunStepItem> = Vec::new();
+        let mut group_kind = RowKind::Alone;
+        let flush = |steps: View, group: &mut Vec<RunStepItem>, kind: RowKind| match kind {
+            _ if group.is_empty() => steps,
+            RowKind::Routine => steps.child(folded(std::mem::take(group))),
+            RowKind::Edits => steps.child(edits(store, std::mem::take(group), coding)),
+            RowKind::Alone => steps,
+        };
         for step in &detail.steps {
-            if stands_alone(step) {
-                if !routine.is_empty() {
-                    steps = steps.child(folded(std::mem::take(&mut routine)));
-                }
-                steps = steps.child(step_row(store, step, coding));
-            } else {
-                routine.push(step.clone());
+            let kind = row_kind(step);
+            if kind != group_kind {
+                steps = flush(steps, &mut group, group_kind);
+                group_kind = kind;
+            }
+            match kind {
+                RowKind::Alone => steps = steps.child(step_row(store, step, coding)),
+                _ => group.push(step.clone()),
             }
         }
-        if !routine.is_empty() {
-            steps = steps.child(folded(routine));
-        }
+        steps = flush(steps, &mut group, group_kind);
         page = page.child(steps);
     }
     // Only what was not simply allowed is worth a line: a run that may do
@@ -1471,18 +1478,76 @@ fn body(store: Store, detail: RunDetail, coding: bool) -> View {
     page
 }
 
-/// Whether a step keeps a row of its own: a change, a failure, one still
-/// going, or the agents working together. Steps from a daemon that does not
-/// say their kind all do.
-fn stands_alone(step: &RunStepItem) -> bool {
-    step.state != RunStepState::Done
-        || matches!(
-            step.kind,
-            RunStepKind::Edit
-                | RunStepKind::Delegate
-                | RunStepKind::Coordinate
-                | RunStepKind::Unknown
+/// How a step is shown among its neighbours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    /// A row of its own: a failure, one still going, the agents working
+    /// together, or any step from a daemon that does not say its kind.
+    Alone,
+    /// A finished edit: edits in a row are one row per file.
+    Edits,
+    /// A finished read, search, command, lookup or other tool: folded.
+    Routine,
+}
+
+fn row_kind(step: &RunStepItem) -> RowKind {
+    if step.state != RunStepState::Done {
+        return RowKind::Alone;
+    }
+    match step.kind {
+        RunStepKind::Edit if step.path.is_some() => RowKind::Edits,
+        RunStepKind::Edit
+        | RunStepKind::Delegate
+        | RunStepKind::Coordinate
+        | RunStepKind::Unknown => RowKind::Alone,
+        _ => RowKind::Routine,
+    }
+}
+
+/// Finished edits in a row: one row per file, with how many edits it took
+/// (each opens its diff); more than one file sit under "Changed N files".
+fn edits(store: Store, steps: Vec<RunStepItem>, coding: bool) -> View {
+    let mut files: Vec<(String, usize)> = Vec::new();
+    for path in steps.iter().filter_map(|step| step.path.clone()) {
+        match files.iter_mut().find(|(seen, _)| *seen == path) {
+            Some((_, count)) => *count += 1,
+            None => files.push((path, 1)),
+        }
+    }
+    let file_row = move |(path, count): &(String, usize)| {
+        let mut words = format!("Editing {}", super::files::file_name(path));
+        if *count > 1 {
+            words.push_str(&format!(" · {count} edits"));
+        }
+        let row = line(Glyph::Check, Tone::Success, words.clone(), false);
+        if !coding {
+            return row;
+        }
+        let path = path.clone();
+        view().child(
+            button()
+                .accessibility_label(format!("{words}, show what changed"))
+                .on_press(move || store.show_change(&path))
+                .child(row),
         )
+    };
+    if files.len() == 1 {
+        return file_row(&files[0]);
+    }
+    let open = signal(false);
+    view()
+        .gap_1()
+        .child(ui::quiet_disclosure(
+            format!("Changed {} files", files.len()),
+            open,
+        ))
+        .child(ui::unfold(open, move || {
+            let mut list = view().gap_1().pl(px(8.0));
+            for file in &files {
+                list = list.child(file_row(file));
+            }
+            list
+        }))
 }
 
 /// One step's row; a file it changed opens its diff in Changes.
@@ -1595,8 +1660,8 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
 #[cfg(test)]
 mod tests {
     use super::{
-        FOCUSED_REPLY_BUDGET, clean_asked_text, is_owner_prompt, markdown_preview, routine_summary,
-        stands_alone,
+        FOCUSED_REPLY_BUDGET, RowKind, clean_asked_text, is_owner_prompt, markdown_preview,
+        routine_summary, row_kind,
     };
     use aidaemon_client_protocol::{RunStepItem, RunStepKind, RunStepState};
 
@@ -1625,15 +1690,23 @@ mod tests {
     }
 
     #[test]
-    fn changes_failures_running_steps_and_teamwork_keep_their_own_rows() {
+    fn failures_running_steps_and_teamwork_keep_their_own_rows() {
         use RunStepKind::*;
-        assert!(!stands_alone(&step(Read, RunStepState::Done)));
-        assert!(stands_alone(&step(Read, RunStepState::Failed)));
-        assert!(stands_alone(&step(Run, RunStepState::Started)));
-        assert!(stands_alone(&step(Edit, RunStepState::Done)));
-        assert!(stands_alone(&step(Coordinate, RunStepState::Done)));
+        let kind = |kind, state| row_kind(&step(kind, state));
+        assert_eq!(kind(Read, RunStepState::Done), RowKind::Routine);
+        assert_eq!(kind(Read, RunStepState::Failed), RowKind::Alone);
+        assert_eq!(kind(Run, RunStepState::Started), RowKind::Alone);
+        assert_eq!(kind(Coordinate, RunStepState::Done), RowKind::Alone);
+        // A finished edit goes with its neighbours when it names its file;
+        // a failed one stands out.
+        let mut edit = step(Edit, RunStepState::Done);
+        assert_eq!(row_kind(&edit), RowKind::Alone);
+        edit.path = Some("/w/synthetic/slug.py".into());
+        assert_eq!(row_kind(&edit), RowKind::Edits);
+        edit.state = RunStepState::Failed;
+        assert_eq!(row_kind(&edit), RowKind::Alone);
         // An older daemon says no kind: nothing folds.
-        assert!(stands_alone(&step(Unknown, RunStepState::Done)));
+        assert_eq!(kind(Unknown, RunStepState::Done), RowKind::Alone);
     }
     use aidaemon_client_protocol::{RunAsked, RunPhase, RunSummary};
 
