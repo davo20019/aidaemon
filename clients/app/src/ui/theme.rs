@@ -247,13 +247,41 @@ pub mod fit {
     pub fn small() -> f32 {
         if touch() { 13.0 } else { super::text::SM }
     }
+    /// Metadata, timestamps, counts, section labels: on the 13/15/16/22
+    /// touch scale; 11 on desktop.
+    pub fn meta() -> f32 {
+        if touch() { 13.0 } else { super::text::XS }
+    }
     /// A bar at the top of a pane.
     pub fn bar() -> f32 {
         if touch() { 52.0 } else { 44.0 }
     }
-    /// A list row.
+    /// A list row (two-line conversations, sheets).
     pub fn row() -> f32 {
         if touch() { 52.0 } else { super::size::ROW }
+    }
+    /// A compact single-line navigation row (projects on Home): meets the
+    /// 44 pt touch target minimum while keeping vertical density tight.
+    pub fn compact_row() -> f32 {
+        if touch() { 44.0 } else { super::size::ROW }
+    }
+    /// Outer horizontal inset of the sidebar's scrollable list. Paired with
+    /// [`sidebar_row_inset`] so all sidebar rails land on the same 16 pt line.
+    pub fn sidebar_list_inset() -> f32 {
+        if touch() { 4.0 } else { 8.0 }
+    }
+    /// Inner horizontal padding of sidebar rows and section headers.
+    pub fn sidebar_row_inset() -> f32 {
+        if touch() { 12.0 } else { 8.0 }
+    }
+    /// Left indent of a conversation's title and its work/approval line
+    /// relative to the sidebar list container.
+    pub fn sidebar_body_indent() -> f32 {
+        if touch() {
+            sidebar_row_inset()
+        } else {
+            sidebar_row_inset() + icon_slot() + 8.0
+        }
     }
     /// An icon's slot and glyph.
     pub fn icon_slot() -> f32 {

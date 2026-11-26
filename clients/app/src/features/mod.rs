@@ -4,6 +4,7 @@ pub mod approvals;
 pub mod automations;
 pub mod browser_tab;
 pub mod code;
+pub mod config_nav;
 pub mod conversation;
 pub mod files;
 pub mod inspector;

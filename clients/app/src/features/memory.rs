@@ -5,7 +5,7 @@ use aidaemon_client_protocol::MemoryItem;
 use nsh_core::prelude::*;
 
 use crate::store::{MemoryRead, Store, now_ms};
-use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, time, type_scale};
+use crate::ui::{self, Size, Tone, Variant, colors, section_label, size, time, type_scale};
 
 pub fn page(store: Store) -> View {
     let filter = signal(String::new());
@@ -48,33 +48,7 @@ pub fn page(store: Store) -> View {
 }
 
 fn header(store: Store) -> View {
-    view()
-        .h(px(ui::fit::bar()))
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .border_b_1()
-        .border_color(colors::LINE)
-        .child(when(
-            move || store.is_compact() || !store.sidebar_open(),
-            move || {
-                ui::icon_btn(Glyph::Sidebar, "Conversations", Size::Md, move || {
-                    store.open_sidebar()
-                })
-            },
-        ))
-        .child(
-            text("Memory")
-                .flex_1()
-                .px_2()
-                .role(AccessibilityRole::Header)
-                .text_size(px(ui::fit::body()))
-                .font_weight(FontWeight::SEMIBOLD),
-        )
-        .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Md, move || {
-            store.refresh_memories()
-        }))
+    crate::features::config_nav::header(store)
 }
 
 fn body(store: Store, read: MemoryRead, query: &str) -> View {

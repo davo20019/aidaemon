@@ -1086,8 +1086,12 @@ pub fn drawer(
         .absolute()
         .top_0()
         .bottom_0()
-        .style_when(left, |s| s.left_0())
-        .style_when(!left, |s| s.right_0())
+        .style_when(left, |s| {
+            s.left_0().border_r_1().border_color(colors::BORDER)
+        })
+        .style_when(!left, |s| {
+            s.right_0().border_l_1().border_color(colors::BORDER)
+        })
         .py_safe_area()
         .w(percentage(0.86))
         .max_w(px(380.0))
@@ -1325,10 +1329,15 @@ where
         .rounded(px(radius::CONTROL))
         .transition_colors()
         .duration(motion::FAST)
-        .hover(|s| s.bg(colors::HOVER))
+        .active(|s| s.bg(colors::SELECTED))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
         .focus(super::controls::focus_band)
         .child(trigger);
+    let trigger = if super::touch() {
+        trigger
+    } else {
+        trigger.hover(|s| s.bg(colors::HOVER))
+    };
     if super::touch() {
         view()
             .style_when(wide, |s| s.w_full())

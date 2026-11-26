@@ -102,10 +102,22 @@ fn frame(variant: Variant, size: Size, scale: f32) -> nsh_base::ButtonElement {
         .active(move |s| s.scale(scale))
         .disabled_style(|s| s.opacity(DISABLED_OPACITY));
     let base = match fill(variant) {
-        Some(color) => base.bg(color).hover(|s| s.opacity(0.88)),
-        None => base
-            .hover(|s| s.bg(colors::HOVER))
-            .active(|s| s.bg(colors::SELECTED)),
+        Some(color) => {
+            let b = base.bg(color);
+            if touch() {
+                b
+            } else {
+                b.hover(|s| s.opacity(0.88))
+            }
+        }
+        None => {
+            let b = base.active(|s| s.bg(colors::SELECTED));
+            if touch() {
+                b
+            } else {
+                b.hover(|s| s.bg(colors::HOVER))
+            }
+        }
     };
     if variant == Variant::Outline {
         base.border_1().border_color(colors::BORDER)
@@ -196,6 +208,52 @@ pub fn icon_btn_disabled(
                     .text_color(colors::MUTED)
                     .accessibility_elements_hidden(true),
             ),
+    )
+}
+
+/// A square glyph button that opens a top-level destination (such as the
+/// sidebar's Settings icon): highlights with `SELECTED` while active and
+/// optionally shows a small accent dot for unseen activity.
+pub fn icon_nav_btn(
+    glyph: Glyph,
+    label: impl Into<SharedString>,
+    size: Size,
+    selected: impl Fn() -> bool + Copy + 'static,
+    has_news: impl Fn() -> bool + 'static,
+    on_press: impl Fn() + 'static,
+) -> View {
+    let label: SharedString = label.into();
+    with_hint(
+        label.clone(),
+        frame(Variant::Ghost, size, motion::PRESS_SCALE_ICON)
+            .relative()
+            .w(px(size.height()))
+            .selected(selected)
+            .style_when(selected, |s| s.bg(colors::SELECTED))
+            .accessibility_label(label)
+            .on_press(on_press)
+            .child(
+                icon(glyph)
+                    .text_color(move || {
+                        if selected() {
+                            colors::TEXT
+                        } else {
+                            colors::MUTED
+                        }
+                    })
+                    .accessibility_elements_hidden(true),
+            )
+            .child(when(has_news, || {
+                view()
+                    .absolute()
+                    .top(px(if touch() { 10.0 } else { 5.0 }))
+                    .right(px(if touch() { 10.0 } else { 5.0 }))
+                    .w(px(PAGE_NAV_DOT_SIZE))
+                    .h(px(PAGE_NAV_DOT_SIZE))
+                    .rounded_full()
+                    .bg(colors::ACCENT)
+                    .accessibility_elements_hidden(true)
+            })),
     )
 }
 
@@ -291,6 +349,8 @@ pub enum Glyph {
     Mic,
     /// A folder.
     Folder,
+    /// A grid / collection (All projects).
+    Grid,
     /// Save a copy.
     Download,
     /// Open outside the app.
@@ -422,6 +482,7 @@ impl Glyph {
             Self::Columns => "◫",
             Self::Mic => "◉",
             Self::Folder => "▸",
+            Self::Grid => "⊞",
             Self::Download => "⤓",
             Self::External => "↗",
             Self::Share => "⇪",
@@ -542,7 +603,7 @@ impl Glyph {
                 r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>"#
             }
             Self::Settings => {
-                r#"<path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/>"#
+                r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>"#
             }
             Self::Copy => {
                 r#"<rect x="8" y="8" width="14" height="14" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#
@@ -597,6 +658,9 @@ impl Glyph {
             }
             Self::Folder => {
                 r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#
+            }
+            Self::Grid => {
+                r#"<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>"#
             }
             Self::File => {
                 r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>"#
@@ -833,12 +897,60 @@ pub fn separator() -> View {
 /// Small caps over a group.
 pub fn section_label(label: impl IntoReactive<SharedString>) -> Text {
     text(label)
-        .text_size(px(type_scale::XS))
+        .text_size(px(fit::meta()))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(colors::FAINT)
         .px_2()
         .pt_3()
         .pb_1()
+}
+
+const SIDEBAR_HEADER_TOUCH_H: f32 = 40.0;
+const SIDEBAR_HEADER_TOUCH_PLAIN_H: f32 = 32.0;
+const SIDEBAR_HEADER_DESKTOP_H: f32 = 28.0;
+const SIDEBAR_FILTER_PAD_X: f32 = 8.0;
+
+/// A sidebar section header on the shared sidebar rail, with an optional
+/// trailing control (such as the Recent source filter) vertically centred
+/// against the label rather than fighting asymmetric text padding.
+pub fn sidebar_section_header(
+    label: impl IntoReactive<SharedString>,
+    trailing: Option<View>,
+) -> View {
+    let inset = fit::sidebar_row_inset();
+    let has_trailing = trailing.is_some();
+    let pr = if has_trailing {
+        (inset - SIDEBAR_FILTER_PAD_X).max(0.0)
+    } else {
+        inset
+    };
+    let min_h = match (touch(), has_trailing) {
+        (true, true) => SIDEBAR_HEADER_TOUCH_H,
+        (true, false) => SIDEBAR_HEADER_TOUCH_PLAIN_H,
+        (false, _) => SIDEBAR_HEADER_DESKTOP_H,
+    };
+    let mut header = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .pl(px(inset))
+        .pr(px(pr))
+        .pt(px(if has_trailing { 8.0 } else { 12.0 }))
+        .pb(px(if has_trailing { 0.0 } else { 4.0 }))
+        .min_h(px(min_h))
+        .child(
+            text(label)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .text_size(px(fit::meta()))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors::FAINT),
+        );
+    if let Some(trailing) = trailing {
+        header = header.child(trailing);
+    }
+    header
 }
 
 /// One of a few ways, all in view (a new conversation's Chat or In a
@@ -942,13 +1054,15 @@ pub fn chip(
         )
 }
 
-/// A selectable row in a list (the sidebar's sessions, a menu-like list).
+/// A selectable row in a list (menus, pickers, settings).
 /// The wash fills its whole hit area; selection is stronger than hover.
+/// On touch devices, skip sticky `:hover` washes so tapped coordinates don't
+/// leave ghost highlights on the next screen; `.active` provides press feedback.
 pub fn row(
     selected: impl Fn() -> bool + 'static,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
-    button()
+    let base = button()
         .min_h(px(fit::row()))
         .flex_row()
         .items_center()
@@ -957,12 +1071,150 @@ pub fn row(
         .rounded(px(radius::CONTROL))
         .transition_colors()
         .duration(motion::FAST)
-        .hover(|s| s.bg(colors::HOVER))
         .active(|s| s.bg(colors::SELECTED))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
         .focus(focus_band)
         .style_when(selected, |s| s.bg(colors::SELECTED))
-        .on_press(on_press)
+        .on_press(on_press);
+    if touch() {
+        base
+    } else {
+        base.hover(|s| s.bg(colors::HOVER))
+    }
+}
+
+/// A selectable row in the sidebar: uses the shared sidebar horizontal rail
+/// ([`fit::sidebar_row_inset`]) without altering `row()` callers elsewhere.
+pub fn sidebar_row(
+    selected: impl Fn() -> bool + 'static,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    row(selected, on_press).px(px(fit::sidebar_row_inset()))
+}
+
+const UNREAD_DOT_SIZE: f32 = 6.0;
+const UNREAD_DOT_GAP: f32 = 4.0;
+
+/// An unread dot tucked cleanly inside a touch sidebar row's 12 pt left
+/// padding (at x = 2..8 pt inside the pill, leaving 4 pt before the title),
+/// explicitly centred vertically on the title line without indenting read rows.
+pub fn sidebar_unread_dot_inset(unread: impl Fn() -> bool + 'static) -> View {
+    view()
+        .absolute()
+        .left(px(-(UNREAD_DOT_SIZE + UNREAD_DOT_GAP)))
+        .top_0()
+        .bottom_0()
+        .justify_center()
+        .accessibility_elements_hidden(true)
+        .child(
+            view()
+                .w(px(UNREAD_DOT_SIZE))
+                .h(px(UNREAD_DOT_SIZE))
+                .rounded_full()
+                .bg(move || {
+                    if unread() {
+                        colors::TEXT
+                    } else {
+                        colors::TRANSPARENT
+                    }
+                }),
+        )
+}
+
+const PAGE_NAV_H_TOUCH: f32 = 36.0;
+const PAGE_NAV_H_DESKTOP: f32 = 30.0;
+const PAGE_NAV_PAD_X_TOUCH: f32 = 8.0;
+const PAGE_NAV_PAD_X_DESKTOP: f32 = 10.0;
+const PAGE_NAV_SLOP_TOUCH: f32 = 4.0;
+const PAGE_NAV_DOT_SIZE: f32 = 6.0;
+
+/// One link in the shared 4-destination top bar across Settings, Automations,
+/// Memory and System: pill-selected (distinct from Settings' underlined
+/// sub-tabs), full 44 pt touch target via hit_slop, with inline icons on
+/// desktop and an optional accent dot for unseen activity.
+pub fn page_nav_item(
+    glyph: Glyph,
+    label: &'static str,
+    a11y_label: impl Fn() -> SharedString + 'static,
+    selected: impl Fn() -> bool + Copy + 'static,
+    has_news: impl Fn() -> bool + 'static,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let base = button()
+        .role(AccessibilityRole::Tab)
+        .selected(selected)
+        .min_h(px(if touch() {
+            PAGE_NAV_H_TOUCH
+        } else {
+            PAGE_NAV_H_DESKTOP
+        }))
+        // Vertical-only hit slop gives a full 44 pt touch height without
+        // overlapping adjacent links across the horizontal gap.
+        .hit_slop(EdgeInsets {
+            top: px(if touch() { PAGE_NAV_SLOP_TOUCH } else { 0.0 }),
+            bottom: px(if touch() { PAGE_NAV_SLOP_TOUCH } else { 0.0 }),
+            left: px(0.0),
+            right: px(0.0),
+        })
+        .px(px(if touch() {
+            PAGE_NAV_PAD_X_TOUCH
+        } else {
+            PAGE_NAV_PAD_X_DESKTOP
+        }))
+        .flex_row()
+        .items_center()
+        .gap_1p5()
+        .rounded(px(radius::CONTROL))
+        .transition_colors()
+        .duration(motion::FAST)
+        .active(|s| s.bg(colors::SELECTED))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .focus(focus_band)
+        .style_when(selected, |s| s.bg(colors::SELECTED))
+        .accessibility_label(a11y_label)
+        .on_press(on_press);
+    let base = if touch() {
+        base
+    } else {
+        base.hover(|s| s.bg(colors::HOVER))
+    };
+    let base = if touch() {
+        base
+    } else {
+        base.child(
+            icon_inline(glyph)
+                .text_color(move || {
+                    if selected() {
+                        colors::TEXT
+                    } else {
+                        colors::MUTED
+                    }
+                })
+                .accessibility_elements_hidden(true),
+        )
+    };
+    base.child(
+        text(label)
+            .number_of_lines(1)
+            .text_size(px(fit::small()))
+            .font_weight(FontWeight::MEDIUM)
+            .style_when(selected, |s| s.font_weight(FontWeight::SEMIBOLD))
+            .text_color(move || {
+                if selected() {
+                    colors::TEXT
+                } else {
+                    colors::MUTED
+                }
+            }),
+    )
+    .child(when(has_news, || {
+        view()
+            .w(px(PAGE_NAV_DOT_SIZE))
+            .h(px(PAGE_NAV_DOT_SIZE))
+            .rounded_full()
+            .bg(colors::ACCENT)
+            .accessibility_elements_hidden(true)
+    }))
 }
 
 /// A picture sent with a message, pressable to open it full size. A
@@ -1203,9 +1455,13 @@ pub fn name_btn(label: &'static str, inset: f32, on_press: impl Fn() + 'static) 
     )
 }
 
-/// A state as one small dot beside a name (the connection beside the
-/// app's): `label` is what screen readers and the tooltip say, and a
-/// press says it too, for a phone with no hover.
+const STATUS_DOT_SIZE: f32 = 8.0;
+const STATUS_DOT_W_TOUCH: f32 = 44.0;
+const STATUS_DOT_W_DESKTOP: f32 = 20.0;
+
+/// A state as one small dot beside a name (the connection beside the app's):
+/// `label` is what screen readers and the tooltip say, and a press triggers
+/// `on_press` (opening System).
 pub fn status_dot(
     tone: impl Fn() -> Tone + 'static,
     label: impl Fn() -> String + Clone + 'static,
@@ -1214,22 +1470,34 @@ pub fn status_dot(
     let hint = label.clone();
     with_hint(
         move || SharedString::from(hint()),
-        // The whole target to press, the dot at its start: it sits by the
-        // name it belongs to.
+        // Left-aligned inside a full 44 pt touch box extending into the empty
+        // header spacer: keeps the dot ~8 pt beside the brand wordmark with
+        // zero hitbox overlap onto the brand button.
         frame(Variant::Ghost, Size::Sm, motion::PRESS_SCALE_ICON)
-            .w(px(Size::Sm.height()))
+            .w(px(if touch() {
+                STATUS_DOT_W_TOUCH
+            } else {
+                STATUS_DOT_W_DESKTOP
+            }))
             .justify_start()
-            .pl(px(2.0))
+            .pl(px(4.0))
             .accessibility_label(move || SharedString::from(label()))
             .on_press(on_press)
-            // The "●" glyph, a size up from a [`status`] line's: alone by a
-            // name it carries the state by itself.
-            .child(
-                text(Glyph::Dot.symbol())
-                    .text_size(px(12.0))
-                    .text_color(move || tone().color())
-                    .accessibility_elements_hidden(true),
-            ),
+            .child(if idiom() == nsh_core::platform::Idiom::Terminal {
+                view().child(
+                    text(Glyph::Dot.symbol())
+                        .text_size(px(10.0))
+                        .text_color(move || tone().color())
+                        .accessibility_elements_hidden(true),
+                )
+            } else {
+                view()
+                    .w(px(STATUS_DOT_SIZE))
+                    .h(px(STATUS_DOT_SIZE))
+                    .rounded_full()
+                    .bg(move || tone().color())
+                    .accessibility_elements_hidden(true)
+            }),
     )
 }
 
@@ -1249,7 +1517,7 @@ pub fn badge_dot(label: &'static str, tone: Tone) -> View {
         )
         .child(
             text(label)
-                .text_size(px(if touch() { 12.0 } else { type_scale::XS }))
+                .text_size(px(fit::meta()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(tone.color()),
         )

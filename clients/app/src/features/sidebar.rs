@@ -10,7 +10,7 @@
 use nsh_core::prelude::*;
 
 use crate::store::{AnswerSurface, Felt, Page, SearchRead, SidebarView, Source, Store, now_ms};
-use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
+use crate::ui::{self, Glyph, Tone, colors, icon, sidebar_row, sidebar_section_header, status};
 use aidaemon_client_core::machine::DropKind;
 use aidaemon_client_protocol::{Approval, ApprovalDecision};
 
@@ -50,8 +50,6 @@ pub fn sidebar(store: Store) -> View {
         })
     });
     let query = signal(store.filter());
-    // The dot by the name, pressed: its words at the foot until pressed again.
-    let status_shown = signal(false);
     effect(move || {
         let q = query.get();
         untracked(|| {
@@ -65,14 +63,19 @@ pub fn sidebar(store: Store) -> View {
         .w_full()
         .flex_1()
         .bg(colors::SIDEBAR)
-        .border_r_1()
-        .border_color(colors::LINE)
-        // The top line: the name, Search, (a phone's) New conversation and
-        // Close; Search turns the line into the field, Cancel turns it back.
-        .child(top_line(store, query, status_shown))
+        // Compact drawers draw their exposed edge via `ui::drawer` (`BORDER`);
+        // on desktop the docked sidebar keeps a quiet `LINE` separator.
+        .style_when(
+            move || !store.is_compact(),
+            |s| s.border_r_1().border_color(colors::LINE),
+        )
+        // The top line: the name, connection dot (opens System), Search,
+        // (a phone's) New conversation and Close; Search turns the line into
+        // the field, Cancel turns it back.
+        .child(top_line(store, query))
         .child(when(!ui::touch(), move || {
-            view().px_2().child(
-                row(
+            view().px(px(ui::fit::sidebar_list_inset())).pt_1().child(
+                sidebar_row(
                     move || store.page() == Page::Conversation && store.selected().is_none(),
                     move || new_here(store),
                 )
@@ -88,16 +91,19 @@ pub fn sidebar(store: Store) -> View {
                     })
                     .flex_1()
                     .number_of_lines(1)
-                    .text_size(px(type_scale::BASE)),
+                    .text_size(px(ui::fit::body())),
                 )
                 .child(ui::kbd(key_label("mod+n"))),
             )
         }))
+        // Pinned subview header (All projects, a project, or Archived) so deep
+        // scrolling never loses the Back button or page title.
+        .child(subview_head(store))
         .child(ui::refreshable(
             scroll().flex_1().child(
                 view()
-                    .px_2()
-                    .pb_2()
+                    .px(px(ui::fit::sidebar_list_inset()))
+                    .pb_4()
                     .gap(px(1.0))
                     .on_mouse_enter(move |_: &MouseEvent| held.set(true))
                     .on_mouse_leave(move |_: &MouseEvent| held.set(false))
@@ -130,13 +136,20 @@ pub fn sidebar(store: Store) -> View {
                         }))
                     }))
                     .child(search_hits(store))
+                    // Only show a local empty-title message when message search
+                    // has not run; once message search is Ready, `search_hits`
+                    // owns the combined empty state so it never contradicts hits.
                     .child(when(
-                        move || ids.with(Vec::is_empty) && !store.filter().trim().is_empty(),
+                        move || {
+                            ids.with(Vec::is_empty)
+                                && !store.filter().trim().is_empty()
+                                && matches!(store.search(), SearchRead::Idle)
+                        },
                         || {
                             text("No conversation matches.")
-                                .px_2()
+                                .px(px(ui::fit::sidebar_row_inset()))
                                 .py_2()
-                                .text_size(px(type_scale::SM))
+                                .text_size(px(ui::fit::small()))
                                 .text_color(colors::FAINT)
                         },
                     )),
@@ -144,18 +157,17 @@ pub fn sidebar(store: Store) -> View {
             move || store.pull_refreshing(),
             move || store.pull_refresh(),
         ))
-        .child(pages(store))
-        // The line shows only when something is wrong: the dot by the name
-        // says connected or reconnecting.
+        .child(settings_footer(store))
+        // The connection line shows only when something is wrong: the dot by
+        // the name opens System when healthy.
         .child(
             view()
                 .style_when(
                     move || {
-                        !status_shown.get()
-                            && matches!(
-                                store.felt(),
-                                Felt::Online | Felt::Connecting | Felt::Reconnecting
-                            )
+                        matches!(
+                            store.felt(),
+                            Felt::Online | Felt::Connecting | Felt::Reconnecting
+                        )
                     },
                     |s| s.hidden(),
                 )
@@ -219,35 +231,40 @@ fn work_line(store: Store, id: String) -> View {
             let (words, color) = work_words(&work);
             let began = work.began_at_ms;
             let label = format!("{words}, open its agents");
+            let btn = nsh_base::button()
+                .w_full()
+                .accessibility_label(label)
+                .rounded(px(ui::radius::CONTROL))
+                .active(|s| s.bg(colors::SELECTED))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                .on_press(move || store.open_agents(open_id.clone()));
+            let btn = if ui::touch() {
+                btn
+            } else {
+                btn.hover(|s| s.bg(colors::HOVER))
+            };
             view().child(
-                nsh_base::button()
-                    .w_full()
-                    .accessibility_label(label)
-                    .rounded(px(ui::radius::CONTROL))
-                    .hover(|s| s.bg(colors::HOVER))
-                    .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
-                    .on_press(move || store.open_agents(open_id.clone()))
-                    .child(
-                        view()
-                            .w_full()
-                            .min_h(px(ui::Size::Sm.height()))
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .pl(px(WORK_INDENT))
-                            .pr_2()
-                            .py_1()
-                            .child(work_marks(store, &work, words, color))
-                            .child(
-                                text(move || {
-                                    store.tick();
-                                    ui::time::span(now_ms().saturating_sub(began) / 1000)
-                                })
-                                .tabular_nums()
-                                .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                                .text_color(colors::FAINT),
-                            ),
-                    ),
+                btn.child(
+                    view()
+                        .w_full()
+                        .min_h(px(ui::Size::Sm.height()))
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(ui::fit::sidebar_body_indent()))
+                        .pr(px(ui::fit::sidebar_row_inset()))
+                        .py_1()
+                        .child(work_marks(store, &work, words, color))
+                        .child(
+                            text(move || {
+                                store.tick();
+                                ui::time::span(now_ms().saturating_sub(began) / 1000)
+                            })
+                            .tabular_nums()
+                            .text_size(px(ui::fit::meta()))
+                            .text_color(colors::FAINT),
+                        ),
+                ),
             )
         }))
     }))
@@ -262,7 +279,7 @@ fn work_marks(
     words: String,
     color: AdaptiveColor,
 ) -> View {
-    let size = px(if ui::touch() { 12.0 } else { type_scale::XS });
+    let size = px(ui::fit::meta());
     let line = view()
         .flex_row()
         .items_center()
@@ -307,9 +324,6 @@ fn work_marks(
     line
 }
 
-/// Where a row's work line starts: under its title, past the unread dot.
-const WORK_INDENT: f32 = 26.0;
-
 /// The work line's words and colour: a failure first, else progress.
 fn work_words(work: &crate::store::AgentWork) -> (String, AdaptiveColor) {
     if let Some(failed) = work.failed.first() {
@@ -353,15 +367,15 @@ fn ask_line(store: Store, approval: Approval) -> View {
         .flex_row()
         .items_center()
         .gap_2()
-        .pl(px(WORK_INDENT))
-        .pr_2()
+        .pl(px(ui::fit::sidebar_body_indent()))
+        .pr(px(ui::fit::sidebar_row_inset()))
         .pb_1()
         .child(
             text(words)
                 .flex_1()
                 .min_w(px(0.0))
                 .number_of_lines(2)
-                .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                .text_size(px(ui::fit::meta()))
                 .text_color(colors::WARNING),
         );
     store.answer_shown(AnswerSurface::Line, &approval.id);
@@ -486,7 +500,7 @@ fn session_preview(store: Store, id: String) -> View {
         .child(
             text(move || store.title(&title))
                 .number_of_lines(2)
-                .text_size(px(type_scale::SM))
+                .text_size(px(ui::fit::small()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors::TEXT),
         )
@@ -503,7 +517,7 @@ fn session_preview(store: Store, id: String) -> View {
                 parts.join(" · ")
             })
             .number_of_lines(1)
-            .text_size(px(type_scale::XS))
+            .text_size(px(ui::fit::meta()))
             .text_color(colors::FAINT),
         )
         .child(
@@ -513,7 +527,7 @@ fn session_preview(store: Store, id: String) -> View {
                 None => "Open it to read it.".to_owned(),
             })
             .number_of_lines(4)
-            .text_size(px(type_scale::XS))
+            .text_size(px(ui::fit::meta()))
             .text_color(colors::MUTED),
         )
 }
@@ -523,22 +537,36 @@ fn session_preview(store: Store, id: String) -> View {
 /// the search field across the line, focused, and Cancel, which clears it.
 /// A search left in the field keeps it open.
 /// The name button's own padding, taken from the line's so the name stays
-/// where it was.
+/// aligned with the 16 pt sidebar content rail.
 const NAME_INSET: f32 = 4.0;
 
-fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> View {
+fn top_line(store: Store, query: Signal<String>) -> View {
     let open = signal(!untracked(|| query.get()).trim().is_empty());
     let close = move || {
         query.set(String::new());
         open.set(false);
     };
+    let header_action_size = if ui::touch() {
+        ui::Size::Sm
+    } else {
+        ui::Size::Md
+    };
     view()
-        .h(px(ui::fit::bar()))
+        .min_h(px(ui::fit::bar()))
         .flex_row()
         .items_center()
-        .pl(px(12.0 - NAME_INSET))
-        .pr_2()
+        .pl(px(16.0 - NAME_INSET))
+        // Touch: 2 pt right edge + 44 pt Close button centres × at 24 pt,
+        // matching ⋮ below and the 22 pt grip/chevron rail. Desktop: 16 pt
+        // right edge aligns ⌘K cleanly with timestamps.
+        .pr(px(if ui::touch() {
+            2.0
+        } else {
+            ui::fit::sidebar_list_inset() + ui::fit::sidebar_row_inset()
+        }))
         .gap_1()
+        .border_b_1()
+        .border_color(colors::LINE)
         .child(
             when(
                 move || open.get(),
@@ -548,6 +576,7 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
                         .flex_row()
                         .items_center()
                         .gap_1()
+                        .pr(px(if ui::touch() { 6.0 } else { 0.0 }))
                         .child(
                             ui::field("Search", query)
                                 .label("Search conversations")
@@ -562,32 +591,35 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
                     .flex_1()
                     .flex_row()
                     .items_center()
-                    .gap_1()
-                    // The name goes home: the main list and a new
-                    // conversation.
-                    .child(ui::name_btn("AIDaemon", NAME_INSET, move || {
-                        store.show_sidebar_view(SidebarView::Home);
-                        store.leave_drawer(move || store.select(None));
-                    }))
-                    // The connection at a glance; its words come to the
-                    // footer only when something is wrong.
-                    .child(ui::status_dot(
-                        move || felt_status(&store.felt()).0,
-                        move || felt_status(&store.felt()).1,
-                        move || status_shown.update(|shown| *shown = !*shown),
-                    ))
+                    .gap(px(if ui::touch() { 0.0 } else { 4.0 }))
+                    // The name and connection dot sit tightly together as one
+                    // unit (~8 pt gap): the name goes home; the dot opens System.
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .child(ui::name_btn("AIDaemon", NAME_INSET, move || {
+                                store.show_sidebar_view(SidebarView::Home);
+                                store.leave_drawer(move || store.select(None));
+                            }))
+                            .child(ui::status_dot(
+                                move || felt_status(&store.felt()).0,
+                                move || format!("{}, open System", felt_status(&store.felt()).1),
+                                move || store.leave_drawer(move || store.open_system()),
+                            )),
+                    )
                     .child(view().flex_1())
                     .child(ui::icon_btn(
                         Glyph::Search,
                         "Search conversations",
-                        ui::Size::Md,
+                        header_action_size,
                         move || open.set(true),
                     ))
                     .child(when(ui::touch(), move || {
                         ui::icon_btn(
                             Glyph::Compose,
                             "New conversation",
-                            ui::Size::Md,
+                            header_action_size,
                             move || new_here(store),
                         )
                     }))
@@ -595,7 +627,7 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
                         when(
                             move || store.is_compact(),
                             move || {
-                                ui::icon_btn(Glyph::Close, "Close", ui::Size::Md, move || {
+                                ui::icon_btn(Glyph::Close, "Close", header_action_size, move || {
                                     store.close_panes()
                                 })
                             },
@@ -658,12 +690,13 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         store.home_projects(room)
     });
     let more = computed(move || all.with(Vec::len) > shown.with(Vec::len));
+    let total_projects = computed(move || all.with(Vec::len));
     let reorder = Reorder::new(shown, false);
     view()
         .gap(px(1.0))
         .child(group(store, "Needs you", needs))
         .child(group(store, "Pinned", pinned))
-        .child(section_label("Projects"))
+        .child(sidebar_section_header("Projects", None))
         .child(when(
             move || store.project_form_open(),
             move || project_form(store),
@@ -675,43 +708,47 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         )))
         .child(
             when(more, move || {
-                row(
+                sidebar_row(
                     || false,
                     move || store.show_sidebar_view(SidebarView::Projects),
                 )
+                .min_h(px(ui::fit::compact_row()))
                 .accessibility_label("All projects")
-                .child(icon(Glyph::Folder).text_color(colors::FAINT))
+                .child(icon(Glyph::Grid).text_color(colors::FAINT))
                 .child(
                     text("All projects")
                         .flex_1()
                         .text_size(px(ui::fit::body()))
                         .text_color(colors::MUTED),
                 )
-                .child(icon(Glyph::Chevron).text_color(colors::FAINT))
+                .child(
+                    text(move || total_projects.get().to_string())
+                        .tabular_nums()
+                        .text_size(px(ui::fit::meta()))
+                        .text_color(colors::FAINT),
+                )
+                .child(ui::icon_inline(Glyph::Chevron).text_color(colors::FAINT))
             })
             .otherwise(move || new_project_row(store)),
         )
         // Their heading, with which ones are listed as one filter: where
         // they came from (when from more than one place) and the archived
         // (when there are any).
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .child(section_label("Recent").flex_1())
-                .child(when(
-                    move || !store.sources().is_empty() || store.archived_count() > 0,
-                    move || source_filter(store),
-                )),
-        )
+        .child(sidebar_section_header(
+            "Recent",
+            Some(view().child(when(
+                move || !store.sources().is_empty() || store.archived_count() > 0,
+                move || source_filter(store),
+            ))),
+        ))
         .child(listed(store, recent))
         .child(when(
             move || recent.with(Vec::is_empty) && store.source_filter() != Source::All,
             || {
                 text("None from here.")
-                    .px_2()
+                    .px(px(ui::fit::sidebar_row_inset()))
                     .py_1()
-                    .text_size(px(type_scale::SM))
+                    .text_size(px(ui::fit::small()))
                     .text_color(colors::FAINT)
             },
         ))
@@ -719,12 +756,15 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
 
 /// A drag reordering a list of projects (Home's, or every project's):
 /// which one and how far it moved, the list as it stands, and how tall its
-/// rows are (`detailed`: a second line, the folder).
+/// rows are (`detailed`: a second line, the folder). `measured_row` tracks
+/// the actual laid-out row height so drag landing stays accurate under large
+/// system text sizes.
 #[derive(Clone, Copy)]
 struct Reorder {
     drag: Signal<Option<(String, f32)>>,
     order: Memo<Vec<String>>,
     detailed: bool,
+    measured_row: Signal<f32>,
 }
 
 /// The gap between two project rows.
@@ -732,16 +772,40 @@ const ROW_GAP: f32 = 1.0;
 
 impl Reorder {
     fn new(order: Memo<Vec<String>>, detailed: bool) -> Self {
+        let initial = ui::fit::compact_row()
+            + if detailed {
+                if ui::touch() { 18.0 } else { 14.0 }
+            } else {
+                0.0
+            };
         Self {
             drag: signal(None),
             order,
             detailed,
+            measured_row: signal(initial),
         }
     }
 
-    /// A row's height.
+    /// A row's minimum height, falling back to the measured height when OS
+    /// font scaling grows the row past its baseline.
+    fn min_row(&self) -> f32 {
+        ui::fit::compact_row()
+            + if self.detailed {
+                if ui::touch() { 18.0 } else { 14.0 }
+            } else {
+                0.0
+            }
+    }
+
+    /// Current laid-out row height for drag stride and handle height.
     fn row(&self) -> f32 {
-        ui::fit::row() + if self.detailed { 14.0 } else { 0.0 }
+        self.measured_row.get().max(self.min_row())
+    }
+
+    fn note_row_height(&self, height: f32) {
+        if height > 0.0 && (self.measured_row.get_untracked() - height).abs() > 0.5 {
+            self.measured_row.set(height);
+        }
     }
 
     /// A drag moves a row a place each this far.
@@ -786,7 +850,7 @@ impl Reorder {
 
 /// A project's row: its name and how many conversations it has; a press
 /// goes inside it, its menu pins, moves or deletes it. `reorder` adds a
-/// handle to drag it by (and, detailed, its folder).
+/// quiet inline drag handle (and `detailed` shows its folder).
 fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
     let (name, folder, label, open, count_id) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
@@ -825,7 +889,7 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
         }),
         ui::MenuAction::new("Delete project…", move || confirm_delete(store, &gone)),
     ];
-    let mut names = view().flex_1().min_w(px(0.0)).child(
+    let mut names = view().flex_1().min_w(px(0.0)).gap(px(2.0)).child(
         text(move || store.project(&name).map(|p| p.name).unwrap_or_default())
             .number_of_lines(1)
             .text_size(px(ui::fit::body())),
@@ -840,15 +904,16 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
                     .unwrap_or_else(|| "No folder".to_owned())
             })
             .number_of_lines(1)
-            .text_size(px(type_scale::XS))
+            .text_size(px(ui::fit::meta()))
             .text_color(colors::FAINT),
         );
     }
     let star = pinned.clone();
-    let mut line = row(
+    let mut line = sidebar_row(
         || false,
         move || store.show_sidebar_view(SidebarView::Project(open.clone())),
     )
+    .min_h(px(ui::fit::compact_row()))
     .accessibility_label(move || {
         Some(SharedString::from(format!(
             "Project {}{}, {} conversations",
@@ -859,15 +924,19 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
     })
     .child(icon(Glyph::Folder).text_color(colors::MUTED))
     .child(names)
-    .child(when(star, || icon(Glyph::Pinned).text_color(colors::FAINT)))
+    .child(when(star, || {
+        ui::icon_inline(Glyph::Pinned).text_color(colors::FAINT)
+    }))
     .child(
-        text(move || match count.get() {
-            0 => String::new(),
-            n => n.to_string(),
-        })
-        .tabular_nums()
-        .text_size(px(type_scale::XS))
-        .text_color(colors::FAINT),
+        view().flex_row().justify_end().min_w(px(20.0)).child(
+            text(move || match count.get() {
+                0 => String::new(),
+                n => n.to_string(),
+            })
+            .tabular_nums()
+            .text_size(px(ui::fit::meta()))
+            .text_color(colors::FAINT),
+        ),
     );
     let about = signal(false);
     line = line.style_when(move || about.get(), ui::menu_target);
@@ -877,11 +946,13 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
         return ui::with_menu_about(
             about_name,
             about,
-            line.child(icon(Glyph::Chevron).text_color(colors::FAINT)),
+            line.child(ui::icon_inline(Glyph::Chevron).text_color(colors::FAINT)),
             actions,
         );
     };
-    line = line.h(px(reorder.row()));
+    // Tighten inner right padding before the sibling drag handle so the count
+    // sits closer to the grip and the grip centres on the chevron rail.
+    line = line.pr_0().min_h(px(reorder.min_row()));
     let (moving, offset_id, handle_id) = (id.clone(), id.clone(), id.clone());
     let lifted = move || {
         reorder
@@ -896,6 +967,7 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
         })
         .rounded(px(ui::radius::CONTROL))
         .style_when(lifted, |s| s.bg(colors::SURFACE).shadow_md())
+        .on_layout(move |bounds: &Bounds<Points>| reorder.note_row_height(bounds.size.height.0))
         .child(
             view()
                 .flex_row()
@@ -915,13 +987,17 @@ fn drag_handle(store: Store, reorder: Reorder, id: String) -> View {
     let (grant, end) = (id.clone(), id.clone());
     view()
         .test_id(&format!("drag:{id}"))
-        .w(px(ui::fit::icon_slot() + 8.0))
-        .h(px(reorder.row()))
+        // 36 pt visual lane + 4 pt hit_slop on each side = 44 pt touch target,
+        // centring the inline grip on the same right rail as All projects' chevron.
+        .w(px(if ui::touch() { 36.0 } else { 24.0 }))
+        .h(move || px(reorder.row()))
+        .hit_slop(EdgeInsets::all(px(if ui::touch() { 4.0 } else { 0.0 })))
         .items_center()
         .justify_center()
         // The mouse's and a finger's; the keyboard and a screen reader
-        // have Move up and Move down in the row's menu.
-        .child(icon(Glyph::Grip).text_color(colors::FAINT))
+        // have Move up and Move down in the row's menu. Kept at full FAINT
+        // token contrast (no extra opacity dimming) so contrast stays >= 4.5:1.
+        .child(ui::icon_inline(Glyph::Grip).text_color(colors::FAINT))
         .claim_touches(TouchClaim::on_start())
         .keep_touches(true)
         .on_responder_grant(move |_: &ResponderEvent| {
@@ -980,7 +1056,8 @@ fn confirm_delete(store: Store, id: &str) {
 /// "New project": opens the form.
 fn new_project_row(store: Store) -> View {
     view().child(
-        row(|| false, move || store.show_project_form(true))
+        sidebar_row(|| false, move || store.show_project_form(true))
+            .min_h(px(ui::fit::compact_row()))
             .accessibility_label("New project")
             .child(icon(Glyph::Plus).text_color(colors::FAINT))
             .child(
@@ -992,8 +1069,95 @@ fn new_project_row(store: Store) -> View {
     )
 }
 
+/// Pinned subview header rendered above the scroll area for All projects,
+/// a project page, or Archived, so deep scrolling keeps Back and the title
+/// in view.
+fn subview_head(store: Store) -> View {
+    view().child(dynamic(move || {
+        if !store.filter().trim().is_empty() {
+            return None;
+        }
+        let archived = store.showing_archived();
+        let shown = store.sidebar_view();
+        if archived {
+            let project = match shown {
+                SidebarView::Project(id) => Some(id),
+                _ => None,
+            };
+            return Some(untracked(move || {
+                page_head(
+                    store,
+                    move || match project.as_ref().and_then(|id| store.project(id)) {
+                        Some(project) => format!("Archived in {}", project.name),
+                        None => "Archived".to_owned(),
+                    },
+                    view(),
+                )
+            }));
+        }
+        match shown {
+            SidebarView::Home => None,
+            SidebarView::Projects => Some(untracked(move || {
+                page_head(store, || "Projects".to_owned(), view())
+            })),
+            SidebarView::Project(id) => Some(untracked(move || {
+                let (name, edit, put_away) = (id.clone(), id.clone(), id.clone());
+                let (pin, unpin, pinned, unpinned, gone) =
+                    (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+                let archived_btn = dynamic(move || {
+                    let any = store.session_ids().iter().any(|s| {
+                        store.is_archived(s)
+                            && store.session_project(s).as_deref() == Some(put_away.as_str())
+                    });
+                    any.then(|| {
+                        untracked(|| {
+                            ui::icon_btn(
+                                Glyph::Archive,
+                                "Archived conversations in this project",
+                                ui::Size::Sm,
+                                move || store.show_archived(true),
+                            )
+                        })
+                    })
+                });
+                let tools =
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .child(archived_btn)
+                        .child(ui::press_menu(
+                            Glyph::More,
+                            "Project options",
+                            vec![
+                                ui::MenuAction::new("Pin to the top", move || {
+                                    store.toggle_project_pin(&pin)
+                                })
+                                .shown_when(move || !store.is_project_pinned(&unpinned)),
+                                ui::MenuAction::new("Unpin", move || {
+                                    store.toggle_project_pin(&unpin)
+                                })
+                                .shown_when(move || store.is_project_pinned(&pinned)),
+                                ui::MenuAction::new("Edit name or folder", move || {
+                                    store.edit_project(&edit)
+                                }),
+                                ui::MenuAction::new("Delete project…", move || {
+                                    confirm_delete(store, &gone)
+                                }),
+                            ],
+                        ));
+                page_head(
+                    store,
+                    move || store.project(&name).map(|p| p.name).unwrap_or_default(),
+                    tools,
+                )
+            })),
+        }
+    }))
+}
+
 /// The top of a page inside the sidebar: Back, its title and what it
-/// offers.
+/// offers. Back is 44 pt on touch starting at 4 pt so the title lands on the
+/// 48 pt inner rail beside the folder/New-conversation labels below it.
 fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) -> View {
     let in_project = untracked(|| {
         store.showing_archived() && matches!(store.sidebar_view(), SidebarView::Project(_))
@@ -1001,8 +1165,20 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
     view()
         .flex_row()
         .items_center()
-        .gap_1()
-        .pt_1()
+        .gap(px(if ui::touch() { 0.0 } else { 4.0 }))
+        .pl(px(if ui::touch() {
+            4.0
+        } else {
+            ui::fit::sidebar_list_inset()
+        }))
+        .pr(px(if ui::touch() {
+            2.0
+        } else {
+            ui::fit::sidebar_list_inset()
+        }))
+        .py(px(2.0))
+        .border_b_1()
+        .border_color(colors::LINE)
         .child(ui::icon_btn(
             Glyph::Back,
             if in_project {
@@ -1010,7 +1186,7 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
             } else {
                 "Back to all conversations"
             },
-            ui::Size::Md,
+            ui::Size::Sm,
             move || {
                 // A project's archived are a page of the project's.
                 if in_project {
@@ -1037,8 +1213,8 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
 fn all_projects(store: Store, _ids: Memo<Vec<String>>) -> View {
     let reorder = Reorder::new(computed(move || store.sorted_projects()), true);
     view()
+        .pt_1()
         .gap(px(1.0))
-        .child(page_head(store, || "Projects".to_owned(), view()))
         .child(view().gap(px(ROW_GAP)).child(each(
             reorder.order,
             |id: &String| id.clone(),
@@ -1054,7 +1230,7 @@ fn all_projects(store: Store, _ids: Memo<Vec<String>>) -> View {
         ))
 }
 
-/// One project: its name and folder, Edit, then its conversations
+/// One project: its folder, Edit, then its conversations
 /// (New conversation, above, starts one here).
 fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
     let mine = {
@@ -1068,50 +1244,11 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
             })
         })
     };
-    let (name, folder, edit, empty) = (id.clone(), id.clone(), id.clone(), id.clone());
-    let put_away = id.clone();
-    let (browse, browsing, has_folder) = (id.clone(), id.clone(), id.clone());
-    let (pin, unpin, pinned, unpinned, gone) =
-        (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
-    // Its archived, an icon beside the menu (only when it has some).
-    let archived = dynamic(move || {
-        let any = store.session_ids().iter().any(|s| {
-            store.is_archived(s) && store.session_project(s).as_deref() == Some(put_away.as_str())
-        });
-        any.then(|| {
-            untracked(|| {
-                ui::icon_btn(
-                    Glyph::Archive,
-                    "Archived conversations in this project",
-                    ui::Size::Md,
-                    move || store.show_archived(true),
-                )
-            })
-        })
-    });
-    let tools = view()
-        .flex_row()
-        .items_center()
-        .child(archived)
-        .child(ui::press_menu(
-            Glyph::More,
-            "Project options",
-            vec![
-                ui::MenuAction::new("Pin to the top", move || store.toggle_project_pin(&pin))
-                    .shown_when(move || !store.is_project_pinned(&unpinned)),
-                ui::MenuAction::new("Unpin", move || store.toggle_project_pin(&unpin))
-                    .shown_when(move || store.is_project_pinned(&pinned)),
-                ui::MenuAction::new("Edit name or folder", move || store.edit_project(&edit)),
-                ui::MenuAction::new("Delete project…", move || confirm_delete(store, &gone)),
-            ],
-        ));
+    let (folder, empty) = (id.clone(), id.clone());
+    let (browse, browsing, has_folder) = (id.clone(), id.clone(), id);
     view()
+        .pt_1()
         .gap(px(1.0))
-        .child(page_head(
-            store,
-            move || store.project(&name).map(|p| p.name).unwrap_or_default(),
-            tools,
-        ))
         // Its folder, the way into its files (a page of their own, no
         // conversation needed); without one, the way to add one.
         .child(dynamic(move || {
@@ -1121,10 +1258,11 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                 .filter(|f| !f.trim().is_empty());
             let (open, on, add) = (browse.clone(), browsing.clone(), has_folder.clone());
             Some(untracked(move || match path {
-                Some(path) => row(
+                Some(path) => sidebar_row(
                     move || store.showing_files_of(&on),
                     move || store.open_project_files(&open),
                 )
+                .min_h(px(ui::fit::compact_row()))
                 .accessibility_label("This project's files")
                 .child(icon(Glyph::Folder).text_color(colors::MUTED))
                 .child(
@@ -1133,18 +1271,19 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                         .min_w(px(0.0))
                         .number_of_lines(1)
                         .font_family(ui::theme::MONO)
-                        .text_size(px(type_scale::SM))
+                        .text_size(px(ui::fit::small()))
                         .text_color(colors::MUTED),
                 )
-                .child(icon(Glyph::Chevron).text_color(colors::FAINT)),
-                None => row(|| false, move || store.edit_project(&add))
+                .child(ui::icon_inline(Glyph::Chevron).text_color(colors::FAINT)),
+                None => sidebar_row(|| false, move || store.edit_project(&add))
+                    .min_h(px(ui::fit::compact_row()))
                     .accessibility_label("Add a folder to this project")
                     .child(icon(Glyph::Folder).text_color(colors::FAINT))
                     .child(
                         text("Add a folder…")
                             .flex_1()
                             .number_of_lines(1)
-                            .text_size(px(type_scale::SM))
+                            .text_size(px(ui::fit::small()))
                             .text_color(colors::MUTED),
                     ),
             }))
@@ -1159,25 +1298,30 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
         .child(when(ui::touch(), move || {
             let start = empty.clone();
             // At once, as `new_here`: the keyboard comes up inside the tap.
-            row(|| false, move || store.new_in_project(Some(start.clone())))
+            sidebar_row(|| false, move || store.new_in_project(Some(start.clone())))
+                .min_h(px(ui::fit::compact_row()))
                 .accessibility_label("New conversation in this project")
                 .child(icon(Glyph::Compose).text_color(colors::MUTED))
                 .child(
                     text("New conversation")
                         .flex_1()
                         .number_of_lines(1)
-                        .text_size(px(type_scale::BASE)),
+                        .text_size(px(ui::fit::body())),
                 )
         }))
         .child(when(
             move || mine.with(Vec::is_empty),
             move || {
                 text("No conversations yet")
-                    .px_2()
+                    .px(px(ui::fit::sidebar_row_inset()))
                     .py_1()
-                    .text_size(px(type_scale::SM))
+                    .text_size(px(ui::fit::small()))
                     .text_color(colors::FAINT)
             },
+        ))
+        .child(when(
+            move || !mine.with(Vec::is_empty),
+            || sidebar_section_header("Conversations", None),
         ))
         .child(listed(store, mine))
 }
@@ -1248,7 +1392,8 @@ fn source_filter(store: Store) -> View {
         },
         move || format!("Show conversations from: {}", shown()),
         view()
-            .min_h(px(ui::fit::row()))
+            .min_h(px(if ui::touch() { 32.0 } else { 24.0 }))
+            .hit_slop(EdgeInsets::all(px(if ui::touch() { 6.0 } else { 0.0 })))
             .flex_row()
             .items_center()
             .gap_1()
@@ -1256,18 +1401,19 @@ fn source_filter(store: Store) -> View {
             .child(dynamic(move || {
                 let glyph = filter_glyph(store.source_filter())?;
                 Some(untracked(move || {
-                    icon(glyph)
+                    ui::icon_inline(glyph)
                         .text_color(colors::MUTED)
                         .accessibility_elements_hidden(true)
                 }))
             }))
             .child(
                 text(shown)
-                    .text_size(px(ui::fit::small()))
+                    .text_size(px(ui::fit::meta()))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(colors::MUTED),
             )
             .child(
-                icon(Glyph::Down)
+                ui::icon_inline(Glyph::Down)
                     .text_color(colors::FAINT)
                     .accessibility_elements_hidden(true),
             ),
@@ -1315,7 +1461,7 @@ fn project_form(store: Store) -> View {
         )
         .child(
             text("Any folder: a site, a repository, designs. Leave it empty for none.")
-                .text_size(px(type_scale::XS))
+                .text_size(px(ui::fit::meta()))
                 .text_color(colors::FAINT),
         )
         // A missing folder the daemon can make is a question, not an error.
@@ -1478,7 +1624,7 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
     let (f, g, h) = (id.clone(), id.clone(), id.clone());
     let label_id = id.clone();
     let date_id = id.clone();
-    row(
+    let row = sidebar_row(
         // Lit only while the conversation is what the page shows, not
         // behind another page (Files, Memory, …).
         move || {
@@ -1489,8 +1635,10 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             store.leave_drawer(move || store.select(Some(b)))
         },
     )
-    // Two lines need air between rows; a phone's taller rows have it.
-    .py(px(if ui::touch() { 0.0 } else { 4.0 }))
+    // One-line conversations sit at 44 pt on touch (matching Projects);
+    // two-line rows grow naturally to ~54–56 pt from their content.
+    .min_h(px(ui::fit::compact_row()))
+    .py(px(if ui::touch() { 6.0 } else { 5.0 }))
     // Read as one item: its name, where it lives, who answers and whether it is working.
     .accessibility_label(move || {
         let id = &label_id;
@@ -1508,24 +1656,69 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             parts.push("new reply".into());
         }
         Some(SharedString::from(parts.join(", ")))
-    })
-    // A new reply: a filled dot; nothing otherwise, in the same slot so
-    // the names line up.
-    .child(ui::state_dot(
-        move || store.is_unread(&c),
-        move || {
-            if store.is_unread(&e) {
-                colors::TEXT
-            } else {
-                colors::TRANSPARENT
-            }
-        },
-    ))
-    .child(row_names(store, id, d, f, g, h))
-    // At the end, what it is doing: waiting on the owner ("Needs you",
-    // amber), working (a turning ring), else when it last moved ("3h",
-    // "Oct 30") where the list shows times.
-    .child(dynamic(move || {
+    });
+    // Desktop keeps the 16 pt leading dot slot so project names and
+    // conversation titles stay aligned at 40 pt, top-aligned to line 1 so the
+    // dot shares line 1's baseline with the title and timestamp. On touch, the
+    // dot tucks into the row's 12 pt left padding on line 1.
+    let row = if !ui::touch() {
+        row.items_start().child(
+            ui::state_dot(
+                move || store.is_unread(&c),
+                move || {
+                    if store.is_unread(&e) {
+                        colors::TEXT
+                    } else {
+                        colors::TRANSPARENT
+                    }
+                },
+            )
+            .h(px(19.0)),
+        )
+    } else {
+        row
+    };
+    row.child(row_names(store, id, d, f, g, h, date_id, dated))
+}
+
+/// A conversation row's name, trailing state/timestamp on line 1, and where it
+/// is from on line 2: its project's name (outside that project's page), its
+/// coding agent when set to one, or the chat it came from when not the app
+/// (Telegram, Discord and Slack by their icons, a group adding people; any
+/// other by name). A row with nothing to say stays one line.
+#[allow(clippy::too_many_arguments)]
+fn row_names(
+    store: Store,
+    id: String,
+    d: String,
+    f: String,
+    g: String,
+    h: String,
+    date_id: String,
+    dated: bool,
+) -> View {
+    let unread_id = h.clone();
+    let title = text(move || store.title(&d))
+        .flex_1()
+        .min_w(px(0.0))
+        .number_of_lines(1)
+        .text_size(px(ui::fit::body()))
+        // The name is what a row is found by: body text always, a new
+        // reply adding weight (beside its dot) rather than brightness.
+        .text_color(colors::TEXT)
+        .style_when(
+            move || store.is_unread(&h),
+            |s| s.font_weight(FontWeight::MEDIUM),
+        );
+    let star = when(
+        move || store.is_pinned(&f),
+        || ui::icon_inline(Glyph::Pinned).text_color(colors::FAINT),
+    );
+    // At line 1's end, what it is doing: waiting on the owner ("Needs you",
+    // amber), working (a turning ring), else when it last moved ("3m", "Nov 24")
+    // where the list shows times. Aligned to the title line so 1-line and
+    // 2-line rows match and metadata below gets the row's full width.
+    let trailing = view().flex_shrink(0.0).child(dynamic(move || {
         let state = if store.needs_you(&date_id) {
             RowState::NeedsYou
         } else if store.is_working(&date_id) {
@@ -1553,34 +1746,11 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
                         .unwrap_or_default()
                 })
                 .tabular_nums()
-                .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                .text_size(px(ui::fit::meta()))
                 .text_color(colors::FAINT)
             })),
         }))
-    }))
-}
-
-/// A conversation row's name and where it is from: its project's name
-/// (outside that project's page), its coding agent when set to one, or the
-/// chat it came from when not the app (Telegram, Discord and Slack by their
-/// icons, a group adding people; any other by name). Shown on a second line
-/// under the title, and a row with nothing to say stays one line.
-fn row_names(store: Store, id: String, d: String, f: String, g: String, h: String) -> View {
-    let title = text(move || store.title(&d))
-        .flex_1()
-        .min_w(px(0.0))
-        .number_of_lines(1)
-        .text_size(px(ui::fit::body()))
-        // The name is what a row is found by: body text always, a new
-        // reply adding weight (beside its dot) rather than brightness.
-        .text_color(colors::TEXT)
-        .style_when(
-            move || store.is_unread(&h),
-            |s| s.font_weight(FontWeight::MEDIUM),
-        );
-    let star = text(move || if store.is_pinned(&f) { "★" } else { "" })
-        .text_size(px(type_scale::XS))
-        .text_color(colors::FAINT);
+    }));
     let (tag_id, mark_id, any_id) = (g, id.clone(), id);
     let tag_shown_id = tag_id.clone();
     let agent_id = tag_id.clone();
@@ -1591,7 +1761,7 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
         let tag = tag.clone();
         text(tag)
             .number_of_lines(1)
-            .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+            .text_size(px(ui::fit::meta()))
             .text_color(colors::MUTED)
     };
     // The coding agent the conversation is set to (messages there go
@@ -1629,25 +1799,25 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
             }))
         })
     };
-    // Two lines everywhere: the title, then where it is and who answers
-    // (one desktop line had no room for both beside a title).
+    // Two lines everywhere: the title + time/state, then where it is and who
+    // answers (one desktop line had no room for both beside a title).
     let said = move || {
         !row_tag(store, &any_id).is_empty()
             || row_glyph(store, &any_id).is_some()
             || store.session_agent(&any_id).is_some()
     };
+    let mut top = view().flex_row().items_center().gap_2();
+    if ui::touch() {
+        top = top.child(ui::sidebar_unread_dot_inset(move || {
+            store.is_unread(&unread_id)
+        }));
+    }
+    top = top.child(title).child(star).child(trailing);
     view()
         .flex_1()
         .min_w(px(0.0))
-        .gap(px(2.0))
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(title)
-                .child(star),
-        )
+        .gap(px(if ui::touch() { 3.0 } else { 2.0 }))
+        .child(top)
         .child(when(said, move || {
             let has_tag = has_tag.clone();
             let tag_text = tag_text.clone();
@@ -1660,7 +1830,7 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
                 .flex_row()
                 .items_center()
                 .min_w(px(0.0))
-                .gap_1()
+                .gap_1p5()
                 .child(when(has_tag, move || {
                     tag_text().min_w(px(0.0)).flex_shrink(1.0)
                 }))
@@ -1685,8 +1855,10 @@ fn row_tag(store: Store, id: &str) -> String {
 
 fn row_place(store: Store, id: &str) -> String {
     if let Some(project) = store.session_project(id).and_then(|p| store.project(&p)) {
+        // Global search always names the project even when started inside one.
+        let searching = !store.filter().trim().is_empty();
         return match store.sidebar_view() {
-            SidebarView::Project(_) => String::new(),
+            SidebarView::Project(_) if !searching => String::new(),
             _ => project.name,
         };
     }
@@ -1736,134 +1908,39 @@ enum RowState {
     Quiet,
 }
 
-/// Automations, System, Memory and Settings: rows on a desktop; on a phone
-/// one row of four, so the conversations keep the screen.
-fn pages(store: Store) -> View {
-    if ui::touch() {
-        let tab = |glyph: Glyph,
-                   label: &'static str,
-                   name: &'static str,
-                   page: Page,
-                   open: fn(&Store)| {
-            ui::row(
-                move || store.page() == page,
-                move || store.leave_drawer(move || open(&store)),
-            )
-            .flex_1()
-            .flex_col()
-            .justify_center()
-            .gap(px(2.0))
-            .accessibility_label(name)
-            .child(icon(glyph).text_color(colors::MUTED))
-            .child(
-                text(label)
-                    .number_of_lines(1)
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::MUTED),
-            )
-        };
-        return view()
-            .flex_row()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .border_t_1()
-            .border_color(colors::LINE)
-            .child(tab(
-                Glyph::Clock,
-                "Automate",
-                "Automations: what runs on its own",
-                Page::Automations,
-                Store::open_automations,
-            ))
-            .child(tab(
-                Glyph::System,
-                "System",
-                "System: how the daemon is doing",
-                Page::System,
-                Store::open_system,
-            ))
-            .child(tab(
-                Glyph::Memory,
-                "Memory",
-                "Memory: what the daemon remembers",
-                Page::Memory,
-                Store::open_memory,
-            ))
-            .child(tab(
-                Glyph::Settings,
-                "Settings",
-                "Settings: change how the daemon runs",
-                Page::Settings,
-                Store::open_settings,
-            ));
-    }
+/// One quiet Settings icon button anchored at the foot of the sidebar on both
+/// touch and desktop: opens the configuration hub (Settings, Automations,
+/// Memory and System, switched from their shared 4-link top bar). Stays
+/// highlighted while any of the four config pages is open, and carries an
+/// accent dot when automations have unseen news.
+fn settings_footer(store: Store) -> View {
+    let active = move || {
+        matches!(
+            store.page(),
+            Page::Settings | Page::Automations | Page::Memory | Page::System
+        )
+    };
+    let action_size = if ui::touch() {
+        ui::Size::Sm
+    } else {
+        ui::Size::Md
+    };
     view()
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::Automations,
-                    move || store.open_automations(),
-                )
-                .accessibility_label("Automations: what runs on its own")
-                .child(icon(Glyph::Clock).text_color(colors::MUTED))
-                .child(text("Automations").flex_1().text_size(px(ui::fit::body())))
-                // Runs with something to read since the last look.
-                .child(when(
-                    move || store.automation_news() > 0,
-                    move || {
-                        ui::badge(
-                            move || format!("{} new", store.automation_news()),
-                            Tone::Accent,
-                        )
-                    },
-                )),
-            ),
-        )
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::System,
-                    move || store.open_system(),
-                )
-                .accessibility_label("System: how the daemon is doing")
-                .child(icon(Glyph::System).text_color(colors::MUTED))
-                .child(text("System").flex_1().text_size(px(ui::fit::body())))
-                .child(
-                    text(move || {
-                        store
-                            .today_tokens()
-                            .filter(|n| *n > 0)
-                            .map(|n| format!("{} today", ui::time::compact_count(n)))
-                            .unwrap_or_default()
-                    })
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                ),
-            ),
-        )
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::Memory,
-                    move || store.open_memory(),
-                )
-                .accessibility_label("Memory: what the daemon remembers")
-                .child(icon(Glyph::Memory).text_color(colors::MUTED))
-                .child(text("Memory").flex_1().text_size(px(ui::fit::body()))),
-            ),
-        )
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::Settings,
-                    move || store.open_settings(),
-                )
-                .accessibility_label("Settings: change how the daemon runs")
-                .child(icon(Glyph::Settings).text_color(colors::MUTED))
-                .child(text("Settings").flex_1().text_size(px(ui::fit::body()))),
-            ),
-        )
+        .border_t_1()
+        .border_color(colors::LINE)
+        .flex_row()
+        .items_center()
+        .justify_start()
+        .px(px(if ui::touch() { 2.0 } else { 8.0 }))
+        .py_1()
+        .child(ui::icon_nav_btn(
+            Glyph::Settings,
+            "Settings: change how the daemon runs",
+            action_size,
+            active,
+            move || store.automation_news() > 0,
+            move || store.leave_drawer(move || store.open_settings()),
+        ))
 }
 
 /// A titled group of conversations, shown only when it has any.
@@ -1872,7 +1949,7 @@ fn group(store: Store, title: &'static str, ids: Memo<Vec<String>>) -> View {
         .gap(px(1.0))
         .child(when(
             move || !ids.with(Vec::is_empty),
-            move || section_label(title),
+            move || sidebar_section_header(title, None),
         ))
         .child(each(
             ids,
@@ -1887,11 +1964,13 @@ fn search_hits(store: Store) -> View {
         let read = store.search();
         Some(untracked(move || match read {
             SearchRead::Idle => view(),
-            SearchRead::Loading(_) => view().child(section_label("In messages: searching…")),
+            SearchRead::Loading(_) => {
+                view().child(sidebar_section_header("In messages: searching…", None))
+            }
             SearchRead::Failed(error) => view().child(
                 text(error)
-                    .px_2()
-                    .text_size(px(type_scale::SM))
+                    .px(px(ui::fit::sidebar_row_inset()))
+                    .text_size(px(ui::fit::small()))
                     .text_color(colors::MUTED),
             ),
             // Conversations already listed above match: "nothing" here
@@ -1902,11 +1981,14 @@ fn search_hits(store: Store) -> View {
                 view()
             }
             SearchRead::Ready { hits, .. } => {
-                let mut list = view().gap(px(1.0)).child(section_label(if hits.is_empty() {
-                    "Nothing matches, in titles or messages"
-                } else {
-                    "In messages"
-                }));
+                let mut list = view().gap(px(1.0)).child(sidebar_section_header(
+                    if hits.is_empty() {
+                        "Nothing matches, in titles or messages"
+                    } else {
+                        "In messages"
+                    },
+                    None,
+                ));
                 for hit in hits {
                     let open = hit.session_id.clone();
                     let who = if hit.role == "user" {
@@ -1921,33 +2003,50 @@ fn search_hits(store: Store) -> View {
                         title
                     };
                     list = list.child(
-                        row(
+                        sidebar_row(
                             || false,
                             move || {
                                 let open = open.clone();
                                 store.leave_drawer(move || store.select(Some(open)))
                             },
                         )
+                        // Align search results with the conversation title rail
+                        // on both touch (16 pt) and desktop (40 pt).
+                        .pl(px(ui::fit::sidebar_body_indent()))
+                        .py(px(if ui::touch() { 6.0 } else { 5.0 }))
                         .accessibility_label(format!("{title}: {}", hit.snippet))
                         .child(
                             view()
                                 .flex_1()
                                 .min_w(px(0.0))
-                                .py_1()
+                                .gap(px(2.0))
                                 .child(
-                                    text(hit.snippet.clone())
-                                        .number_of_lines(2)
-                                        .text_size(px(type_scale::SM))
-                                        .text_color(colors::TEXT),
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            text(title)
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .number_of_lines(1)
+                                                .text_size(px(ui::fit::body()))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(colors::TEXT),
+                                        )
+                                        .child(
+                                            text(ui::time::ago(hit.at_ms, now_ms()))
+                                                .flex_shrink(0.0)
+                                                .tabular_nums()
+                                                .text_size(px(ui::fit::meta()))
+                                                .text_color(colors::FAINT),
+                                        ),
                                 )
                                 .child(
-                                    text(format!(
-                                        "{who} · {title} · {}",
-                                        ui::time::ago(hit.at_ms, now_ms())
-                                    ))
-                                    .number_of_lines(1)
-                                    .text_size(px(type_scale::XS))
-                                    .text_color(colors::FAINT),
+                                    text(format!("{who}: {}", hit.snippet))
+                                        .number_of_lines(2)
+                                        .text_size(px(ui::fit::small()))
+                                        .text_color(colors::MUTED),
                                 ),
                         ),
                     );
@@ -2015,7 +2114,7 @@ fn connection(store: Store) -> View {
                     .child(
                         text(detail)
                             .number_of_lines(1)
-                            .text_size(px(type_scale::XS))
+                            .text_size(px(ui::fit::meta()))
                             .text_color(colors::FAINT),
                     )
                     .child(when(repair, move || {
@@ -2035,7 +2134,6 @@ fn connection(store: Store) -> View {
 /// brought back, then the conversations. `project`: only that project's,
 /// asked for on its page.
 fn archived_page(store: Store, project: Option<String>, ids: Memo<Vec<String>>) -> View {
-    let named = project.clone();
     let ids = computed(move || {
         ids.with(|ids| {
             ids.iter()
@@ -2045,15 +2143,8 @@ fn archived_page(store: Store, project: Option<String>, ids: Memo<Vec<String>>) 
         })
     });
     view()
+        .pt_1()
         .gap(px(1.0))
-        .child(page_head(
-            store,
-            move || match named.as_ref().and_then(|id| store.project(id)) {
-                Some(project) => format!("Archived in {}", project.name),
-                None => "Archived".to_owned(),
-            },
-            view(),
-        ))
         .child(
             text(move || {
                 if ids.with(Vec::is_empty) {
@@ -2064,9 +2155,9 @@ fn archived_page(store: Store, project: Option<String>, ids: Memo<Vec<String>>) 
                     "Right-click a conversation to bring it back."
                 }
             })
-            .px_2()
+            .px(px(ui::fit::sidebar_row_inset()))
             .py_1()
-            .text_size(px(type_scale::SM))
+            .text_size(px(ui::fit::small()))
             .text_color(colors::FAINT),
         )
         .child(listed(store, ids))

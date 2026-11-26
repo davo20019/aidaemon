@@ -9,7 +9,7 @@ use nsh_core::prelude::*;
 
 use crate::store::{Store, SystemRead, now_ms};
 use crate::ui::{
-    self, Glyph, Size, Tone, Variant, badge, colors, section_label, size, status, time, type_scale,
+    self, Size, Tone, Variant, badge, colors, section_label, size, status, time, type_scale,
 };
 
 pub fn page(store: Store) -> View {
@@ -34,41 +34,7 @@ pub fn page(store: Store) -> View {
 }
 
 fn header(store: Store) -> View {
-    view()
-        .h(px(ui::fit::bar()))
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .border_b_1()
-        .border_color(colors::LINE)
-        .child(when(
-            move || store.is_compact() || !store.sidebar_open(),
-            move || {
-                ui::icon_btn(Glyph::Sidebar, "Conversations", Size::Md, move || {
-                    store.open_sidebar()
-                })
-            },
-        ))
-        .child(
-            text("System")
-                .flex_1()
-                .px_2()
-                .role(AccessibilityRole::Header)
-                .text_size(px(ui::fit::body()))
-                .font_weight(FontWeight::SEMIBOLD),
-        )
-        .child(
-            text(move || match store.system() {
-                SystemRead::Ready { at_ms, .. } => format!("Updated {}", time::clock(at_ms)),
-                _ => String::new(),
-            })
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT),
-        )
-        .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Md, move || {
-            store.refresh_system()
-        }))
+    crate::features::config_nav::header(store)
 }
 
 fn body(store: Store, read: SystemRead) -> View {
@@ -87,7 +53,14 @@ fn body(store: Store, read: SystemRead) -> View {
                 store.refresh_system()
             }),
         )),
-        SystemRead::Ready { status, .. } => column
+        SystemRead::Ready { status, at_ms } => column
+            .child(
+                view().flex_row().justify_end().child(
+                    text(format!("Updated {}", time::clock(at_ms)))
+                        .text_size(px(ui::fit::meta()))
+                        .text_color(colors::FAINT),
+                ),
+            )
             .child(attention(&status))
             .child(overview(&status))
             .child(bots(store))

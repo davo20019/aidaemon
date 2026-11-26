@@ -268,7 +268,9 @@ fn the_name_carries_the_connection_as_a_dot() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     feed([Update::Connected]);
-    app.wait_for("label:Connected to the daemon")?;
+    app.wait_for("label:Connected to the daemon, open System")?;
+    app.press("label:Connected to the daemon, open System")?;
+    app.wait_for("Reading the daemon's status…")?;
     Ok(())
 }
 
@@ -1644,6 +1646,8 @@ fn a_missed_run_reads_as_missed_in_the_last_run_line_and_history() -> Result<(),
     let mut app = start();
     app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("Automations: what runs on its own")?;
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
     feed([frame(
@@ -1665,6 +1669,8 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     let mut app = start();
     app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("Automations: what runs on its own")?;
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
     feed([frame(
@@ -1721,6 +1727,8 @@ fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
     let mut app = start();
     app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("Automations: what runs on its own")?;
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
     feed([frame(
@@ -2161,6 +2169,8 @@ fn an_automation_waiting_on_a_sign_in_says_so_on_its_card() -> Result<(), String
             r#"{"type":"event","at_ms":1,"event":{"type":"surface_updated","surface":{"id":"srf_auto_1","kind":"browser_tab","session_id":"telegram:synthetic-user-1","title":"Sign in","site":"bank.acme.example","width":1280,"height":720,"controller":{"kind":"agent"},"handoff_pending":true,"interactive":true}}}"#,
         ),
     ]);
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("Automations: what runs on its own")?;
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
     feed([frame(
@@ -2296,6 +2306,8 @@ fn the_system_page_lists_devices_and_how_they_connect() -> Result<(), String> {
     app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     let before = sent("get_system");
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("System")?;
     app.press("System")?;
     let id = wait_sent_new("get_system", before)?;
     let fixture =

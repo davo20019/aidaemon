@@ -38,40 +38,7 @@ pub fn page(store: Store) -> View {
 }
 
 fn header(store: Store) -> View {
-    view()
-        .h(px(ui::fit::bar()))
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .border_b_1()
-        .border_color(colors::LINE)
-        .child(when(
-            move || store.is_compact() || !store.sidebar_open(),
-            move || {
-                ui::icon_btn(Glyph::Sidebar, "Conversations", Size::Md, move || {
-                    store.open_sidebar()
-                })
-            },
-        ))
-        .child(
-            text("Automations")
-                .flex_1()
-                .px_2()
-                .role(AccessibilityRole::Header)
-                .text_size(px(ui::fit::body()))
-                .font_weight(FontWeight::SEMIBOLD),
-        )
-        .child(ui::btn_icon(
-            Glyph::Plus,
-            "New",
-            Variant::Ghost,
-            Size::Sm,
-            move || new_automation(store),
-        ))
-        .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Md, move || {
-            store.refresh_automations()
-        }))
+    crate::features::config_nav::header(store)
 }
 
 /// A new automation is asked for in words: a new conversation, started.
@@ -111,13 +78,27 @@ fn body(store: Store, read: AutomationsRead) -> View {
         AutomationsRead::Ready(list) => {
             let count = list.len();
             let mut column = column.child(
-                text(format!(
-                    "{count} automation{}, next to run first",
-                    if count == 1 { "" } else { "s" }
-                ))
-                .px_1()
-                .text_size(px(type_scale::XS))
-                .text_color(colors::FAINT),
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        text(format!(
+                            "{count} automation{}, next to run first",
+                            if count == 1 { "" } else { "s" }
+                        ))
+                        .flex_1()
+                        .px_1()
+                        .text_size(px(ui::fit::meta()))
+                        .text_color(colors::FAINT),
+                    )
+                    .child(ui::btn_icon(
+                        Glyph::Plus,
+                        "New",
+                        Variant::Ghost,
+                        Size::Sm,
+                        move || new_automation(store),
+                    )),
             );
             for automation in list {
                 column = column.child(card(store, automation));
