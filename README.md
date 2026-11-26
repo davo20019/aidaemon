@@ -21,6 +21,8 @@ Most AI agents live in a terminal. AIdaemon has an app anyone can use: install i
 
 <img alt="AIdaemon on a phone: the conversation list, a morning brief, and an approval card asking before it sends an email" src=".github/readme/phone.png">
 
+<p align="center"><img width="360" alt="On a phone: asked to clean up the Downloads folder, it looks through it and proposes a plan; after 'Go ahead' it asks for approval before moving 312 installers to the Trash, then reports 11.2 GB freed" src=".github/readme/phone-approval.gif"><br><sub>Recorded in the app with a scripted demo agent and synthetic data.</sub></p>
+
 A few things people ask it for:
 
 - "Plan a 3-day weekend in Lisbon under $1,500, flights from Boston." Then "watch the fare and tell me if it drops."
@@ -41,7 +43,9 @@ A few things people ask it for:
 - **Any model.** Use your ChatGPT plan, or an API key for Anthropic, OpenAI, Google Gemini, xAI, DeepSeek, Moonshot, MiniMax, OpenRouter or Cloudflare AI Gateway, or run models on your own hardware with Ollama, llama.cpp, LM Studio or vLLM. Fallbacks take over when one is down or out of quota.
 - **One small program.** A single Rust binary: no Docker, Node.js or Python needed. It runs on a laptop, a Raspberry Pi or a cheap server, and it is open source under the MIT license.
 
-<img alt="One request worked by three coding agents: Claude Code built a pricing page and handed the API to Codex, Gemini CLI reviewed both, and Claude Code applied the review. The Agents tab lists each agent by the name the owner gave it" src=".github/readme/agents-team.png">
+<img alt="Asking AIdaemon to rebuild a pricing page: Claude Code starts, hands the API to Codex, Gemini CLI reviews both, Claude Code applies the review, and the reply sums it up with the four agents' runs below" src=".github/readme/agents-team.gif">
+
+<sub>Recorded in the app with a scripted demo agent and synthetic data.</sub>
 
 ## Quick start
 
@@ -90,6 +94,8 @@ Dozens of built-in tools: terminal, files, git, a headless Chrome browser, web s
 `manage_api` connects an API from its OpenAPI spec or GraphQL schema and checks the connection safely. Credentials stay in the OS keychain.
 
 ### Coding agents as a team
+<img alt="One request worked by three coding agents: Claude Code built a pricing page and handed the API to Codex, Gemini CLI reviewed both, and Claude Code applied the review. The Agents tab lists each agent by the name the owner gave it" src=".github/readme/agents-team.png">
+
 Ask for a change and say who should do what ("Claude Code does the page, Codex the API, then have Gemini review"), or let AIdaemon decide. Each agent runs in its own session: in its own git worktree for parallel edits, or read-only for a review. Agents hand work to each other, check on one another and share a coordination board, so the work doesn't collide. The app shows every agent in the conversation's **Agents** tab under a name you give it ("Frontend", "Reviewer"). Open one to see what it was asked, what it answered, its checks, changed files and steps, and send it a follow-up that continues its own session. Each changed file opens its diff. An agent whose plan runs out of usage pauses until its usage resets, and its work goes to another agent meanwhile.
 
 <img alt="Claude Code's run view: what AIdaemon asked it, its answer, the passing test run, the files it changed, and a reply box for a follow-up in the same session" src=".github/readme/agents-run.png">
