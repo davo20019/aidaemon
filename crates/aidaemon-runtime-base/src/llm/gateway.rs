@@ -271,10 +271,22 @@ impl SideCallGateway {
                 Err(_) => Err(SideCallError::Deadline(spec.deadline)),
             };
         let elapsed = started.elapsed();
+        // The model that answered, when one did: a fallback's, not the one
+        // asked for; and how many models were tried.
+        let (answered_by, attempts) = {
+            let log = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let answered = log
+                .iter()
+                .find(|attempt| matches!(attempt.finished, Some((_, Ok(_)))))
+                .map(|attempt| attempt.model.clone());
+            (answered, log.len())
+        };
         // One line per side call, so a turn's latency splits by grep alone.
         tracing::info!(
             purpose = spec.purpose,
             model = %request.model,
+            answered_by = answered_by.as_deref().unwrap_or("-"),
+            attempts,
             elapsed_ms = elapsed.as_millis() as u64,
             outcome = match &result {
                 Ok(_) => "answered",

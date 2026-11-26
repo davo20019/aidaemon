@@ -264,15 +264,16 @@ impl LlmRuntimeSnapshot {
             .unwrap_or_else(|| self.primary_model.clone())
     }
 
-    /// `primary_models` followed by every failover provider's models (fast
-    /// tier first), for callers that try candidates one by one themselves.
-    /// Run them on [`Self::model_routed_backend`].
-    pub(in crate::llm) fn with_failover_models(
+    /// `primary_models` followed by every failover provider's models, each
+    /// provider's strongest first: the order a call that needs judgment
+    /// (a safety judge) falls back in, never from the strongest model to a
+    /// provider's cheapest.
+    pub(in crate::llm) fn with_failover_models_strongest_first(
         &self,
         mut primary_models: Vec<String>,
     ) -> Vec<String> {
         for target in &self.failover_targets {
-            for model in target.models_cheap_first() {
+            for model in target.models_for_failover(false) {
                 if !primary_models.contains(&model) {
                     primary_models.push(model);
                 }
@@ -282,8 +283,8 @@ impl LlmRuntimeSnapshot {
     }
 
     /// Ask for a safety judgment within one time budget, starting on the
-    /// primary model and moving to the failover providers only on an
-    /// infrastructure failure. A failure tied to this request stops, so the
+    /// primary model and moving to the failover providers (each one's
+    /// strongest model first) only on an infrastructure failure. A failure tied to this request stops, so the
     /// content being judged cannot pick a different judge. One attempt per
     /// model; the caller fails closed on an error, which is the last
     /// attempt's. The backend is passed through `wrap` (the side-call gateway
@@ -299,7 +300,7 @@ impl LlmRuntimeSnapshot {
         let routed = self.model_routed_backend();
         let models = available_first(
             &routed,
-            self.with_failover_models(vec![self.primary_model()]),
+            self.with_failover_models_strongest_first(vec![self.primary_model()]),
         );
         let backend = wrap(routed);
         let deadline = std::time::Instant::now() + budget;
@@ -927,8 +928,37 @@ mod tests {
         )
     }
 
-    /// Auxiliary calls start on each provider's fast tier, and callers that
-    /// pick candidates themselves see the failover provider's models too.
+    /// A judgment whose primary account cannot pay moves to the failover
+    /// provider's strongest model, not its fast tier (live 2026-11-26: the
+    /// untrusted-call verifier fell from claude-opus to the cheapest Gemini).
+    #[tokio::test]
+    async fn a_judgment_falls_back_to_the_strongest_failover_model() {
+        let primary = Arc::new(ScriptedProvider::with_results([Err(
+            aidaemon_core::ProviderError::Billing {
+                message: "credit balance is too low".into(),
+                affordable_tokens: None,
+            },
+        )]));
+        let verdict = r#"{"consistent":true,"reason":"asked for"}"#;
+        let failover = Arc::new(ScriptedProvider::new([text(verdict)]));
+        let runtime = two_provider_runtime(primary.clone(), failover.clone());
+        let answer = runtime
+            .snapshot()
+            .ask_for_judgment_through(
+                &[serde_json::json!({"role": "user", "content": "judge this"})],
+                &Default::default(),
+                std::time::Duration::from_secs(5),
+                |backend| backend,
+            )
+            .await
+            .expect("the failover provider judges");
+        assert_eq!(answer.content.as_deref(), Some(verdict));
+        assert_eq!(primary.requests()[0].model, "strong");
+        assert_eq!(failover.requests()[0].model, "big-claude");
+    }
+
+    /// Auxiliary calls start on each provider's fast tier; a judge's
+    /// candidates include the failover provider's models, strongest first.
     #[test]
     fn auxiliary_models_are_cheap_first_and_include_failover_providers() {
         let runtime = two_provider_runtime(
@@ -938,8 +968,8 @@ mod tests {
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.cheap_model(), "cheap");
         assert_eq!(
-            snapshot.with_failover_models(vec!["cheap".into(), "strong".into()]),
-            ["cheap", "strong", "small-claude", "big-claude"]
+            snapshot.with_failover_models_strongest_first(vec!["strong".into()]),
+            ["strong", "big-claude", "small-claude"]
         );
     }
 
