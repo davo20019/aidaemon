@@ -216,6 +216,13 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# SQLite (with SQLCipher) is C the daemon runs on every query: unoptimized, a
+# dev daemon's queries ran 30-50x slower than the same SQL in an optimized
+# build (5-10 s for a sessions-list snapshot with three clients loading).
+# Compiled once and cached, so it costs incremental builds nothing.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
 [profile.release]
 # Thin LTO with the default codegen units: fat LTO with one unit optimized the
 # whole daemon on one core (62-70 minutes on GitHub's 3-core Mac runners) and
