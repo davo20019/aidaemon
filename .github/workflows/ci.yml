@@ -505,10 +505,11 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install && rustc --version
 
+      # From crates.io, not install-action: on these runners its bash step
+      # failed to start (actions/partner-runner-images#169, 2026-11-26),
+      # failing every shard before a test ran.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
-        with:
-          tool: cargo-nextest
+        run: cargo install cargo-nextest --locked --version 0.9.152
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
