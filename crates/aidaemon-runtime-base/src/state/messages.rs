@@ -325,6 +325,18 @@ impl crate::state::types::MessageStore for SqliteStateStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        // The conversation's coding-agent peer trees (boards, peer outputs).
+        let prefix = super::peer_tree_settings_prefix(session_id);
+        // Exactly this session's: the rest of the key is an agent name, not
+        // another session id that merely starts with this one.
+        sqlx::query(
+            "DELETE FROM settings
+             WHERE substr(key, 1, length(?1)) = ?1
+               AND instr(substr(key, length(?1) + 1), ':') = 0",
+        )
+        .bind(&prefix)
+        .execute(&mut *tx)
+        .await?;
         // The kernel's run journal and checkpoints hold the same text.
         aidaemon_store_sqlite::erase_session_in_tx(&mut tx, session_id).await?;
         tx.commit().await?;

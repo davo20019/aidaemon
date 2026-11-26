@@ -104,6 +104,19 @@ fn note_daemon_files(db_path: &str) {
 
 /// Whether `path` is one of the daemon's own files: its database or one of
 /// SQLite's companions to it.
+/// The settings key a conversation's coding-agent peer tree is kept under
+/// for its lead `agent`: its board and peers, which hold the conversation's
+/// text, so a wipe of the conversation deletes it
+/// ([`peer_tree_settings_prefix`]).
+pub fn peer_tree_settings_key(session_id: &str, agent: &str) -> String {
+    format!("{}{agent}", peer_tree_settings_prefix(session_id))
+}
+
+/// What every peer-tree settings key of `session_id` starts with.
+pub fn peer_tree_settings_prefix(session_id: &str) -> String {
+    format!("peer_tree:{session_id}:")
+}
+
 pub fn is_daemon_file(path: &std::path::Path) -> bool {
     let files = daemon_files()
         .read()
@@ -535,6 +548,7 @@ mod tests;
 mod turn_id_hydration_tests {
     use super::*;
     use aidaemon_events::{Event, EventStore, EventType};
+    use aidaemon_tools::services::SettingsStore;
     use types::MessageStore;
 
     /// The event store on the daemon's seams, over the same pool.
@@ -740,8 +754,35 @@ mod turn_id_hydration_tests {
         store.clear_session_context(sess).await.unwrap();
         append_user(&events, sess, "gone-two").await;
 
+        // Its coding-agent peer trees, and another session's whose id
+        // starts with this one.
+        store
+            .set_setting(&peer_tree_settings_key(sess, "agy"), "{}")
+            .await
+            .unwrap();
+        let nested = format!("{sess}:thread");
+        store
+            .set_setting(&peer_tree_settings_key(&nested, "codex"), "{}")
+            .await
+            .unwrap();
+
         // Destructive wipe: everything for the session is deleted.
         store.clear_session(sess).await.unwrap();
+        assert_eq!(
+            store
+                .get_setting(&peer_tree_settings_key(sess, "agy"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            store
+                .get_setting(&peer_tree_settings_key(&nested, "codex"))
+                .await
+                .unwrap()
+                .is_some(),
+            "another session's tree stays"
+        );
         let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE session_id = ?")
             .bind(sess)
             .fetch_one(&store.pool())

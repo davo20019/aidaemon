@@ -588,6 +588,9 @@ pub(super) async fn watch_run(
                     resumable: Some(resumable),
                 },
             );
+            // Saved before the cleanup too: a tree whose lead ended is
+            // always on record ([`PeerCoordinator::load_conversation_tree`]).
+            binding.save_conversation_tree().await;
             binding.cleanup_children(&cli_run_id(&call.task_id)).await;
             binding.save_conversation_tree().await;
         }

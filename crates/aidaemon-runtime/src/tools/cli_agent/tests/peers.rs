@@ -919,4 +919,39 @@ async fn a_conversations_tree_survives_a_restart() {
         }),
     );
     assert_ne!(fresh.tree.id(), first.tree.id());
+
+    // A wiped conversation: its lead ended and nothing is saved (the wipe
+    // deleted it), so the tree kept in memory goes too.
+    let wiped = peer_mod::ConversationLead {
+        session_id: "app:synthetic-wiped".into(),
+        agent: "bash-agent".into(),
+    };
+    let wiped_continuity = |run: &str| {
+        Some(peer_mod::TreeContinuity {
+            lead: wiped.clone(),
+            fresh: false,
+            run_id: run.into(),
+        })
+    };
+    let before =
+        coord.start_root_tree("bash-agent", "Lead", root(), &[], wiped_continuity("run-4"));
+    before
+        .tree
+        .post_message("peer-root", None, "plan", "erased")
+        .unwrap();
+    before.tree.update_peer(
+        "peer-root",
+        PeerUpdate {
+            state: PeerState::Completed,
+            run_id: None,
+            working_dir: None,
+            branch: None,
+            output: None,
+            resumable: None,
+        },
+    );
+    coord.load_conversation_tree(&wiped).await;
+    let after = coord.start_root_tree("bash-agent", "Lead", root(), &[], wiped_continuity("run-5"));
+    assert_ne!(after.tree.id(), before.tree.id());
+    assert!(after.tree.read_messages("peer-root", 0, false).is_empty());
 }

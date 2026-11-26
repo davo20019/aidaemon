@@ -272,18 +272,25 @@ impl PeerCoordinator {
 
     /// The settings key `lead`'s kept tree is saved under.
     fn conversation_tree_key(lead: &ConversationLead) -> String {
-        format!("peer_tree:{}:{}", lead.session_id, lead.agent)
+        crate::state::peer_tree_settings_key(&lead.session_id, &lead.agent)
     }
 
     /// Bring `lead`'s saved tree back after a restart, when none is kept in
-    /// memory: a later run of the lead continues it.
+    /// memory: a later run of the lead continues it. A tree kept in memory
+    /// whose lead ended is saved; with nothing saved, the conversation was
+    /// wiped, and the tree goes too.
     pub(super) async fn load_conversation_tree(&self, lead: &ConversationLead) {
         let kept = self
             .conversation_trees
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(lead);
-        if kept {
+            .get(lead)
+            .cloned();
+        let lead_running = kept.as_ref().is_some_and(|tree| {
+            tree.peer("peer-root")
+                .is_some_and(|root| !root.state.is_terminal())
+        });
+        if lead_running {
             return;
         }
         let Some(tool) = self.tool.upgrade() else {
@@ -294,8 +301,21 @@ impl PeerCoordinator {
             .get_setting(&Self::conversation_tree_key(lead))
             .await
         {
+            Ok(Some(_)) if kept.is_some() => return,
             Ok(Some(saved)) => saved,
-            Ok(None) => return,
+            Ok(None) => {
+                if let Some(kept) = kept {
+                    let mut trees = self
+                        .conversation_trees
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if trees.get(lead).is_some_and(|tree| Arc::ptr_eq(tree, &kept)) {
+                        trees.remove(lead);
+                        info!(session_id = %lead.session_id, "A wiped conversation's peer tree is dropped");
+                    }
+                }
+                return;
+            }
             Err(error) => {
                 tracing::warn!(%error, "Could not read a conversation's saved peer tree");
                 return;
