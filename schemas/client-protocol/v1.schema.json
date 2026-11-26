@@ -6324,6 +6324,17 @@
           "description": "One of the agent's own helpers ran it.",
           "type": "boolean"
         },
+        "kind": {
+          "$ref": "#/$defs/RunStepKind",
+          "description": "What kind of step it is (protocol 1.56), so a client can fold\nroutine ones together; `Unknown` from an older daemon."
+        },
+        "path": {
+          "description": "The file it read or changed, where it names one (protocol 1.56).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "state": {
           "$ref": "#/$defs/RunStepState"
         },
@@ -6336,6 +6347,50 @@
         "state"
       ],
       "type": "object"
+    },
+    "RunStepKind": {
+      "description": "What a run's step did, by its typed event (protocol 1.56).",
+      "oneOf": [
+        {
+          "enum": [
+            "read",
+            "search",
+            "edit",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "run",
+          "description": "Ran a command.",
+          "type": "string"
+        },
+        {
+          "const": "fetch",
+          "description": "Looked something up online.",
+          "type": "string"
+        },
+        {
+          "const": "delegate",
+          "description": "Asked one of its own helpers.",
+          "type": "string"
+        },
+        {
+          "const": "plan",
+          "description": "Updated its plan.",
+          "type": "string"
+        },
+        {
+          "const": "coordinate",
+          "description": "Worked with the other agents of its run (handing work over,\nmessaging, the shared board).",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "Any other tool.",
+          "type": "string"
+        }
+      ]
     },
     "RunStepState": {
       "oneOf": [

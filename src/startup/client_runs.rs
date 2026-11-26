@@ -7,7 +7,7 @@
 
 use aidaemon_client_protocol::{
     RunDetail, RunPermission, RunPermissionOutcome, RunPlanItem, RunPlanStatus, RunStepItem,
-    RunStepState, RunUsage,
+    RunStepKind, RunStepState, RunUsage,
 };
 use aidaemon_tools::services::{CliAgentEvent, CliAgentRun};
 use serde_json::Value;
@@ -89,11 +89,15 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool
                 if let Some(id) = text("id") {
                     by_id.insert(id, detail.steps.len());
                 }
+                let tool = data.get("tool");
+                let (kind, path) = step_kind(tool);
                 detail.steps.push(RunStepItem {
                     words: text("words").unwrap_or_default(),
                     state: RunStepState::Started,
                     at_ms: at_ms(&event.at),
                     by_helper: data.get("parent").is_some_and(|parent| !parent.is_null()),
+                    kind,
+                    path,
                 });
             }
             "step_ended" => {
@@ -340,6 +344,38 @@ fn at_ms(at: &str) -> Option<u64> {
     u64::try_from(at.and_utc().timestamp_millis()).ok()
 }
 
+/// A kept step's kind and the file it names, from its stored tool
+/// (`aidaemon_coding_agents::AgentEvent::to_record`'s `kind` values).
+fn step_kind(tool: Option<&Value>) -> (RunStepKind, Option<String>) {
+    let field = |key: &str| {
+        tool.and_then(|tool| tool.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    };
+    let kind = match field("kind").as_deref() {
+        Some("read") => RunStepKind::Read,
+        Some("search") => RunStepKind::Search,
+        Some("edit") => RunStepKind::Edit,
+        Some("run") => RunStepKind::Run,
+        Some("fetch") => RunStepKind::Fetch,
+        Some("delegate") => RunStepKind::Delegate,
+        Some("plan") => RunStepKind::Plan,
+        Some("other")
+            if field("name")
+                .is_some_and(|name| aidaemon_coding_agents::is_coordination_tool(&name)) =>
+        {
+            RunStepKind::Coordinate
+        }
+        Some("other") => RunStepKind::Other,
+        _ => RunStepKind::Unknown,
+    };
+    let path = matches!(kind, RunStepKind::Read | RunStepKind::Edit)
+        .then(|| field("path"))
+        .flatten();
+    (kind, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,15 +436,41 @@ mod tests {
                 "usage",
                 r#"{"input_tokens":120,"output_tokens":30,"cost_usd":0.01}"#,
             ),
-            event(8, "turn_ended", r#"{"failed":false}"#),
+            event(
+                8,
+                "step",
+                r#"{"id":"i3","parent":null,"tool":{"kind":"other","name":"mcp_aidaemon_peers_post_board"},"words":"Posting to the agents' board"}"#,
+            ),
+            event(
+                9,
+                "step",
+                r#"{"id":"i4","parent":null,"tool":{"kind":"other","name":"mcp__synthetic__lookup"},"words":"Using mcp__synthetic__lookup"}"#,
+            ),
+            event(10, "turn_ended", r#"{"failed":false}"#),
         ];
         let detail = detail("cli-agent-1", run, &events, false);
         assert_eq!(detail.agent_session_id.as_deref(), Some("thread-1"));
         assert!(detail.can_continue, "its agent kept the session it named");
         assert_eq!(detail.model.as_deref(), Some("synthetic-large"));
         assert_eq!(detail.task, "Review the slug module");
-        assert_eq!(detail.steps.len(), 2);
+        assert_eq!(detail.steps.len(), 4);
         assert_eq!(detail.steps[0].words, "Running pytest");
+        // Each step's kind and, for a file it changed, the file.
+        let kinds: Vec<RunStepKind> = detail.steps.iter().map(|step| step.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RunStepKind::Run,
+                RunStepKind::Edit,
+                RunStepKind::Coordinate,
+                RunStepKind::Other
+            ]
+        );
+        assert_eq!(detail.steps[0].path, None);
+        assert_eq!(
+            detail.steps[1].path.as_deref(),
+            Some("/w/synthetic/slug.py")
+        );
         assert_eq!(detail.steps[0].state, RunStepState::Failed);
         assert_eq!(detail.steps[0].at_ms, Some(1_767_323_045_000));
         // No end on record, but its turn ended: done.

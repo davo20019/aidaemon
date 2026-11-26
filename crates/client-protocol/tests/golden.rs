@@ -1483,6 +1483,8 @@ fn server_samples() -> Vec<ServerFrame> {
                     state: RunStepState::Done,
                     at_ms: Some(1_767_225_660_000),
                     by_helper: false,
+                    kind: RunStepKind::Edit,
+                    path: Some("/w/synthetic/release.md".into()),
                 }],
                 plan: vec![RunPlanItem {
                     text: "Write the notes".into(),

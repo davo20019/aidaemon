@@ -16,7 +16,8 @@
 //! it as soon as that starts.
 
 use aidaemon_client_protocol::{
-    ModelChoice, RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
+    ModelChoice, RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepItem,
+    RunStepKind, RunStepState, RunSummary,
 };
 use nsh_base::{button, input};
 use nsh_core::platform::Idiom;
@@ -1033,6 +1034,7 @@ fn steps(store: Store, run: &RunSummary) -> View {
         .as_ref()
         .is_some_and(|result| !result.text.trim().is_empty());
     let open = signal(run.phase == RunPhase::Running || !has_reply);
+    let coding = store.is_coding(&run.session_id);
     view().child(dynamic(move || {
         let Read::Ready(detail) = store.run_view() else {
             return None;
@@ -1055,7 +1057,9 @@ fn steps(store: Store, run: &RunSummary) -> View {
                 view()
                     .gap_1()
                     .child(ui::quiet_disclosure(label, open))
-                    .child(ui::unfold(open, move || body(detail.clone())))
+                    .child(ui::unfold(open, move || {
+                        body(store, detail.clone(), coding)
+                    }))
             })
         })
     }))
@@ -1362,7 +1366,7 @@ fn note(words: String) -> View {
 }
 
 /// The run's steps, plan, permissions, and what it ran on and cost.
-fn body(detail: RunDetail) -> View {
+fn body(store: Store, detail: RunDetail, coding: bool) -> View {
     let mut page = view().gap_3().pt_1().pl(px(4.0));
     if !detail.plan.is_empty() {
         let mut plan = view().gap_1();
@@ -1378,13 +1382,21 @@ fn body(detail: RunDetail) -> View {
     }
     if !detail.steps.is_empty() {
         let mut steps = view().gap_1();
+        // Routine steps in a row fold into one line that opens them; what
+        // the owner looks for keeps its own ([`stands_alone`]).
+        let mut routine: Vec<RunStepItem> = Vec::new();
         for step in &detail.steps {
-            let (glyph, tone) = match step.state {
-                RunStepState::Done => (Glyph::Check, Tone::Success),
-                RunStepState::Failed => (Glyph::Warning, Tone::Danger),
-                _ => (Glyph::Work, Tone::Accent),
-            };
-            steps = steps.child(line(glyph, tone, step.words.clone(), step.by_helper));
+            if stands_alone(step) {
+                if !routine.is_empty() {
+                    steps = steps.child(folded(std::mem::take(&mut routine)));
+                }
+                steps = steps.child(step_row(store, step, coding));
+            } else {
+                routine.push(step.clone());
+            }
+        }
+        if !routine.is_empty() {
+            steps = steps.child(folded(routine));
         }
         page = page.child(steps);
     }
@@ -1459,6 +1471,104 @@ fn body(detail: RunDetail) -> View {
     page
 }
 
+/// Whether a step keeps a row of its own: a change, a failure, one still
+/// going, or the agents working together. Steps from a daemon that does not
+/// say their kind all do.
+fn stands_alone(step: &RunStepItem) -> bool {
+    step.state != RunStepState::Done
+        || matches!(
+            step.kind,
+            RunStepKind::Edit
+                | RunStepKind::Delegate
+                | RunStepKind::Coordinate
+                | RunStepKind::Unknown
+        )
+}
+
+/// One step's row; a file it changed opens its diff in Changes.
+fn step_row(store: Store, step: &RunStepItem, coding: bool) -> View {
+    let (glyph, tone) = match step.state {
+        RunStepState::Done => (Glyph::Check, Tone::Success),
+        RunStepState::Failed => (Glyph::Warning, Tone::Danger),
+        _ => (Glyph::Work, Tone::Accent),
+    };
+    let row = line(glyph, tone, step.words.clone(), step.by_helper);
+    match (&step.path, step.kind) {
+        (Some(path), RunStepKind::Edit) if coding => {
+            let path = path.clone();
+            view().child(
+                button()
+                    .accessibility_label(format!("{}, show what changed", step.words))
+                    .on_press(move || store.show_change(&path))
+                    .child(row),
+            )
+        }
+        _ => row,
+    }
+}
+
+/// Routine steps in a row: one alone is its own line; more are one line
+/// ("Read 6 files · ran 4 commands") that opens them.
+fn folded(steps: Vec<RunStepItem>) -> View {
+    let row = |step: &RunStepItem| {
+        line(
+            Glyph::Check,
+            Tone::Success,
+            step.words.clone(),
+            step.by_helper,
+        )
+    };
+    if steps.len() == 1 {
+        return row(&steps[0]);
+    }
+    let open = signal(false);
+    view()
+        .gap_1()
+        .child(ui::quiet_disclosure(routine_summary(&steps), open))
+        .child(ui::unfold(open, move || {
+            let mut list = view().gap_1().pl(px(8.0));
+            for step in &steps {
+                list = list.child(row(step));
+            }
+            list
+        }))
+}
+
+/// What a fold of routine steps did, by kind, in their first order.
+fn routine_summary(steps: &[RunStepItem]) -> String {
+    let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
+    for step in steps {
+        match counts.iter_mut().find(|(kind, _)| *kind == step.kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((step.kind, 1)),
+        }
+    }
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            one.to_string()
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let parts: Vec<String> = counts
+        .into_iter()
+        .map(|(kind, n)| match kind {
+            RunStepKind::Read => format!("read {}", plural(n, "a file", "files")),
+            RunStepKind::Search => format!("searched {}", plural(n, "once", "times")),
+            RunStepKind::Run => format!("ran {}", plural(n, "a command", "commands")),
+            RunStepKind::Fetch => format!("looked up {}", plural(n, "a page", "pages")),
+            RunStepKind::Plan => "updated its plan".to_string(),
+            _ => format!("used {}", plural(n, "another tool", "other tools")),
+        })
+        .collect();
+    let words = parts.join(" · ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => words,
+    }
+}
+
 fn section(title: &'static str, content: View) -> View {
     view().gap_1().child(section_label(title)).child(content)
 }
@@ -1484,7 +1594,47 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOCUSED_REPLY_BUDGET, clean_asked_text, is_owner_prompt, markdown_preview};
+    use super::{
+        FOCUSED_REPLY_BUDGET, clean_asked_text, is_owner_prompt, markdown_preview, routine_summary,
+        stands_alone,
+    };
+    use aidaemon_client_protocol::{RunStepItem, RunStepKind, RunStepState};
+
+    fn step(kind: RunStepKind, state: RunStepState) -> RunStepItem {
+        RunStepItem {
+            words: String::new(),
+            state,
+            at_ms: None,
+            by_helper: false,
+            kind,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn routine_steps_are_summed_up_by_kind_in_their_order() {
+        use RunStepKind::*;
+        let steps: Vec<RunStepItem> = [Run, Read, Read, Run, Other, Search]
+            .into_iter()
+            .map(|kind| step(kind, RunStepState::Done))
+            .collect();
+        assert_eq!(
+            routine_summary(&steps),
+            "Ran 2 commands · read 2 files · used another tool · searched once"
+        );
+    }
+
+    #[test]
+    fn changes_failures_running_steps_and_teamwork_keep_their_own_rows() {
+        use RunStepKind::*;
+        assert!(!stands_alone(&step(Read, RunStepState::Done)));
+        assert!(stands_alone(&step(Read, RunStepState::Failed)));
+        assert!(stands_alone(&step(Run, RunStepState::Started)));
+        assert!(stands_alone(&step(Edit, RunStepState::Done)));
+        assert!(stands_alone(&step(Coordinate, RunStepState::Done)));
+        // An older daemon says no kind: nothing folds.
+        assert!(stands_alone(&step(Unknown, RunStepState::Done)));
+    }
     use aidaemon_client_protocol::{RunAsked, RunPhase, RunSummary};
 
     fn sample_run(asked: Option<RunAsked>) -> RunSummary {

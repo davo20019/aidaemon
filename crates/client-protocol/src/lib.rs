@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 55;
+pub const PROTOCOL_MINOR: u16 = 56;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3281,6 +3281,44 @@ pub struct RunStepItem {
     /// One of the agent's own helpers ran it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub by_helper: bool,
+    /// What kind of step it is (protocol 1.56), so a client can fold
+    /// routine ones together; `Unknown` from an older daemon.
+    #[serde(default, skip_serializing_if = "RunStepKind::is_unknown")]
+    pub kind: RunStepKind,
+    /// The file it read or changed, where it names one (protocol 1.56).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// What a run's step did, by its typed event (protocol 1.56).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStepKind {
+    Read,
+    Search,
+    Edit,
+    /// Ran a command.
+    Run,
+    /// Looked something up online.
+    Fetch,
+    /// Asked one of its own helpers.
+    Delegate,
+    /// Updated its plan.
+    Plan,
+    /// Worked with the other agents of its run (handing work over,
+    /// messaging, the shared board).
+    Coordinate,
+    /// Any other tool.
+    Other,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl RunStepKind {
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

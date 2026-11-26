@@ -48,7 +48,7 @@ pub use agent::{
 };
 pub use events::{
     AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, command_key, command_keys, host_of,
-    program_of,
+    is_coordination_tool, program_of,
 };
 pub use mode::{PermissionMode, mode_within, modes_within};
 pub use models::{ModelListing, list_models};

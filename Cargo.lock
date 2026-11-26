@@ -113,6 +113,7 @@ dependencies = [
  "aidaemon-client-core",
  "aidaemon-client-gateway",
  "aidaemon-client-protocol",
+ "aidaemon-coding-agents",
  "aidaemon-core",
  "aidaemon-decisions",
  "aidaemon-eval",

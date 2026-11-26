@@ -231,7 +231,13 @@ fn tool_record(tool: &StepTool) -> Value {
     }
 }
 
-/// A path's last component.
+/// Whether `name` is a tool of the daemon's own coordination server
+/// ([`crate::peer`]), as an agent spells it: such a step is the agents
+/// working together, not routine work.
+pub fn is_coordination_tool(name: &str) -> bool {
+    coordination_words(name).is_some()
+}
+
 /// A call to the daemon's own coordination tools ([`crate::peer`]) in
 /// plain words, by the tool's name as each agent spells an MCP tool:
 /// `mcp__<server>__<tool>` (Claude Code), `<server>.<tool>` (Codex) and
@@ -259,6 +265,7 @@ fn coordination_words(name: &str) -> Option<&'static str> {
     })
 }
 
+/// A path's last component.
 fn file_name(path: &str) -> String {
     let trimmed = path.trim_end_matches(['/', '\\']);
     trimmed
