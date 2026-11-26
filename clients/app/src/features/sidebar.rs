@@ -438,6 +438,13 @@ fn menu_row(store: Store, id: String, dated: bool) -> View {
             move || store.archive_session(&session, !archived),
         ));
     }
+    {
+        let session = id.clone();
+        actions.push(
+            ui::MenuAction::new("Delete…", move || confirm_delete_session(store, &session))
+                .shown_when(move || store.can_delete_sessions()),
+        );
+    }
     let (preview, title, open) = (id.clone(), id.clone(), id.clone());
     let is_open = computed(move || store.selected().as_deref() == Some(open.as_str()));
     // While the menu is up its row is the marked one, whichever
@@ -1054,6 +1061,20 @@ fn confirm_delete(store: Store, id: &str) {
         format!("{moved}{folder}"),
         "Delete",
         move || store.delete_project(&id),
+    );
+}
+
+/// Ask, then delete a conversation for good, as `/wipe` erases one.
+fn confirm_delete_session(store: Store, id: &str) {
+    let title = untracked(|| store.title(id));
+    let id = id.to_owned();
+    ui::confirm(
+        format!("Delete {title}?"),
+        "Its messages, runs and summaries are erased for good, and its running work stops. \
+         Facts already saved to memory are kept."
+            .to_owned(),
+        "Delete",
+        move || store.delete_session(&id),
     );
 }
 

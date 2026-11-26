@@ -1596,6 +1596,55 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
 }
 
 #[test]
+fn a_conversation_is_deleted_after_asking_and_only_on_a_daemon_that_deletes() -> Result<(), String>
+{
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let sessions = r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-21","channel":"app","title":"HERON plan","writable":true},{"id":"app:synthetic-22","channel":"app","title":"Kept notes","writable":true}]}}"#;
+    // A daemon older than 1.59 does not delete: no Delete in the menu.
+    feed([
+        Update::Connected,
+        frame(r#"{"type":"welcome","version":{"major":1,"minor":58},"owner":{},"latest_seq":0}"#),
+        frame(sessions),
+    ]);
+    app.wait_for("HERON plan")?;
+    open_menu(&mut app, "HERON plan >> nth=0", "Rename")?;
+    assert!(!app.screen().shows("Delete…"), "no Delete on a 1.58 daemon");
+    app.press_key("Escape")?;
+    feed([
+        frame(r#"{"type":"welcome","version":{"major":1,"minor":59},"owner":{},"latest_seq":0}"#),
+        frame(sessions),
+    ]);
+    // Delete asks first and says what goes.
+    open_menu(&mut app, "HERON plan >> nth=0", "Delete…")?;
+    app.answer_dialogs_myself();
+    let before = sent("delete_session");
+    app.press("Delete…")?;
+    let asked = app
+        .pending_dialog()
+        .map(|d| (d.title.clone(), d.message.clone()));
+    assert_eq!(
+        asked,
+        Some((
+            Some("Delete HERON plan?".to_owned()),
+            Some(
+                "Its messages, runs and summaries are erased for good, and its running work stops. Facts already saved to memory are kept."
+                    .to_owned()
+            )
+        ))
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Delete".into()))?;
+    wait_sent_new("delete_session", before)?;
+    feed([frame(
+        r#"{"type":"event","seq":3,"at_ms":3,"event":{"type":"session_deleted","session_id":"app:synthetic-21"}}"#,
+    )]);
+    app.wait_for_gone("HERON plan", std::time::Duration::from_secs(5))?;
+    app.wait_for("Kept notes")?;
+    Ok(())
+}
+
+#[test]
 fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

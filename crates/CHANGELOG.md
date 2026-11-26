@@ -12,6 +12,14 @@ stability promise.
 
 ## [Unreleased]
 
+### Added
+- `aidaemon-client-protocol` 1.59: `Command::DeleteSession` and the durable `Event::SessionDeleted`, sent when a conversation is deleted or wiped; `aidaemon-client-core` drops it (`Client::delete_session`, `Client::can_delete_sessions`).
+- `aidaemon-channels`: `TurnObserver::session_erased`; `SharedCommands::erase_session`, the erase a confirmed `/wipe` makes.
+- `aidaemon-client-gateway`: `ClientHost::delete_session`; logging `session_deleted` erases the conversation's events from the client log; read-only commands' replies are no longer remembered.
+- `aidaemon-store-sqlite`: `SqliteClientEventLog::erase_session`; `erase_session_in_tx` also erases the conversation's client-log events.
+- `aidaemon-mcp`: `ScopedEndpoint::rebind`.
+- `aidaemon-coding-agents`: `PeerTree::continue_root`, `PeerTree::snapshot`, `PeerTree::restore` and `PeerTreeSnapshot`: a conversation's peer tree goes on across its exchanges and a restart.
+
 ### Changed
 - `aidaemon-client-gateway`: `FileStore::rotate_key`; revoking a device rotates the file-link key.
 - `aidaemon-client-core`: `Client::resign_files` takes the current time and re-reads at most once a minute; `Client::resign_project_file`.

@@ -3621,6 +3621,23 @@ impl Store {
         }));
     }
 
+    /// Delete conversation `id` for good (the owner confirmed): off the
+    /// screen and out of the pins now; the daemon erases it, and its
+    /// `session_deleted` drops it from every client.
+    pub fn delete_session(&self, id: &str) {
+        if self.selected.get_untracked().as_deref() == Some(id) {
+            self.select(None);
+        }
+        self.pins.update(|p| {
+            if p.remove(id) {
+                let text = p.iter().cloned().collect::<Vec<_>>().join("\n");
+                let _ = nsh_core::storage::Storage::set_item(PINS_KEY, text);
+            }
+        });
+        self.act(|c| c.delete_session(id));
+        self.say("Deleted");
+    }
+
     /// Take back archiving conversation `id`: it is in the list again,
     /// and on screen if it was when it was archived.
     pub fn undo_archive(&self, id: &str) {
@@ -3680,6 +3697,11 @@ impl Store {
     }
 
     /// Whether a waiting message can be given to the running work now.
+    /// Whether the daemon deletes conversations (protocol 1.59).
+    pub fn can_delete_sessions(&self) -> bool {
+        self.read(|c| c.can_delete_sessions())
+    }
+
     pub fn can_send_queued_now(&self) -> bool {
         self.read(|c| c.can_send_queued_now())
     }

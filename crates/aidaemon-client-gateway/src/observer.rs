@@ -317,6 +317,17 @@ impl GatewayObserver {
 }
 
 impl TurnObserver for GatewayObserver {
+    fn session_erased(&self, session_id: &str) {
+        // Logged with no conversation of its own, so the erase that follows
+        // it in the log keeps it.
+        self.publisher.publish(
+            None,
+            Event::SessionDeleted {
+                session_id: session_id.to_string(),
+            },
+        );
+    }
+
     fn turn_started(&self, turn: &TurnStart<'_>) {
         if turn.platform != APP_CHANNEL
             && let Ok(mut contexts) = self.contexts.lock()

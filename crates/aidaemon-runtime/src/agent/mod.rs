@@ -777,9 +777,15 @@ impl Agent {
         .summary())
     }
 
-    /// HARD-clear a session (destructive: deletes events). Backs `/wipe`.
+    /// HARD-clear a session (destructive: deletes events). Backs `/wipe`
+    /// and deleting a conversation. Whoever sees every turn (the Client
+    /// Gateway) is told, so it drops its own copy of the conversation.
     pub async fn clear_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.state.clear_session(session_id).await
+        self.state.clear_session(session_id).await?;
+        if let Some(observer) = self.turn_watch().and_then(|watch| watch.observer()) {
+            observer.session_erased(session_id);
+        }
+        Ok(())
     }
 
     /// Reset a session's conversation context non-destructively (events remain

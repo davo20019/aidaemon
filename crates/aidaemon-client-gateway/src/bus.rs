@@ -110,6 +110,13 @@ impl EventBus {
                 return None;
             }
         };
+        // An erased conversation: what was logged of it goes, now that the
+        // erase itself is the newest event (the log never loses its newest).
+        if let Event::SessionDeleted { session_id: erased } = &event
+            && let Err(error) = self.log.erase_session(OWNER, erased).await
+        {
+            warn!(%error, "Could not erase a deleted conversation from the client log");
+        }
         let _ = self.live.send(Arc::new(ServerFrame::Event {
             seq: Some(seq),
             at_ms,
@@ -172,4 +179,75 @@ fn owner_event(event: Event) -> Event {
         return event;
     }
     serde_json::from_value(redacted).unwrap_or(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn bus() -> EventBus {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        EventBus::new(SqliteClientEventLog::open(pool).await.unwrap())
+    }
+
+    fn said(session: &str, text: &str) -> Event {
+        Event::AssistantMessage {
+            session_id: session.to_string(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    /// An erased conversation leaves nothing in the log but the erase
+    /// itself; another conversation's events stay, and numbering goes on.
+    #[tokio::test]
+    async fn an_erased_conversation_leaves_only_its_erase_in_the_log() {
+        let bus = bus().await;
+        bus.publish(
+            Some("app:synthetic-a".into()),
+            said("app:synthetic-a", "HERON erased text"),
+        )
+        .await
+        .unwrap();
+        bus.publish(
+            Some("app:synthetic-b".into()),
+            said("app:synthetic-b", "kept"),
+        )
+        .await
+        .unwrap();
+        // The erased conversation's event is the newest before the erase.
+        bus.publish(
+            Some("app:synthetic-a".into()),
+            said("app:synthetic-a", "HERON newest"),
+        )
+        .await
+        .unwrap();
+        let erase = bus
+            .publish(
+                None,
+                Event::SessionDeleted {
+                    session_id: "app:synthetic-a".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let frames = bus.after(0, 100).await.unwrap();
+        let text = serde_json::to_string(&frames).unwrap();
+        assert!(!text.contains("HERON"), "{text}");
+        assert!(text.contains("kept"), "{text}");
+        assert!(text.contains("session_deleted"), "{text}");
+        let next = bus
+            .publish(
+                Some("app:synthetic-b".into()),
+                said("app:synthetic-b", "after"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next, erase + 1, "numbering goes on");
+    }
 }

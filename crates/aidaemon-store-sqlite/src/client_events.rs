@@ -356,6 +356,22 @@ impl SqliteClientEventLog {
         Ok(done.rows_affected())
     }
 
+    /// Remove every event of conversation `session_id` (it was erased),
+    /// but never the owner's newest event, so numbering goes on. Returns
+    /// how many were removed.
+    pub async fn erase_session(&self, owner: &str, session_id: &str) -> Result<u64, Error> {
+        let done = sqlx::query(
+            "DELETE FROM client_events
+             WHERE owner = ?1 AND session_id = ?2
+               AND seq < (SELECT MAX(seq) FROM client_events WHERE owner = ?1)",
+        )
+        .bind(owner)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Remove events older than `before_ms`, and beyond the newest
     /// `keep_newest`, but never the owner's newest event. Returns how many
     /// were removed.

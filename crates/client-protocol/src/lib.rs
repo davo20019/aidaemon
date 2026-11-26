@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 58;
+pub const PROTOCOL_MINOR: u16 = 59;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -469,6 +469,11 @@ pub enum Command {
     /// Archive a conversation, or bring it back (protocol 1.17). Answers
     /// with `reply`; `session_updated` follows.
     ArchiveSession { session_id: String, archived: bool },
+    /// Delete a conversation for good (protocol 1.59): its running work
+    /// stops and everything of it is erased (messages, runs, summaries,
+    /// what clients were sent of it), as `/wipe` does. Facts already saved
+    /// to memory are kept. Answers with `reply`; `session_deleted` follows.
+    DeleteSession { session_id: String },
     /// Undo the uncommitted changes to one file of a session's changes
     /// (protocol 1.17): a changed or deleted file goes back to its last
     /// commit, a new one is removed. `root` and `path` as `get_changes`
@@ -2367,6 +2372,12 @@ pub enum Event {
     ProjectDeleted {
         project_id: String,
     },
+    /// A conversation was erased (protocol 1.59): deleted, or wiped with
+    /// `/wipe`. Clients drop everything they hold of it (its messages,
+    /// turns, runs, approvals) and leave it if it is open.
+    SessionDeleted {
+        session_id: String,
+    },
     /// Only with capability `goals`.
     GoalUpdated {
         goal: GoalSummary,
@@ -2465,6 +2476,7 @@ impl Event {
             Event::AgentRenamed { .. } => "agent_renamed",
             Event::ProjectUpdated { .. } => "project_updated",
             Event::ProjectDeleted { .. } => "project_deleted",
+            Event::SessionDeleted { .. } => "session_deleted",
             Event::GoalUpdated { .. } => "goal_updated",
             Event::ViewAction { .. } => "view_action",
             Event::SettingsUpdated { .. } => "settings_updated",

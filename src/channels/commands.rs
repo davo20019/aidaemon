@@ -64,6 +64,12 @@ impl CommandContext {
         reload_config(self.agent.as_ref(), &self.config_path).await
     }
 
+    /// Erase conversation `session_id` for good, as a confirmed `/wipe`
+    /// does; returns what was stopped.
+    pub(crate) async fn erase_session(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        self.shared().erase_session(session_id).await
+    }
+
     /// The menu and `/help` entries of the daemon's own shared commands
     /// (devices, exposure).
     pub(crate) fn extension_commands(&self) -> Vec<aidaemon_channels::slash::CommandDef> {

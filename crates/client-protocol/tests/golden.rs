@@ -280,6 +280,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RenameSession { .. } => "rename_session",
         Command::RenameAgent { .. } => "rename_agent",
         Command::ArchiveSession { .. } => "archive_session",
+        Command::DeleteSession { .. } => "delete_session",
         Command::RevertFile { .. } => "revert_file",
         Command::ListProjectFiles { .. } => "list_project_files",
         Command::ReadProjectFile { .. } => "read_project_file",
@@ -617,6 +618,12 @@ fn client_samples() -> Vec<ClientFrame> {
             },
         ),
         command(
+            "5d0c2b1e-0022d",
+            Command::DeleteSession {
+                session_id: "app:6c1f".into(),
+            },
+        ),
+        command(
             "5d0c2b1e-0023",
             Command::RevertFile {
                 session_id: "app:6c1f".into(),
@@ -890,6 +897,12 @@ fn server_samples() -> Vec<ServerFrame> {
             Some(10),
             Event::ProjectDeleted {
                 project_id: "project-acme".into(),
+            },
+        ),
+        event(
+            Some(10),
+            Event::SessionDeleted {
+                session_id: "app:6c1f".into(),
             },
         ),
         event(

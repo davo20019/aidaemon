@@ -341,6 +341,9 @@ pub trait TurnObserver: Send + Sync {
     /// started, took a step or ended, from the runtime's record of it. Its
     /// updates go on after the turn that started it is over.
     fn run_changed(&self, _change: &RunChange) {}
+    /// Conversation `session_id` was erased (`/wipe`, or deleted from a
+    /// client): whoever keeps a copy of what it said drops it.
+    fn session_erased(&self, _session_id: &str) {}
 }
 
 /// A helper run as its record stands after a change, for a

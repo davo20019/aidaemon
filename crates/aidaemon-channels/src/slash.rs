@@ -917,6 +917,23 @@ impl SharedCommands {
         }
     }
 
+    /// Erase conversation `session_id` for good, as a confirmed `/wipe`
+    /// does (and deleting it from a client): its running work stops, then
+    /// everything of it in the active database goes. Returns what was
+    /// stopped, for the reply.
+    pub async fn erase_session(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        let stopped_work =
+            crate::stop::stop_background_work(&self.task_registry, self.agent.as_ref(), session_id)
+                .await;
+        let cancelled = self
+            .task_registry
+            .cancel_running_for_session(session_id)
+            .await;
+        // Destructive: erases this session's active database artifacts.
+        self.agent.clear_session(session_id).await?;
+        Ok(stopped_with_turns(cancelled.len(), stopped_work))
+    }
+
     async fn handle_wipe(&self, session_id: &str) -> String {
         // Irreversible, and one tap away from /clear in the command menu:
         // the first /wipe only asks.
@@ -933,18 +950,8 @@ impl SharedCommands {
                 crate::tasks::WIPE_CONFIRM_WINDOW.as_secs() / 60
             );
         }
-        let stopped_work =
-            crate::stop::stop_background_work(&self.task_registry, self.agent.as_ref(), session_id)
-                .await;
-        let cancelled = self
-            .task_registry
-            .cancel_running_for_session(session_id)
-            .await;
-
-        // Destructive: erases this session's active database artifacts.
-        match self.agent.clear_session(session_id).await {
-            Ok(_) => {
-                let stopped = stopped_with_turns(cancelled.len(), stopped_work);
+        match self.erase_session(session_id).await {
+            Ok(stopped) => {
                 let suffix = clear_suffix(&[], &stopped);
                 format!(
                     "Conversation erased from the active database (events, exact-search index, \

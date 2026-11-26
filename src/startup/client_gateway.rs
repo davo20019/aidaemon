@@ -900,6 +900,15 @@ impl ClientHost for DaemonClientHost {
         super::client_sessions::archive(&self.system.pool, session_id, archived).await
     }
 
+    async fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        // The same erase a confirmed `/wipe` makes; the app asked first.
+        self.commands
+            .erase_session(session_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("Could not delete the conversation: {error}"))
+    }
+
     async fn revert_file(
         &self,
         session_id: &str,

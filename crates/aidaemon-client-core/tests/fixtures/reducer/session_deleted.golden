@@ -1,0 +1,62 @@
+{
+  "description": "session_deleted drops an erased conversation whole: its messages and runs go, another conversation stays.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:6c1f",
+        "text": "HERON erased",
+        "type": "user_message"
+      },
+      "seq": 1,
+      "session_id": "app:6c1f",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "origin": "app",
+        "session_id": "app:7d2e",
+        "text": "kept",
+        "type": "user_message"
+      },
+      "seq": 2,
+      "session_id": "app:7d2e",
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225603000,
+      "event": {
+        "session_id": "app:6c1f",
+        "type": "session_deleted"
+      },
+      "seq": 3,
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 3,
+    "notice": null,
+    "order": [
+      "app:7d2e"
+    ],
+    "sessions": {
+      "app:7d2e": {
+        "lines": [
+          {
+            "at_ms": 1767225602000,
+            "kind": "user",
+            "origin": "app",
+            "text": "kept"
+          }
+        ],
+        "live": null,
+        "summary": null
+      }
+    },
+    "tasks": {},
+    "view_request": null
+  }
+}

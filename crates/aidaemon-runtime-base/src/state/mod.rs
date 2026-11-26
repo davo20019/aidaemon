@@ -766,8 +766,32 @@ mod turn_id_hydration_tests {
             .await
             .unwrap();
 
+        // What the Client Gateway logged of it: all goes but the log's
+        // newest event (numbering), which the gateway's own erase removes.
+        let client_log = aidaemon_store_sqlite::SqliteClientEventLog::open(store.pool())
+            .await
+            .unwrap();
+        for (session, kind) in [(sess, "first"), ("sess-other", "kept"), (sess, "newest")] {
+            client_log
+                .append("owner", 1, Some(session), kind, None, "{}")
+                .await
+                .unwrap();
+        }
+
         // Destructive wipe: everything for the session is deleted.
         store.clear_session(sess).await.unwrap();
+        let left: Vec<(String, String)> =
+            sqlx::query_as("SELECT session_id, kind FROM client_events ORDER BY seq")
+                .fetch_all(&store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            left,
+            vec![
+                ("sess-other".to_string(), "kept".to_string()),
+                (sess.to_string(), "newest".to_string())
+            ]
+        );
         assert_eq!(
             store
                 .get_setting(&peer_tree_settings_key(sess, "agy"))

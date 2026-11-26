@@ -179,6 +179,16 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon does not archive conversations".to_string())
     }
 
+    /// Delete conversation `session_id` for good, as a confirmed `/wipe`
+    /// erases it (protocol 1.59): its work stops and everything of it goes.
+    /// The host's erase tells the gateway ([`TurnObserver::session_erased`]),
+    /// which drops what clients were sent of it. `Err`: why not.
+    ///
+    /// [`TurnObserver::session_erased`]: aidaemon_channels::turns::TurnObserver::session_erased
+    async fn delete_session(&self, _session_id: &str) -> Result<(), String> {
+        Err("This daemon does not delete conversations".to_string())
+    }
+
     /// Undo the uncommitted changes to `path` in repository `root`, one of
     /// session `session_id`'s; the changes after (protocol 1.17).
     async fn revert_file(
@@ -454,6 +464,70 @@ pub struct Publisher(mpsc::UnboundedSender<(Option<String>, Event)>);
 impl Publisher {
     pub fn publish(&self, session_id: Option<String>, event: Event) {
         let _ = self.0.send((session_id, event));
+    }
+}
+
+/// The scope a device needs for `command`; `None`: none beyond pairing, or
+/// a check of its own. `Observe` commands only read.
+fn needed_scope(command: &Command) -> Option<Scope> {
+    match command {
+        Command::SendMessage { .. }
+        | Command::StopTurn { .. }
+        | Command::CancelTask { .. }
+        | Command::ClearSession { .. }
+        | Command::RunSlash { .. } => Some(Scope::Chat),
+        Command::ResolveApproval { .. } => Some(Scope::Approve),
+        Command::ListSessions { .. }
+        | Command::GetHistory { .. }
+        | Command::GetGlance
+        | Command::GetSnapshot
+        | Command::GetSystem
+        | Command::SearchMessages { .. }
+        | Command::ListCommands
+        | Command::ListMemories
+        | Command::GetSettings
+        | Command::GetSetup
+        | Command::GetChanges { .. }
+        | Command::ListProjects
+        | Command::ListAutomations
+        | Command::GetRun { .. }
+        | Command::ListModels
+        | Command::GetSessionModel { .. } => Some(Scope::Observe),
+        Command::SetSessionModel { .. } => Some(Scope::Chat),
+        Command::ListQueued { .. } => Some(Scope::Observe),
+        Command::RenameSession { .. }
+        | Command::RenameAgent { .. }
+        | Command::ArchiveSession { .. }
+        | Command::DeleteSession { .. }
+        | Command::RevertFile { .. }
+        | Command::EditQueued { .. } => Some(Scope::Chat),
+        // A project's source is more than a watch should read; a device
+        // that may chat could ask the agent for it anyway.
+        Command::ListProjectFiles { .. } | Command::ReadProjectFile { .. } => Some(Scope::Chat),
+        Command::CreateProject { .. }
+        | Command::UpdateProject { .. }
+        | Command::DeleteProject { .. }
+        | Command::SetSessionProject { .. }
+        | Command::SetChannelProject { .. }
+        | Command::ChangeAutomation { .. }
+        | Command::EditAutomation { .. } => Some(Scope::Chat),
+        Command::ForgetMemory { .. }
+        | Command::UploadFile { .. }
+        | Command::ChangeSettings { .. }
+        | Command::Setup { .. } => Some(Scope::Chat),
+        Command::ListDevices => Some(Scope::Observe),
+        // The agent's screens (their sites and titles) are for a device
+        // that may watch them.
+        Command::ListSurfaces => Some(Scope::Control),
+        Command::PointAt { .. } | Command::ShareScreen { .. } => Some(Scope::Control),
+        Command::SetDeviceScopes { .. } => None,
+        Command::OpenSurface { .. }
+        | Command::CloseSurface { .. }
+        | Command::TakeControl { .. }
+        | Command::ReleaseControl { .. } => Some(Scope::Control),
+        // A shell runs anything here: checked below, beyond a scope.
+        Command::OpenShell { .. } | Command::CloseShell { .. } => Some(Scope::Control),
+        Command::Unknown => None,
     }
 }
 
@@ -887,6 +961,7 @@ impl ClientGateway {
             Some(device_id) => format!("{device_id}/{request_id}"),
             None => request_id.to_string(),
         };
+        let reads_only = needed_scope(&command) == Some(Scope::Observe);
         match log.remembered_reply(OWNER, &remembered_as).await {
             Ok(Some(reply)) => {
                 if let Ok(frame) = serde_json::from_str::<ServerFrame>(&reply) {
@@ -906,8 +981,11 @@ impl ClientGateway {
                 error,
             },
         };
-        // A reply worth retrying for is not remembered.
-        let keep = !matches!(&reply, ServerFrame::Error { error, .. } if error.retryable);
+        // A reply worth retrying for is not remembered, nor a read's: reading
+        // again is the same as replaying it, and a read's reply (history,
+        // search) holds conversation text an erase must not leave behind.
+        let keep =
+            !reads_only && !matches!(&reply, ServerFrame::Error { error, .. } if error.retryable);
         if keep && let Ok(text) = serde_json::to_string(&reply) {
             match log
                 .remember_reply(OWNER, &remembered_as, bus::now_ms(), &text)
@@ -930,64 +1008,7 @@ impl ClientGateway {
         command: Command,
         caller: &Caller,
     ) -> Result<CommandResult, ProtocolError> {
-        let needs = match &command {
-            Command::SendMessage { .. }
-            | Command::StopTurn { .. }
-            | Command::CancelTask { .. }
-            | Command::ClearSession { .. }
-            | Command::RunSlash { .. } => Some(Scope::Chat),
-            Command::ResolveApproval { .. } => Some(Scope::Approve),
-            Command::ListSessions { .. }
-            | Command::GetHistory { .. }
-            | Command::GetGlance
-            | Command::GetSnapshot
-            | Command::GetSystem
-            | Command::SearchMessages { .. }
-            | Command::ListCommands
-            | Command::ListMemories
-            | Command::GetSettings
-            | Command::GetSetup
-            | Command::GetChanges { .. }
-            | Command::ListProjects
-            | Command::ListAutomations
-            | Command::GetRun { .. }
-            | Command::ListModels
-            | Command::GetSessionModel { .. } => Some(Scope::Observe),
-            Command::SetSessionModel { .. } => Some(Scope::Chat),
-            Command::ListQueued { .. } => Some(Scope::Observe),
-            Command::RenameSession { .. }
-            | Command::RenameAgent { .. }
-            | Command::ArchiveSession { .. }
-            | Command::RevertFile { .. }
-            | Command::EditQueued { .. } => Some(Scope::Chat),
-            // A project's source is more than a watch should read; a device
-            // that may chat could ask the agent for it anyway.
-            Command::ListProjectFiles { .. } | Command::ReadProjectFile { .. } => Some(Scope::Chat),
-            Command::CreateProject { .. }
-            | Command::UpdateProject { .. }
-            | Command::DeleteProject { .. }
-            | Command::SetSessionProject { .. }
-            | Command::SetChannelProject { .. }
-            | Command::ChangeAutomation { .. }
-            | Command::EditAutomation { .. } => Some(Scope::Chat),
-            Command::ForgetMemory { .. }
-            | Command::UploadFile { .. }
-            | Command::ChangeSettings { .. }
-            | Command::Setup { .. } => Some(Scope::Chat),
-            Command::ListDevices => Some(Scope::Observe),
-            // The agent's screens (their sites and titles) are for a device
-            // that may watch them.
-            Command::ListSurfaces => Some(Scope::Control),
-            Command::PointAt { .. } | Command::ShareScreen { .. } => Some(Scope::Control),
-            Command::SetDeviceScopes { .. } => None,
-            Command::OpenSurface { .. }
-            | Command::CloseSurface { .. }
-            | Command::TakeControl { .. }
-            | Command::ReleaseControl { .. } => Some(Scope::Control),
-            // A shell runs anything here: checked below, beyond a scope.
-            Command::OpenShell { .. } | Command::CloseShell { .. } => Some(Scope::Control),
-            Command::Unknown => None,
-        };
+        let needs = needed_scope(&command);
         if let Some(scope) = needs
             && !self.pairing.may_now(&caller.principal, scope)
         {
@@ -1106,6 +1127,18 @@ impl ClientGateway {
                 }
                 Ok(CommandResult::Reply {
                     text: if archived { "Archived" } else { "Brought back" }.to_string(),
+                })
+            }
+            Command::DeleteSession { session_id } => {
+                self.host
+                    .delete_session(&session_id)
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                if let Some(desk) = self.shells.get() {
+                    desk.registry().close_session(&session_id);
+                }
+                Ok(CommandResult::Reply {
+                    text: "Deleted".to_string(),
                 })
             }
             Command::RevertFile {

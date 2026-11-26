@@ -135,6 +135,8 @@ const GET_SETTINGS_MINOR: u16 = 4;
 /// ignores the field and would take the message out, so it is never sent
 /// to one.
 const SEND_QUEUED_NOW_MINOR: u16 = 41;
+/// The protocol minor that deletes conversations.
+const DELETE_SESSION_MINOR: u16 = 59;
 
 /// Something read from the daemon, as last asked.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -3301,6 +3303,24 @@ impl Client {
         });
     }
 
+    /// Whether the daemon deletes conversations (protocol 1.59).
+    pub fn can_delete_sessions(&self) -> bool {
+        self.daemon_version
+            .is_some_and(|v| v.major == 1 && v.minor >= DELETE_SESSION_MINOR)
+    }
+
+    /// Delete conversation `id` for good (protocol 1.59); the client drops
+    /// it when `session_deleted` comes back. Nothing is sent to a daemon
+    /// that predates it.
+    pub fn delete_session(&mut self, id: &str) {
+        if !self.can_delete_sessions() {
+            return;
+        }
+        self.send(Command::DeleteSession {
+            session_id: id.to_owned(),
+        });
+    }
+
     /// Whether the owner archived conversation `id`.
     pub fn is_archived(&self, id: &str) -> bool {
         self.state
@@ -4035,6 +4055,27 @@ mod tests {
                 if run == "cli-agent-1" && text.is_empty() && attachments.len() == 1
         ));
         assert!(client.draft_files.is_empty());
+    }
+
+    /// A delete goes only to a daemon that deletes conversations.
+    #[test]
+    fn a_delete_is_sent_only_to_a_daemon_that_deletes() {
+        for (minor, sent) in [(58, false), (59, true)] {
+            let mut client = Client {
+                daemon_version: Some(aidaemon_client_protocol::ProtocolVersion { major: 1, minor }),
+                ..Client::default()
+            };
+            assert_eq!(client.can_delete_sessions(), sent, "1.{minor}");
+            client.delete_session("app:s1");
+            let deletes = client
+                .take_outgoing()
+                .into_iter()
+                .filter(|(_, command)| {
+                    matches!(command, Command::DeleteSession { session_id } if session_id == "app:s1")
+                })
+                .count();
+            assert_eq!(deletes, usize::from(sent), "1.{minor}");
+        }
     }
 
     /// "Send now" goes only to a daemon that knows it: an older one would

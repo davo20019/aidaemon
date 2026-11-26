@@ -473,8 +473,9 @@ impl RunStore for SqliteStore {
     }
 }
 
-/// Erase every run of one session from the journal and the checkpoints, in
-/// the caller's transaction (a `/wipe` deletes conversation text atomically).
+/// Erase every run of one session from the journal and the checkpoints, and
+/// what the Client Gateway logged of it, in the caller's transaction (a
+/// `/wipe` deletes conversation text atomically).
 ///
 /// `run_events` is append-only: a trigger aborts every `DELETE`. This is the
 /// one sanctioned exception. It drops the guard, deletes the session's rows
@@ -486,6 +487,26 @@ pub async fn erase_session_in_tx(
 ) -> Result<(), Error> {
     // A pool the run store was never opened on has no journal to erase, and
     // `/wipe` must still succeed there.
+    // What the Client Gateway sent clients of it, when it ever ran on
+    // this database: all but each owner's newest event, which keeps the
+    // numbering (the gateway's own erase removes that one after logging
+    // the erase itself).
+    let client_log: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'client_events'",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if client_log.is_some() {
+        sqlx::query(
+            "DELETE FROM client_events
+             WHERE session_id = ?1
+               AND seq < (SELECT MAX(n.seq) FROM client_events n
+                          WHERE n.owner = client_events.owner)",
+        )
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     let journaled: Option<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_states'",
     )

@@ -660,6 +660,19 @@ impl State {
                     }
                 }
             }
+            // Erased (deleted, or wiped): nothing of it stays on show.
+            Event::SessionDeleted { session_id } => {
+                self.sessions.remove(&session_id);
+                self.order.retain(|id| id != &session_id);
+                self.approvals
+                    .retain(|_, approval| approval.session_id != session_id);
+                self.tasks.retain(|_, task| task.session_id != session_id);
+                self.runs.retain(|_, run| run.session_id != session_id);
+                self.past_runs.retain(|_, run| run.session_id != session_id);
+                self.feature_requests
+                    .retain(|request| request.session_id != session_id);
+                self.shells.remove(&session_id);
+            }
             Event::TaskUpdated { task } => {
                 if matches!(task.state, TaskState::Running | TaskState::Cancelling) {
                     self.tasks.insert(task.id.clone(), task);
@@ -905,6 +918,47 @@ mod tests {
             session_id: Some("app:s1".into()),
             event,
         }
+    }
+
+    /// An erased conversation leaves nothing on show; another one stays.
+    #[test]
+    fn a_deleted_conversation_is_dropped_whole() {
+        use aidaemon_client_protocol::RunPhase;
+        let mut state = State::default();
+        let say = |session: &str, text: &str| ServerFrame::Event {
+            seq: None,
+            at_ms: 1,
+            session_id: Some(session.into()),
+            event: Event::AssistantMessage {
+                session_id: session.into(),
+                text: text.into(),
+                attachments: Vec::new(),
+                suggestions: Vec::new(),
+            },
+        };
+        state.apply(say("app:s1", "erased"));
+        state.apply(say("app:s2", "kept"));
+        state.apply(event(
+            Some(1),
+            Event::RunUpdated {
+                run: run("r1", RunPhase::Succeeded, 10),
+            },
+        ));
+        assert!(state.sessions.contains_key("app:s1"));
+        assert_eq!(state.runs_for("app:s1").len(), 1);
+        state.apply(ServerFrame::Event {
+            seq: Some(2),
+            at_ms: 2,
+            session_id: None,
+            event: Event::SessionDeleted {
+                session_id: "app:s1".into(),
+            },
+        });
+        assert!(!state.sessions.contains_key("app:s1"));
+        assert!(!state.order.iter().any(|id| id == "app:s1"));
+        assert!(state.runs_for("app:s1").is_empty());
+        assert!(state.sessions.contains_key("app:s2"));
+        assert_eq!(state.last_seq, Some(2));
     }
 
     fn run(id: &str, phase: aidaemon_client_protocol::RunPhase, at: u64) -> RunSummary {

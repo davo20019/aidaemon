@@ -122,6 +122,7 @@ pub fn Offline() -> impl IntoElement {
             "set_session_model",
             "edit_queued",
             "archive_session",
+            "delete_session",
             "revert_file",
             "set_session_project",
             "delete_project",
