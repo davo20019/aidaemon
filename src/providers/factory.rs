@@ -93,7 +93,7 @@ pub(crate) fn chatgpt_backend(
             },
         );
     let mut builder = aidaemon_providers::ChatGpt::builder()
-        .base_url(base_override.unwrap_or(crate::providers::chatgpt_login::CODEX_BACKEND_BASE_URL))
+        .base_url(base_override.unwrap_or(crate::providers::chatgpt_login::OPENAI_API_BASE_URL))
         .auth(DaemonChatGptAuth {
             manager: crate::providers::chatgpt_login::shared_credential_manager(),
             client,

@@ -122,7 +122,7 @@ impl CliAgentTool {
         // nothing; a key the owner gave it is handed to it at launch.
         let signed = match self
             .permissions()
-            .sign_in_of(tool_name)
+            .sign_in_of_for(tool_name, &*coding_agent)
             .and_then(|sign_in| coding_agent.signed_in(&sign_in))
         {
             Ok(signed) => signed,

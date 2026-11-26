@@ -1,8 +1,8 @@
 //! What each connected provider's account has used and has left, for the
-//! Providers tab: a ChatGPT plan's rolling limits and an OpenRouter key's
-//! balance (the providers that report one; see `aidaemon_providers::usage`).
-//! Readings are cached a minute, and Settings waits only briefly for a new
-//! one, so opening the page never stalls on a provider.
+//! Providers tab: an OpenRouter key's balance (the provider with a public
+//! usage endpoint; see `aidaemon_providers::usage`). Readings are cached a
+//! minute, and Settings waits only briefly for a new one, so opening the
+//! page never stalls on a provider.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -24,7 +24,6 @@ const WAIT_AT_MOST: Duration = Duration::from_secs(4);
 /// Where a provider's usage is read from.
 #[derive(Debug, Clone, PartialEq)]
 enum Source {
-    ChatGpt,
     OpenRouter { base_url: String, api_key: String },
 }
 
@@ -32,7 +31,6 @@ impl Source {
     /// The cache key: the account, never the secret itself.
     fn cache_key(&self, key_setting: &str) -> String {
         match self {
-            Source::ChatGpt => "chatgpt".to_string(),
             Source::OpenRouter { base_url, .. } => format!("openrouter {base_url} {key_setting}"),
         }
     }
@@ -81,9 +79,6 @@ fn source_of(
     table: &toml::Table,
     key: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Source> {
-    if provider.credential == CredentialState::SignedIn {
-        return Some(Source::ChatGpt);
-    }
     let base_url = if provider.base_url.is_empty() {
         aidaemon_providers::catalog::CATALOG
             .iter()
@@ -143,13 +138,6 @@ fn shown(usage: AccountUsage, now: SystemTime) -> ProviderUsage {
 
 async fn read(source: &Source) -> Option<ProviderUsage> {
     let result = match source {
-        Source::ChatGpt => match crate::providers::factory::chatgpt_backend(None, None) {
-            Ok(backend) => backend.usage().await,
-            Err(error) => {
-                debug!(%error, "No ChatGPT backend to read usage from");
-                return None;
-            }
-        },
         Source::OpenRouter { base_url, api_key } => {
             aidaemon_providers::usage::openrouter_usage(base_url, api_key).await
         }
@@ -230,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn only_chatgpt_and_openrouter_report_usage() {
+    fn only_openrouter_reports_usage() {
         let table = toml::Table::new();
         let stored = |_: &str| Some("sk-synthetic".to_string());
         assert_eq!(
@@ -239,7 +227,7 @@ mod tests {
                 &table,
                 &stored
             ),
-            Some(Source::ChatGpt)
+            None
         );
         assert_eq!(
             source_of(

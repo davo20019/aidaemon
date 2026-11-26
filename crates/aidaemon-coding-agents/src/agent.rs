@@ -74,6 +74,12 @@ pub trait CodingAgent: Send + Sync {
         &[]
     }
 
+    /// How it signs in when the owner has not chosen explicitly.
+    /// Defaults to [`crate::SignInMethod::Own`].
+    fn default_sign_in(&self) -> crate::SignInMethod {
+        crate::SignInMethod::Own
+    }
+
     /// A word about running it on its own sign-in, when there is one to
     /// say (shown while that is the choice).
     fn sign_in_note(&self) -> Option<crate::SignInNote> {

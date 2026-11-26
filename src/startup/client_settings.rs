@@ -1328,6 +1328,7 @@ impl SettingsHost {
                     &crate::config::config_file(&self.config_path),
                     &self.permissions,
                     &agent,
+                    &*coding_agent,
                     method,
                 )
                 .await
@@ -1664,7 +1665,7 @@ async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protoco
                 })
                 .unwrap_or_default(),
             sign_ins: agent.sign_ins().iter().copied().map(wire_sign_in).collect(),
-            sign_in: wire_sign_in(permissions.sign_in_method(&info.name)),
+            sign_in: wire_sign_in(permissions.sign_in_method_for(&info.name, &**agent)),
             sign_in_key_saved: !agent.sign_ins().is_empty()
                 && permissions.has_sign_in_key(&info.name),
             sign_in_note: agent.sign_in_note().map(|note| {
@@ -1794,7 +1795,7 @@ allowed_user_ids = [1]
         use aidaemon_runtime::tools::agent_mode::{self, AgentInfo};
         let registry = agent_mode::CodingAgents::builtin();
         agent_mode::publish(Arc::new(move || {
-            ["agy", "codex"]
+            ["agy", "gemini", "codex"]
                 .into_iter()
                 .map(|program| AgentInfo {
                     name: format!("synthetic-sign-in-{program}"),
@@ -1816,6 +1817,13 @@ allowed_user_ids = [1]
         assert_eq!(agy.sign_in, AgentSignIn::Own);
         assert!(!agy.sign_in_key_saved);
         assert!(agy.sign_in_note.is_some());
+        let gemini = agents
+            .iter()
+            .find(|a| a.name == "synthetic-sign-in-gemini")
+            .unwrap();
+        assert_eq!(gemini.sign_ins, vec![AgentSignIn::GeminiApiKey]);
+        assert_eq!(gemini.sign_in, AgentSignIn::Own);
+        assert!(gemini.sign_in_note.is_none());
         let codex = agents
             .iter()
             .find(|a| a.name == "synthetic-sign-in-codex")
@@ -1853,7 +1861,7 @@ allowed_user_ids = [1]
                 .unwrap_err()
                 .contains("can't sign in")
         );
-        // Back to its own sign-in needs nothing.
+        // Explicitly opting into its own sign-in needs nothing and persists.
         host.change(
             SettingsChange::SetAgentSignIn {
                 agent: "synthetic-sign-in-agy".into(),
@@ -1864,8 +1872,10 @@ allowed_user_ids = [1]
         )
         .await
         .unwrap();
+        let agy_agent = agent_mode::CodingAgents::builtin().for_program("agy");
         assert_eq!(
-            host.permissions.sign_in_method("synthetic-sign-in-agy"),
+            host.permissions
+                .sign_in_method_for("synthetic-sign-in-agy", &*agy_agent),
             aidaemon_runtime::tools::agent_mode::SignInMethod::Own
         );
     }

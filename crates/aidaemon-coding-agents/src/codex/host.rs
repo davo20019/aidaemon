@@ -352,7 +352,7 @@ pub fn initialize_line() -> String {
     request_line(
         INITIALIZE_ID,
         "initialize",
-        json!({"clientInfo": {"name": "aidaemon", "version": env!("CARGO_PKG_VERSION")}}),
+        json!({"clientInfo": {"name": "aidaemon", "title": "AIdaemon", "version": env!("CARGO_PKG_VERSION")}}),
     )
 }
 

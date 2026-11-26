@@ -13,13 +13,14 @@ pub fn shared_credential_manager() -> Arc<ChatGptCredentialManager> {
     SHARED
         .get_or_init(|| {
             let mut settings = LoginSettings::new("aidaemon", "aidaemon auth login openai");
-            // A public client id; the variable overrides it if OpenAI rotates it.
+            // Optional override for a pre-registered Sign in with ChatGPT
+            // client ID; unset uses OpenAI's dynamic open-source registration.
             if let Some(client_id) = std::env::var("AIDAEMON_CHATGPT_CLIENT_ID")
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
             {
-                settings.client_id = client_id;
+                settings.client_id = Some(client_id);
             }
             Arc::new(ChatGptCredentialManager::new(
                 crate::config::shared_secret_store(),

@@ -1,8 +1,8 @@
 //! What a provider account has used and has left, where the provider says:
-//! a ChatGPT plan's rolling limits ([`ChatGpt::usage`](crate::ChatGpt::usage))
-//! and an OpenRouter key's spend and balance ([`openrouter_usage`]).
-//! Other providers report no such thing to an API key (Anthropic only
-//! per-minute rate limits, Gemini nothing), so they have no reader here.
+//! an OpenRouter key's spend and balance ([`openrouter_usage`]). Other
+//! providers report no public balance/window endpoint (Anthropic only
+//! per-minute rate limits, ChatGPT plan usage lives in ChatGPT settings,
+//! Gemini nothing), so they have no reader here.
 
 use std::time::{Duration, SystemTime};
 
@@ -44,59 +44,6 @@ pub struct Balance {
     pub limit: Option<f64>,
     /// Left to spend; `None`: no cap.
     pub remaining: Option<f64>,
-}
-
-/// The `wham/usage` address for a Codex base URL
-/// (`https://chatgpt.com/backend-api/codex` → `.../backend-api/wham/usage`).
-pub(crate) fn chatgpt_usage_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    let base = base.strip_suffix("/codex").unwrap_or(base);
-    format!("{base}/wham/usage")
-}
-
-/// A ChatGPT plan's usage as `wham/usage` answers:
-/// `{"plan_type", "rate_limit": {"primary_window": {"used_percent",
-/// "limit_window_seconds", "reset_at" | "reset_after_seconds"},
-/// "secondary_window": ..}}`. `now` dates a reset given as a delay.
-pub fn parse_chatgpt_usage(body: &str, now: SystemTime) -> Option<AccountUsage> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let limits = value.get("rate_limit");
-    let mut windows: Vec<UsageWindow> = ["primary_window", "secondary_window"]
-        .iter()
-        .filter_map(|name| window(limits?.get(*name)?, now))
-        .collect();
-    windows.sort_by_key(|w| w.length);
-    let plan = value
-        .get("plan_type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|plan| !plan.is_empty())
-        .map(str::to_string);
-    (plan.is_some() || !windows.is_empty()).then_some(AccountUsage {
-        plan,
-        windows,
-        balance: None,
-    })
-}
-
-fn window(value: &Value, now: SystemTime) -> Option<UsageWindow> {
-    let number = |name: &str| {
-        value
-            .get(name)
-            .and_then(Value::as_f64)
-            .filter(|v| v.is_finite() && *v >= 0.0)
-    };
-    let used_percent = number("used_percent")?.min(100.0);
-    let length = Duration::from_secs_f64(number("limit_window_seconds")?);
-    let resets_at = number("reset_at")
-        .filter(|secs| *secs > 0.0)
-        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs))
-        .or_else(|| number("reset_after_seconds").map(|secs| now + Duration::from_secs_f64(secs)));
-    Some(UsageWindow {
-        length,
-        used_percent,
-        resets_at,
-    })
 }
 
 /// An OpenRouter key's spend and cap as `GET /key` answers:
@@ -193,68 +140,6 @@ pub async fn openrouter_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn at(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    #[test]
-    fn the_usage_address_sits_beside_the_codex_base() {
-        assert_eq!(
-            chatgpt_usage_url("https://chatgpt.com/backend-api/codex"),
-            "https://chatgpt.com/backend-api/wham/usage"
-        );
-        assert_eq!(
-            chatgpt_usage_url("https://example.test/backend-api/"),
-            "https://example.test/backend-api/wham/usage"
-        );
-    }
-
-    #[test]
-    fn a_chatgpt_plan_reads_its_windows_shortest_first() {
-        let body = r#"{
-            "plan_type": "plus",
-            "rate_limit": {
-                "allowed": true,
-                "limit_reached": false,
-                "secondary_window": {"used_percent": 18, "limit_window_seconds": 604800,
-                                     "reset_after_seconds": 3600},
-                "primary_window": {"used_percent": 42.5, "limit_window_seconds": 18000,
-                                   "reset_at": 1700000100}
-            },
-            "credits": {"has_credits": false, "unlimited": false, "balance": null}
-        }"#;
-        let usage = parse_chatgpt_usage(body, at(1_000)).unwrap();
-        assert_eq!(usage.plan.as_deref(), Some("plus"));
-        assert_eq!(
-            usage.windows,
-            vec![
-                UsageWindow {
-                    length: Duration::from_secs(18_000),
-                    used_percent: 42.5,
-                    resets_at: Some(at(1_700_000_100)),
-                },
-                UsageWindow {
-                    length: Duration::from_secs(604_800),
-                    used_percent: 18.0,
-                    resets_at: Some(at(4_600)),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_chatgpt_answer_without_limits_or_plan_is_none() {
-        assert_eq!(parse_chatgpt_usage(r#"{"rate_limit": null}"#, at(0)), None);
-        assert_eq!(parse_chatgpt_usage("not json", at(0)), None);
-        // A window missing its length is skipped, the plan kept.
-        let usage = parse_chatgpt_usage(
-            r#"{"plan_type": "pro", "rate_limit": {"primary_window": {"used_percent": 5}}}"#,
-            at(0),
-        )
-        .unwrap();
-        assert!(usage.windows.is_empty());
-    }
 
     #[test]
     fn an_openrouter_key_reads_its_cap_or_none() {

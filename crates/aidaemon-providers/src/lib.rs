@@ -6,8 +6,8 @@
 //!   OpenRouter, Ollama, llama.cpp, vLLM and other compatible servers.
 //! - [`Anthropic`]: the Messages API, with prompt caching of the stable
 //!   prefix (system prompt and tool definitions).
-//! - [`ChatGpt`]: models on a ChatGPT subscription through the Codex
-//!   backend's Responses API, with credentials from a [`ChatGptAuth`].
+//! - [`ChatGpt`]: models on a ChatGPT subscription through OpenAI's public
+//!   Responses API (`Sign in with ChatGPT`), with credentials from a [`ChatGptAuth`].
 //! - [`GoogleGenai`]: Gemini's `generateContent`, with thought signatures
 //!   carried in `ToolCall::provider_data` and Google Search grounding.
 //! - [`Xai`]: xAI's Responses API.
@@ -79,9 +79,9 @@ pub use anthropic::{
     AnthropicBuilder, THINKING_BLOCKS_KEY,
 };
 pub use chatgpt::{
-    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_LIST_CLIENT_VERSIONS,
-    CHATGPT_REASONING_EFFORTS, ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials,
-    ChatGptModel, StaticChatGptAuth, chatgpt_base_url_refusal,
+    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_REASONING_EFFORTS, ChatGpt,
+    ChatGptAuth, ChatGptBuilder, ChatGptCredentials, ChatGptModel, StaticChatGptAuth,
+    chatgpt_base_url_refusal,
 };
 pub use errors::{affordable_tokens, context_overflow, error_for_status};
 pub use google::{

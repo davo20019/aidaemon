@@ -46,10 +46,15 @@ pub struct AcpAgent {
     account: &'static str,
     /// What a client draws for it ([`CodingAgent::mark`]).
     mark: Option<&'static str>,
-    /// It can run on a Gemini API key AIdaemon hands it, in its own data
-    /// folder under `~/.gemini` (this name), apart from the owner's own
+    /// Whether this agent can authenticate with a Gemini API key supplied by
+    /// AIdaemon (`GEMINI_API_KEY`).
+    supports_gemini_key: bool,
+    /// When set, the agent keeps its Gemini-API-key settings in a dedicated
+    /// folder under `~/.gemini` (`--app-data-dir`), apart from the owner's own
     /// sessions with it.
     gemini_key_folder: Option<&'static str>,
+    /// Sign-in method used when the owner has not chosen one explicitly.
+    default_sign_in: crate::SignInMethod,
 }
 
 impl AcpAgent {
@@ -64,11 +69,14 @@ impl AcpAgent {
             arguments: None,
             account: "",
             mark: None,
+            supports_gemini_key: false,
             gemini_key_folder: None,
+            default_sign_in: crate::SignInMethod::Own,
         }
     }
 
-    /// Antigravity CLI (`agy acp`).
+    /// Antigravity CLI (`agy acp`). Uses its own sign-in by default; owners
+    /// can switch to a Gemini API key in Settings (see [`CodingAgent::sign_in_note`]).
     pub fn antigravity() -> Self {
         Self {
             discovery: Some(Discovery {
@@ -84,14 +92,17 @@ impl AcpAgent {
             }),
             account: "Its own Antigravity sign-in, or a Gemini API key you give AIdaemon.",
             mark: Some("gemini"),
+            supports_gemini_key: true,
             gemini_key_folder: Some(AGY_KEY_FOLDER),
+            default_sign_in: crate::SignInMethod::Own,
             ..Self::custom("Antigravity CLI", "agy", &["acp"])
         }
     }
 
     /// Gemini CLI (`gemini --acp`). Since 2026-06-18 Google serves it only
     /// to enterprise licences and paid API keys: a personal sign-in is
-    /// refused a session, which its readiness check reports.
+    /// refused a session, which its readiness check reports. Owners may also
+    /// supply a Gemini API key directly in Settings.
     pub fn gemini() -> Self {
         Self {
             discovery: Some(Discovery {
@@ -105,8 +116,9 @@ impl AcpAgent {
                 valued: &["--model", "-m"],
                 subcommands: &[],
             }),
-            account: "Its own Gemini CLI sign-in: a Google account or a Gemini API key.",
+            account: "Its own Gemini CLI sign-in (enterprise or API key), or a Gemini API key you give AIdaemon.",
             mark: Some("gemini"),
+            supports_gemini_key: true,
             ..Self::custom("Gemini CLI", "gemini", &["--acp"])
         }
     }
@@ -170,30 +182,36 @@ impl CodingAgent for AcpAgent {
     }
 
     fn sign_ins(&self) -> &[crate::SignInMethod] {
-        if self.gemini_key_folder.is_some() {
+        if self.supports_gemini_key {
             &[crate::SignInMethod::GeminiApiKey]
         } else {
             &[]
         }
     }
 
-    /// Google's FAQ: a consumer sign-in driven from another app is not
-    /// supported; a Gemini API key is.
+    fn default_sign_in(&self) -> crate::SignInMethod {
+        self.default_sign_in
+    }
+
+    /// Google's Antigravity terms/FAQ: consumer OAuth in third-party clients
+    /// is prohibited and risks account suspension; a Gemini API key is the
+    /// supported path (enterprise accounts may still opt into Own).
     fn sign_in_note(&self) -> Option<crate::SignInNote> {
         self.gemini_key_folder.map(|_| crate::SignInNote {
-            text: "Google prefers third-party apps to use agy with a Gemini API key.",
+            text: "Consumer OAuth risks suspension under Google's terms; use a Gemini API key.",
             link: "https://antigravity.google/docs/faq",
         })
     }
 
-    /// On a Gemini API key: its own data folder, whose settings name the
-    /// key as its sign-in (`agy acp` reads its sign-in from there and the
-    /// key from `GEMINI_API_KEY`), and no other Google credential in its
-    /// environment.
+    /// On a Gemini API key: when a dedicated data folder is configured
+    /// (`agy`), its settings name the key as its sign-in (`agy acp` reads its
+    /// sign-in from there and the key from `GEMINI_API_KEY`); otherwise
+    /// (`gemini`) the key is passed via `GEMINI_API_KEY`. In both cases other
+    /// Google credential environment variables are stripped.
     fn signed_in(&self, sign_in: &crate::SignIn) -> Result<crate::SignedIn, String> {
-        match (sign_in, self.gemini_key_folder) {
-            (crate::SignIn::Own, _) => Ok(crate::SignedIn::default()),
-            (crate::SignIn::GeminiApiKey(key), Some(folder)) => {
+        match (sign_in, self.supports_gemini_key, self.gemini_key_folder) {
+            (crate::SignIn::Own, _, _) => Ok(crate::SignedIn::default()),
+            (crate::SignIn::GeminiApiKey(key), true, Some(folder)) => {
                 let gemini = dirs::home_dir()
                     .ok_or("there is no home folder to keep its settings in")?
                     .join(".gemini");
@@ -207,7 +225,15 @@ impl CodingAgent for AcpAgent {
                         .collect(),
                 })
             }
-            (other, None) => Err(format!(
+            (crate::SignIn::GeminiApiKey(key), true, None) => Ok(crate::SignedIn {
+                args: Vec::new(),
+                env: vec![("GEMINI_API_KEY".into(), key.clone())],
+                env_remove: crate::sign_in::GOOGLE_CREDENTIAL_VARS
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            }),
+            (other, false, _) => Err(format!(
                 "{} can't sign in with {}",
                 self.name,
                 other.method().as_str()
@@ -394,18 +420,39 @@ mod tests {
     }
 
     #[test]
-    fn agy_on_a_gemini_key_uses_its_own_folder_and_only_that_key() {
+    fn agy_and_gemini_default_to_own_and_offer_gemini_key() {
         let agent = AcpAgent::antigravity();
         assert_eq!(agent.sign_ins(), [crate::SignInMethod::GeminiApiKey]);
+        assert_eq!(agent.default_sign_in(), crate::SignInMethod::Own);
         assert!(agent.sign_in_note().is_some());
         // Its own sign-in adds nothing.
         assert_eq!(
             agent.signed_in(&crate::SignIn::Own).unwrap(),
             crate::SignedIn::default()
         );
+        // Gemini CLI defaults to its own sign-in and also accepts a Gemini API key.
+        let gemini = AcpAgent::gemini();
+        assert_eq!(gemini.sign_ins(), [crate::SignInMethod::GeminiApiKey]);
+        assert_eq!(gemini.default_sign_in(), crate::SignInMethod::Own);
+        assert!(gemini.sign_in_note().is_none());
+        let gemini_signed = gemini
+            .signed_in(&crate::SignIn::GeminiApiKey("synthetic-key".into()))
+            .unwrap();
+        assert!(gemini_signed.args.is_empty());
+        assert_eq!(
+            gemini_signed.env,
+            vec![("GEMINI_API_KEY".into(), "synthetic-key".into())]
+        );
+        assert!(
+            gemini_signed
+                .env_remove
+                .iter()
+                .any(|v| v == "GOOGLE_API_KEY")
+        );
         // Another agent offers none.
         let other = AcpAgent::custom("Synthetic Agent", "synthetic-agent", &["--acp"]);
         assert!(other.sign_ins().is_empty());
+        assert_eq!(other.default_sign_in(), crate::SignInMethod::Own);
         assert!(other.sign_in_note().is_none());
         assert!(
             other

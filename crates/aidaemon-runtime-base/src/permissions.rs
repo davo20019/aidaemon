@@ -192,9 +192,14 @@ impl Permissions {
         let _ = self.1.set(secrets);
     }
 
-    /// How the owner chose the agent named `name` signs in.
-    pub fn sign_in_method(&self, name: &str) -> SignInMethod {
-        self.read().sign_ins.get(name).copied().unwrap_or_default()
+    /// How the agent named `name` signs in: the owner's explicit choice in
+    /// `[cli_agents.sign_in]`, or `agent.default_sign_in()` when unset.
+    pub fn sign_in_method_for(&self, name: &str, agent: &dyn CodingAgent) -> SignInMethod {
+        self.read()
+            .sign_ins
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| agent.default_sign_in())
     }
 
     /// Whether a key is saved for the agent named `name` to sign in with.
@@ -204,11 +209,12 @@ impl Permissions {
         })
     }
 
-    /// The sign-in the agent named `name` runs with, its key read now
-    /// (`Err`: the owner chose a key and none is saved, in words for the
-    /// owner).
-    pub fn sign_in_of(&self, name: &str) -> Result<SignIn, String> {
-        match self.sign_in_method(name) {
+    /// The sign-in `agent` (named `name`) runs with, honoring `agent.default_sign_in()`.
+    pub fn sign_in_of_for(&self, name: &str, agent: &dyn CodingAgent) -> Result<SignIn, String> {
+        let method = self.sign_in_method_for(name, agent);
+        let defaulted_to_key = agent.default_sign_in() == SignInMethod::GeminiApiKey
+            && !self.read().sign_ins.contains_key(name);
+        match method {
             SignInMethod::Own => Ok(SignIn::Own),
             SignInMethod::GeminiApiKey => self
                 .1
@@ -220,9 +226,16 @@ impl Permissions {
                 })
                 .map(|key| SignIn::GeminiApiKey(key.expose().to_string()))
                 .ok_or_else(|| {
-                    "it is set to sign in with a Gemini API key, and none is saved. Add one in \
-                     Settings (Coding agents), or switch it back to its own sign-in."
-                        .to_string()
+                    if defaulted_to_key {
+                        "it defaults to signing in with a Gemini API key, and none is saved. \
+                         Add one in Settings (Coding agents), or explicitly switch it to its own \
+                         sign-in (approved enterprise accounts only)."
+                            .to_string()
+                    } else {
+                        "it is set to sign in with a Gemini API key, and none is saved. Add one \
+                         in Settings (Coding agents), or switch it back to its own sign-in."
+                            .to_string()
+                    }
                 }),
         }
     }
@@ -374,23 +387,24 @@ pub async fn save_agent(
     .await
 }
 
-/// Save how the agent named `name` signs in ([`SignInMethod::Own`]: back
-/// to its own sign-in) and take it.
+/// Save how `agent` (named `name`) signs in and take it. When `method`
+/// matches `agent.default_sign_in()`, the override key is removed from
+/// `[cli_agents.sign_in]`; otherwise it is written explicitly (so opting an
+/// agent like `agy` into `own` persists across restarts).
 pub async fn save_agent_sign_in(
     config: &ConfigFile,
     permissions: &Permissions,
     name: &str,
+    agent: &dyn CodingAgent,
     method: SignInMethod,
 ) -> anyhow::Result<()> {
+    let default = agent.default_sign_in();
     edit_config(config, permissions, |doc| {
         let table = table_at(doc, &["cli_agents", "sign_in"])?;
-        match method {
-            SignInMethod::Own => {
-                table.remove(name);
-            }
-            other => {
-                table.insert(name, toml_edit::value(other.as_str()));
-            }
+        if method == default {
+            table.remove(name);
+        } else {
+            table.insert(name, toml_edit::value(method.as_str()));
         }
         Ok(())
     })
@@ -579,17 +593,22 @@ mod tests {
 
     #[test]
     fn a_sign_in_choice_reads_its_key_from_the_secret_store() {
+        let agy = aidaemon_coding_agents::acp::AcpAgent::antigravity();
+        let other = PlainAgent::unknown("other");
         let permissions = Permissions::from_config(&config(
             "[cli_agents.sign_in]\nagy = \"gemini_api_key\"\nother = \"unknown\"\n",
         ));
         assert_eq!(
-            permissions.sign_in_method("agy"),
+            permissions.sign_in_method_for("agy", &agy),
             SignInMethod::GeminiApiKey
         );
-        assert_eq!(permissions.sign_in_method("other"), SignInMethod::Own);
-        assert_eq!(permissions.sign_in_of("other"), Ok(SignIn::Own));
+        assert_eq!(
+            permissions.sign_in_method_for("other", &other),
+            SignInMethod::Own
+        );
+        assert_eq!(permissions.sign_in_of_for("other", &other), Ok(SignIn::Own));
         // Chosen, and no key saved: it can't run, and says how to fix it.
-        assert!(permissions.sign_in_of("agy").is_err());
+        assert!(permissions.sign_in_of_for("agy", &agy).is_err());
         assert!(!permissions.has_sign_in_key("agy"));
         let secrets = Arc::new(aidaemon_secrets::MemorySecretStore::default());
         secrets
@@ -601,8 +620,50 @@ mod tests {
         permissions.set_secrets(secrets);
         assert!(permissions.has_sign_in_key("agy"));
         assert_eq!(
-            permissions.sign_in_of("agy"),
+            permissions.sign_in_of_for("agy", &agy),
             Ok(SignIn::GeminiApiKey("synthetic-gemini-key-0001".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn agent_sign_in_defaults_and_overrides_persist() {
+        let agy = aidaemon_coding_agents::acp::AcpAgent::antigravity();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let file = ConfigFile::new(
+            &path,
+            Arc::new(aidaemon_tools::config_file::toml_only)
+                as Arc<dyn aidaemon_tools::config_file::ConfigCheck>,
+        );
+        let permissions = Permissions::from_config(&file.load_table().await.unwrap());
+        // Unset in config: agy defaults to its own sign-in.
+        assert_eq!(
+            permissions.sign_in_method_for("agy", &agy),
+            SignInMethod::Own
+        );
+        assert_eq!(permissions.sign_in_of_for("agy", &agy), Ok(SignIn::Own));
+
+        // Choosing GeminiApiKey writes `agy = "gemini_api_key"` and survives reload.
+        save_agent_sign_in(&file, &permissions, "agy", &agy, SignInMethod::GeminiApiKey)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("agy = \"gemini_api_key\""), "{text}");
+        let reloaded = Permissions::from_config(&file.load_table().await.unwrap());
+        assert_eq!(
+            reloaded.sign_in_method_for("agy", &agy),
+            SignInMethod::GeminiApiKey
+        );
+        assert!(reloaded.sign_in_of_for("agy", &agy).is_err());
+
+        // Switching back to its default (Own) removes the override from config.toml.
+        save_agent_sign_in(&file, &permissions, "agy", &agy, SignInMethod::Own)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("agy ="), "{text}");
+        let reloaded = Permissions::from_config(&file.load_table().await.unwrap());
+        assert_eq!(reloaded.sign_in_method_for("agy", &agy), SignInMethod::Own);
     }
 }

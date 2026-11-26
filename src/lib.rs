@@ -1250,7 +1250,7 @@ fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
         CallbackMode::Paste(Box::new(|_url| {
             println!();
             println!(
-                "After approving, your browser will land on a localhost URL that will not load."
+                "After approving, your browser will land on a 127.0.0.1 URL that will not load."
             );
             println!("Copy that URL from the address bar and paste it here, then press Enter:");
             let mut line = String::new();

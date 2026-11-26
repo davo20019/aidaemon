@@ -80,8 +80,9 @@ async fn streams_text_with_the_subscription_headers() {
     let sent = &server.requests()[0];
     assert_eq!(sent.path, "/responses");
     assert_eq!(sent.headers["authorization"], "Bearer token-1");
-    assert_eq!(sent.headers["chatgpt-account-id"], "acct-synthetic");
-    assert_eq!(sent.headers["originator"], "aidaemon");
+    assert!(!sent.headers.contains_key("chatgpt-account-id"));
+    assert!(!sent.headers.contains_key("openai-beta"));
+    assert!(!sent.headers.contains_key("originator"));
     assert_eq!(sent.body["instructions"], "Be brief.");
     assert_eq!(sent.body["store"], false);
 }

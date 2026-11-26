@@ -887,14 +887,18 @@ pub async fn register_optional_tools(
                     continue;
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
-                tools.push(Arc::new(
-                    GenerateImageTool::chatgpt_subscription(
-                        PathBuf::from(&inbox_dir),
-                        crate::providers::chatgpt_login::shared_credential_manager(),
-                    )
-                    .map_err(anyhow::Error::msg)?
-                    .with_event_store(event_store.clone()),
-                ));
+                let api_key = config.openai_provider_api_key().or_else(|| {
+                    std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                });
+                let tool = match api_key {
+                    Some(key) => GenerateImageTool::openai_api(PathBuf::from(&inbox_dir), key)
+                        .map_err(anyhow::Error::msg)?,
+                    None => GenerateImageTool::unconfigured(PathBuf::from(&inbox_dir)),
+                };
+                tools.push(Arc::new(tool.with_event_store(event_store.clone())));
             }
             OptionalToolId::CliAgents => {
                 let register_cli = config.tools.is_enabled("cli_agent");

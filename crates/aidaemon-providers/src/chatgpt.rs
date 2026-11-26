@@ -1,10 +1,11 @@
-//! [`ChatGpt`]: models on a ChatGPT subscription, through the Codex
-//! backend's Responses API (`chatgpt.com/backend-api/codex/responses`).
+//! [`ChatGpt`]: models on a ChatGPT subscription, through OpenAI's public
+//! Responses API (`https://api.openai.com/v1/responses`) using an OAuth access
+//! token from OpenAI's official open-source Sign in with ChatGPT flow.
 //!
-//! Calls draw on the user's ChatGPT Plus/Pro/Business plan instead of a
+//! Calls draw on the user's ChatGPT Go/Plus/Pro/Business plan instead of a
 //! metered API key. Credentials come from a [`ChatGptAuth`]: the app owns
 //! the OAuth login and token storage, the provider only asks for a usable
-//! token and reports one the backend rejected.
+//! token and reports one the API rejected.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,8 +25,8 @@ use crate::transport::{
     map_status, parse_arguments,
 };
 
-/// The Codex backend root.
-pub const CHATGPT_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// OpenAI's public API root for Sign in with ChatGPT plan usage.
+pub const CHATGPT_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Models reachable with a ChatGPT subscription. The backend has no model
 /// listing; unknown ids still pass through, and the API decides.
@@ -120,7 +121,6 @@ pub struct ChatGpt {
     base_url: String,
     auth: Arc<dyn ChatGptAuth>,
     reasoning_effort: Option<String>,
-    originator: String,
     user_agent: String,
     timeout: Duration,
 }
@@ -220,17 +220,15 @@ impl ChatGptBuilder {
                     std::env::consts::ARCH
                 )
             }),
-            originator: self.originator,
             timeout: self.timeout,
         })
     }
 }
 
-/// The subscription's bearer token and account id go to this URL on every
-/// request, so only ChatGPT's own backend (https, `chatgpt.com` or a
-/// subdomain) or this machine (a test server) may receive them: a base URL
-/// left over from another provider, or plain http, would hand the token
-/// to that host or to anyone on the path.
+/// The subscription's bearer token goes to this URL on every request, so only
+/// OpenAI's public API (`https://api.openai.com`) or this machine (a test
+/// server) may receive it: a base URL left over from another provider,
+/// ChatGPT's private `backend-api`, or plain http is refused.
 fn check_base_url(base_url: &str) -> Result<(), ConfigError> {
     chatgpt_base_url_refusal(base_url).map_or(Ok(()), |why| {
         Err(ConfigError::BaseUrl(base_url.to_string(), why))
@@ -238,8 +236,8 @@ fn check_base_url(base_url: &str) -> Result<(), ConfigError> {
 }
 
 /// Why [`ChatGptBuilder::build`] would refuse `base_url`, or `None` when
-/// the subscription's token may go there: https on `chatgpt.com` (or a
-/// subdomain), or a server on this machine.
+/// the subscription's token may go there: https on `api.openai.com`, or a
+/// server on this machine.
 pub fn chatgpt_base_url_refusal(base_url: &str) -> Option<&'static str> {
     let refuse = Some;
     let base_url = base_url.trim().trim_end_matches('/');
@@ -257,10 +255,10 @@ pub fn chatgpt_base_url_refusal(base_url: &str) -> Option<&'static str> {
     if url.scheme() != "https" {
         return refuse("ChatGPT sign-in tokens go over https only");
     }
-    if host == "chatgpt.com" || host.ends_with(".chatgpt.com") {
+    if host == "api.openai.com" {
         None
     } else {
-        refuse("ChatGPT sign-in tokens go only to chatgpt.com")
+        refuse("ChatGPT sign-in tokens go only to https://api.openai.com")
     }
 }
 
@@ -270,19 +268,10 @@ impl ChatGpt {
         credentials: &ChatGptCredentials,
         body: &Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        let mut post = self.client.post(format!("{}/responses", self.base_url));
-        // The backend routes a conversation to its prompt cache by the
-        // `session-id` header, not by `prompt_cache_key` alone: without it,
-        // calls in one run land on cold shards (as Codex does, both carry
-        // the same id).
-        if let Some(key) = session_id(body) {
-            post = post.header("session-id", key);
-        }
-        post.timeout(self.timeout)
+        self.client
+            .post(format!("{}/responses", self.base_url))
+            .timeout(self.timeout)
             .bearer_auth(&credentials.access_token)
-            .header("chatgpt-account-id", &credentials.account_id)
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", &self.originator)
             .header("User-Agent", &self.user_agent)
             .header("accept", "text/event-stream")
             .json(body)
@@ -359,54 +348,25 @@ impl Provider for ChatGpt {
     }
 }
 
-/// The client versions the model listing asks as, in turn. The backend
-/// hides models that need a newer client than the one named (0.99 saw only
-/// an internal model; 0.166 saw the GPT-6 family), so a far-future version
-/// comes first, and a version known to answer follows in case the backend
-/// refuses it.
-pub const CHATGPT_LIST_CLIENT_VERSIONS: &[&str] = &["999.0.0", "0.166.0"];
-
-/// A model the ChatGPT backend offers the signed-in account.
+/// A model the signed-in ChatGPT account can use on the public Responses API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatGptModel {
     pub id: String,
-    /// The name the backend shows people, when it gives one.
+    /// The name the API shows people, when it gives one.
     pub display_name: Option<String>,
-    /// The backend's one-line description, when it gives one.
+    /// The API's one-line description, when it gives one.
     pub description: Option<String>,
-    /// Shown in a model picker (the backend can list a model it hides).
+    /// Shown in a model picker (`visibility == "list"`, or absent).
     pub listed: bool,
 }
 
 impl ChatGpt {
-    /// The models the backend offers this account
-    /// (`GET {base}/models?client_version=..`), with a 401 refreshed once.
+    /// The models the signed-in account can use (`GET {base}/models`), with a
+    /// 401 refreshed once.
     pub async fn list_models(&self) -> Result<Vec<ChatGptModel>, ProviderError> {
-        let mut last_error = None;
-        for version in CHATGPT_LIST_CLIENT_VERSIONS {
-            match self.list_models_as(version).await {
-                Ok(models) if models.iter().any(|m| m.listed) => return Ok(models),
-                Ok(models) => {
-                    last_error = Some(ProviderError::NotFound(format!(
-                        "model listing as client {version} showed no models to pick ({})",
-                        models
-                            .iter()
-                            .map(|m| m.id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )))
-                }
-                Err(error @ ProviderError::Auth(_)) => return Err(error),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| ProviderError::NotFound("no model listing".into())))
-    }
-
-    async fn list_models_as(&self, version: &str) -> Result<Vec<ChatGptModel>, ProviderError> {
         let auth_error = |error: String| ProviderError::Auth(error);
         let mut credentials = self.auth.credentials().await.map_err(auth_error)?;
-        let mut response = self.get_models(&credentials, version).await?;
+        let mut response = self.get_models(&credentials).await?;
         if response.status().as_u16() == 401 {
             let rejected = credentials.access_token.clone();
             let _ = response.bytes().await;
@@ -415,7 +375,7 @@ impl ChatGpt {
                 .refresh_after_rejection(&rejected)
                 .await
                 .map_err(auth_error)?;
-            response = self.get_models(&credentials, version).await?;
+            response = self.get_models(&credentials).await?;
         }
         let status = response.status();
         let headers = response.headers().clone();
@@ -426,59 +386,14 @@ impl ChatGpt {
         Ok(parse_model_listing(&body))
     }
 
-    /// The plan's usage limits as the backend reports them
-    /// (`GET .../backend-api/wham/usage`, what Codex's `/status` shows),
-    /// with a 401 refreshed once.
-    pub async fn usage(&self) -> Result<crate::usage::AccountUsage, ProviderError> {
-        let auth_error = |error: String| ProviderError::Auth(error);
-        let url = crate::usage::chatgpt_usage_url(&self.base_url);
-        let get = |credentials: ChatGptCredentials| {
-            self.client
-                .get(&url)
-                .timeout(Duration::from_secs(10))
-                .bearer_auth(credentials.access_token)
-                .header("chatgpt-account-id", credentials.account_id)
-                .header("originator", &self.originator)
-                .header("User-Agent", &self.user_agent)
-                .send()
-        };
-        let credentials = self.auth.credentials().await.map_err(auth_error)?;
-        let rejected = credentials.access_token.clone();
-        let mut response = get(credentials).await.map_err(map_reqwest_error)?;
-        if response.status().as_u16() == 401 {
-            let _ = response.bytes().await;
-            let credentials = self
-                .auth
-                .refresh_after_rejection(&rejected)
-                .await
-                .map_err(auth_error)?;
-            response = get(credentials).await.map_err(map_reqwest_error)?;
-        }
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(map_status(status, &headers, &body));
-        }
-        crate::usage::parse_chatgpt_usage(&body, SystemTime::now()).ok_or_else(|| {
-            ProviderError::InvalidRequest(format!(
-                "the usage answer had no limits: {}",
-                body_excerpt(&body)
-            ))
-        })
-    }
-
     async fn get_models(
         &self,
         credentials: &ChatGptCredentials,
-        version: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         self.client
-            .get(format!("{}/models?client_version={version}", self.base_url))
+            .get(format!("{}/models", self.base_url))
             .timeout(Duration::from_secs(30))
             .bearer_auth(&credentials.access_token)
-            .header("chatgpt-account-id", &credentials.account_id)
-            .header("originator", &self.originator)
             .header("User-Agent", &self.user_agent)
             .send()
             .await
@@ -531,25 +446,26 @@ fn annotate(status: u16, body: &str) -> String {
 
 /// A rejected call. A 429 is either throttling (worth a short wait) or the
 /// plan's usage limit (`usage_limit_reached`, or a rate-limit window at
-/// 100%), which only its reset cures; the plan not covering Codex at all
-/// (`usage_not_included`) is a billing failure.
+/// 100%), which only its reset cures; `subscription_sharing_usage_unavailable`
+/// is a temporary availability failure (retryable, credentials preserved);
+/// an ineligible plan (`usage_not_included`, `subscription_sharing_user_not_eligible`)
+/// is a billing failure.
 fn chatgpt_error(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: &str,
 ) -> ProviderError {
-    if status.as_u16() == 429
+    if matches!(status.as_u16(), 403 | 429 | 503)
         && let Some(error) = plan_limit(headers, body, SystemTime::now())
     {
-        tracing::warn!(%error, "ChatGPT plan limit");
+        tracing::warn!(%error, "ChatGPT plan status");
         return error;
     }
     map_status(status, headers, body)
 }
 
-/// The plan-limit error a 429 states, if it is one. The reset comes from the
-/// body (`resets_at`, epoch seconds, or `resets_in_seconds`), else from the
-/// exhausted window's `x-codex-<window>-reset-at` header.
+/// The plan-limit, eligibility, or temporary availability error a 403/429/503
+/// states, if it is one.
 fn plan_limit(
     headers: &reqwest::header::HeaderMap,
     body: &str,
@@ -558,14 +474,25 @@ fn plan_limit(
     let value: Option<Value> = serde_json::from_str(body).ok();
     let error = value.as_ref().and_then(|v| v.get("error"));
     let field = |name: &str| error.and_then(|e| e.get(name));
-    let kind = field("type")
-        .or_else(|| field("code"))
+    let kind = field("code")
+        .or_else(|| field("type"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     let message = body_excerpt(body);
-    if kind == "usage_not_included" {
+    if kind == "subscription_sharing_usage_unavailable" {
+        return Some(ProviderError::Transient(format!(
+            "ChatGPT plan usage is temporarily unavailable; retrying later: {message}"
+        )));
+    }
+    if matches!(
+        kind,
+        "usage_not_included" | "subscription_sharing_user_not_eligible"
+    ) {
         return Some(ProviderError::Billing {
-            message: format!("This ChatGPT plan does not include Codex usage: {message}"),
+            message: format!(
+                "This ChatGPT plan does not currently allow app plan usage \
+                 (manage at https://chatgpt.com/settings/usage): {message}"
+            ),
             affordable_tokens: None,
         });
     }
@@ -578,12 +505,15 @@ fn plan_limit(
     };
     let epoch =
         |secs: f64| (secs > 0.0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs));
-    // The window that is used up, and when it resets.
     let exhausted_window = ["primary", "secondary"].iter().find_map(|window| {
         let used = header(&format!("x-codex-{window}-used-percent"))?;
         (used >= 100.0).then(|| header(&format!("x-codex-{window}-reset-at")).and_then(epoch))
     });
-    if kind != "usage_limit_reached" && exhausted_window.is_none() {
+    if !matches!(
+        kind,
+        "usage_limit_reached" | "subscription_sharing_usage_limit_exceeded"
+    ) && exhausted_window.is_none()
+    {
         return None;
     }
     let resets_at = field("resets_at")
@@ -601,7 +531,9 @@ fn plan_limit(
         .map(|plan| format!(" ({plan} plan)"))
         .unwrap_or_default();
     Some(ProviderError::QuotaExhausted {
-        message: format!("ChatGPT usage limit reached{plan}: {message}"),
+        message: format!(
+            "ChatGPT usage limit reached{plan} (manage at https://chatgpt.com/settings/usage): {message}"
+        ),
         resets_at,
         per_model: false,
         in_stream: false,
@@ -618,11 +550,6 @@ fn prompt_cache_key(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     let hex: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
     format!("aidaemon-{hex}")
-}
-
-/// The `session-id` header for a body: its cache-routing key.
-fn session_id(body: &Value) -> Option<&str> {
-    body.get("prompt_cache_key").and_then(Value::as_str)
 }
 
 /// The Responses `input` items and `instructions` for a transcript.
@@ -1000,12 +927,19 @@ impl SseDecoder for CodexDecoder {
         if let Some(failure) = self.failure.take() {
             return Err(failure);
         }
-        // The stream died before completing: hand back what arrived.
+        // The stream died before completing: never execute tool calls from an
+        // uncompleted response; partial plain text is returned with a note.
         let mut response = parse_output(&items);
+        if !response.tool_calls.is_empty() {
+            return Err(ProviderError::Malformed {
+                message: "Response stream ended without a completion event; refusing incomplete tool calls".into(),
+                parse: false,
+            });
+        }
         if response.text.is_empty() {
             response.text = delta_text;
         }
-        if response.text.is_empty() && response.tool_calls.is_empty() {
+        if response.text.is_empty() {
             return Err(ProviderError::Malformed {
                 message: "Codex stream ended with no response events".into(),
                 parse: false,
@@ -1042,7 +976,11 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
     // The Responses API's documented failure codes, compared exactly.
     let overloaded = matches!(
         code.as_str(),
-        "server_is_overloaded" | "slow_down" | "server_error" | "service_unavailable"
+        "server_is_overloaded"
+            | "slow_down"
+            | "server_error"
+            | "service_unavailable"
+            | "subscription_sharing_usage_unavailable"
     )
         // A failure event with neither a status nor a code carries no
         // structured signal at all; its "overloaded" wording is then the
@@ -1051,7 +989,7 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
             && status.is_none()
             && message.to_ascii_lowercase().contains("overloaded"));
     match code.as_str() {
-        "usage_limit_reached" => {
+        "usage_limit_reached" | "subscription_sharing_usage_limit_exceeded" => {
             let resets_at = field("resets_at")
                 .and_then(Value::as_f64)
                 .filter(|secs| *secs > 0.0)
@@ -1069,7 +1007,7 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
                 limit: None,
             };
         }
-        "insufficient_quota" => {
+        "insufficient_quota" | "subscription_sharing_user_not_eligible" => {
             return ProviderError::Billing {
                 message,
                 affordable_tokens: None,
@@ -1212,21 +1150,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_token_goes_only_to_chatgpt_or_this_machine() {
+    fn the_token_goes_only_to_openai_api_or_this_machine() {
         for ok in [
             CHATGPT_DEFAULT_BASE_URL,
-            "https://api.chatgpt.com/backend-api/codex",
-            "http://127.0.0.1:8765/codex",
+            "https://api.openai.com/v1",
+            "http://127.0.0.1:8765/v1",
             "http://[::1]:8765",
             "http://localhost:9",
         ] {
             assert!(check_base_url(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "http://chatgpt.com/backend-api/codex",
-            "https://api.openai.com/v1",
-            "https://chatgpt.com.attacker.example/x",
-            "https://user:pw@chatgpt.com/x",
+            "http://api.openai.com/v1",
+            "https://chatgpt.com/backend-api/codex",
+            "https://api.openai.com.attacker.example/v1",
+            "https://user:pw@api.openai.com/v1",
             "http://192.168.1.20:8080",
             "not a url",
         ] {
@@ -1406,8 +1344,6 @@ mod tests {
                 .unwrap()
                 .contains("synthetic-user-1")
         );
-        // The backend routes by the session-id header: same key, both places.
-        assert_eq!(session_id(&first), first["prompt_cache_key"].as_str());
     }
 
     /// The reasoning that led to a tool call goes back just before that call,
@@ -1608,6 +1544,44 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            chatgpt_error(
+                status(429),
+                &headers(&[]),
+                r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Plan usage limit reached"}}"#
+            ),
+            ProviderError::QuotaExhausted {
+                in_stream: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            chatgpt_error(
+                status(403),
+                &headers(&[]),
+                r#"{"error":{"code":"subscription_sharing_user_not_eligible","message":"Not eligible"}}"#
+            ),
+            ProviderError::Billing {
+                affordable_tokens: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            chatgpt_error(
+                status(503),
+                &headers(&[]),
+                r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"Unavailable"}}"#
+            ),
+            ProviderError::Transient(_)
+        ));
+        assert!(matches!(
+            chatgpt_error(
+                status(403),
+                &headers(&[]),
+                r#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"Unavailable"}}"#
+            ),
+            ProviderError::Transient(_)
+        ));
     }
 
     #[test]
@@ -1625,6 +1599,48 @@ mod tests {
         ));
         // Reported inside an answer already started: not proof of no spend.
         assert!(!capped.unwrap_err().proves_nothing_spent());
+
+        let siwc_capped = decode(&[json!({"type": "response.failed", "response": {"error": {
+            "code": "subscription_sharing_usage_limit_exceeded", "message": "plan limit"
+        }}})]);
+        assert!(matches!(
+            siwc_capped,
+            Err(ProviderError::QuotaExhausted {
+                in_stream: true,
+                ..
+            })
+        ));
+        let siwc_ineligible = decode(&[json!({"type": "response.failed", "response": {"error": {
+            "code": "subscription_sharing_user_not_eligible", "message": "not eligible"
+        }}})]);
+        assert!(matches!(
+            siwc_ineligible,
+            Err(ProviderError::Billing {
+                affordable_tokens: None,
+                ..
+            })
+        ));
+        let siwc_unavailable = decode(&[json!({"type": "response.failed", "response": {"error": {
+            "code": "subscription_sharing_usage_unavailable", "message": "temporarily unavailable"
+        }}})]);
+        assert!(matches!(siwc_unavailable, Err(ProviderError::Transient(_))));
+    }
+
+    #[test]
+    fn a_cut_off_stream_with_tool_calls_is_refused() {
+        let interrupted = decode(&[json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-synthetic-1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        })]);
+        assert!(matches!(
+            interrupted,
+            Err(ProviderError::Malformed { parse: false, .. })
+        ));
     }
 
     #[test]

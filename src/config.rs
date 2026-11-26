@@ -346,6 +346,32 @@ impl AppConfig {
         }
         find(&self.provider)
     }
+
+    /// The API key of the first direct OpenAI (`api.openai.com`) provider in
+    /// the provider chain (primary, then fallbacks in order), for tools that
+    /// call metered OpenAI API endpoints (such as `generate_image`).
+    pub fn openai_provider_api_key(&self) -> Option<String> {
+        fn is_openai_api(base_url: &str) -> bool {
+            let trimmed = base_url.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            reqwest::Url::parse(trimmed)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+                .is_some_and(|host| host == "api.openai.com")
+        }
+        fn find(provider: &ProviderConfig) -> Option<String> {
+            if provider.kind == ProviderKind::OpenaiCompatible
+                && is_openai_api(&provider.base_url)
+                && !provider.api_key.trim().is_empty()
+            {
+                return Some(provider.api_key.trim().to_string());
+            }
+            provider.fallbacks.iter().find_map(find)
+        }
+        find(&self.provider)
+    }
 }
 
 pub use aidaemon_runtime::authority::OwnerLevel;

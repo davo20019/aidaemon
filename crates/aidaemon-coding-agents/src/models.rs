@@ -83,7 +83,7 @@ async fn ask(
             &["app-server"],
             vec![
                 json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                    "clientInfo": {"name": "aidaemon", "version": env!("CARGO_PKG_VERSION")},
+                    "clientInfo": {"name": "aidaemon", "title": "AIdaemon", "version": env!("CARGO_PKG_VERSION")},
                 }}),
                 json!({"jsonrpc": "2.0", "method": "initialized"}),
                 json!({"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}}),

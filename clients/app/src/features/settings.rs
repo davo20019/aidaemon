@@ -1548,10 +1548,10 @@ fn sign_in_card(
         card = card
             .child(muted(
                 "2. The browser then lands on a page that does not load (its address starts \
-                 with http://localhost:1455). Copy that whole address and paste it here.",
+                 with http://127.0.0.1:1455). Copy that whole address and paste it here.",
             ))
             .child(
-                ui::field("http://localhost:1455/auth/callback?code=…", form.redirect)
+                ui::field("http://127.0.0.1:1455/auth/callback?code=…", form.redirect)
                     .label("Address the browser ended on")
                     .w_full(),
             )

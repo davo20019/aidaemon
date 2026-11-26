@@ -169,11 +169,7 @@ async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>
                 line
             };
             let mut lines = BufReader::new(stdout).lines();
-            let first = request(
-                1,
-                "initialize",
-                json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}}),
-            );
+            let first = crate::acp::host::initialize_line();
             if stdin.write_all(first.as_bytes()).await.is_err() {
                 return Readiness::Unchecked.into();
             }

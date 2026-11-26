@@ -21,9 +21,6 @@ use tokio::sync::mpsc;
 use aidaemon_channels::attachments::{save_tool_observation_image, sniff_image_mime};
 use aidaemon_events::EventStore;
 use aidaemon_events::payloads::ResourceRegisteredData;
-use aidaemon_providers::chatgpt_login::{
-    self as chatgpt_codex, CODEX_BACKEND_BASE_URL, ChatGptCredentialManager,
-};
 use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
@@ -31,9 +28,10 @@ use aidaemon_tools::semantics::{
 };
 use aidaemon_tools::status::StatusUpdate;
 
-const CHATGPT_IMAGE_MODEL: &str = "gpt-image-2";
-const CHATGPT_IMAGE_BACKEND: &str = "chatgpt_subscription";
-const ORIGINATOR: &str = "aidaemon";
+pub const OPENAI_IMAGES_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_IMAGE_MODEL: &str = "gpt-image-2.5-sunburst";
+const OPENAI_IMAGE_BACKEND: &str = "openai_images_api";
+const UNCONFIGURED_IMAGE_BACKEND: &str = "unconfigured";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_REFERENCE_IMAGES: usize = 16;
 const MAX_REFERENCE_IMAGE_BYTES: u64 = 50 * 1_048_576;
@@ -142,68 +140,124 @@ pub trait ImageGenerationBackend: Send + Sync {
     ) -> Result<GeneratedImage, ImageGenerationError>;
 }
 
-/// Image adapter backed by the user's ChatGPT subscription OAuth login.
-pub struct ChatGptSubscriptionImageBackend {
+/// Image adapter backed by OpenAI's official metered Images API
+/// (`POST /v1/images/generations` and `POST /v1/images/edits`).
+pub struct OpenAiImagesBackend {
     client: reqwest::Client,
     base_url: String,
-    credentials: Arc<ChatGptCredentialManager>,
+    api_key: String,
+    model: String,
 }
 
-impl ChatGptSubscriptionImageBackend {
-    /// A backend on the ChatGPT subscription `credentials` (the host's one
-    /// manager, so every subscription adapter shares its token rotation).
-    pub fn new(
-        base_url: Option<&str>,
-        credentials: Arc<ChatGptCredentialManager>,
-    ) -> Result<Self, String> {
+impl OpenAiImagesBackend {
+    /// Create a backend authenticated with an OpenAI API key.
+    pub fn new(base_url: Option<&str>, api_key: String) -> Result<Self, String> {
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            return Err("OpenAI API key cannot be empty".to_string());
+        }
         Ok(Self {
             client: crate::chat_bridge::build_http_client(DEFAULT_TIMEOUT)?,
             base_url: normalize_base_url(base_url),
-            credentials,
+            api_key,
+            model: OPENAI_IMAGE_MODEL.to_string(),
         })
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        let model = model.into();
+        if !model.trim().is_empty() {
+            self.model = model.trim().to_string();
+        }
+        self
     }
 
     #[cfg(test)]
-    fn with_dependencies(
-        base_url: &str,
-        client: reqwest::Client,
-        credentials: Arc<ChatGptCredentialManager>,
-    ) -> Self {
+    fn with_dependencies(base_url: &str, client: reqwest::Client, api_key: String) -> Self {
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            credentials,
+            api_key,
+            model: OPENAI_IMAGE_MODEL.to_string(),
         }
     }
 
-    async fn send_authenticated(
+    async fn send_generation(
         &self,
-        url: &str,
-        body: &Value,
-        turn_id: Option<&str>,
-        credentials: &chatgpt_codex::ChatGptCredentials,
+        request: &ImageGenerationRequest,
     ) -> Result<reqwest::Response, ImageGenerationError> {
-        let mut request_builder = self
-            .client
-            .post(url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", credentials.access_token),
-            )
-            .header("chatgpt-account-id", &credentials.account_id)
-            .header("originator", ORIGINATOR)
+        let url = format!("{}/images/generations", self.base_url);
+        let body = json!({
+            "model": self.model,
+            "prompt": request.prompt,
+            "background": "auto",
+            "quality": "auto",
+            "size": "auto"
+        });
+        self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
             .header("User-Agent", image_user_agent())
             .header("accept", "application/json")
             .header("content-type", "application/json")
-            .json(body);
-        if let Some(turn_id) = turn_id.map(str::trim).filter(|value| !value.is_empty()) {
-            request_builder = request_builder.header("x-codex-image-turn-id", turn_id);
-        }
-        request_builder.send().await.map_err(|error| {
-            ImageGenerationError::retryable(format!(
-                "ChatGPT image request could not be sent: {error}"
-            ))
-        })
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                ImageGenerationError::retryable(format!(
+                    "OpenAI image generation request could not be sent: {error}"
+                ))
+            })
+    }
+
+    async fn send_edit(
+        &self,
+        request: &ImageGenerationRequest,
+    ) -> Result<reqwest::Response, ImageGenerationError> {
+        let url = format!("{}/images/edits", self.base_url);
+        let boundary = format!("----aidaemon-image-{}", uuid::Uuid::new_v4().simple());
+        let body = build_multipart_edit_body(&boundary, &self.model, request);
+        self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("User-Agent", image_user_agent())
+            .header("accept", "application/json")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| {
+                ImageGenerationError::retryable(format!(
+                    "OpenAI image edit request could not be sent: {error}"
+                ))
+            })
+    }
+}
+
+/// Placeholder backend used when no metered image API key is configured.
+/// Keeps the `generate_image` tool registered and returns an actionable
+/// configuration message instead of silently failing or calling unofficial
+/// subscription endpoints.
+pub struct UnconfiguredImageBackend;
+
+#[async_trait]
+impl ImageGenerationBackend for UnconfiguredImageBackend {
+    fn name(&self) -> &str {
+        UNCONFIGURED_IMAGE_BACKEND
+    }
+
+    async fn generate(
+        &self,
+        _request: &ImageGenerationRequest,
+    ) -> Result<GeneratedImage, ImageGenerationError> {
+        Err(ImageGenerationError::blocked(
+            "Image generation requires an OpenAI API key (ChatGPT subscription sign-in does not \
+             include image generation). Set `OPENAI_API_KEY` in the daemon environment or \
+             configure an OpenAI API provider in `config.toml`.",
+        ))
     }
 }
 
@@ -211,110 +265,115 @@ fn normalize_base_url(base_url: Option<&str>) -> String {
     base_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(CODEX_BACKEND_BASE_URL)
+        .unwrap_or(OPENAI_IMAGES_BASE_URL)
         .trim_end_matches('/')
         .to_string()
 }
 
+fn sanitize_multipart_filename(filename: &str, index: usize, mime_type: &str) -> String {
+    let cleaned: String = filename
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n' | '"' | '\\') && !ch.is_control())
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        format!("reference_{}.{}", index + 1, extension_for_mime(mime_type))
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build an RFC 7578 `multipart/form-data` payload for OpenAI's
+/// `POST /v1/images/edits` endpoint, preserving the exact order of
+/// `request.references` via `image[]` file parts.
+fn build_multipart_edit_body(
+    boundary: &str,
+    model: &str,
+    request: &ImageGenerationRequest,
+) -> Vec<u8> {
+    let estimated_bytes: usize = request
+        .references
+        .iter()
+        .map(|reference| reference.bytes.len() + 256)
+        .sum::<usize>()
+        + request.prompt.len()
+        + 512;
+    let mut out = Vec::with_capacity(estimated_bytes);
+
+    let push_text_field = |buf: &mut Vec<u8>, name: &str, value: &str| {
+        buf.extend_from_slice(b"--");
+        buf.extend_from_slice(boundary.as_bytes());
+        buf.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"");
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(b"\"\r\n\r\n");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    };
+
+    push_text_field(&mut out, "model", model);
+    push_text_field(&mut out, "prompt", &request.prompt);
+    push_text_field(&mut out, "background", "auto");
+    push_text_field(&mut out, "quality", "auto");
+    push_text_field(&mut out, "size", "auto");
+
+    for (index, reference) in request.references.iter().enumerate() {
+        let filename =
+            sanitize_multipart_filename(&reference.filename, index, &reference.mime_type);
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"");
+        out.extend_from_slice(filename.as_bytes());
+        out.extend_from_slice(b"\"\r\nContent-Type: ");
+        out.extend_from_slice(reference.mime_type.as_bytes());
+        out.extend_from_slice(b"\r\n\r\n");
+        out.extend_from_slice(&reference.bytes);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    out
+}
+
 #[derive(Debug, Deserialize)]
-struct ChatGptImageResponse {
+struct OpenAiImageResponse {
     #[serde(default)]
-    data: Vec<ChatGptImageData>,
+    data: Vec<OpenAiImageData>,
     #[serde(default)]
     size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatGptImageData {
+struct OpenAiImageData {
     b64_json: String,
 }
 
 #[async_trait]
-impl ImageGenerationBackend for ChatGptSubscriptionImageBackend {
+impl ImageGenerationBackend for OpenAiImagesBackend {
     fn name(&self) -> &str {
-        CHATGPT_IMAGE_BACKEND
+        OPENAI_IMAGE_BACKEND
     }
 
     async fn generate(
         &self,
         request: &ImageGenerationRequest,
     ) -> Result<GeneratedImage, ImageGenerationError> {
-        let mut credentials = self
-            .credentials
-            .usable_credentials(&self.client)
-            .await
-            .map_err(|error| ImageGenerationError::blocked(error.to_string()))?;
-
-        let endpoint = if request.references.is_empty() {
-            "generations"
+        let response = if request.references.is_empty() {
+            self.send_generation(request).await?
         } else {
-            "edits"
+            self.send_edit(request).await?
         };
-        let url = format!("{}/images/{endpoint}", self.base_url);
-        let mut body = json!({
-            "prompt": request.prompt,
-            "background": "auto",
-            "model": CHATGPT_IMAGE_MODEL,
-            "quality": "auto",
-            "size": "auto"
-        });
-        if !request.references.is_empty() {
-            body["images"] = Value::Array(
-                request
-                    .references
-                    .iter()
-                    .map(|reference| {
-                        json!({
-                            "image_url": format!(
-                                "data:{};base64,{}",
-                                reference.mime_type,
-                                base64::engine::general_purpose::STANDARD.encode(&reference.bytes)
-                            )
-                        })
-                    })
-                    .collect(),
-            );
-        }
-        let turn_id = request
-            .turn_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let mut response = self
-            .send_authenticated(&url, &body, turn_id, &credentials)
-            .await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let rejected = credentials.access_token.clone();
-            let _ = response.bytes().await;
-            credentials = self
-                .credentials
-                .refresh_after_rejection(&self.client, &rejected)
-                .await
-                .map_err(|error| ImageGenerationError::blocked(error.to_string()))?;
-            response = self
-                .send_authenticated(&url, &body, turn_id, &credentials)
-                .await?;
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                let response_body = response.text().await.unwrap_or_default();
-                self.credentials
-                    .mark_rejected(
-                        &credentials.access_token,
-                        "ChatGPT image authentication remained rejected after automatic refresh",
-                    )
-                    .await;
-                return Err(chatgpt_image_http_error(401, &response_body));
-            }
-        }
         let status = response.status();
         let response_body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(chatgpt_image_http_error(status.as_u16(), &response_body));
+            return Err(openai_image_http_error(status.as_u16(), &response_body));
         }
 
-        let parsed: ChatGptImageResponse =
+        let parsed: OpenAiImageResponse =
             serde_json::from_str(&response_body).map_err(|error| {
                 ImageGenerationError::retryable(format!(
-                    "ChatGPT image generation returned unexpected JSON: {error}"
+                    "OpenAI image generation returned unexpected JSON: {error}"
                 ))
             })?;
         let encoded = parsed
@@ -323,20 +382,20 @@ impl ImageGenerationBackend for ChatGptSubscriptionImageBackend {
             .next()
             .map(|data| data.b64_json)
             .ok_or_else(|| {
-                ImageGenerationError::permanent("ChatGPT image generation returned no image data")
+                ImageGenerationError::permanent("OpenAI image generation returned no image data")
             })?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded.trim().as_bytes())
             .map_err(|error| {
                 ImageGenerationError::permanent(format!(
-                    "ChatGPT image generation returned invalid base64: {error}"
+                    "OpenAI image generation returned invalid base64: {error}"
                 ))
             })?;
 
         Ok(GeneratedImage {
             bytes,
             mime_type: Some("image/png".to_string()),
-            model: Some(CHATGPT_IMAGE_MODEL.to_string()),
+            model: Some(self.model.clone()),
             dimensions: parsed.size,
         })
     }
@@ -351,26 +410,24 @@ fn image_user_agent() -> String {
     )
 }
 
-fn chatgpt_image_http_error(status: u16, body: &str) -> ImageGenerationError {
+fn openai_image_http_error(status: u16, body: &str) -> ImageGenerationError {
     let details = truncate_error_body(body);
     let error = match status {
         401 => ImageGenerationError::blocked(format!(
-            "ChatGPT subscription auth rejected. Re-connect with `aidaemon auth login openai`. \
-             Details: {details}"
+            "OpenAI Images API authentication rejected. Check your OpenAI API key \
+             (`OPENAI_API_KEY` or `[provider]` in config.toml). Details: {details}"
         )),
         403 => ImageGenerationError::blocked(format!(
-            "ChatGPT image generation is unavailable for this account or workspace. \
-             Details: {details}"
+            "OpenAI Images API access denied for this project or organization. Details: {details}"
         )),
         429 => ImageGenerationError::retryable(format!(
-            "ChatGPT image generation usage limit reached or temporarily throttled. \
-             Details: {details}"
+            "OpenAI Images API rate limit or quota reached. Details: {details}"
         )),
         500..=599 => ImageGenerationError::retryable(format!(
-            "ChatGPT image generation is temporarily unavailable. Details: {details}"
+            "OpenAI Images API is temporarily unavailable. Details: {details}"
         )),
         _ => ImageGenerationError::permanent(format!(
-            "ChatGPT image generation failed with HTTP {status}. Details: {details}"
+            "OpenAI image generation failed with HTTP {status}. Details: {details}"
         )),
     };
     error.with_http_status(status)
@@ -405,14 +462,15 @@ impl GenerateImageTool {
         }
     }
 
-    pub fn chatgpt_subscription(
-        inbox_dir: PathBuf,
-        credentials: Arc<ChatGptCredentialManager>,
-    ) -> Result<Self, String> {
+    pub fn openai_api(inbox_dir: PathBuf, api_key: String) -> Result<Self, String> {
         Ok(Self::new(
-            Arc::new(ChatGptSubscriptionImageBackend::new(None, credentials)?),
+            Arc::new(OpenAiImagesBackend::new(None, api_key)?),
             inbox_dir,
         ))
+    }
+
+    pub fn unconfigured(inbox_dir: PathBuf) -> Self {
+        Self::new(Arc::new(UnconfiguredImageBackend), inbox_dir)
     }
 
     pub fn with_event_store(mut self, event_store: Arc<EventStore>) -> Self {
@@ -788,33 +846,24 @@ mod tests {
     use aidaemon_tools::testing::ToolCalls as _;
     use std::sync::Mutex as StdMutex;
 
+    use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::post;
     use axum::{Json, Router};
-    use chrono::Utc;
 
     #[derive(Debug, Default)]
     struct CapturedRequest {
         authorization: String,
-        account_id: String,
-        originator: String,
-        turn_id: String,
+        content_type: String,
+        has_account_id: bool,
+        has_originator: bool,
+        has_codex_turn_id: bool,
         body: Value,
+        raw_body: Vec<u8>,
     }
 
-    async fn image_response(
-        State(captured): State<Arc<StdMutex<CapturedRequest>>>,
-        headers: HeaderMap,
-        Json(body): Json<Value>,
-    ) -> Json<Value> {
-        let mut captured = captured.lock().expect("capture request");
-        captured.authorization = header(&headers, "authorization");
-        captured.account_id = header(&headers, "chatgpt-account-id");
-        captured.originator = header(&headers, "originator");
-        captured.turn_id = header(&headers, "x-codex-image-turn-id");
-        captured.body = body;
-
+    fn synthetic_png_response() -> Json<Value> {
         let png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         Json(json!({
             "created": 1,
@@ -823,6 +872,36 @@ mod tests {
             }],
             "size": "1024x1024"
         }))
+    }
+
+    async fn image_json_response(
+        State(captured): State<Arc<StdMutex<CapturedRequest>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let mut captured = captured.lock().expect("capture request");
+        captured.authorization = header(&headers, "authorization");
+        captured.content_type = header(&headers, "content-type");
+        captured.has_account_id = headers.contains_key("chatgpt-account-id");
+        captured.has_originator = headers.contains_key("originator");
+        captured.has_codex_turn_id = headers.contains_key("x-codex-image-turn-id");
+        captured.body = body;
+        synthetic_png_response()
+    }
+
+    async fn image_multipart_response(
+        State(captured): State<Arc<StdMutex<CapturedRequest>>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<Value> {
+        let mut captured = captured.lock().expect("capture multipart request");
+        captured.authorization = header(&headers, "authorization");
+        captured.content_type = header(&headers, "content-type");
+        captured.has_account_id = headers.contains_key("chatgpt-account-id");
+        captured.has_originator = headers.contains_key("originator");
+        captured.has_codex_turn_id = headers.contains_key("x-codex-image-turn-id");
+        captured.raw_body = body.to_vec();
+        synthetic_png_response()
     }
 
     fn header(headers: &HeaderMap, name: &str) -> String {
@@ -970,10 +1049,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_backend_authenticates_saves_and_attaches_image() {
+    async fn openai_backend_authenticates_saves_and_attaches_image() {
         let captured = Arc::new(StdMutex::new(CapturedRequest::default()));
         let app = Router::new()
-            .route("/images/generations", post(image_response))
+            .route("/images/generations", post(image_json_response))
             .with_state(captured.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -983,17 +1062,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let credentials =
-            ChatGptCredentialManager::with_credentials(chatgpt_codex::ChatGptCredentials {
-                access_token: "synthetic-access".to_string(),
-                refresh_token: "synthetic-refresh".to_string(),
-                account_id: "acct-synthetic".to_string(),
-                expires_at: Utc::now() + chrono::Duration::hours(1),
-            });
-        let backend = ChatGptSubscriptionImageBackend::with_dependencies(
+        let backend = OpenAiImagesBackend::with_dependencies(
             &format!("http://{address}"),
             reqwest::Client::new(),
-            Arc::new(credentials),
+            "sk-synthetic-test-key".to_string(),
         );
         let temp = tempfile::tempdir().expect("create temp inbox");
         let tool = GenerateImageTool::new(Arc::new(backend), temp.path().to_path_buf());
@@ -1035,12 +1107,12 @@ mod tests {
         assert!(outcome.output.contains("send_file"));
 
         let captured = captured.lock().expect("read request capture");
-        assert_eq!(captured.authorization, "Bearer synthetic-access");
-        assert_eq!(captured.account_id, "acct-synthetic");
-        assert_eq!(captured.originator, "aidaemon");
-        assert_eq!(captured.turn_id, "turn-synthetic-1");
+        assert_eq!(captured.authorization, "Bearer sk-synthetic-test-key");
+        assert!(!captured.has_account_id);
+        assert!(!captured.has_originator);
+        assert!(!captured.has_codex_turn_id);
         assert_eq!(captured.body["prompt"], "A tiny red fox in watercolor");
-        assert_eq!(captured.body["model"], CHATGPT_IMAGE_MODEL);
+        assert_eq!(captured.body["model"], OPENAI_IMAGE_MODEL);
         assert_eq!(captured.body["background"], "auto");
         assert_eq!(captured.body["quality"], "auto");
         assert_eq!(captured.body["size"], "auto");
@@ -1048,10 +1120,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chatgpt_backend_uses_json_edits_for_ordered_reference_images() {
+    async fn openai_backend_uses_multipart_edits_for_ordered_reference_images() {
         let captured = Arc::new(StdMutex::new(CapturedRequest::default()));
         let app = Router::new()
-            .route("/images/edits", post(image_response))
+            .route("/images/edits", post(image_multipart_response))
             .with_state(captured.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1061,17 +1133,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let credentials =
-            ChatGptCredentialManager::with_credentials(chatgpt_codex::ChatGptCredentials {
-                access_token: "synthetic-access".to_string(),
-                refresh_token: "synthetic-refresh".to_string(),
-                account_id: "acct-synthetic".to_string(),
-                expires_at: Utc::now() + chrono::Duration::hours(1),
-            });
-        let backend = ChatGptSubscriptionImageBackend::with_dependencies(
+        let backend = OpenAiImagesBackend::with_dependencies(
             &format!("http://{address}"),
             reqwest::Client::new(),
-            Arc::new(credentials),
+            "sk-synthetic-test-key".to_string(),
         );
         let result = backend
             .generate(&ImageGenerationRequest {
@@ -1079,12 +1144,12 @@ mod tests {
                 references: vec![
                     ImageGenerationReference {
                         bytes: b"FIRST_REFERENCE_BYTES".to_vec(),
-                        filename: "bella-primary.jpg".to_string(),
+                        filename: "mia-primary.jpg".to_string(),
                         mime_type: "image/jpeg".to_string(),
                     },
                     ImageGenerationReference {
                         bytes: b"SECOND_REFERENCE_BYTES".to_vec(),
-                        filename: "bella-secondary.png".to_string(),
+                        filename: "zoe-\"quoted\"\r\n.png".to_string(),
                         mime_type: "image/png".to_string(),
                     },
                 ],
@@ -1096,34 +1161,51 @@ mod tests {
 
         assert_eq!(result.dimensions.as_deref(), Some("1024x1024"));
         let captured = captured.lock().expect("read edit request capture");
-        assert_eq!(captured.authorization, "Bearer synthetic-access");
-        assert_eq!(captured.account_id, "acct-synthetic");
-        assert_eq!(captured.originator, "aidaemon");
-        assert_eq!(captured.turn_id, "turn-edit-1");
-        assert_eq!(captured.body["model"], CHATGPT_IMAGE_MODEL);
-        assert_eq!(
-            captured.body["prompt"],
-            "Preserve the face from the first reference"
+        assert_eq!(captured.authorization, "Bearer sk-synthetic-test-key");
+        assert!(!captured.has_account_id);
+        assert!(!captured.has_originator);
+        assert!(!captured.has_codex_turn_id);
+        assert!(
+            captured
+                .content_type
+                .starts_with("multipart/form-data; boundary=----aidaemon-image-"),
+            "{}",
+            captured.content_type
         );
-        let images = captured.body["images"]
-            .as_array()
-            .expect("ordered image reference array");
-        assert_eq!(images.len(), 2);
-        assert_eq!(
-            images[0]["image_url"],
-            format!(
-                "data:image/jpeg;base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(b"FIRST_REFERENCE_BYTES")
+        let body_text = String::from_utf8_lossy(&captured.raw_body);
+        assert!(body_text.contains(&format!(
+            "Content-Disposition: form-data; name=\"model\"\r\n\r\n{OPENAI_IMAGE_MODEL}\r\n"
+        )));
+        assert!(body_text.contains(
+            "Content-Disposition: form-data; name=\"prompt\"\r\n\r\nPreserve the face from the first reference\r\n"
+        ));
+        let first_idx = body_text
+            .find("name=\"image[]\"; filename=\"mia-primary.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nFIRST_REFERENCE_BYTES\r\n")
+            .expect("first reference part");
+        let second_idx = body_text
+            .find("name=\"image[]\"; filename=\"zoe-quoted.png\"\r\nContent-Type: image/png\r\n\r\nSECOND_REFERENCE_BYTES\r\n")
+            .expect("second reference part with sanitized filename");
+        assert!(first_idx < second_idx, "reference order must be preserved");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_backend_blocks_with_setup_instructions() {
+        let temp = tempfile::tempdir().expect("create temp inbox");
+        let tool = GenerateImageTool::unconfigured(temp.path().to_path_buf());
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({"prompt": "A watercolor lighthouse"}).to_string(),
+                None,
             )
-        );
+            .await
+            .expect("return structured blocked error");
+
         assert_eq!(
-            images[1]["image_url"],
-            format!(
-                "data:image/png;base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(b"SECOND_REFERENCE_BYTES")
-            )
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
         );
-        assert!(captured.body.get("input_fidelity").is_none());
+        assert!(outcome.output.contains("OPENAI_API_KEY"));
+        assert!(outcome.output.contains("config.toml"));
     }
 
     #[tokio::test]
@@ -1303,17 +1385,10 @@ mod tests {
 
     #[test]
     fn schema_and_capabilities_are_provider_neutral() {
-        let credentials =
-            ChatGptCredentialManager::with_credentials(chatgpt_codex::ChatGptCredentials {
-                access_token: "a".to_string(),
-                refresh_token: "r".to_string(),
-                account_id: "acct".to_string(),
-                expires_at: Utc::now() + chrono::Duration::hours(1),
-            });
-        let backend = ChatGptSubscriptionImageBackend::with_dependencies(
+        let backend = OpenAiImagesBackend::with_dependencies(
             "http://example.invalid",
             reqwest::Client::new(),
-            Arc::new(credentials),
+            "sk-synthetic".to_string(),
         );
         let tool = GenerateImageTool::new(Arc::new(backend), PathBuf::from("/tmp"));
         let schema = tool.schema();
@@ -1339,12 +1414,16 @@ mod tests {
 
     #[test]
     fn http_errors_have_actionable_provider_specific_messages() {
-        let auth = chatgpt_image_http_error(401, "expired");
+        let auth = openai_image_http_error(401, "invalid_api_key");
         assert_eq!(auth.kind, ImageGenerationErrorKind::Blocked);
-        assert!(auth.message.contains("aidaemon auth login openai"));
+        assert!(auth.message.contains("OPENAI_API_KEY"));
         assert_eq!(auth.http_status, Some(401));
 
-        let rate_limit = chatgpt_image_http_error(429, "limit");
+        let forbidden = openai_image_http_error(403, "org_not_verified");
+        assert_eq!(forbidden.kind, ImageGenerationErrorKind::Blocked);
+        assert_eq!(forbidden.http_status, Some(403));
+
+        let rate_limit = openai_image_http_error(429, "limit");
         assert_eq!(rate_limit.kind, ImageGenerationErrorKind::Retryable);
         assert_eq!(rate_limit.http_status, Some(429));
     }

@@ -555,7 +555,7 @@ fn choices(
                                  copy that page's address and paste it here.",
                         ))
                         .child(field(
-                            "http://localhost:1455/auth/callback?code=…",
+                            "http://127.0.0.1:1455/auth/callback?code=…",
                             redirect,
                         ))
                         .child(

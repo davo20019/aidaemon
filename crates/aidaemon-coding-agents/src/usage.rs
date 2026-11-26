@@ -58,7 +58,7 @@ async fn ask(check: UsageCheck, command: &str, prefix: &[String]) -> Option<Usag
     let stdout = child.stdout.take()?;
     for request in [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "clientInfo": {"name": "aidaemon", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": "aidaemon", "title": "AIdaemon", "version": env!("CARGO_PKG_VERSION")},
         }}),
         json!({"jsonrpc": "2.0", "method": "initialized"}),
         // The counts alone: the reset-credit details are a second lookup.

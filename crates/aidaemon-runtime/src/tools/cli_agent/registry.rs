@@ -338,17 +338,19 @@ impl CliAgentTool {
                                     .flatten()
                                     .map(|index| entry.args[..=index].to_vec())
                                     .unwrap_or_default();
+                                let agent = registry.for_program(&entry_program(entry));
+                                let sign_in = permissions
+                                    .get()
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .sign_in_of_for(name, &*agent);
                                 crate::tools::agent_mode::AgentInfo {
                                     name: name.clone(),
-                                    agent: registry.for_program(&entry_program(entry)),
+                                    agent,
                                     command: entry.command.clone(),
                                     prefix,
                                     local,
-                                    sign_in: permissions
-                                        .get()
-                                        .cloned()
-                                        .unwrap_or_default()
-                                        .sign_in_of(name),
+                                    sign_in,
                                 }
                             })
                             .collect()
@@ -356,11 +358,6 @@ impl CliAgentTool {
                 })
                 .unwrap_or_default()
         }));
-        // Each agent says whether it can work, in the background (never
-        // under test: it would ask the agents installed on the machine).
-        if cfg!(not(test)) {
-            tokio::spawn(crate::tools::agent_mode::check_all());
-        }
 
         tool
     }
@@ -369,7 +366,11 @@ impl CliAgentTool {
     /// Follow the daemon's permission choices (shared with Settings). Set
     /// once, at start; until then the defaults (Standard, no choices).
     pub fn set_permissions(&self, permissions: crate::permissions::Permissions) {
-        let _ = self.permissions.set(permissions);
+        if self.permissions.set(permissions).is_ok() && cfg!(not(test)) {
+            // Ask each agent whether it can work now that config sign-ins and
+            // secrets are wired (never under test: it would probe local CLIs).
+            tokio::spawn(crate::tools::agent_mode::check_all());
+        }
     }
 
     pub(super) fn permissions(&self) -> crate::permissions::Permissions {
