@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-26
+
 ### Added
 
+- **Coding agents give each other files, not just paths.** `cli_agent` runs and the peer tools `delegate_cli`, `message_peer` and `post_board` take `files`: the daemon checks the sender may read each one (never a secret; at most 8, 20 MB each) and names it in the recipient's prompt or message, copying it into the recipient's working folder (under a self-ignoring `.aidaemon-shared/`) only when the recipient's sandbox can't reach the original.
+- **A coding agent whose plan runs out of usage pauses instead of failing.** When a run fails, the daemon asks the agent's own account (Codex: `account/rateLimits/read`, typed) whether it is out of usage; the run then reads "Codex ran out of usage on its plan; it resets at 11:07 PM", the agent is not started again until then (a coordinator is told to hand the work elsewhere, and `check_peer` reports it), and the app's Agents tab shows "out of usage until …" with a clock, then "usage reset · can continue" and a **Continue** button (protocol 1.58).
+- **Address a specific coding-agent session from the composer,** including a note to one that is still working (mid-run notes).
+- **The agent run view reads at a glance:** finished work between milestones folds into one line ("Changed 3 files · read 6 files · ran 2 commands"), each changed file opening its diff; hand-offs name their agents ("Handed work to Claude Code and Codex") and open their runs; calls to the coordination tools read in plain words; the Permissions section lists only what was refused, declined or unanswered (protocol 1.56, 1.57).
+- **Coding agents are shown by their makers' marks** (protocol 1.53).
 - **Antigravity CLI (`agy`) can sign in with a Gemini API key.** Settings → Models → Coding agents offers "Its own sign-in" (the default, unchanged) or "Gemini API key": the key is kept in the keychain and handed to `agy acp` at launch, in its own data folder (`~/.gemini/aidaemon-agy`), so your own agy sign-in and sessions are untouched. While agy runs on its own sign-in, a short note links Google's FAQ, which prefers a Gemini API key for agy driven by other apps.
+- **The phone drawer closes with a swipe** to the left; Settings, Automations, Memory and System share one navigation bar, and Settings is a gear in the drawer's header.
 
 ### Security
 
@@ -19,11 +27,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Linux confined runs create a repository's missing `.git/hooks` first,** so it is mounted read-only too.
 - **`render_pdf` renders a private copy of the approved bytes,** so nothing can swap the file between the check and the render.
 - **Approval buttons wait again whenever the card moves under the pointer,** and the settings dialog and command palette are armed the same way.
+- **A coding agent's result is untrusted output wherever it ran,** since it may follow instructions it found in a project.
+- **One approval gate for configuration, OAuth, HTTP auth, skills and scheduling** (`manage_config` took any approval before).
+- **Auth probes (`manage_oauth`, `manage_http_auth`) connect through the public-only client:** no redirects, no private addresses.
+- **Provider base URLs must be https,** or plain http only to a loopback or private address.
+- **Owner-only files are written atomically** (a private sibling renamed over the file).
 
 ### Changed
 
+- **The README leads with what AIdaemon does for anyone,** with screenshots and two short clips of the app (a conversation, automations, the phone, and coding agents working as a team); the crate's description and keywords say the same.
 - **The app's conversation list names the coding agent a conversation is set to** (`project · Claude Code`; just the agent inside a project), so a conversation whose messages go straight to a CLI stands apart. A conversation's agents line under its row opens its Agents tab.
 - **The app is on Native Shell 0.7.1 from crates.io,** no longer a fork of 0.6.1: dictation comes from the `nsh-extra` speech module, the desktop app draws in an explicit main window that quits the app when closed, and CI and releases use the 0.7.1 `nsh` CLI.
+- **Background coding-agent runs have no total-time cap by default** (`cli_agents.background_timeout_secs` defaults to 0): an agent still producing output runs as long as it needs, and `idle_timeout_secs` stops a stalled one.
+- **The connection dot by the app's name shows only when something is wrong;** the drawer has no close button.
+- **Conversation rows are two lines on desktop too** (title, then project · agent).
+- **The runtime is split into `aidaemon-runtime-base`, `aidaemon-runtime-core` and `aidaemon-runtime`,** so an edit recompiles less; modules moved between them.
+- **Breaking for SDK users:** 0.25.0 drops public items nothing used (`plans::tracking`, `plans::detection`, the old skills prompt builders, unused items in `aidaemon-channels` and `aidaemon-memory`).
+
+### Fixed
+
+- **The Changes tab's file tree no longer freezes the page** when a folder is closed.
+- **xAI and ChatGPT tool results:** xAI no longer gets orphan function-call outputs it refuses, and ChatGPT keeps tool-result images.
+- **A browser paired from a link keeps its daemon's iroh address,** and a remote link that drops reconnects at once instead of waiting out a dead dial.
+- **One long run no longer fills the client event log** (only a run's newest update is kept; 12 GB seen).
+- **Stored memory times** written by SQLite read back correctly, and Telegram's plain-text fallback keeps `my_var_name` intact.
+- **A claimed bot's access ids go to its own config entry,** not always the first.
 
 ## [0.24.0] - 2026-11-25
 
