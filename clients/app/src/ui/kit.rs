@@ -1379,6 +1379,8 @@ where
     let trigger = view()
         .role(AccessibilityRole::Button)
         .label(move || SharedString::from(name()))
+        .min_w(px(0.0))
+        .max_w(percentage(1.0))
         .style_when(wide, |s| s.w_full())
         .rounded(px(radius::CONTROL))
         .transition_colors()
@@ -1394,34 +1396,40 @@ where
     };
     if super::touch() {
         view()
+            .min_w(px(0.0))
+            .max_w(percentage(1.0))
             .style_when(wide, |s| s.w_full())
             .child(trigger.on_press(move || open.set(true)))
             .child(pick_sheet(picker, open))
     } else {
         let body = pick_content(picker, open, false);
-        view().style_when(wide, |s| s.w_full()).child(
-            popover()
-                .open(move || Some(open.get()))
-                .on_open_change(move |event: &nsh_base::PopoverEvent| {
-                    if let nsh_base::PopoverEvent::OpenChange(now_open, _) = event {
-                        open.set(*now_open);
-                    }
-                })
-                .trigger(trigger)
-                .popup_style(|s| {
-                    s.w(px(380.0))
-                        .bg(colors::SURFACE)
-                        .border_1()
-                        .border_color(colors::EDGE)
-                        .rounded(px(radius::SURFACE))
-                        .shadow_lg()
-                        .transition_all()
-                        .duration(motion::BASE)
-                })
-                .popup_starting_class("opacity-0 scale-95")
-                .popup_ending_class("opacity-0 scale-95")
-                .child(body.build()),
-        )
+        view()
+            .min_w(px(0.0))
+            .max_w(percentage(1.0))
+            .style_when(wide, |s| s.w_full())
+            .child(
+                popover()
+                    .open(move || Some(open.get()))
+                    .on_open_change(move |event: &nsh_base::PopoverEvent| {
+                        if let nsh_base::PopoverEvent::OpenChange(now_open, _) = event {
+                            open.set(*now_open);
+                        }
+                    })
+                    .trigger(trigger)
+                    .popup_style(|s| {
+                        s.w(px(380.0))
+                            .bg(colors::SURFACE)
+                            .border_1()
+                            .border_color(colors::EDGE)
+                            .rounded(px(radius::SURFACE))
+                            .shadow_lg()
+                            .transition_all()
+                            .duration(motion::BASE)
+                    })
+                    .popup_starting_class("opacity-0 scale-95")
+                    .popup_ending_class("opacity-0 scale-95")
+                    .child(body.build()),
+            )
     }
 }
 

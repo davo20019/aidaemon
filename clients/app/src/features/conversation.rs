@@ -3052,6 +3052,7 @@ fn composer(store: Store, session: Option<String>) -> View {
         ),
         None => format!("Also posted in {place}"),
     });
+    let has_chat_note = chat_note.is_some();
     // A phone's composer sits close to the conversation and the screen's
     // foot: every point it takes is a point of reading gone.
     let (pad_top, pad_bottom) = if touch { (4.0, 8.0) } else { (8.0, 16.0) };
@@ -3070,6 +3071,7 @@ fn composer(store: Store, session: Option<String>) -> View {
         })
         .child(
             ui::surface()
+                .test_id("composer")
                 // No fill of its own in dark: a box of the page's colour
                 // drawn by its edge, as the field it is (a filled slab read
                 // as a black block under the conversation).
@@ -3228,9 +3230,11 @@ fn composer(store: Store, session: Option<String>) -> View {
                 )
                 .child(
                     view()
+                        .w_full()
+                        .min_w(px(0.0))
                         .flex_row()
                         .items_center()
-                        .gap_1()
+                        .gap(px(if touch { 2.0 } else { 4.0 }))
                         .child(attach_button(store, terminal))
                         .child(dictation(store, terminal))
                         // Recipient / model chip: keep visible on phones too
@@ -3300,8 +3304,16 @@ fn composer(store: Store, session: Option<String>) -> View {
                                     },
                                 }
                             })
+                            .truncate()
                             .flex_1()
-                            .px(px(8.0))
+                            .min_w(px(0.0))
+                            .px(px(if !touch {
+                                8.0
+                            } else if has_chat_note {
+                                4.0
+                            } else {
+                                0.0
+                            }))
                             .text_size(px(type_scale::XS))
                             .text_color(colors::FAINT),
                         )
@@ -3325,15 +3337,23 @@ fn composer(store: Store, session: Option<String>) -> View {
                                         } else {
                                             ("Queue", "Queue: send after the running work")
                                         };
-                                        ui::btn(label, Variant::Ghost, ui::Size::Sm, move || {
-                                            if tv.working {
-                                                store.submit_placed(Some(MidRun::Queue));
-                                            } else {
-                                                store.submit_placed(Some(other_placement(store)));
-                                            }
-                                        })
+                                        let btn = ui::btn(
+                                            label,
+                                            Variant::Ghost,
+                                            ui::Size::Sm,
+                                            move || {
+                                                if tv.working {
+                                                    store.submit_placed(Some(MidRun::Queue));
+                                                } else {
+                                                    store.submit_placed(Some(other_placement(
+                                                        store,
+                                                    )));
+                                                }
+                                            },
+                                        )
                                         .disabled(move || !can_send())
-                                        .accessibility_label(name)
+                                        .accessibility_label(name);
+                                        if touch { btn.px(px(10.0)) } else { btn }
                                     }))
                                 }))
                             },
@@ -3830,12 +3850,13 @@ pub(crate) fn dictation_for(
         move || {
             view().child(dynamic(move || {
                 let on = listening.get();
+                let mic_size = if ui::touch() { Size::Sm } else { Size::Md };
                 Some(untracked(move || {
                     if on {
-                        ui::icon_btn(Glyph::Stop, "Stop listening", Size::Md, press)
+                        ui::icon_btn(Glyph::Stop, "Stop listening", mic_size, press)
                             .text_color(colors::ACCENT)
                     } else {
-                        ui::icon_btn(Glyph::Mic, "Speak instead of typing", Size::Md, press)
+                        ui::icon_btn(Glyph::Mic, "Speak instead of typing", mic_size, press)
                     }
                 }))
             }))

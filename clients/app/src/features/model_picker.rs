@@ -175,114 +175,123 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         .h(px(if ui::touch() { 44.0 } else { 26.0 }))
         .flex_row()
         .items_center()
+        .min_w(px(0.0))
+        .max_w(percentage(1.0))
         .gap(px(4.0))
-        .px(px(8.0))
+        .px(px(if ui::touch() { 6.0 } else { 8.0 }))
         .child(
             text(move || label.get())
-                .number_of_lines(1)
+                .truncate()
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
                 .max_w(px(240.0))
                 .text_size(px(ui::type_scale::XS))
                 .text_color(ui::colors::MUTED),
         )
         .child(
-            ui::icon(ui::Glyph::Down)
+            ui::icon_inline(ui::Glyph::Down)
+                .flex_shrink_0()
                 .text_color(ui::colors::FAINT)
                 .accessibility_elements_hidden(true),
         );
     let pick_session = session.clone();
-    view().test_id("model-picker").child(when(
-        move || shown.get(),
-        move || {
-            let session = pick_session.clone();
-            let has_session = session.is_some();
-            ui::pick_list(
-                ui::Picker {
-                    title: if target_view.get_untracked().shows_recipient {
-                        "Send to"
-                    } else {
-                        "Model and effort"
-                    },
-                    items: move || {
-                        let view = target_view.get_untracked();
-                        if view.shows_recipient {
-                            recipient_choices(
-                                store,
-                                has_session,
-                                view.target,
-                                current.get_untracked(),
-                            )
+    view()
+        .test_id("model-picker")
+        .flex_shrink(1.0)
+        .min_w(px(0.0))
+        .child(when(
+            move || shown.get(),
+            move || {
+                let session = pick_session.clone();
+                let has_session = session.is_some();
+                ui::pick_list(
+                    ui::Picker {
+                        title: if target_view.get_untracked().shows_recipient {
+                            "Send to"
                         } else {
-                            choices(store, current.get_untracked())
-                        }
-                    },
-                    pick: move |id: String| {
-                        if let Some(thread) = id.strip_prefix("session:") {
-                            if let Some(session_id) = session.as_deref() {
-                                store.set_composer_target(
-                                    session_id,
-                                    ComposerTarget::Session {
-                                        thread: thread.to_owned(),
-                                    },
+                            "Model and effort"
+                        },
+                        items: move || {
+                            let view = target_view.get_untracked();
+                            if view.shows_recipient {
+                                recipient_choices(
+                                    store,
+                                    has_session,
+                                    view.target,
+                                    current.get_untracked(),
+                                )
+                            } else {
+                                choices(store, current.get_untracked())
+                            }
+                        },
+                        pick: move |id: String| {
+                            if let Some(thread) = id.strip_prefix("session:") {
+                                if let Some(session_id) = session.as_deref() {
+                                    store.set_composer_target(
+                                        session_id,
+                                        ComposerTarget::Session {
+                                            thread: thread.to_owned(),
+                                        },
+                                    );
+                                }
+                            } else if let Some(agent) = id.strip_prefix("new_agent:") {
+                                let agent_model = ModelChoice::Agent {
+                                    agent: agent.to_owned(),
+                                };
+                                if code.get_untracked() {
+                                    store.remember_code_worker(&agent_model);
+                                }
+                                match session.as_deref() {
+                                    Some(session_id) => store.set_composer_target(
+                                        session_id,
+                                        ComposerTarget::NewAgent {
+                                            agent: agent.to_owned(),
+                                        },
+                                    ),
+                                    None => store.set_session_model(None, Some(agent_model), None),
+                                }
+                            } else if id == "aidaemon" {
+                                if code.get_untracked() {
+                                    store.remember_code_worker(&ModelChoice::Auto);
+                                }
+                                match session.as_deref() {
+                                    Some(session_id) => store
+                                        .set_composer_target(session_id, ComposerTarget::Aidaemon),
+                                    None => {
+                                        store.set_session_model(None, Some(ModelChoice::Auto), None)
+                                    }
+                                }
+                            } else if let Some(model) = id.strip_prefix("model:") {
+                                let model = decode(model);
+                                if code.get_untracked() {
+                                    store.remember_code_worker(&model);
+                                }
+                                store.set_session_model(session.as_deref(), Some(model), None);
+                            } else if let Some(effort) = id.strip_prefix("effort:") {
+                                store.set_session_model(
+                                    session.as_deref(),
+                                    None,
+                                    Some(effort_of(effort)),
                                 );
                             }
-                        } else if let Some(agent) = id.strip_prefix("new_agent:") {
-                            let agent_model = ModelChoice::Agent {
-                                agent: agent.to_owned(),
-                            };
-                            if code.get_untracked() {
-                                store.remember_code_worker(&agent_model);
-                            }
-                            match session.as_deref() {
-                                Some(session_id) => store.set_composer_target(
-                                    session_id,
-                                    ComposerTarget::NewAgent {
-                                        agent: agent.to_owned(),
-                                    },
-                                ),
-                                None => store.set_session_model(None, Some(agent_model), None),
-                            }
-                        } else if id == "aidaemon" {
-                            if code.get_untracked() {
-                                store.remember_code_worker(&ModelChoice::Auto);
-                            }
-                            match session.as_deref() {
-                                Some(session_id) => {
-                                    store.set_composer_target(session_id, ComposerTarget::Aidaemon)
-                                }
-                                None => {
-                                    store.set_session_model(None, Some(ModelChoice::Auto), None)
-                                }
-                            }
-                        } else if let Some(model) = id.strip_prefix("model:") {
-                            let model = decode(model);
-                            if code.get_untracked() {
-                                store.remember_code_worker(&model);
-                            }
-                            store.set_session_model(session.as_deref(), Some(model), None);
-                        } else if let Some(effort) = id.strip_prefix("effort:") {
-                            store.set_session_model(
-                                session.as_deref(),
-                                None,
-                                Some(effort_of(effort)),
-                            );
+                        },
+                        action: None,
+                    },
+                    move || {
+                        let current_label = label.get();
+                        if target_view.get().shows_recipient {
+                            let clean =
+                                current_label.strip_prefix("To: ").unwrap_or(&current_label);
+                            format!("Send to: {clean}")
+                        } else {
+                            format!("Model and effort: {current_label}")
                         }
                     },
-                    action: None,
-                },
-                move || {
-                    let current_label = label.get();
-                    if target_view.get().shows_recipient {
-                        let clean = current_label.strip_prefix("To: ").unwrap_or(&current_label);
-                        format!("Send to: {clean}")
-                    } else {
-                        format!("Model and effort: {current_label}")
-                    }
-                },
-                chip.clone(),
-                false,
-            )
-        },
-    ))
+                    chip.clone(),
+                    false,
+                )
+            },
+        ))
 }
 
 /// Recipient picker for conversations with coding agents (or Code mode):

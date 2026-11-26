@@ -2598,3 +2598,119 @@ fn the_drawer_closes_with_a_swipe_and_has_no_close_button() -> Result<(), String
     app.wait_for_gone("Search conversations", std::time::Duration::from_secs(3))?;
     Ok(())
 }
+
+/// On a narrow phone (360 pt) with attach, dictation, a long recipient chip
+/// ("To: Antigravity CLI · idle"), and the mid-run Queue button all shown in
+/// the composer's bottom row, the recipient chip shrinks so Send stays wholly
+/// inside the composer frame and viewport.
+#[test]
+fn the_composer_keeps_send_inside_the_box_on_a_narrow_phone() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    no_local_daemon();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            nsh_extra::speech::set_backend(None);
+        }
+    }
+    let _restore = Restore;
+    nsh_extra::speech::set_backend(Some(std::sync::Arc::new(Hears)));
+
+    for viewport_w in [360.0f32, 390.0f32] {
+        let mut config = EngineConfig::new(Root::of::<Offline>());
+        config.viewport = Size::new(Points(viewport_w), Points(780.0));
+        config.environment.idiom = nsh_core::platform::Idiom::Phone;
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("What can I help you with?")?;
+        let before_models = sent("list_models");
+        feed([
+            Update::Connected,
+            frame(
+                r#"{"type":"snapshot","seq":20,"state":{"sessions":[{"id":"app:synthetic-narrow","channel":"app","title":"Narrow phone layout","writable":true,"project_id":"project-acme"}],"projects":[{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-a1","session_id":"app:synthetic-narrow","label":"First pass","agent":"Antigravity CLI","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999960000,"can_continue":true,"result":{"text":"First synthetic pass done."}},{"id":"cli-agent-c1","session_id":"app:synthetic-narrow","label":"Second pass","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999980000,"accepts_mid_run":true}]}}"#,
+            ),
+        ]);
+        let models_id = wait_sent_new("list_models", before_models)?;
+        feed([frame(&format!(
+            r#"{{"type":"ack","request_id":"{models_id}","result":{{"type":"models","options":{{"providers":[],"agents":[{{"id":"agy","name":"Antigravity CLI"}},{{"id":"codex","name":"Codex"}}]}}}}}}"#
+        ))]);
+        settle(&mut app)?;
+
+        // Open the conversation from the phone drawer.
+        app.press("label:Conversations")?;
+        app.wait_for("Narrow phone layout")?;
+        app.press("Narrow phone layout >> nth=0")?;
+        app.wait_for("text:First synthetic pass done.")?;
+
+        // Target the idle Antigravity CLI session while the conversation is
+        // actively running a turn, and type a draft so Queue + Send both appear.
+        app.press("Reply to Antigravity CLI")?;
+        app.wait_for("label:Send to: Antigravity CLI · idle")?;
+        feed([frame(
+            r#"{"type":"event","seq":21,"at_ms":21,"session_id":"app:synthetic-narrow","event":{"type":"turn_started","turn_id":"t-narrow","session_id":"app:synthetic-narrow","origin":"app"}}"#,
+        )]);
+        settle(&mut app)?;
+        app.wait_for("label:Speak instead of typing")?;
+        app.type_text("label:Message", "Commit all changes and test")?;
+        app.wait_for("label:Queue: send after the running work")?;
+        app.wait_for("label:Send now: the running work reads it")?;
+
+        let screen = app.screen();
+        let queue_id = screen.id("label:Queue: send after the running work")?;
+        let send_id = screen.id("label:Send now: the running work reads it")?;
+        let nodes = screen.layout_nodes();
+        let composer = nodes
+            .iter()
+            .find(|n| n.test_id.as_deref() == Some("composer") && !n.hidden)
+            .ok_or("no composer surface on screen")?;
+        let picker = nodes
+            .iter()
+            .find(|n| n.test_id.as_deref() == Some("model-picker") && !n.hidden)
+            .ok_or("no model-picker on screen")?;
+        let queue = nodes
+            .iter()
+            .find(|n| n.id == queue_id && !n.hidden)
+            .ok_or("no Queue button on screen")?;
+        let send = nodes
+            .iter()
+            .find(|n| n.id == send_id && !n.hidden)
+            .ok_or("no Send button on screen")?;
+
+        let composer_right = composer.bounds.origin.x.0 + composer.bounds.size.width.0;
+        let picker_right = picker.bounds.origin.x.0 + picker.bounds.size.width.0;
+        let queue_right = queue.bounds.origin.x.0 + queue.bounds.size.width.0;
+        let send_right = send.bounds.origin.x.0 + send.bounds.size.width.0;
+
+        assert!(
+            send.bounds.size.width.0 >= 38.0,
+            "at {viewport_w} pt, Send width shrank to {}",
+            send.bounds.size.width.0
+        );
+        assert!(
+            send_right <= composer_right + 0.5 && send_right <= viewport_w,
+            "at {viewport_w} pt, Send right ({send_right}) overflowed composer ({composer_right}) / viewport ({viewport_w}); picker=({}..{picker_right}), queue=({}..{queue_right}), send=({}..{send_right})",
+            picker.bounds.origin.x.0,
+            queue.bounds.origin.x.0,
+            send.bounds.origin.x.0
+        );
+        assert!(
+            picker_right <= queue.bounds.origin.x.0 + 0.5,
+            "at {viewport_w} pt, picker ({picker_right}) overlapped Queue ({})",
+            queue.bounds.origin.x.0
+        );
+        assert!(
+            queue_right <= send.bounds.origin.x.0 + 0.5,
+            "at {viewport_w} pt, Queue ({queue_right}) overlapped Send ({})",
+            send.bounds.origin.x.0
+        );
+        assert!(
+            picker.bounds.size.width.0 >= 40.0,
+            "at {viewport_w} pt, recipient chip collapsed to {} pt",
+            picker.bounds.size.width.0
+        );
+
+        let before_send = sent("send_message");
+        app.press("label:Send now: the running work reads it")?;
+        wait_sent_new("send_message", before_send)?;
+    }
+    Ok(())
+}
