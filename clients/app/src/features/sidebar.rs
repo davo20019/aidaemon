@@ -1057,11 +1057,23 @@ fn confirm_delete(store: Store, id: &str) {
     };
     let id = id.to_owned();
     ui::confirm(
-        format!("Delete {}?", project.name),
+        delete_question(&project.name),
         format!("{moved}{folder}"),
         "Delete",
         move || store.delete_project(&id),
     );
+}
+
+/// "Delete <name>?", without doubling the punctuation a name (often a
+/// conversation's first message) already ends with: "Delete Say hi?", not
+/// "Delete Say hi.?".
+fn delete_question(name: &str) -> String {
+    let name = name.trim_end().trim_end_matches(['.', ',', ':', ';']);
+    if name.ends_with(['?', '!']) {
+        format!("Delete {name}")
+    } else {
+        format!("Delete {name}?")
+    }
 }
 
 /// Ask, then delete a conversation for good, as `/wipe` erases one.
@@ -1069,7 +1081,7 @@ fn confirm_delete_session(store: Store, id: &str) {
     let title = untracked(|| store.title(id));
     let id = id.to_owned();
     ui::confirm(
-        format!("Delete {title}?"),
+        delete_question(&title),
         "Its messages, runs and summaries are erased for good, and its running work stops. \
          Facts already saved to memory are kept."
             .to_owned(),
@@ -2194,5 +2206,24 @@ mod hold_tests {
     #[test]
     fn nothing_shown_yet_takes_the_fresh_order() {
         assert_eq!(hold_order(&[], v(&["b", "a"])), v(&["b", "a"]));
+    }
+}
+
+#[cfg(test)]
+mod delete_question_tests {
+    use super::delete_question;
+
+    #[test]
+    fn a_name_keeps_one_question_mark() {
+        assert_eq!(delete_question("Notes"), "Delete Notes?");
+        assert_eq!(
+            delete_question("Reply with ready."),
+            "Delete Reply with ready?"
+        );
+        assert_eq!(
+            delete_question("What is my model?"),
+            "Delete What is my model?"
+        );
+        assert_eq!(delete_question("Ship it!"), "Delete Ship it!");
     }
 }
