@@ -96,10 +96,21 @@ pub fn agent_named(name: &str) -> Option<Arc<dyn CodingAgent>> {
         .map(|info| info.agent)
 }
 
-fn readiness_cache() -> &'static Mutex<std::collections::HashMap<String, Readiness>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Readiness>>> = OnceLock::new();
+/// An agent's last answer, and when it was given.
+struct Answer {
+    readiness: Readiness,
+    at: std::time::Instant,
+}
+
+fn readiness_cache() -> &'static Mutex<std::collections::HashMap<String, Answer>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Answer>>> = OnceLock::new();
     CACHE.get_or_init(Mutex::default)
 }
+
+/// How long an agent that could be asked but gave no answer (its check
+/// timed out or it closed first, as a slow first start does) waits before
+/// [`ensure_checked`] asks it again.
+const ASK_UNANSWERED_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether the agent named `name` can do work, as it last answered
 /// (`Unchecked` before it is asked).
@@ -107,14 +118,47 @@ pub fn readiness_of(name: &str) -> Readiness {
     readiness_cache()
         .lock()
         .ok()
-        .and_then(|cache| cache.get(name).cloned())
+        .and_then(|cache| cache.get(name).map(|answer| answer.readiness.clone()))
         .unwrap_or(Readiness::Unchecked)
 }
 
 fn remember(name: &str, readiness: Readiness) {
     tracing::info!(agent = %name, ?readiness, "A coding agent says whether it can work");
     if let Ok(mut cache) = readiness_cache().lock() {
-        cache.insert(name.to_string(), readiness);
+        cache.insert(
+            name.to_string(),
+            Answer {
+                readiness,
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// A run of the agent named `name` finished on its own with success: it
+/// can work, whatever its check said (a check that timed out left it
+/// unchecked).
+pub fn mark_ready_after_run(name: &str) {
+    if readiness_of(name) != Readiness::Ready {
+        remember(name, Readiness::Ready);
+    }
+}
+
+/// Whether [`ensure_checked`] asks `info` now: never asked, or it can be
+/// asked (it runs here and has a check) yet its last check gave no answer,
+/// long enough ago.
+fn due_for_check(info: &AgentInfo, now: std::time::Instant) -> bool {
+    let Ok(cache) = readiness_cache().lock() else {
+        return false;
+    };
+    match cache.get(&info.name) {
+        None => true,
+        Some(answer) => {
+            answer.readiness == Readiness::Unchecked
+                && info.local
+                && info.agent.readiness_probe().is_some()
+                && now.saturating_duration_since(answer.at) >= ASK_UNANSWERED_AGAIN_AFTER
+        }
     }
 }
 
@@ -201,16 +245,28 @@ pub async fn check_all() {
     futures::future::join_all(checks).await;
 }
 
-/// Ask the agents not asked yet.
+/// Ask the agents not asked yet, and, without waiting for them, the ones
+/// whose last check gave no answer a while ago (a slow first start must
+/// not hide an agent until the daemon restarts, nor stall every caller on
+/// one that hangs).
 pub async fn ensure_checked() {
-    let unasked: Vec<AgentInfo> = agents()
+    let now = std::time::Instant::now();
+    let (unasked, unanswered): (Vec<AgentInfo>, Vec<AgentInfo>) = agents()
         .into_iter()
-        .filter(|info| {
+        .filter(|info| due_for_check(info, now))
+        .partition(|info| {
             readiness_cache()
                 .lock()
                 .is_ok_and(|cache| !cache.contains_key(&info.name))
-        })
-        .collect();
+        });
+    for info in unanswered {
+        // Asked once at a time: until its answer, it reads as asked now.
+        remember(&info.name, Readiness::Unchecked);
+        tokio::spawn(async move {
+            let checked = ask(&info).await;
+            remember_checked(&info.name, checked);
+        });
+    }
     let checks = unasked.into_iter().map(|info| async move {
         let checked = ask(&info).await;
         remember_checked(&info.name, checked);
@@ -542,6 +598,38 @@ mod tests {
         assert!(!readiness_of("synthetic-signed-out").is_usable());
         remember("synthetic-signed-out", Readiness::Ready);
         assert!(readiness_of("synthetic-signed-out").is_usable());
+    }
+
+    /// A check that gave no answer (timed out on a slow first start) is
+    /// asked again after a while, not kept for the daemon's life; an agent
+    /// with no check of its own is not; a finished run marks it ready.
+    #[test]
+    fn an_unanswered_check_is_asked_again_and_a_finished_run_marks_ready() {
+        let info = |name: &str, local: bool| AgentInfo {
+            name: name.to_string(),
+            agent: Arc::new(aidaemon_coding_agents::acp::AcpAgent::custom(
+                "Synthetic ACP",
+                "synthetic-acp",
+                &["acp"],
+            )),
+            command: "synthetic-acp".into(),
+            prefix: Vec::new(),
+            local,
+            sign_in: Ok(SignIn::default()),
+        };
+        let slow = info("synthetic-slow-start", true);
+        let now = std::time::Instant::now();
+        assert!(due_for_check(&slow, now), "never asked");
+        remember(&slow.name, Readiness::Unchecked);
+        assert!(!due_for_check(&slow, now), "just asked");
+        let later = now + ASK_UNANSWERED_AGAIN_AFTER + std::time::Duration::from_secs(1);
+        assert!(due_for_check(&slow, later), "unanswered, a while ago");
+        let remote = info("synthetic-remote", false);
+        remember(&remote.name, Readiness::Unchecked);
+        assert!(!due_for_check(&remote, later), "it can't be asked here");
+        mark_ready_after_run(&slow.name);
+        assert_eq!(readiness_of(&slow.name), Readiness::Ready);
+        assert!(!due_for_check(&slow, later), "answered");
     }
 
     /// A run's judge names that run while its ask is judged (the card it

@@ -379,6 +379,8 @@ pub(super) async fn watch_run(
             "It couldn't sign in on its last run.",
             None,
         );
+    } else if exit_code == Some(0) && !loop_detected && !timed_out {
+        crate::tools::agent_mode::mark_ready_after_run(&tool_name_owned);
     }
     // A run that failed on its own (not stopped by the runtime): its
     // agent, when it can be asked, says whether its plan ran out.
