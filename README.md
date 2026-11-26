@@ -1,105 +1,119 @@
-# aidaemon
+# AIdaemon
 
 [![CI](https://github.com/davo20019/aidaemon/actions/workflows/ci.yml/badge.svg)](https://github.com/davo20019/aidaemon/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/aidaemon)](https://crates.io/crates/aidaemon)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[Website](https://aidaemon.ai/) · [Documentation](https://docs.aidaemon.ai/) · [Discord](https://discord.gg/JCCPtEEy) · [𝕏](https://x.com/aidaemon_ai)
+[Website](https://aidaemon.ai/) · [Documentation](https://docs.aidaemon.ai/) · [Download](https://github.com/davo20019/aidaemon/releases/latest) · [Discord](https://discord.gg/JCCPtEEy) · [𝕏](https://x.com/aidaemon_ai)
 
-A self-hosted AI agent that runs on your machine and talks to you on Telegram, Slack, or Discord. It can run commands, browse the web, manage files, remember things across conversations, and learn your workflows over time.
+**Your own AI agent. It runs on your computer, works while you're away, and you can reach it from anywhere.**
 
-I built this because I wanted to control my computer from my phone, from anywhere. Send a message on Telegram, and it runs a command, checks a log, deploys something, or researches a topic — then replies with the result. I also wanted it to run on cheap hardware: a Raspberry Pi, an old laptop, a $5/month VPS.
+Ask it to plan a trip, clean up a folder, compare products, keep an eye on a price, write a morning brief, or fix a bug in your code. It looks things up, runs programs, uses a real browser, remembers what matters to you, and asks before it sends, posts, deletes or spends anything. Talk to it in the AIdaemon app on your Mac, Windows or Linux computer, phone or browser, or in Telegram, Slack and Discord. Your phone reaches it from anywhere with no tunnel, port forwarding, VPN or account: scan a QR code and you're connected.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/chat-dark.png">
+  <img alt="The AIdaemon desktop app: a conversation where the agent planned a long weekend in Lisbon, with flights, hotel and a day-by-day plan in a table" src=".github/readme/chat-light.png">
+</picture>
+
+## Not only for developers
+
+Most AI agents live in a terminal. AIdaemon has an app anyone can use: install it, sign in to the AI you already pay for (a ChatGPT plan works, no API key needed), and start asking. The same agent then follows you to your phone.
+
+<img alt="AIdaemon on a phone: the conversation list, a morning brief, and an approval card asking before it sends an email" src=".github/readme/phone.png">
+
+A few things people ask it for:
+
+- "Plan a 3-day weekend in Lisbon under $1,500, flights from Boston." Then "watch the fare and tell me if it drops."
+- "My Downloads folder is a mess. Clean it up, but ask before deleting anything."
+- "Every weekday at 7:30, send me the weather, my calendar and the news I follow."
+- "Compare three laptops for my daughter's school, under $900."
+- "The contact form on our site sends nothing. Fix it and run the tests."
 
 ## What makes it different
 
-- **It's yours** — runs on your machine, your API keys, your data. Nothing goes to a third party beyond the LLM API calls you choose to make.
-- **It remembers you** — persistent memory with fact extraction, vector embeddings, and semantic recall. It learns your preferences, your projects, the people you mention. Not a shallow "memory" feature — a full knowledge graph that grows over time.
-- **It's always on** — runs as a background daemon. Message it on Telegram at 3am from your phone. Schedule tasks with cron syntax or natural language. It's not an app you open — it's an assistant that's always available.
-- **It can act** — 40+ tools: terminal commands, file operations, git, web browsing, web research, HTTP requests with OAuth, MCP servers. It doesn't just answer questions — it does things.
-- **It's a single binary** — no Docker, no Node.js, no Python environment. One binary, copy it anywhere and run it. Starts in milliseconds, uses minimal RAM.
-- **It works with any LLM** — OpenAI, xAI (Grok), Anthropic, Google Gemini, DeepSeek, Moonshot, MiniMax, Ollama, llama.cpp, OpenRouter, Cloudflare AI Gateway, or any OpenAI-compatible API. Switch providers without changing anything else.
+- **It's yours.** It runs on your own computer or server, with your accounts. Your conversations, memory and files stay there; what goes out is the calls to the AI model you choose and whatever a task you asked for needs, such as a search.
+- **Reach it from anywhere. No tunnels.** Pair your phone by scanning a QR code, and that's the whole setup: no tunnel, port forwarding, VPN, domain or account. The app connects straight to your computer when the network allows, and through an encrypted relay otherwise (the project's own by default, or yours). It's end-to-end encrypted, so the relay never sees what you say. Or message it on Telegram, Slack or Discord.
+- **It does the work, not just the talking.** It runs commands, edits files, uses git, browses the web in a real browser you can watch and take over, calls APIs, connects MCP servers, and on a Mac can operate your apps for you.
+- **Safe by design.** Anything that sends, posts, deletes, spends or runs a risky command waits for your OK on a card like the one above. When it has read something someone else wrote (a web page, an email, a stranger's message), every outward action it then tries is checked against only what *you* asked for, so text written to steer an AI agent can't make it act for someone else.
+- **It remembers you.** It keeps durable facts about you, your projects and the people you mention, recalls past conversations by meaning, and keeps each project's notes in plain Markdown files you can read and edit. You can see and delete what it knows at any time.
+- **It works on its own.** Scheduled automations run at set times; watching automations pursue a goal within limits you approve and tell you only when something changes. Each one shows what it does, how often, what it may do and when it ends.
+- **Your coding agents work as a team.** Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, OpenCode, Aider and any [Agent Client Protocol](https://agentclientprotocol.com) agent work under AIdaemon as a team: they hand work to each other (in separate git worktrees, or read-only for a review), AIdaemon pauses one that runs out of usage and hands its work to another, and shows every changed file, step and test run in the app.
+- **Any model.** Use your ChatGPT plan, or an API key for Anthropic, OpenAI, Google Gemini, xAI, DeepSeek, Moonshot, MiniMax, OpenRouter or Cloudflare AI Gateway, or run models on your own hardware with Ollama, llama.cpp, LM Studio or vLLM. Fallbacks take over when one is down or out of quota.
+- **One small program.** A single Rust binary: no Docker, Node.js or Python needed. It runs on a laptop, a Raspberry Pi or a cheap server, and it is open source under the MIT license.
 
-## Quick Start
+<img alt="One request worked by three coding agents: Claude Code built a pricing page and handed the API to Codex, Gemini CLI reviewed both, and Claude Code applied the review. The Agents tab lists each agent by the name the owner gave it" src=".github/readme/agents-team.png">
 
-### One-line install
+## Quick start
+
+**Mac:** download `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIDaemon to Applications and open it. Until the download is notarized, macOS asks once: open it, then **System Settings → Privacy & Security → Open Anyway**.
+
+**Windows:** download `aidaemon-windows-x86_64.zip` from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), extract it to a folder you keep (for example `%LOCALAPPDATA%\AIDaemon`) and open `aidaemon-app.exe`. If SmartScreen warns about an unrecognized app: **More info → Run anyway**.
+
+**Linux, or any machine with a terminal:**
 
 ```bash
 curl -sSfL https://get.aidaemon.ai | bash
 ```
 
-### macOS download
+Or with Homebrew (`brew install davo20019/tap/aidaemon`) or Cargo (`cargo install --locked aidaemon`, the daemon only). Then run `aidaemon app` to open the app.
 
-Get `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIDaemon to Applications and open it. No terminal needed. Until the download is notarized, macOS asks once: open it, then **System Settings → Privacy & Security → Open Anyway**.
+The first time it opens, the app starts AIdaemon on this computer (now and at login, with no administrator password). It finds an AI you already have (a ChatGPT sign-in, a provider key in your environment, Ollama or llama.cpp running locally) and offers it in one click, or connects the one you pick. Each is tested before anything is saved, and each says whether it uses your plan, bills per token or runs on your own machine. Your first conversation opens next. To reach it from your phone or from Telegram, Slack or Discord, open **Settings → Reach it from your phone**.
 
-### Windows download
+**Phone:** on Android, install `aidaemon-android.apk` from the [latest release](https://github.com/davo20019/aidaemon/releases/latest); on any phone, the web app works in the browser. In the desktop app, **Settings → Paired devices → Pair a phone** shows a QR code to scan.
 
-Get `aidaemon-windows-x86_64.zip` from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), extract it to a folder you keep (for example `%LOCALAPPDATA%\AIDaemon`) and open `aidaemon-app.exe`. Windows SmartScreen may warn about an unrecognized app: **More info → Run anyway**.
+**On a server:** over SSH, run `aidaemon setup` to connect a model, then `aidaemon service install` to keep it running. Run `aidaemon pair` for a QR code: your phone and laptop connect through the encrypted relay, with no tunnel or open port. (To set it up from a browser instead, run `aidaemon` with no config: it prints a link and a one-time code for its setup page on port 8788, which you reach through SSH port forwarding until it is set up.)
 
-### Homebrew
+<details>
+<summary>Self-hosted models: notes</summary>
 
-```bash
-brew install davo20019/tap/aidaemon
-```
-
-### Cargo
-
-```bash
-cargo install --locked aidaemon
-```
-
-This installs the daemon only; the app comes with the downloads above.
-
-Then open the AIDaemon app (`aidaemon app`, or `aidaemon-app` from a release). The first time it opens, the desktop app starts the daemon on this computer right away, now and at login, with no administrator password (**Run it on another machine instead** pairs with a server; `aidaemon service uninstall` stops it, and the app then asks before starting it again). It finds a model already on the computer (a ChatGPT sign-in, a provider key in the environment, Ollama or llama.cpp running locally) and offers it in one click, or connects one you pick; each is tested before anything is saved, and each provider says whether it uses your plan, bills per token or runs on your own machine. Self-hosted models need no key: pick **Ollama (local)** or **llama.cpp (local)**, or **Another OpenAI-compatible service** with your server's address (LM Studio, vLLM) and the key left empty. `llama-server` and this daemon's health check both default to port 8080: start one of them elsewhere (`llama-server --port 8081`, or `[daemon] health_port`) and give llama.cpp's address in its form. Your first conversation opens next. To talk to your agent from Telegram, Slack or Discord later, use **Settings → Reach it from your phone**.
-
-On a server, run `aidaemon` there with no config: it prints a link and a one-time code. Reach the machine's port 8788 through an SSH tunnel or your own HTTPS tunnel, open the link on your laptop or phone, and set it up from there (the code pairs the first device only). Prefer a terminal? `aidaemon setup` connects the model right there.
+Self-hosted models need no key: pick **Ollama (local)** or **llama.cpp (local)**, or **Another OpenAI-compatible service** with your server's address (LM Studio, vLLM) and the key left empty. `llama-server` and the daemon's health check both default to port 8080: start one of them elsewhere (`llama-server --port 8081`, or `[daemon] health_port`) and give llama.cpp's address in its form.
+</details>
 
 ## Features
 
-### Channels
-Talk to it on **Telegram**, **Slack** (Socket Mode), or **Discord**. Run multiple bots; on Telegram, add new ones at runtime with `/connect`, no restart needed.
-Send images with a caption and the agent analyzes them via vision-capable LLMs (toggle with `[files] vision_enabled` in config).
-Ask it to create an image and the provider-neutral `generate_image` tool saves and attaches the result, ready for `send_file`. The bundled image backend uses a connected ChatGPT subscription and works even when the conversational model is Anthropic, Gemini, or another configured provider.
-Send voice notes or audio files on Telegram, Slack, or Discord. Audio-capable models receive native `input_audio` blocks; otherwise enable local Whisper STT fallback under `[files.stt]` (requires `whisper-cli`, a GGUF model, and `ffmpeg` for OGG/Opus). See `config.toml.example` for settings. Restart after config changes.
-Telegram owners can also run `/terminal` to open the hosted terminal Mini App (`https://terminal.aidaemon.ai`) with automatic secure daemon pairing, or `/agent [codex|claude|gemini|opencode] [dir]` for a direct CLI-agent session; `aidaemon attach <code>` continues that session in a terminal on your computer, and `aidaemon share` makes a code to resume one from Telegram.
-
-### Tools & Agents
-40+ built-in tools including terminal execution, file operations, git, web browser (headless Chrome), web search, HTTP requests with auth profiles, and MCP server integration. Tools declare their risk level — read-only operations run freely, side effects require approval.
-
-Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude Code, Codex, Antigravity, Gemini CLI, GitHub Copilot CLI, Aider — auto-discovered). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first, so every one can be judged.
-
-`manage_api` onboards an API from its OpenAPI spec or GraphQL schema and derives a safe verification probe from it (GraphQL reuses introspection when no `verify_url` is given). Credentials stay in the OS keychain by default, or in the configured `.env` file when `AIDAEMON_NO_KEYCHAIN=1`.
-
 ### The app
-The AIDaemon app (desktop, web, terminal, iOS and Android) is where you can see and steer everything:
+One app for Mac, Windows, Linux, iOS, Android, the browser and the terminal, where you see and steer everything:
 
-- **Conversation details** show a conversation's Changes, Files, Steps, Terminal and Browser. The Terminal tab is that conversation's own shell on the daemon's computer, started in its folder; the agent can read it and type into it once you allow (`shared_terminal`). The Browser tab shows the agent's browser live: take control, give it back, or point at something for it. The Terminal tab is not in the terminal build of the app.
-- **Messages sent while work runs** wait under "Waiting to send", where you can edit or remove them, or press **Send now** to give one to the running work. A setting picks whether Enter tells the running work now or sends after it.
-- **Model and effort per conversation:** the composer picks Auto or a model you pin, and Auto, Low, Medium or High effort.
-- **The System page** shows the daemon's and the app's versions, the model and its fallbacks, how the app reaches the daemon (this computer, peer to peer direct or via relay, or a tunnel), token use, background jobs, health checks, chat bots, and your devices (Nodes) with whether each is online and how it connects.
-- **`aidaemon share-screen`** shares a Mac's screen with your daemon elsewhere so you can watch and drive it from the app (`--pair <link>` the first time, with a link from `aidaemon pair`; needs the `computer_use-macos` build). It shares only while it runs.
+- **Conversations and projects.** Chat about anything, or open a project (a folder or a repository) whose conversations share its notes, skills and tools.
+- **Conversation details** show its Changes, Files, Steps, Terminal and Browser. The Terminal tab is that conversation's own shell on the daemon's computer, started in its folder; the agent can read it and type into it once you allow. The Browser tab shows the agent's browser live: take control, give it back, or point at something for it.
+- **Messages sent while work runs** wait under "Waiting to send", where you can edit or remove them, or press **Send now** to give one to the running work.
+- **Model and effort per conversation:** pick Auto or a model you pin, and Auto, Low, Medium or High effort.
+- **Automations, Memory and System pages:** your automations as cards you pause or run now; what it remembers, which you can delete; and versions, the model and its fallbacks, how the app reaches the daemon, token use, background jobs, health checks, chat bots and paired devices.
+- **`aidaemon share-screen`** shares a Mac's screen with your daemon elsewhere so you can watch and drive it from the app (`--pair <link>` the first time, with a link from `aidaemon pair`; needs the `computer_use-macos` build).
+
+### Chat apps
+Talk to it on **Telegram**, **Slack** (Socket Mode) or **Discord**. Run several bots; on Telegram, add new ones at runtime with `/connect`, no restart needed. Send pictures and it looks at them with a vision-capable model. Ask for an image and `generate_image` makes one (with a connected ChatGPT plan, whatever model the conversation runs on). Send voice notes: audio-capable models hear them directly; otherwise turn on local Whisper speech-to-text under `[files.stt]` (needs `whisper-cli`, a GGUF model, and `ffmpeg` for OGG/Opus). On Telegram, `/terminal` opens the hosted terminal Mini App with secure pairing, and `/agent [codex|claude|gemini|opencode] [dir]` starts a coding-agent session; `aidaemon attach <code>` continues it in a terminal on your computer, and `aidaemon share` makes a code to resume one from Telegram.
+
+### Tools and agents
+Dozens of built-in tools: terminal, files, git, a headless Chrome browser, web search, HTTP requests with saved auth profiles, MCP servers, images and more. Each tool declares what it does: reading runs freely, side effects ask first. Hand complex work to **sub-agents** or to **coding agents** (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, Aider, found automatically). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first.
+
+`manage_api` connects an API from its OpenAPI spec or GraphQL schema and checks the connection safely. Credentials stay in the OS keychain.
+
+### Coding agents as a team
+Ask for a change and say who should do what ("Claude Code does the page, Codex the API, then have Gemini review"), or let AIdaemon decide. Each agent runs in its own session: in its own git worktree for parallel edits, or read-only for a review. Agents hand work to each other, check on one another and share a coordination board, so the work doesn't collide. The app shows every agent in the conversation's **Agents** tab under a name you give it ("Frontend", "Reviewer"). Open one to see what it was asked, what it answered, its checks, changed files and steps, and send it a follow-up that continues its own session. Each changed file opens its diff. An agent whose plan runs out of usage pauses until its usage resets, and its work goes to another agent meanwhile.
+
+<img alt="Claude Code's run view: what AIdaemon asked it, its answer, the passing test run, the files it changed, and a reply box for a follow-up in the same session" src=".github/readme/agents-run.png">
 
 ### Computer use (macOS)
-Built with `--features computer_use-macos`, the agent can operate native macOS apps: it reads an app's accessibility tree, takes a screenshot, and clicks, types and scrolls to finish a task. It is off by default: build with the feature and enable it in config. Setup and permissions: [COMPUTER_USE_MACOS.md](COMPUTER_USE_MACOS.md).
+Built with `--features computer_use-macos`, the agent can operate Mac apps: it reads an app's accessibility tree, takes a screenshot, and clicks, types and scrolls to finish a task. Off by default; setup and permissions in [COMPUTER_USE_MACOS.md](COMPUTER_USE_MACOS.md).
 
 ### Memory
-SQLite-backed persistent memory with local vector embeddings (quantized AllMiniLM-L6-v2 by default; any fastembed model via `[memory] embedding_model`). Background consolidation extracts durable facts from conversations. Semantic episode recall is the coarse discovery layer; `search_history` adds authorized FTS5 search over exact retained user/assistant messages, anchored context, task bookends, and signed forward/backward paging. Exact recall follows `state.retention.messages_days` (90 by default; `0` opts into permanent active-database history), independently of short-lived diagnostic events. Database encrypted at rest by default.
+Memory lives in an encrypted SQLite database with local vector embeddings (quantized AllMiniLM-L6-v2 by default; any fastembed model via `[memory] embedding_model`). Background consolidation turns conversations into durable facts. Past conversations are recalled by meaning, and `search_history` finds exact messages (kept 90 days by default, `state.retention.messages_days`; `0` keeps them for good). To keep one message out of memory, send `/private` first, or just ask it not to remember something.
 
-**Project memory.** A conversation placed in a project (the app's Code conversations, or a chat moved there with `/project`) keeps what it learns about that project in the project's own notes: plain Markdown files under `~/.aidaemon/projects/<project-id>/memory/` with a generated `MEMORY.md` index. Notes are outside the repository, keyed by the project's id so a rename or a moved folder keeps them, and you can read or edit them by hand. `remember_fact` takes `scope: "project" | "personal"` (default `project` in a project conversation), and background extraction, consolidation and delegated-task learning route the same way. Facts about you and the people around you always stay in personal memory, and nothing a project learns can replace or merge with them. Each project turn shows the project's index after your own memory; `/memory` shows where it lives. Turn it off with `[memory] project_memory = false`, or move it with `[memory] projects_dir`.
-
-A project conversation also gets the repository's own skills (`.agents/skills`, `.claude/skills`) and can start the MCP servers its `.mcp.json` declares with `manage_mcp project_start`, each only after you approve its exact command; those tools stay in that project's conversations.
+**Project memory.** A conversation in a project (a Code conversation in the app, or a chat moved there with `/project`) keeps what it learns about that project in the project's own notes: Markdown files under `~/.aidaemon/projects/<project-id>/memory/` with a generated `MEMORY.md` index, outside the repository and kept by the project's id, so a rename or a moved folder keeps them. `remember_fact` takes `scope: "project" | "personal"`. Facts about you and the people around you always stay in personal memory. Turn it off with `[memory] project_memory = false`, or move it with `[memory] projects_dir`. A project conversation also gets the repository's own skills (`.agents/skills`, `.claude/skills`) and can start the MCP servers its `.mcp.json` declares, each only after you approve its exact command.
 
 ### Skills
-Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. A procedure that keeps working becomes a skill draft for you to review, approve or dismiss (`manage_skills review`).
+Instructions that teach it new workflows, loaded when a task needs them or when you ask by name: from files, URLs or remote registries. A procedure that keeps working becomes a skill draft for you to review, approve or dismiss (`manage_skills review`).
 
-### Automation
-Everything that runs on its own is an automation, of two kinds. **Scheduled** automations run a fixed instruction at set times: reminders and recurring tasks, with natural language time parsing and multi-schedule support. **Watching** automations work toward an objective within limits you approve, deciding each time whether to act, wait, ask you, or stop. Ask for what you want; the agent picks the kind. Your automations show in one list, each as the same five-line card (what, how often, what it can do, when it tells you, when it ends), and you pause, resume or cancel any of them by name. Email triggers via IMAP IDLE.
+### Automations
+Everything that runs on its own is an automation. **Scheduled** ones run an instruction at set times, from natural-language schedules ("every weekday at 7:30"). **Watching** ones work toward an objective within limits you approve, deciding each time whether to act, wait, ask you or stop. Health checks watch a site, port, command or file. Email can trigger work through IMAP IDLE. Ask for what you want and the agent picks the kind; pause, resume or cancel any of them by name.
+
+<img alt="The Automations page: a morning brief, a fare watch, a bills reminder and a site health check, each with its schedule and last run" src=".github/readme/automations.png">
 
 ### Security
-Terminal command allowlists, inline approval flow (Allow / Allow until restart or Always allow / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
+Approval cards for risky actions (Allow, Allow until restart or Always allow, Deny), the untrusted-content check described below, terminal allowlists, SSRF protection, secrets kept out of outgoing requests, an encrypted database, secrets in the OS keychain, and role-based access for other people in your chats. The database key lives in the OS keychain (on a machine without one, such as a headless Linux server, it stays in an owner-only `.env` beside the database, so keep backups of that folder private). Release downloads are signed with ed25519 (`<file>.sig`, key in `scripts/release-signing-key.pub.pem`); self-update installs only a signed release. Details: [security docs](https://docs.aidaemon.ai/).
 
-The database key is kept in the OS keychain (config.toml says `encryption_key = "keychain"`); an older install's key in `.env` moves there on the next start that opens the database. On a machine with no usable keychain (a headless Linux server) it stays in `.env`, owner-only, beside the database: a backup or synced copy of the daemon's folder then carries both, so keep such copies as private as the data itself. Release downloads carry an ed25519 signature (`<file>.sig`, key in `scripts/release-signing-key.pub.pem`); the daemon's self-update installs only a signed release, and `install.sh` checks the signature where OpenSSL 3 is available.
-
-## Running as a Service
+## Running as a service
 
 ```bash
 aidaemon service install      # this user, at login, from ~/.aidaemon (--dir to change); starts it now
@@ -130,9 +144,10 @@ This is what the app's **Run it here** does: a launchd agent on macOS, a systemd
 
 ## Configuration
 
-All settings live in `config.toml`, written by first-run setup and editable from the app's Settings page. See [`config.toml.example`](config.toml.example) for the full reference and the [documentation](https://docs.aidaemon.ai/) for detailed guides on each feature. The provider config supports both model-level fallbacks on the primary backend and ordered cross-provider fallbacks via `[[provider.fallbacks]]`.
+All settings live in `config.toml`, written by first-run setup and editable from the app's Settings page. See [`config.toml.example`](config.toml.example) for the full reference and the [documentation](https://docs.aidaemon.ai/) for guides on each feature. The provider config supports model-level fallbacks on the primary backend and ordered cross-provider fallbacks via `[[provider.fallbacks]]`. The sections below are the reference for the parts people ask about most.
 
-### Execution environments
+<details>
+<summary><b>Execution environments</b></summary>
 
 By default, agent-visible files and commands run locally with the same behavior
 as earlier releases. You can instead put the entire workspace behind a
@@ -163,7 +178,10 @@ approval. Persistent terminal approvals are scoped to the concrete execution
 target. See [`config.toml.example`](config.toml.example) for complete Docker and
 SSH examples.
 
-### Workspace source checkpoints
+</details>
+
+<details>
+<summary><b>Workspace source checkpoints</b></summary>
 
 For remotely operated agents, the local execution backend can create a
 conflict-aware source checkpoint before the first workspace mutation in each
@@ -197,7 +215,10 @@ unsafe rather than offered for rollback. The external object store is
 owner-readable and contains plaintext copies of eligible source files; use
 retention and size limits appropriate for the machine.
 
-### Authority and untrusted content
+</details>
+
+<details>
+<summary><b>Authority and untrusted content</b></summary>
 
 Pages, emails, other people's messages and files outside your own folders can
 contain text written to steer an AI agent. aidaemon tracks this. Once a turn
@@ -264,7 +285,10 @@ aidaemon still uses what it knows to answer, but learns nothing from that
 message, now or later. `/private off` cancels. You can also just ask it not
 to remember something; the agent then marks that turn the same way.
 
-### Approvals
+</details>
+
+<details>
+<summary><b>Approvals</b></summary>
 
 Some actions wait for your OK. aidaemon sends you a card in the chat that
 says what the agent wants to do, how risky it is, and anything worth
@@ -324,7 +348,12 @@ message you send about the task while it is still running joins that task,
 and the Deny still holds. Once the task has finished, your next message starts a new
 task, so you can change your mind and ask again.
 
-### Reaching the gateways from your other devices
+</details>
+
+<details>
+<summary><b>Optional: your own tunnel</b></summary>
+
+You don't need a tunnel to reach AIdaemon: the apps connect over its encrypted peer-to-peer link and relay (see the phone app below). Use one only if you want the gateways at an address of your own.
 
 The Client Gateway (`/client/v1`, for `aidaemon tui`, `aidaemon web` and paired phones) listens only on loopback; the apps reach it from elsewhere over iroh (see the phone app below). The Node Gateway (`/node/v1`) listens on loopback and, once Nodes are enabled, on this computer's local network over HTTPS (`[nodes.gateway.lan]`, port 8443, on by default), with a certificate from the daemon's own CA that Nodes learn over the channel they already use. To reach either from elsewhere through a tunnel instead, let the daemon run the tunnel itself: it starts with the daemon, stops with it, restarts with backoff when it drops, and feeds its address into pairing links and Node heartbeats. The tunnel only moves bytes; devices still pair with their own keys.
 
@@ -340,7 +369,10 @@ tunnel = "my-tunnel"         # created with `cloudflared tunnel create`
 
 Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` for a throwaway `trycloudflare.com` address, Client Gateway only), `manual` (`url` of a reverse proxy you run) and `command` (any program that prints `{"url": "https://..."}` on its first line and keeps running; argv only, `{port}`, `{addr}` and `{service}` are filled in). The Node Gateway needs an address that survives restarts, so it refuses `quick` and a `command` without `stable = true`. `cloudflared` or `tailscale` must be on `PATH` (or set `binary`). Changes apply after a restart; `/exposure` shows each tunnel's state, address and last failure. The agent can set this up for you (`manage_config enable_exposure`, with your approval), except `command`, which only you can write.
 
-### The phone app (iOS and Android)
+</details>
+
+<details>
+<summary><b>The phone app (iOS and Android)</b></summary>
 
 The app on a phone never runs the daemon; it pairs with yours, and reaches it from anywhere with no tunnel, account or domain: remote access over [iroh](https://iroh.computer) is on whenever the Client Gateway is. The phone connects straight to your computer when the network allows, and through a relay otherwise: the project's own `relay.aidaemon.ai` by default, or your own `iroh-relay` servers in `[client_gateway.remote] relays` ([deploy/](deploy/README.md) shows how the project's relay and its address lookup are set up). Traffic is end-to-end encrypted, so a relay sees your computer's address but never what it says. On the project's relay the daemon also publishes which relay it is on, signed with its key, so an app whose saved relay went stale still finds it. Phones paired earlier through n0's public relays keep working. The daemon's iroh key lives in `~/.aidaemon/remote-key`. Turn it off with `[client_gateway.remote] enabled = false`. The quickest way to pair: in the desktop app on the daemon's computer, open Settings → Paired devices → **Pair a phone**, scan the QR code with the phone's camera, tap **Open AIDaemon**, and approve the phone on the desktop. Or run `aidaemon pair` on the daemon's computer for a QR code, or send `/pair_device` to your agent from Telegram, Slack, Discord or the desktop app, open the link it replies with on the phone, tap **Open AIDaemon**, and approve the phone in that chat. Both links open your daemon's own pairing page (`/client/v1/pair`), which hands the pairing to the app (or its store page), or pairs that browser instead: the pairing details ride after the `#`, which browsers never send to the server. Pasting the link into the app works too. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
 
@@ -348,7 +380,10 @@ Releases build the phone app themselves. With the `ANDROID_KEYSTORE_*` secrets s
 
 Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI (after `nsh component add android` or `ios`): `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
 
-### Customize your agent
+</details>
+
+<details>
+<summary><b>Customize your agent</b></summary>
 
 Your agent's first message offers to change its name and personality: just tell it, and it can save them to a persona file (setting `persona_file` asks for your approval).
 
@@ -380,7 +415,10 @@ The built-in policy profiles `cheap`, `balanced`, and `strong` are execution pre
 
 Model supervision is trust-tiered. By default (`trust_tier = "auto"` under `[policy]`), recognized frontier models (Claude, GPT-4 and later, o-series, Gemini 2.5+, Grok 3+) run a thin loop where behavioral supervision gates are telemetry-only, while every other model gets the full supervision scaffolding. The auto list matches known model families, so a capable open model it doesn't recognize (for example kimi-k2.5 or a large qwen/deepseek variant) lands in the supervised tier, where a gate misfire can cost extra LLM round-trips before an answer is accepted. If you run such a model, set `trust_tier = "autonomous"` to opt out of the supervision gates; anti-fabrication checks and hard safety caps (iteration/token/wall-clock limits, repetition guards) remain active on every tier. The override is global — it applies to every configured model, including fallbacks — so keep `"auto"` if your fallback chain mixes a strong cloud model with a small local one. See [`config.toml.example`](config.toml.example) for details.
 
-### Using a ChatGPT subscription instead of an API key
+</details>
+
+<details>
+<summary><b>Using a ChatGPT subscription instead of an API key</b></summary>
 
 aidaemon can run on a ChatGPT Plus/Pro/Business plan rather than metered OpenAI
 API billing. Sign in once:
@@ -452,15 +490,17 @@ For external APIs, the built-in auth flow is:
 
 `learn_api` now prefers OpenAPI/Swagger when available, crawls multiple docs pages on the same host when needed, discovers linked specs from docs, bundles remote OpenAPI `$ref` documents, and can switch to GraphQL schema introspection when a GraphQL endpoint is available.
 
+</details>
+
 ## Build your own agent (SDK)
 
-The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every agent SDK crate shares one version (0.22.0; the Node SDK and protocol, `aidaemon-node-sdk` and `aidaemon-node-protocol`, have their own); the public-contract crates are semver-checked in CI.
+The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every agent SDK crate shares one version (0.24.0; the Node SDK and protocol, `aidaemon-node-sdk` and `aidaemon-node-protocol`, have their own); the public-contract crates are semver-checked in CI.
 
 The SDK crates are on [crates.io](https://crates.io/crates/aidaemon-sdk):
 
 ```toml
 [dependencies]
-aidaemon-sdk = "0.22"
+aidaemon-sdk = "0.24"
 ```
 
 Or follow `master`: `aidaemon-sdk = { git = "https://github.com/davo20019/aidaemon" }`.
@@ -487,7 +527,7 @@ Run it inside an async runtime of your own (for example `#[tokio::main]`, as [`e
 
 Try it without an API key: `cargo run -p aidaemon-sdk --example quickstart --features testing`. Other examples cover custom tools, sub-agents, approvals, scheduled workers, your own channel and an SSE server, swapping memory, OpenTelemetry traces, resuming after a crash and a coding agent ([crates/aidaemon-sdk/examples](crates/aidaemon-sdk/examples)). Guide: [docs.aidaemon.ai](https://docs.aidaemon.ai/).
 
-## Building from Source
+## Building from source
 
 ```bash
 cargo build --release                                   # default build

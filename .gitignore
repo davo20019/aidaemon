@@ -49,6 +49,8 @@ deploy/**/ids.env
 # Stand-alone protocol reference docs, not generated from code.
 schemas/node-protocol-v1.schema.json
 *.png
+# The README's screenshots (taken from the demo gateway's showcase mode).
+!.github/readme/*.png
 *.txt
 *.pdf
 *.marp.md

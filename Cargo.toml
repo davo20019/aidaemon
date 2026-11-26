@@ -2,15 +2,15 @@
 name = "aidaemon"
 version = "0.25.0"
 edition = "2024"
-description = "A personal AI agent that runs as a background daemon, accessible via Telegram, Slack, or Discord, with tool use, MCP integration, and persistent memory"
+description = "Your own AI agent: runs on your computer, reachable from the desktop, phone and web app or Telegram, Slack and Discord; uses tools, a browser and coding agents, remembers you, and asks before risky actions"
 license = "MIT"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
 documentation = "https://docs.aidaemon.ai/"
 readme = "README.md"
-keywords = ["ai", "daemon", "telegram", "llm", "mcp"]
+keywords = ["ai-agent", "assistant", "llm", "mcp", "self-hosted"]
 categories = ["command-line-utilities"]
-exclude = ["*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/", "task-75498c01f980/"]
+exclude = [".github/", "*.db", "*.db-shm", "*.db-wal", ".env", "config.toml", "lcov.info", "*.profraw", "docs/", "task-75498c01f980/"]
 
 [workspace.package]
 # One shared version for every SDK crate (crates/aidaemon-*), separate from the
