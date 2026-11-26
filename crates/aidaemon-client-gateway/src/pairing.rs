@@ -860,6 +860,12 @@ impl Pairing {
             }
             None if local => challenge_message(challenge_id, &challenge.nonce),
             None => {
+                // Which device, so its owner can find it and update its app.
+                tracing::warn!(
+                    device = %device.device_id,
+                    name = %device.name,
+                    "A device signs in remotely with an app too old to bind its sign-in"
+                );
                 return Err(ProtocolError::new(
                     ErrorCode::Unauthorized,
                     "Update the app: signing in from another computer needs a sign-in \
