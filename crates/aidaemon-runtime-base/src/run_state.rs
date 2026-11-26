@@ -658,6 +658,10 @@ pub struct RunStates {
     /// Runs the owner asked to stop: when one ends short of done, it ended
     /// because the owner stopped it ([`Self::owner_stopping`]).
     owner_stopping: Mutex<std::collections::HashSet<String>>,
+    /// When each conversation was last erased (`/wipe`, deleted): a run
+    /// that began before then has no conversation to answer
+    /// ([`Self::erased_after`]).
+    erased: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
 }
 
 /// The least time between two step reports of one run.
@@ -1372,6 +1376,20 @@ impl RunStates {
     /// update to one of them after this finds nothing to change.
     pub fn forget_chat(&self, chat: &str) {
         self.lock().retain(|_, entry| entry.state.chat != chat);
+        self.erased
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(chat.to_string(), chrono::Utc::now());
+    }
+
+    /// Whether conversation `chat` was erased after `began`: a run that
+    /// began then must not post into what is left of it.
+    pub fn erased_after(&self, chat: &str, began: chrono::DateTime<chrono::Utc>) -> bool {
+        self.erased
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(chat)
+            .is_some_and(|erased| *erased >= began)
     }
 
     /// Drop an ended run's record.
@@ -1549,6 +1567,13 @@ mod tests {
         assert_eq!(runs.for_chat("app:synthetic-kept").len(), 1);
         runs.set_agent("cli-agent-a", "Codex");
         assert!(runs.get("cli-agent-a").is_none());
+        // A run that began before the erase answers nothing; one begun
+        // after (the conversation goes on) does.
+        let before = Utc::now() - chrono::Duration::seconds(5);
+        assert!(runs.erased_after("app:synthetic-erased", before));
+        let later = Utc::now() + chrono::Duration::seconds(5);
+        assert!(!runs.erased_after("app:synthetic-erased", later));
+        assert!(!runs.erased_after("app:synthetic-kept", before));
     }
 
     /// A helper its turn waits on has the same record as a background one:

@@ -98,6 +98,16 @@ pub(super) async fn deliver_end(
     if call.is_peer_run {
         return;
     }
+    // Its conversation was erased after it began (`/wipe`, deleted): its
+    // end has nowhere to go, and posting it would bring part of it back.
+    if handles.runs.erased_after(&call.session_id, call.began) {
+        info!(
+            task_id = %call.task_id,
+            session_id = %call.session_id,
+            "A run of an erased conversation ended: its result is not posted"
+        );
+        return;
+    }
 
     let direct = !notify_session_id.trim().is_empty()
         && crate::session_model::get(handles.state.as_ref(), &notify_session_id)
