@@ -191,6 +191,9 @@ pub struct HelperView {
     /// plainly ("Stopped by you"), never as a failure or an error. Set
     /// only from its run record's typed end.
     pub stopped_by_owner: bool,
+    /// It stopped because its coding agent's account ran out of usage (the
+    /// agent's own typed answer): until when, where the agent said.
+    pub out_of_usage: Option<OutOfUsage>,
     /// Once it ended, how long it took and when, as the runtime measured it
     /// and already worded for the owner ("Took 21s (2:21:16 PM to 2:21:37 PM
     /// ET)."). Never worked out from anything a model wrote.
@@ -199,6 +202,13 @@ pub struct HelperView {
     /// as the runtime measured it: what "how long did it take" means to the
     /// owner, request to finish.
     pub since_request: Option<SinceRequest>,
+}
+
+/// A coding agent's account out of usage, as the agent itself said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfUsage {
+    /// When its usage resets, ms since the epoch; `None`: it did not say.
+    pub resets_at_ms: Option<u64>,
 }
 
 /// How long after the owner's request a helper ended, measured by the
@@ -223,6 +233,7 @@ impl HelperView {
             steps: Vec::new(),
             reason: None,
             stopped_by_owner: false,
+            out_of_usage: None,
             took: None,
             since_request: None,
         }

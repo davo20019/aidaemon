@@ -6132,6 +6132,21 @@
         }
       ]
     },
+    "RunOutOfUsage": {
+      "description": "A coding agent's plan out of usage (protocol 1.58).",
+      "properties": {
+        "resets_at_ms": {
+          "description": "When its usage resets, ms since the epoch; absent: the agent did\nnot say.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "RunOutcome": {
       "description": "How a run ended, or that it has not yet.",
       "oneOf": [
@@ -6504,6 +6519,17 @@
         "label": {
           "description": "The name the owner reads for it.",
           "type": "string"
+        },
+        "out_of_usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunOutOfUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "It stopped because its coding agent's plan ran out of usage\n(protocol 1.58), as the agent itself said: not an error, and it can\ngo on once the usage resets."
         },
         "phase": {
           "$ref": "#/$defs/RunPhase"

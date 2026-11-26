@@ -950,6 +950,7 @@ mod tests {
         let stopped = HelperView {
             run: None,
             stopped_by_owner: true,
+            out_of_usage: None,
             took: Some("Took 22s.".into()),
             ..ended("Install Claude Drupal", RunPhase::Stopped, false)
         };
@@ -1278,6 +1279,7 @@ mod tests {
                                 steps: Vec::new(),
                                 reason: None,
                                 stopped_by_owner: false,
+                                out_of_usage: None,
                                 took: None,
                                 since_request: None,
                             },

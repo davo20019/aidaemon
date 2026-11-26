@@ -94,6 +94,17 @@ impl CliAgentTool {
                 },
             ));
         };
+        // Its plan ran out (its own answer after a run of it failed): not
+        // started until the usage resets, so the work goes elsewhere.
+        if let Some(until) = crate::tools::agent_mode::out_of_usage(tool_name) {
+            mark_refused_before_launch(PrelaunchRefusal::Policy);
+            return Ok(Err(format!(
+                "Blocked: {} (`{tool_name}`) is out of usage on its plan until {}. Hand this \
+                 to another agent, or wait until then.",
+                coding_agent.name(),
+                aidaemon_work::schedule::owner_time(&until)
+            )));
+        }
         // One that last said it cannot work is asked again first (it may
         // have been signed in since); still not usable, it is not started.
         if !crate::tools::agent_mode::readiness_of(tool_name).is_usable()

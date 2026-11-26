@@ -47,6 +47,20 @@ pub fn state_words(p: &Participant) -> &'static str {
     }
 }
 
+/// Its plan ran out of usage on its latest run: `Some(true)` while the
+/// usage is still out (or the agent did not say when it resets),
+/// `Some(false)` once its reset time has passed.
+fn paused(p: &Participant, now_ms: u64) -> Option<bool> {
+    if p.working() {
+        return None;
+    }
+    let out = p.latest.out_of_usage?;
+    Some(out.resets_at_ms.is_none_or(|at| at > now_ms))
+}
+
+/// What a follow-up says to an agent whose usage has reset.
+const GO_ON: &str = "Your usage limit has reset. Go on from where you stopped.";
+
 fn row(store: Store, p: ReadSignal<Participant>) -> View {
     let editing = signal(false);
     view()
@@ -104,8 +118,12 @@ fn rename_field(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>)
 
 fn shown(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>) -> View {
     let mark = computed(move || {
+        store.tick();
+        let now = crate::store::now_ms();
         p.with(|p| match p.latest.phase {
             _ if p.waiting => (Glyph::Approval, colors::WARNING),
+            // Out of usage: a pause, not an error.
+            _ if paused(p, now) == Some(true) => (Glyph::Clock, colors::WARNING),
             RunPhase::Running => (Glyph::Work, colors::ACCENT),
             RunPhase::Failed => (Glyph::Warning, colors::DANGER),
             RunPhase::Stopped => (Glyph::Warning, colors::WARNING),
@@ -117,7 +135,15 @@ fn shown(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>) -> Vie
     let detail = computed(move || {
         store.tick();
         p.with(|p| {
-            let mut words = state_words(p).to_string();
+            let now = crate::store::now_ms();
+            let mut words = match (paused(p, now), p.latest.out_of_usage) {
+                (Some(true), Some(out)) => match out.resets_at_ms {
+                    Some(at) => format!("out of usage until {}", ui::time::clock(at)),
+                    None => "out of usage".to_string(),
+                },
+                (Some(false), _) => "usage reset · can continue".to_string(),
+                _ => state_words(p).to_string(),
+            };
             if p.working() && !p.waiting && !p.latest.step.is_empty() {
                 words = format!("{words} · {}", p.latest.step);
             }
@@ -184,6 +210,21 @@ fn shown(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>) -> Vie
                         ),
                 ),
         )
+        // Once its usage reset, one press has it go on where it stopped.
+        .child(dynamic(move || {
+            store.tick();
+            let ready =
+                p.with(|p| paused(p, crate::store::now_ms()) == Some(false) && p.can_continue());
+            ready.then(|| {
+                untracked(move || {
+                    ui::btn("Continue", ui::Variant::Outline, ui::Size::Sm, move || {
+                        let (session, run) = p
+                            .with_untracked(|p| (p.latest.session_id.clone(), p.latest.id.clone()));
+                        store.follow_up(&session, &run, GO_ON);
+                    })
+                })
+            })
+        }))
         .child(ui::icon_btn(
             Glyph::Pen,
             "Rename this agent",

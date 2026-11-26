@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 57;
+pub const PROTOCOL_MINOR: u16 = 58;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3121,6 +3121,11 @@ pub struct RunSummary {
     /// It ended because the owner stopped it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped_by_owner: bool,
+    /// It stopped because its coding agent's plan ran out of usage
+    /// (protocol 1.58), as the agent itself said: not an error, and it can
+    /// go on once the usage resets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_usage: Option<RunOutOfUsage>,
     /// The request (its turn's id) that started it: the runs one request
     /// started share it, and a client shows them together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3164,6 +3169,15 @@ pub struct RunSummary {
     /// as the owner's message to that agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked: Option<RunAsked>,
+}
+
+/// A coding agent's plan out of usage (protocol 1.58).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunOutOfUsage {
+    /// When its usage resets, ms since the epoch; absent: the agent did
+    /// not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
 }
 
 /// What a run was asked (protocol 1.48).

@@ -279,6 +279,10 @@ impl CodingAgent for Codex {
         true
     }
 
+    fn usage_check(&self) -> Option<crate::UsageCheck> {
+        Some(crate::UsageCheck::Codex)
+    }
+
     fn model_listing(&self) -> Option<crate::ModelListing> {
         Some(crate::ModelListing::Codex)
     }

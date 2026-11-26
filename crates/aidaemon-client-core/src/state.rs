@@ -921,6 +921,7 @@ mod tests {
             took: None,
             reason: None,
             stopped_by_owner: false,
+            out_of_usage: None,
             group: None,
             edited: Vec::new(),
             continues: None,

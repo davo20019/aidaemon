@@ -230,6 +230,55 @@ pub fn mark_not_usable(name: &str, reason: &str, fix: Option<&str>) {
     );
 }
 
+fn usage_limits() -> &'static Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>
+{
+    static LIMITS: OnceLock<
+        Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+    > = OnceLock::new();
+    LIMITS.get_or_init(Mutex::default)
+}
+
+/// The agent named `name` said its account is out of usage until
+/// `resets_at` (its own typed answer, asked after a run of it failed).
+pub fn mark_out_of_usage(name: &str, resets_at: chrono::DateTime<chrono::Utc>) {
+    if let Ok(mut limits) = usage_limits().lock() {
+        limits.insert(name.to_string(), resets_at);
+    }
+}
+
+/// Until when the agent named `name` is out of usage, while it still is.
+pub fn out_of_usage(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let mut limits = usage_limits().lock().ok()?;
+    match limits.get(name).copied() {
+        Some(until) if until > chrono::Utc::now() => Some(until),
+        Some(_) => {
+            limits.remove(name);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Ask the agent named `name` whether its account is out of usage, when it
+/// can be asked ([`aidaemon_coding_agents::CodingAgent::usage_check`]):
+/// its name in plain words and when the usage resets. Remembered until
+/// then ([`out_of_usage`]).
+pub async fn check_usage(name: &str) -> Option<(String, Option<chrono::DateTime<chrono::Utc>>)> {
+    let info = agents()
+        .into_iter()
+        .find(|info| info.name == name && info.local)?;
+    let check = info.agent.usage_check()?;
+    let limit = aidaemon_coding_agents::usage_limit(check, &info.command, &info.prefix).await?;
+    let resets_at = limit
+        .resets_at_ms
+        .and_then(|ms| i64::try_from(ms).ok())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
+    if let Some(at) = resets_at {
+        mark_out_of_usage(name, at);
+    }
+    Some((info.agent.name().to_string(), resets_at))
+}
+
 /// Judges a hosted agent's requests through the run's nested-call seam,
 /// falling back to a detached safety judge when the launching turn's tool
 /// batch has already returned (`async_mode`, queued runs, or timeout detach).

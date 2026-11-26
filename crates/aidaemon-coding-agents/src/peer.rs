@@ -176,6 +176,11 @@ pub struct PeerRunStatus {
     pub working_dir: Option<String>,
     pub branch: Option<String>,
     pub resumable: bool,
+    /// It stopped because its agent's plan ran out of usage: the host's
+    /// sentence saying so and when it resets. Another agent can take the
+    /// work meanwhile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_usage: Option<String>,
 }
 
 /// Fields updated on a [`PeerRecord`] via [`PeerTree::update_peer`].
@@ -1017,6 +1022,7 @@ mod mcp_bridge {
                         "working_dir": working_dir,
                         "branch": branch,
                         "resumable": status.resumable,
+                        "out_of_usage": status.out_of_usage,
                         "output": status.output,
                         "untrusted": true,
                     }))
@@ -1600,6 +1606,7 @@ mod tests {
                 working_dir: Some("/synthetic/checked".into()),
                 // Like the runtime's launcher: a status check knows no branch.
                 branch: None,
+                out_of_usage: None,
                 resumable: true,
             })
         }

@@ -870,22 +870,21 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
         r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Reading slug.py","state":"done","kind":"read","path":"/w/synthetic/slug.py"}},{{"words":"Reading test_slug.py","state":"done","kind":"read","path":"/w/synthetic/test_slug.py"}},{{"words":"Running ls","state":"done","kind":"run"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing test_slug.py","state":"done","kind":"edit","path":"/w/synthetic/test_slug.py"}},{{"words":"Running pytest","state":"failed","kind":"run"}},{{"words":"Checking on another agent","state":"done","kind":"coordinate"}},{{"words":"Handed work to Claude Code","state":"done","kind":"hand_off","run":"cli-agent-a","agent":"Claude Code"}},{{"words":"Handed work to Codex","state":"done","kind":"hand_off","run":"cli-agent-b","agent":"Codex"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}},{{"label":"write: /w/synthetic/test_slug.py","outcome":"allowed"}},{{"label":"command: rm -rf /w/synthetic/build","outcome":"refused","reason":"outside its folder"}}]}}}}}}"#
     ))]);
     app.wait_for("text:Add truncate_slug on branch a")?;
-    // Routine steps fold into one line that opens them; edits in a row are
-    // one row per file; a failure keeps its own.
-    app.wait_for("text:Read 2 files · ran a command")?;
-    app.wait_for("text:Changed 2 files")?;
+    // Finished work between milestones folds into one line that opens it:
+    // the changed files first (one row each), then the rest; a failure
+    // keeps its own row.
+    app.wait_for("text:Changed 2 files · read 2 files · ran a command")?;
     app.wait_for("text:Running pytest")?;
-    app.press("Changed 2 files")?;
-    app.wait_for("text:Editing slug.py · 2 edits")?;
-    app.wait_for("text:Editing test_slug.py")?;
-    app.press("Read 2 files · ran a command")?;
-    app.wait_for("text:Reading test_slug.py")?;
     // Hand-offs in a row are one row naming each agent, which opens its
     // run; checking on one is bookkeeping (alone, a plain line).
     app.wait_for("text:Handed work to")?;
     app.wait_for("label:Claude Code, open its run")?;
     app.wait_for("label:Codex, open its run")?;
     app.wait_for("text:Checking on another agent")?;
+    app.press("Changed 2 files · read 2 files · ran a command")?;
+    app.wait_for("text:Editing slug.py · 2 edits")?;
+    app.wait_for("text:Editing test_slug.py")?;
+    app.wait_for("text:Reading test_slug.py")?;
     // Only what was not simply allowed gets a line; the rest is a count.
     app.wait_for("text:command: rm -rf /w/synthetic/build · refused: outside its folder")?;
     app.wait_for("text:2 other actions allowed")?;
@@ -1012,6 +1011,25 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.press("1 earlier exchange")?;
     app.wait_for_gone("1 earlier exchange", std::time::Duration::from_secs(2))?;
     app.wait_for("Hide earlier exchanges")?;
+    // Its plan runs out: its row says until when, as a pause, not a
+    // failure, and offers nothing until then.
+    app.press("Back")?;
+    app.press("label:1 agent")?;
+    feed([frame(
+        r#"{"type":"event","seq":13,"at_ms":6,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"stopped","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true,"out_of_usage":{"resets_at_ms":99999999999000}}}}"#,
+    )]);
+    // The reset time in this machine's zone, by the app's own clock format.
+    let until = nsh_app_aidaemon::ui::time::clock(99_999_999_999_000);
+    app.wait_for(&format!("text:out of usage until {until} · 2 runs · now"))?;
+    assert!(app.wait_for("Continue").is_err());
+    // Once its usage reset, one press has it go on where it stopped.
+    feed([frame(
+        r#"{"type":"event","seq":14,"at_ms":7,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"stopped","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true,"out_of_usage":{"resets_at_ms":1000}}}}"#,
+    )]);
+    app.wait_for("text:usage reset · can continue · 2 runs · now")?;
+    let before = sent("send_message");
+    app.press("Continue")?;
+    wait_sent_new("send_message", before)?;
     Ok(())
 }
 

@@ -1382,15 +1382,14 @@ fn body(store: Store, detail: RunDetail, coding: bool) -> View {
     }
     if !detail.steps.is_empty() {
         let mut steps = view().gap_1();
-        // Steps in a row of one kind go together ([`row_kind`]): routine
-        // ones fold into a line that opens them, finished edits into one
-        // row per file; the rest keep a row each.
+        // Finished work between milestones folds into one line that opens
+        // it ([`row_kind`]); hand-offs in a row are one row; the rest (a
+        // failure, the step still going) keep a row each.
         let mut group: Vec<RunStepItem> = Vec::new();
         let mut group_kind = RowKind::Alone;
         let flush = |steps: View, group: &mut Vec<RunStepItem>, kind: RowKind| match kind {
             _ if group.is_empty() => steps,
-            RowKind::Routine => steps.child(folded(std::mem::take(group))),
-            RowKind::Edits => steps.child(edits(store, std::mem::take(group), coding)),
+            RowKind::Work => steps.child(work(store, std::mem::take(group), coding)),
             RowKind::HandOffs => steps.child(hand_offs(store, std::mem::take(group))),
             RowKind::Alone => steps,
         };
@@ -1485,15 +1484,13 @@ enum RowKind {
     /// A row of its own: a failure, one still going, the agents working
     /// together, or any step from a daemon that does not say its kind.
     Alone,
-    /// A finished edit: edits in a row are one row per file.
-    Edits,
     /// Work handed to another agent: hand-offs in a row are one row naming
     /// each agent, which opens its run.
     HandOffs,
-    /// A finished read, search, command, lookup, other tool, or a call to
-    /// the tools the agents work together by (checking on one, the board):
-    /// folded.
-    Routine,
+    /// Finished work: an edit that names its file, a read, search,
+    /// command, lookup, other tool, or a call to the tools the agents work
+    /// together by (checking on one, the board). Work in a row is folded.
+    Work,
 }
 
 fn row_kind(step: &RunStepItem) -> RowKind {
@@ -1501,12 +1498,12 @@ fn row_kind(step: &RunStepItem) -> RowKind {
         return RowKind::Alone;
     }
     match step.kind {
-        RunStepKind::Edit if step.path.is_some() => RowKind::Edits,
+        RunStepKind::Edit if step.path.is_some() => RowKind::Work,
         RunStepKind::HandOff if step.run.is_some() => RowKind::HandOffs,
         RunStepKind::Edit | RunStepKind::HandOff | RunStepKind::Delegate | RunStepKind::Unknown => {
             RowKind::Alone
         }
-        _ => RowKind::Routine,
+        _ => RowKind::Work,
     }
 }
 
@@ -1571,52 +1568,6 @@ fn hand_offs(store: Store, steps: Vec<RunStepItem>) -> View {
     row
 }
 
-/// Finished edits in a row: one row per file, with how many edits it took
-/// (each opens its diff); more than one file sit under "Changed N files".
-fn edits(store: Store, steps: Vec<RunStepItem>, coding: bool) -> View {
-    let mut files: Vec<(String, usize)> = Vec::new();
-    for path in steps.iter().filter_map(|step| step.path.clone()) {
-        match files.iter_mut().find(|(seen, _)| *seen == path) {
-            Some((_, count)) => *count += 1,
-            None => files.push((path, 1)),
-        }
-    }
-    let file_row = move |(path, count): &(String, usize)| {
-        let mut words = format!("Editing {}", super::files::file_name(path));
-        if *count > 1 {
-            words.push_str(&format!(" · {count} edits"));
-        }
-        let row = line(Glyph::Check, Tone::Success, words.clone(), false);
-        if !coding {
-            return row;
-        }
-        let path = path.clone();
-        view().child(
-            button()
-                .accessibility_label(format!("{words}, show what changed"))
-                .on_press(move || store.show_change(&path))
-                .child(row),
-        )
-    };
-    if files.len() == 1 {
-        return file_row(&files[0]);
-    }
-    let open = signal(false);
-    view()
-        .gap_1()
-        .child(ui::quiet_disclosure(
-            format!("Changed {} files", files.len()),
-            open,
-        ))
-        .child(ui::unfold(open, move || {
-            let mut list = view().gap_1().pl(px(8.0));
-            for file in &files {
-                list = list.child(file_row(file));
-            }
-            list
-        }))
-}
-
 /// One step's row; a file it changed opens its diff in Changes.
 fn step_row(store: Store, step: &RunStepItem, coding: bool) -> View {
     let (glyph, tone) = match step.state {
@@ -1639,10 +1590,30 @@ fn step_row(store: Store, step: &RunStepItem, coding: bool) -> View {
     }
 }
 
-/// Routine steps in a row: one alone is its own line; more are one line
-/// ("Read 6 files · ran 4 commands") that opens them.
-fn folded(steps: Vec<RunStepItem>) -> View {
-    let row = |step: &RunStepItem| {
+/// Finished work in a row: one step is its own line; more are one line
+/// ("Changed 3 files · read 6 files · ran 2 commands") that opens them,
+/// the changed files first (one row per file, with how many edits it took,
+/// each opening its diff), then the rest in order.
+fn work(store: Store, steps: Vec<RunStepItem>, coding: bool) -> View {
+    let files = files_changed(&steps);
+    let file_row = move |(path, count): &(String, usize)| {
+        let mut words = format!("Editing {}", super::files::file_name(path));
+        if *count > 1 {
+            words.push_str(&format!(" · {count} edits"));
+        }
+        let row = line(Glyph::Check, Tone::Success, words.clone(), false);
+        if !coding {
+            return row;
+        }
+        let path = path.clone();
+        view().child(
+            button()
+                .accessibility_label(format!("{words}, show what changed"))
+                .on_press(move || store.show_change(&path))
+                .child(row),
+        )
+    };
+    let other = |step: &RunStepItem| {
         line(
             Glyph::Check,
             Tone::Success,
@@ -1650,31 +1621,52 @@ fn folded(steps: Vec<RunStepItem>) -> View {
             step.by_helper,
         )
     };
-    if steps.len() == 1 {
-        return row(&steps[0]);
+    let rest: Vec<RunStepItem> = steps
+        .iter()
+        .filter(|step| step.kind != RunStepKind::Edit)
+        .cloned()
+        .collect();
+    match (files.as_slice(), rest.as_slice()) {
+        ([file], []) => return file_row(file),
+        ([], [step]) => return other(step),
+        _ => {}
     }
     let open = signal(false);
     view()
         .gap_1()
-        .child(ui::quiet_disclosure(routine_summary(&steps), open))
+        .child(ui::quiet_disclosure(work_summary(&steps), open))
         .child(ui::unfold(open, move || {
             let mut list = view().gap_1().pl(px(8.0));
-            for step in &steps {
-                list = list.child(row(step));
+            for file in &files {
+                list = list.child(file_row(file));
+            }
+            for step in &rest {
+                list = list.child(other(step));
             }
             list
         }))
 }
 
-/// What a fold of routine steps did, by kind, in their first order.
-fn routine_summary(steps: &[RunStepItem]) -> String {
-    let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
-    for step in steps {
-        match counts.iter_mut().find(|(kind, _)| *kind == step.kind) {
+/// The files edits changed, each once in the order first changed, with how
+/// many edits each took.
+fn files_changed(steps: &[RunStepItem]) -> Vec<(String, usize)> {
+    let mut files: Vec<(String, usize)> = Vec::new();
+    for path in steps
+        .iter()
+        .filter(|step| step.kind == RunStepKind::Edit)
+        .filter_map(|step| step.path.clone())
+    {
+        match files.iter_mut().find(|(seen, _)| *seen == path) {
             Some((_, count)) => *count += 1,
-            None => counts.push((step.kind, 1)),
+            None => files.push((path, 1)),
         }
     }
+    files
+}
+
+/// What a fold of finished work did: the files it changed first, then the
+/// rest by kind in their first order.
+fn work_summary(steps: &[RunStepItem]) -> String {
     let plural = |n: usize, one: &str, many: &str| {
         if n == 1 {
             one.to_string()
@@ -1682,18 +1674,27 @@ fn routine_summary(steps: &[RunStepItem]) -> String {
             format!("{n} {many}")
         }
     };
-    let parts: Vec<String> = counts
-        .into_iter()
-        .map(|(kind, n)| match kind {
-            RunStepKind::Read => format!("read {}", plural(n, "a file", "files")),
-            RunStepKind::Search => format!("searched {}", plural(n, "once", "times")),
-            RunStepKind::Run => format!("ran {}", plural(n, "a command", "commands")),
-            RunStepKind::Fetch => format!("looked up {}", plural(n, "a page", "pages")),
-            RunStepKind::Plan => "updated its plan".to_string(),
-            RunStepKind::Coordinate => format!("coordinated {}", plural(n, "once", "times")),
-            _ => format!("used {}", plural(n, "another tool", "other tools")),
-        })
-        .collect();
+    let mut parts = Vec::new();
+    let changed = files_changed(steps).len();
+    if changed > 0 {
+        parts.push(format!("changed {}", plural(changed, "a file", "files")));
+    }
+    let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
+    for step in steps.iter().filter(|step| step.kind != RunStepKind::Edit) {
+        match counts.iter_mut().find(|(kind, _)| *kind == step.kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((step.kind, 1)),
+        }
+    }
+    parts.extend(counts.into_iter().map(|(kind, n)| match kind {
+        RunStepKind::Read => format!("read {}", plural(n, "a file", "files")),
+        RunStepKind::Search => format!("searched {}", plural(n, "once", "times")),
+        RunStepKind::Run => format!("ran {}", plural(n, "a command", "commands")),
+        RunStepKind::Fetch => format!("looked up {}", plural(n, "a page", "pages")),
+        RunStepKind::Plan => "updated its plan".to_string(),
+        RunStepKind::Coordinate => format!("coordinated {}", plural(n, "once", "times")),
+        _ => format!("used {}", plural(n, "another tool", "other tools")),
+    }));
     let words = parts.join(" · ");
     let mut chars = words.chars();
     match chars.next() {
@@ -1729,7 +1730,7 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
 mod tests {
     use super::{
         FOCUSED_REPLY_BUDGET, RowKind, clean_asked_text, is_owner_prompt, markdown_preview,
-        routine_summary, row_kind,
+        row_kind, work_summary,
     };
     use aidaemon_client_protocol::{RunStepItem, RunStepKind, RunStepState};
 
@@ -1747,15 +1748,27 @@ mod tests {
     }
 
     #[test]
-    fn routine_steps_are_summed_up_by_kind_in_their_order() {
+    fn finished_work_is_summed_up_changes_first_then_by_kind() {
         use RunStepKind::*;
         let steps: Vec<RunStepItem> = [Run, Read, Read, Run, Other, Search, Coordinate, Coordinate]
             .into_iter()
             .map(|kind| step(kind, RunStepState::Done))
             .collect();
         assert_eq!(
-            routine_summary(&steps),
+            work_summary(&steps),
             "Ran 2 commands · read 2 files · used another tool · searched once · coordinated 2 times"
+        );
+        // Edits count the files they changed, each once, and come first.
+        let mut with_edits = steps.clone();
+        for path in ["/w/a.rs", "/w/b.rs", "/w/a.rs"] {
+            let mut edit = step(Edit, RunStepState::Done);
+            edit.path = Some(path.into());
+            with_edits.push(edit);
+        }
+        assert!(
+            work_summary(&with_edits).starts_with("Changed 2 files · ran 2 commands"),
+            "{}",
+            work_summary(&with_edits)
         );
     }
 
@@ -1763,11 +1776,11 @@ mod tests {
     fn failures_running_steps_and_teamwork_keep_their_own_rows() {
         use RunStepKind::*;
         let kind = |kind, state| row_kind(&step(kind, state));
-        assert_eq!(kind(Read, RunStepState::Done), RowKind::Routine);
+        assert_eq!(kind(Read, RunStepState::Done), RowKind::Work);
         assert_eq!(kind(Read, RunStepState::Failed), RowKind::Alone);
         assert_eq!(kind(Run, RunStepState::Started), RowKind::Alone);
         // Checking on another agent or reading the board is bookkeeping.
-        assert_eq!(kind(Coordinate, RunStepState::Done), RowKind::Routine);
+        assert_eq!(kind(Coordinate, RunStepState::Done), RowKind::Work);
         // A hand-off the daemon recorded goes with its neighbours.
         let mut hand_off = step(HandOff, RunStepState::Done);
         assert_eq!(row_kind(&hand_off), RowKind::Alone);
@@ -1778,7 +1791,7 @@ mod tests {
         let mut edit = step(Edit, RunStepState::Done);
         assert_eq!(row_kind(&edit), RowKind::Alone);
         edit.path = Some("/w/synthetic/slug.py".into());
-        assert_eq!(row_kind(&edit), RowKind::Edits);
+        assert_eq!(row_kind(&edit), RowKind::Work);
         edit.state = RunStepState::Failed;
         assert_eq!(row_kind(&edit), RowKind::Alone);
         // An older daemon says no kind: nothing folds.
@@ -1800,6 +1813,7 @@ mod tests {
             took: None,
             reason: None,
             stopped_by_owner: false,
+            out_of_usage: None,
             group: None,
             edited: Vec::new(),
             continues: None,

@@ -40,6 +40,7 @@ mod registry;
 pub mod report;
 mod sign_in;
 mod stdin;
+mod usage;
 
 pub use action::{ActionJudge, AgentAction, AllowAll, TextEdit, Verdict};
 pub use agent::{
@@ -56,3 +57,4 @@ pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, c
 pub use registry::CodingAgents;
 pub use report::{Check, Report};
 pub use sign_in::{SignIn, SignInMethod, SignInNote, SignedIn};
+pub use usage::{UsageCheck, UsageLimit, usage_limit};

@@ -223,12 +223,26 @@ pub struct ProgramEnd {
     pub refused: Vec<String>,
     /// Actions it asked to take that the owner declined when asked.
     pub declined: Vec<String>,
+    /// Its agent's account was out of usage when the run failed, as the
+    /// agent answered when asked: its name and when the usage resets.
+    pub out_of_usage: Option<(String, Option<chrono::DateTime<chrono::Utc>>)>,
 }
 
 /// How a CLI agent's run ended: an error exit failed, a stop by the runtime
 /// failed; a normal exit succeeded only if it did its work, by the same
 /// [`nothing_done`] rule a sub-agent's run is judged by.
 pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
+    // Its agent's plan ran out: a pause until it resets, whatever else its
+    // exit says.
+    if let Some((agent, resets_at)) = &end.out_of_usage {
+        return (
+            RunEnd::Stopped(Some(RunFailure::OutOfUsage {
+                agent: agent.clone(),
+                resets_at: *resets_at,
+            })),
+            RunEvidence::default(),
+        );
+    }
     if end.timed_out {
         return (
             RunEnd::Failed(RunFailure::NoProgress),
@@ -511,6 +525,7 @@ mod tests {
             step: "Install WordPress in claude-wordpress-7".to_string(),
             refused: Vec::new(),
             declined: Vec::new(),
+            out_of_usage: None,
         };
         let (end, _) = program_phase(&refused);
         assert!(matches!(
@@ -582,6 +597,15 @@ mod tests {
         };
         assert_eq!(program_phase(&changed).0, RunEnd::Succeeded);
         // The owner declined it when asked: the owner's answer.
+        let out = ProgramEnd {
+            exit_code: Some(1),
+            out_of_usage: Some(("Codex".to_string(), None)),
+            ..refused.clone()
+        };
+        assert!(matches!(
+            program_phase(&out).0,
+            RunEnd::Stopped(Some(RunFailure::OutOfUsage { .. }))
+        ));
         let declined = ProgramEnd {
             declined: vec!["Bash: touch notes.txt".to_string()],
             ..refused.clone()

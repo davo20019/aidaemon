@@ -218,6 +218,9 @@ fn run() -> RunSummary {
         took: None,
         reason: None,
         stopped_by_owner: false,
+        out_of_usage: Some(RunOutOfUsage {
+            resets_at_ms: Some(1_767_243_600_000),
+        }),
         group: Some("task-9b1d".into()),
         edited: vec!["/w/synthetic/release.md".into()],
         continues: None,

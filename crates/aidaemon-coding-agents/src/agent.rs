@@ -119,6 +119,12 @@ pub trait CodingAgent: Send + Sync {
         None
     }
 
+    /// How to ask whether its account is out of usage, and until when,
+    /// after a run of it fails. `None`: it cannot be asked.
+    fn usage_check(&self) -> Option<crate::UsageCheck> {
+        None
+    }
+
     /// The actions its own permission check refused, from the record it
     /// writes at the end of a run (`stdout` is its whole output, as the
     /// embedding agent reads it). Empty when it keeps none.

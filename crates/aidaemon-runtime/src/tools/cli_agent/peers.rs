@@ -322,6 +322,14 @@ impl ActivePeerBinding {
     }
 }
 
+/// Why run `task_id` stopped when its agent's plan ran out of usage (its
+/// run record's typed end), in the run's own words.
+fn out_of_usage(tool: &CliAgentTool, task_id: &str) -> Option<String> {
+    let state = tool.run_handles().runs.get(&cli_run_id(task_id))?;
+    let view = state.view();
+    view.out_of_usage.and(view.reason)
+}
+
 /// A launch one peer asked for, as the asker's run records it.
 struct HandOff {
     requested_by: String,
@@ -766,6 +774,7 @@ impl PeerLauncher for RuntimePeerLauncher {
                     working_dir: agent.claim_dir.clone(),
                     branch: None,
                     resumable: false,
+                    out_of_usage: None,
                 });
             }
             let verdict = agent.verdict.get().cloned();
@@ -793,6 +802,7 @@ impl PeerLauncher for RuntimePeerLauncher {
                 working_dir: dir,
                 branch: None,
                 resumable,
+                out_of_usage: out_of_usage(&tool, task_id),
             });
         }
         drop(running);
@@ -817,6 +827,7 @@ impl PeerLauncher for RuntimePeerLauncher {
                 working_dir: None,
                 branch: None,
                 resumable,
+                out_of_usage: out_of_usage(&tool, task_id),
             });
         }
 
@@ -833,6 +844,7 @@ impl PeerLauncher for RuntimePeerLauncher {
                 working_dir: found.working_dir,
                 branch: None,
                 resumable: found.keeps_session && found.agent_session.is_some(),
+                out_of_usage: out_of_usage(&tool, task_id),
             });
         }
 

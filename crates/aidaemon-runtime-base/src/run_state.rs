@@ -229,6 +229,14 @@ pub enum RunFailure {
     /// Its end record says it failed and records nothing more: said as
     /// that, so the owner is never left with a bare "failed".
     NoCause,
+    /// Its coding agent's account ran out of usage, as the agent itself
+    /// answered when asked after the run failed
+    /// ([`aidaemon_coding_agents::usage_limit`]): a pause until `resets_at`,
+    /// not an error. `agent` is its name in plain words ("Codex").
+    OutOfUsage {
+        agent: String,
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// Who stopped a run before it finished.
@@ -362,6 +370,17 @@ impl RunFailure {
             Self::NoCause => {
                 "It ended without a successful outcome, and its records give no cause.".to_string()
             }
+            Self::OutOfUsage {
+                agent,
+                resets_at: Some(at),
+            } => format!(
+                "{agent} ran out of usage on its plan; it resets at {}, and it can go on then.",
+                aidaemon_work::schedule::owner_time(at)
+            ),
+            Self::OutOfUsage {
+                agent,
+                resets_at: None,
+            } => format!("{agent} ran out of usage on its plan, and didn't say when it resets."),
         }
     }
 }
@@ -580,6 +599,15 @@ impl RunState {
                 _ => None,
             },
             stopped_by_owner: self.stopped_by_owner(),
+            out_of_usage: match self.failure.as_ref() {
+                Some(RunFailure::OutOfUsage { resets_at, .. }) => {
+                    Some(aidaemon_core::card::OutOfUsage {
+                        resets_at_ms: resets_at
+                            .and_then(|at| u64::try_from(at.timestamp_millis()).ok()),
+                    })
+                }
+                _ => None,
+            },
             // A waited-on helper's header always carries its time: its turn
             // is still open when it ends.
             took: self
@@ -1882,6 +1910,38 @@ mod tests {
     /// why. A failed run is recorded only with its typed reason, and its
     /// card and its result say it in the same plain words.
     #[test]
+    fn an_agent_out_of_usage_stops_its_run_with_when_it_resets() {
+        let runs = RunStates::default();
+        runs.begin("run-out", "chat", "review the sidebar", None);
+        let failure = RunFailure::OutOfUsage {
+            agent: "Codex".into(),
+            resets_at: chrono::DateTime::from_timestamp(1_795_666_077, 0),
+        };
+        let ended = runs
+            .finish(
+                "run-out",
+                RunEnd::Stopped(Some(failure)),
+                measure(),
+                RunEvidence::default(),
+                report(),
+            )
+            .expect("it ends");
+        let view = ended.view();
+        assert_eq!(view.phase, RunPhase::Stopped);
+        assert_eq!(
+            view.out_of_usage,
+            Some(aidaemon_core::card::OutOfUsage {
+                resets_at_ms: Some(1_795_666_077_000)
+            })
+        );
+        let reason = view.reason.expect("it says why");
+        assert!(
+            reason.starts_with("Codex ran out of usage on its plan; it resets at "),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn every_failure_path_renders_a_reason() {
         use aidaemon_events::ShortResource;
         let failures = [
@@ -1909,6 +1969,14 @@ mod tests {
                 actions: vec!["Bash: touch notes.txt".into()],
             },
             RunFailure::NoCause,
+            RunFailure::OutOfUsage {
+                agent: "Codex".into(),
+                resets_at: None,
+            },
+            RunFailure::OutOfUsage {
+                agent: "Codex".into(),
+                resets_at: chrono::DateTime::from_timestamp(1_795_666_077, 0),
+            },
         ];
         let runs = RunStates::default();
         for (index, failure) in failures.into_iter().enumerate() {

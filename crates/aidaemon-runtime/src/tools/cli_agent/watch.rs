@@ -380,8 +380,28 @@ pub(super) async fn watch_run(
             None,
         );
     }
+    // A run that failed on its own (not stopped by the runtime): its
+    // agent, when it can be asked, says whether its plan ran out.
+    let out_of_usage = if exit_code.is_some_and(|code| code != 0)
+        && !loop_detected
+        && !timed_out
+        && !auth_failed
+    {
+        crate::tools::agent_mode::check_usage(&tool_name_owned).await
+    } else {
+        None
+    };
+    if let Some((agent, resets_at)) = &out_of_usage {
+        info!(
+            task_id = %task_id_for_notify,
+            agent = %agent,
+            resets_at = ?resets_at,
+            "A coding agent's run stopped: its account is out of usage"
+        );
+    }
     let (run_phase, run_evidence) =
         crate::helper_run::program_phase(&crate::helper_run::ProgramEnd {
+            out_of_usage,
             exit_code,
             stopped: loop_detected || auth_failed,
             timed_out,

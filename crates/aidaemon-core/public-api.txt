@@ -52,6 +52,7 @@ pub aidaemon_core::card::SupersededBy::Turn
 pub struct aidaemon_core::card::HelperView
 pub aidaemon_core::card::HelperView::background: bool
 pub aidaemon_core::card::HelperView::label: alloc::string::String
+pub aidaemon_core::card::HelperView::out_of_usage: core::option::Option<aidaemon_core::card::OutOfUsage>
 pub aidaemon_core::card::HelperView::phase: aidaemon_core::card::RunPhase
 pub aidaemon_core::card::HelperView::reason: core::option::Option<alloc::string::String>
 pub aidaemon_core::card::HelperView::run: core::option::Option<alloc::string::String>
@@ -66,6 +67,8 @@ pub fn aidaemon_core::card::HelperView::headline(&self) -> &'static str
 pub fn aidaemon_core::card::HelperView::of_run(self, core::option::Option<&str>) -> Self
 pub fn aidaemon_core::card::HelperView::running(&str, bool, core::option::Option<aidaemon_core::card::Step>) -> Self
 pub fn aidaemon_core::card::HelperView::same_helper(&self, &aidaemon_core::card::HelperView) -> bool
+pub struct aidaemon_core::card::OutOfUsage
+pub aidaemon_core::card::OutOfUsage::resets_at_ms: core::option::Option<u64>
 pub struct aidaemon_core::card::PlanCard
 pub aidaemon_core::card::PlanCard::done: usize
 pub aidaemon_core::card::PlanCard::finished_steps: alloc::vec::Vec<usize>

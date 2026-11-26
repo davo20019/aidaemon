@@ -576,6 +576,11 @@ pub(crate) fn run_summary(
         took: view.took.clone(),
         reason: view.reason.clone(),
         stopped_by_owner: view.stopped_by_owner,
+        out_of_usage: view
+            .out_of_usage
+            .map(|out| aidaemon_client_protocol::RunOutOfUsage {
+                resets_at_ms: out.resets_at_ms,
+            }),
         group: group.map(str::to_string),
         edited: edited.to_vec(),
         continues: continues.map(str::to_string),
