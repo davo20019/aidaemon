@@ -448,7 +448,9 @@ jobs:
       # on some Windows runners (actions/partner-runner-images#169).
       - name: Install cargo-nextest
         if: always()
-        run: cargo install cargo-nextest --locked --version 0.9.152
+        # The build cache may already hold one (installed another way).
+        shell: pwsh
+        run: if (-not (Get-Command cargo-nextest -ErrorAction SilentlyContinue)) { cargo install cargo-nextest --locked --version 0.9.152 }
 
       - name: Archive the tests
         if: always()
@@ -517,7 +519,9 @@ jobs:
       # failed to start (actions/partner-runner-images#169, 2026-11-26),
       # failing every shard before a test ran.
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --version 0.9.152
+        # The build cache may already hold one (installed another way).
+        shell: pwsh
+        run: if (-not (Get-Command cargo-nextest -ErrorAction SilentlyContinue)) { cargo install cargo-nextest --locked --version 0.9.152 }
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
