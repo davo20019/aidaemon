@@ -1803,6 +1803,16 @@ impl ClientGateway {
         // for the device starting it, which says it from the ack (protocol
         // 1.60); how the sign-in ends is announced to every client.
         let own_answer = matches!(change, SettingsChange::SignIn { .. });
+        if own_answer {
+            // Who started it: a sign-in toast on another device is then
+            // traceable to the device (or the local owner) that asked.
+            tracing::info!(
+                device = caller.principal.device_id.as_deref().unwrap_or("local owner"),
+                name = caller.principal.device_name.as_deref().unwrap_or_default(),
+                client = ?caller.kind,
+                "A ChatGPT sign-in was started"
+            );
+        }
         match self.host.settings_gate(&change).await.map_err(invalid)? {
             SettingsGate::Free => {
                 let done = self
