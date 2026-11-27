@@ -61,18 +61,46 @@ pub fn with_followed_up_run_folder(
     user_role: aidaemon_tools::semantics::UserRole,
     in_run: Option<&aidaemon_channels::context::RunThread>,
 ) -> Vec<String> {
-    let folder = in_run
-        .and_then(|thread| thread.working_dir.as_deref())
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty());
-    if let Some(folder) = folder
-        && user_role == aidaemon_tools::semantics::UserRole::Owner
+    if let Some(folder) = followed_up_run_folder(user_role, in_run)
         && !scopes.is_empty()
         && !scopes.iter().any(|scope| scope == folder)
     {
         scopes.push(folder.to_string());
     }
     scopes
+}
+
+/// The folder the owner's typed follow-up to a run continues in: that run's
+/// recorded working directory. None for anyone but the owner, or no run.
+fn followed_up_run_folder(
+    user_role: aidaemon_tools::semantics::UserRole,
+    in_run: Option<&aidaemon_channels::context::RunThread>,
+) -> Option<&str> {
+    (user_role == aidaemon_tools::semantics::UserRole::Owner)
+        .then_some(in_run?)
+        .and_then(|thread| thread.working_dir.as_deref())
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+}
+
+/// `access` (a project-bound turn's manifest) may write in the folder of the
+/// run the owner followed up, as [`with_followed_up_run_folder`] lets its
+/// scopes.
+pub fn grant_followed_up_run_folder(
+    access: &mut aidaemon_events::traits::ToolCallAccessManifest,
+    user_role: aidaemon_tools::semantics::UserRole,
+    in_run: Option<&aidaemon_channels::context::RunThread>,
+) {
+    use aidaemon_events::traits::{ToolTargetHint, ToolTargetHintKind};
+    let Some(folder) = followed_up_run_folder(user_role, in_run) else {
+        return;
+    };
+    let Some(hint) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, folder) else {
+        return;
+    };
+    if !access.write_targets.contains(&hint) {
+        access.write_targets.push(hint);
+    }
 }
 
 /// Whether the turn's scopes are only a guess from conversation text: an
@@ -825,6 +853,11 @@ impl TurnEngine<'_> {
         // A spawned child is never wider than its parent's turn.
         if let Some(parent) = &self.inherited_authority() {
             resolved_authority = crate::authority::narrow_for_child(parent, resolved_authority);
+        } else if let Some(access) = resolved_authority.task_access.as_mut() {
+            // A conversation bound to its project writes only there, but the
+            // owner's typed follow-up to a run goes on in the folder that
+            // run's record names (a peer's worktree), as the scopes below do.
+            grant_followed_up_run_folder(access, user_role, channel_ctx.in_run.as_ref());
         }
         retain_authorized_tool_definitions(&mut tool_defs, &resolved_authority.authority);
         let epistemic_uncertainty = crate::turn::inquiry::epistemic_uncertainty(
@@ -1506,5 +1539,44 @@ mod followed_up_run_folder_tests {
             with_followed_up_run_folder(project.clone(), UserRole::Owner, None),
             project
         );
+    }
+
+    /// A project-bound turn's manifest lets the owner's follow-up write in
+    /// its run's folder, and only the owner's.
+    #[test]
+    fn a_project_bound_follow_up_may_write_in_its_runs_folder() {
+        use aidaemon_events::traits::{ToolCallAccessManifest, ToolTargetHint, ToolTargetHintKind};
+        let scope =
+            |path: &str| ToolTargetHint::new(ToolTargetHintKind::ProjectScope, path).unwrap();
+        let bound = ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: vec![scope("/")],
+            write_targets: vec![scope("/work/acme")],
+            adapter_read_targets: Vec::new(),
+        };
+        let call = ToolCallAccessManifest {
+            execution_cwd: None,
+            read_targets: Vec::new(),
+            write_targets: vec![scope("/cache/peer-worktrees/t1/peer-1-abc123")],
+            adapter_read_targets: Vec::new(),
+        };
+        let check = |task: &ToolCallAccessManifest| {
+            crate::turn::tool_dispatch::access_manifest_scope_check(
+                "cli_agent",
+                &call,
+                Some(task),
+                &[],
+                None,
+                &aidaemon_tools::path_class::DaemonPaths::default(),
+            )
+        };
+        assert!(check(&bound).is_some(), "outside the project: refused");
+        let peer = thread(Some("/cache/peer-worktrees/t1/peer-1-abc123"));
+        let mut guest = bound.clone();
+        super::grant_followed_up_run_folder(&mut guest, UserRole::Guest, Some(&peer));
+        assert!(check(&guest).is_some(), "only the owner's follow-up");
+        let mut owner = bound.clone();
+        super::grant_followed_up_run_folder(&mut owner, UserRole::Owner, Some(&peer));
+        assert!(check(&owner).is_none(), "the run's own folder");
     }
 }
