@@ -812,8 +812,25 @@ impl Client {
             )),
             _ => None,
         };
+        // A coding agent's run that has just failed may have taken it out
+        // of use (a sign-in that expired, a plan out of usage): read again
+        // which agents a conversation can be set to, so the picker stops
+        // offering one the daemon no longer hands work to.
+        let agent_run_failed = matches!(
+            &frame,
+            ServerFrame::Event {
+                event: Event::RunUpdated { run },
+                ..
+            } if run.agent.is_some()
+                && run.phase == aidaemon_client_protocol::RunPhase::Failed
+                && self.state.runs.get(&run.id).map(|before| before.phase)
+                    != Some(aidaemon_client_protocol::RunPhase::Failed)
+        );
         self.settle_sending(&frame);
         self.state.apply(frame);
+        if agent_run_failed && self.models.is_ready() {
+            self.refresh_models();
+        }
         if let Some((session_id, agent)) = created_agent_session {
             self.composer_targets.insert(
                 session_id.clone(),
@@ -5347,6 +5364,45 @@ mod tests {
         );
         assert_eq!(effects, [Effect::Started("app:new".into())]);
         assert_eq!(client.submit(None, "  ", None, None), Ok(false));
+    }
+
+    /// A coding agent's run that fails reads the agents again (the daemon
+    /// may no longer hand that agent work); one that succeeds does not.
+    #[test]
+    fn a_failed_agent_run_reads_the_agents_again() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.refresh_models();
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        assert_eq!(command, Command::ListModels);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"models","options":{{"providers":[],"agents":[{{"id":"synthetic-cli","name":"Synthetic CLI"}}]}}}}}}"#
+            )),
+            &cx(None),
+        );
+        let run = |seq: u64, id: &str, phase: &str| {
+            frame(&format!(
+                r#"{{"type":"event","seq":{seq},"at_ms":{seq},"session_id":"app:c","event":{{"type":"run_updated","run":{{"id":"{id}","session_id":"app:c","label":"Fix","agent":"Synthetic CLI","phase":"{phase}","background":true,"started_at_ms":1}}}}}}"#
+            ))
+        };
+        client.update(run(1, "run-ok", "succeeded"), &cx(None));
+        assert!(
+            !client
+                .take_outgoing()
+                .iter()
+                .any(|(_, c)| *c == Command::ListModels),
+            "a run that succeeded changes nothing"
+        );
+        client.update(run(2, "run-bad", "failed"), &cx(None));
+        assert!(
+            client
+                .take_outgoing()
+                .iter()
+                .any(|(_, c)| *c == Command::ListModels),
+            "a failed run reads the agents again"
+        );
     }
 
     /// A new conversation's first message shows in it as soon as the
