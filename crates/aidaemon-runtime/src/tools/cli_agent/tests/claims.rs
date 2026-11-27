@@ -816,6 +816,7 @@ async fn a_narrowed_peer_nests_inside_only_its_ancestors_folder_claim() {
                 false,
                 false,
                 false,
+                false,
                 &[],
                 &nests_in,
                 None,

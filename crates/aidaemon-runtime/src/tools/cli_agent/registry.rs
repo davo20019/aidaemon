@@ -80,7 +80,8 @@ impl CliAgentTool {
     }
 
     /// Whether an agent may be picked for delegated work on the sign-in
-    /// the owner chose for it (its maker's terms, [`CodingAgent::delegation`]).
+    /// the owner chose for it (its maker's terms, [`CodingAgent::delegation`]):
+    /// a pick is the embedding agent's own choice, never one the owner watches.
     /// A run that names it is refused at launch instead, with the reason.
     ///
     /// [`CodingAgent::delegation`]: aidaemon_coding_agents::CodingAgent::delegation
@@ -89,7 +90,7 @@ impl CliAgentTool {
         self.permissions()
             .sign_in_of_for(name, &*agent)
             .map_or(true, |sign_in| {
-                !agent.delegation(sign_in.method()).is_refused()
+                agent.delegation(sign_in.method()).permits(false)
             })
     }
 

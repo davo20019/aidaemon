@@ -701,6 +701,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
     // Prepare a fresh second launch (before the first had finished).
     let coding_agent = tool.agent_named("claude").unwrap();
     let mut prep = PreparedRun {
+        delegation_note: None,
         command: "claude".to_string(),
         args: vec!["-p".to_string()],
         base_launch: aidaemon_coding_agents::Launch {

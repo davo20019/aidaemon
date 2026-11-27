@@ -106,6 +106,10 @@ pub enum Delegation {
     Allowed,
     /// Allowed, with a word for the owner (a grey area in its maker's terms).
     Warned(SignInNote),
+    /// Allowed only in a session the owner drives and watches (Code mode),
+    /// with the word shown to them each time; refused anywhere else (the
+    /// embedding agent's own delegation, background work).
+    WhileWatched(SignInNote),
     /// Its maker's terms prohibit it: only the owner drives it on this sign-in.
     Refused(SignInNote),
 }
@@ -115,12 +119,18 @@ impl Delegation {
     pub fn note(self) -> Option<SignInNote> {
         match self {
             Self::Allowed => None,
-            Self::Warned(note) | Self::Refused(note) => Some(note),
+            Self::Warned(note) | Self::WhileWatched(note) | Self::Refused(note) => Some(note),
         }
     }
 
-    pub fn is_refused(self) -> bool {
-        matches!(self, Self::Refused(_))
+    /// Whether work may be handed to it, `owner_watches` when the hand-off
+    /// happens in a session the owner drives and watches.
+    pub fn permits(self, owner_watches: bool) -> bool {
+        match self {
+            Self::Allowed | Self::Warned(_) => true,
+            Self::WhileWatched(_) => owner_watches,
+            Self::Refused(_) => false,
+        }
     }
 }
 

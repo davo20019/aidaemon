@@ -35,6 +35,8 @@ impl CliAgentTool {
         waits_for_folder: bool,
         defer_claim: bool,
         direct_agent: bool,
+        // Handed off by an agent in a session the owner drives and watches.
+        owner_watches: bool,
         mcp_servers: &[aidaemon_coding_agents::McpEndpoint],
         nests_in: &[String],
         // A peer run: the most its lead may do. A peer never runs in a mode
@@ -122,11 +124,18 @@ impl CliAgentTool {
         // nothing; a key the owner gave it is handed to it at launch.
         let sign_in = self.permissions().sign_in_of_for(tool_name, &*coding_agent);
         // Its maker's terms on that sign-in: work handed to it by an agent
-        // (not the owner's own prompts, passed through) may be refused.
-        if !direct_agent
-            && let Ok(sign_in) = &sign_in
-            && let aidaemon_coding_agents::Delegation::Refused(note) =
-                coding_agent.delegation(sign_in.method())
+        // (not the owner's own prompts, passed through) may be refused, or
+        // allowed only while the owner watches, with its word shown to them.
+        let delegation = match &sign_in {
+            Ok(sign_in) if !direct_agent => coding_agent.delegation(sign_in.method()),
+            _ => aidaemon_coding_agents::Delegation::Allowed,
+        };
+        let delegation_note = match delegation {
+            aidaemon_coding_agents::Delegation::WhileWatched(note) => Some(note),
+            _ => None,
+        };
+        if !delegation.permits(owner_watches)
+            && let Some(note) = delegation.note()
         {
             mark_refused_before_launch(PrelaunchRefusal::Policy);
             return Ok(Err(format!(
@@ -413,6 +422,7 @@ impl CliAgentTool {
             prompt.to_string()
         };
         Ok(Ok(PreparedRun {
+            delegation_note,
             command,
             args,
             base_launch,

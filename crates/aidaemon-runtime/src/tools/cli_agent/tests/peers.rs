@@ -324,6 +324,7 @@ async fn enable_peer_coordination_and_run_child_peer_in_direct_agent_session() {
             status_tx: None,
             may_send_files: false,
             lead_task: None,
+            owner_watches: false,
         },
         &["bash-agent".into()],
         None,
@@ -409,6 +410,7 @@ async fn a_peer_sends_files_only_to_a_private_owner_chat_from_its_folders() {
         status_tx: None,
         may_send_files,
         lead_task: None,
+        owner_watches: false,
     };
 
     let shared = coord.start_root_tree("bash-agent", "Lead", root(false), &[], None);
@@ -486,6 +488,7 @@ async fn a_peer_shares_files_into_the_recipients_folder() {
             status_tx: None,
             may_send_files: false,
             lead_task: None,
+            owner_watches: false,
         },
         &[],
         None,
@@ -590,6 +593,7 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         status_tx: None,
         may_send_files: false,
         lead_task: None,
+        owner_watches: false,
     };
     let continuity = |fresh: bool, run: &str| {
         Some(peer_mod::TreeContinuity {
@@ -857,6 +861,7 @@ async fn a_conversations_tree_survives_a_restart() {
         status_tx: None,
         may_send_files: false,
         lead_task: None,
+        owner_watches: false,
     };
     let lead = peer_mod::ConversationLead {
         session_id: "app:synthetic-restart".into(),

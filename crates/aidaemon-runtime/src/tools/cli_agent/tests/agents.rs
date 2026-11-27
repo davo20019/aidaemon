@@ -186,12 +186,13 @@ async fn test_run_without_tool_and_no_agents_errors() {
 // Enriched prompt test
 // -----------------------------------------------------------------------
 
-/// Antigravity on its own (consumer) sign-in: Google's terms bar another
-/// agent handing it work. The automatic pick passes it over, and a run
-/// that names it is refused before launch; the owner's own prompts in Code
-/// mode (`direct_agent`) still reach it.
+/// Antigravity on its own (consumer) sign-in: Google's terms may not allow
+/// another agent to hand it work. The automatic pick passes it over and the
+/// daemon's own delegation is refused before launch; an agent in a Code
+/// session the owner watches may hand it work, with Google's word for them;
+/// the owner's own prompts (`direct_agent`) always reach it.
 #[tokio::test]
-async fn agy_on_its_own_sign_in_is_never_handed_work_but_still_runs_directly() {
+async fn agy_on_its_own_sign_in_is_handed_work_only_while_the_owner_watches() {
     let (tool, _db) = setup_bash_tool().await;
     tool.tools.write().unwrap().insert(
         "agy".to_string(),
@@ -208,7 +209,7 @@ async fn agy_on_its_own_sign_in_is_never_handed_work_but_still_runs_directly() {
     assert!(CliAgentTool::tool_priority("agy") < CliAgentTool::tool_priority("bash-agent"));
     assert_eq!(tool.default_tool_name().as_deref(), Some("bash-agent"));
 
-    let prepare = |direct_agent: bool| {
+    let prepare = |direct_agent: bool, owner_watches: bool| {
         let tool = &tool;
         async move {
             tool.prepare_run(
@@ -232,6 +233,7 @@ async fn agy_on_its_own_sign_in_is_never_handed_work_but_still_runs_directly() {
                 false,
                 false,
                 direct_agent,
+                owner_watches,
                 &[],
                 &[],
                 None,
@@ -240,11 +242,16 @@ async fn agy_on_its_own_sign_in_is_never_handed_work_but_still_runs_directly() {
             .unwrap()
         }
     };
-    let Err(message) = prepare(false).await else {
-        panic!("delegated work must not reach agy on its own sign-in");
+    let Err(message) = prepare(false, false).await else {
+        panic!("the daemon's own delegation must not reach agy on its own sign-in");
     };
     assert!(message.contains("can't be handed work"), "{message}");
-    if let Err(message) = prepare(true).await {
-        assert!(!message.contains("can't be handed work"), "{message}");
-    }
+    let watched = prepare(false, true)
+        .await
+        .expect("an agent the owner watches may hand it work");
+    assert!(watched.delegation_note.is_some());
+    let direct = prepare(true, false)
+        .await
+        .expect("the owner's own prompts reach it");
+    assert!(direct.delegation_note.is_none());
 }

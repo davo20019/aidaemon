@@ -443,6 +443,9 @@ pub(super) struct PeerRootContext {
     /// What the lead run was asked to do, shown to each peer it starts as
     /// background to its own brief ([`lead_context_header`]).
     pub(super) lead_task: Option<String>,
+    /// The lead is the owner's own conversation with its agent (Code mode):
+    /// the owner drives and watches what its peers are handed.
+    pub(super) owner_watches: bool,
 }
 
 /// Active peer-coordination session attached to a root CLI run.
@@ -1159,6 +1162,7 @@ impl PeerLauncher for RuntimePeerLauncher {
                 peer_binding: binding,
                 cancel: request.cancel,
                 nests_in,
+                owner_watches: self.root.owner_watches,
                 mode_cap: Some(
                     self.root
                         .lead_mode
@@ -1460,6 +1464,9 @@ pub(super) struct PeerLaunchSpec {
     pub(super) nests_in: Vec<String>,
     /// The lead's mode: the peer runs in no more than this.
     pub(super) mode_cap: Option<aidaemon_coding_agents::PermissionMode>,
+    /// Handed off in a session the owner drives and watches
+    /// ([`PeerRootContext::owner_watches`]).
+    pub(super) owner_watches: bool,
 }
 
 /// The task ids of `peer_id` and its ancestors' runs in `tree`.

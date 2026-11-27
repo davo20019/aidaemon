@@ -61,11 +61,14 @@ pub struct AcpAgent {
 }
 
 /// Google's Antigravity FAQ and Terms (section 6): wrapping `agy` in a
-/// third-party agent on a consumer sign-in is prohibited and risks
-/// suspension; a Gemini API key is the supported path.
+/// third-party agent on a consumer sign-in is not supported and risks
+/// suspension; a Gemini API key is the supported path. Whether an agent the
+/// owner watches may hand it work is unsettled, so that alone is allowed,
+/// with this word each time.
 const AGY_OWN_SIGN_IN: crate::SignInNote = crate::SignInNote {
-    text: "Google's terms bar other AI agents from handing it work on its own sign-in, so \
-           AIdaemon runs it only when you use it directly. A Gemini API key lifts that.",
+    text: "Google's terms may not allow other AI agents to hand it work on its own sign-in: \
+           AIdaemon never does in the background, and agents in a Code session you watch do so \
+           at your account's risk. A Gemini API key avoids that.",
     link: "https://antigravity.google/docs/faq",
 };
 
@@ -108,7 +111,7 @@ impl AcpAgent {
             supports_gemini_key: true,
             gemini_key_folder: Some(AGY_KEY_FOLDER),
             default_sign_in: crate::SignInMethod::Own,
-            own_delegation: crate::Delegation::Refused(AGY_OWN_SIGN_IN),
+            own_delegation: crate::Delegation::WhileWatched(AGY_OWN_SIGN_IN),
             ..Self::custom("Antigravity CLI", "agy", &["acp"])
         }
     }
@@ -432,15 +435,22 @@ mod tests {
         assert!(!plan.keeps_session);
     }
 
-    /// Delegation follows each maker's terms: Antigravity refuses work an
-    /// agent hands it on its own (consumer) sign-in and takes it on a key;
+    /// Delegation follows each maker's terms: Antigravity takes work an
+    /// agent hands it on its own (consumer) sign-in only while the owner
+    /// watches, and anywhere on a key;
     /// Claude Code and Codex take it on theirs with a warning; an agent the
     /// owner added takes it.
     #[test]
     fn delegation_follows_each_makers_terms_by_sign_in() {
         use crate::{CodingAgent as _, Delegation, SignInMethod};
         let agy = AcpAgent::antigravity();
-        assert!(agy.delegation(SignInMethod::Own).is_refused());
+        // Only in a session the owner watches.
+        assert!(matches!(
+            agy.delegation(SignInMethod::Own),
+            Delegation::WhileWatched(_)
+        ));
+        assert!(agy.delegation(SignInMethod::Own).permits(true));
+        assert!(!agy.delegation(SignInMethod::Own).permits(false));
         assert_eq!(
             agy.delegation(SignInMethod::GeminiApiKey),
             Delegation::Allowed

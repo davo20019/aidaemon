@@ -87,6 +87,9 @@ pub(super) const WAITING_FOR_SLOT: &str = "Waiting for a free slot";
 /// its agent and arguments in their mode, its prompt and its working-dir
 /// claim.
 pub(super) struct PreparedRun {
+    /// Its maker's word on being handed this work, for the owner watching
+    /// ([`aidaemon_coding_agents::Delegation::WhileWatched`]).
+    pub(super) delegation_note: Option<aidaemon_coding_agents::SignInNote>,
     pub(super) command: String,
     pub(super) args: Vec<String>,
     /// The launch arguments prior to `coding_agent.prepare`, kept so a queued
@@ -644,6 +647,7 @@ impl CliAgentTool {
                 may_send_files,
                 // What the run was asked, as recorded (the owner's message
                 // for a direct agent; a helper's mission otherwise).
+                owner_watches: direct_agent,
                 lead_task: [task_prompt, spec.mission.as_str()]
                     .into_iter()
                     .find(|task| !task.trim().is_empty())
@@ -727,6 +731,7 @@ impl CliAgentTool {
                 waits_for_folder,
                 thread_wait.is_some(),
                 direct_agent,
+                false,
                 &root_mcp,
                 &[],
                 None,
@@ -1222,6 +1227,7 @@ impl CliAgentTool {
                 false,
                 false,
                 false,
+                spec.owner_watches,
                 &spec.mcp_endpoints,
                 &spec.nests_in,
                 spec.mode_cap,
@@ -1229,6 +1235,19 @@ impl CliAgentTool {
             .await
             .map_err(|error| error.to_string())??;
 
+        // Handed work its maker's terms leave unsettled: the owner watching
+        // hears it each time.
+        if let (Some(note), Some(tx)) = (prep.delegation_note, spec.status_tx.as_ref()) {
+            let _ = tx.try_send(StatusUpdate::ToolProgress {
+                name: spec.tool_name.clone(),
+                chunk: format!(
+                    "{} was handed work on its own sign-in. {} ({})",
+                    prep.coding_agent.name(),
+                    note.text,
+                    note.link
+                ),
+            });
+        }
         if let Some(mcp_guard) = spec.mcp_keep_alive {
             prep.mcp_guard = Some(mcp_guard as Box<dyn std::any::Any + Send>);
         }
