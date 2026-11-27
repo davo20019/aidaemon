@@ -581,6 +581,7 @@ fn choices(
                                         Size::Sm,
                                         move || {
                                             chatgpt_sign_in::paste_and_finish(
+                                                store,
                                                 redirect,
                                                 move |redirect| {
                                                     store.setup_step(SetupAction::FinishSignIn {

@@ -604,11 +604,11 @@ fn agent_sign_in(store: Store, agent: &CodingAgent) -> View {
                     return view();
                 };
                 let link = note.link.clone();
+                // Stacked: a row would keep the note on one line, wider
+                // than a phone.
                 return view()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
+                    .items_start()
+                    .gap_1()
                     .child(faint(note.text))
                     .child(ui::btn("Learn more", Variant::Ghost, Size::Sm, move || {
                         drop(open_url(&link));

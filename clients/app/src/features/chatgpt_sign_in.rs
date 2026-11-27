@@ -3,6 +3,8 @@
 
 use nsh_core::prelude::*;
 
+use crate::store::Store;
+
 /// Above the "Open the sign-in page" button, while an address may be
 /// pasted.
 pub fn intro() -> &'static str {
@@ -29,12 +31,19 @@ pub fn paste_step() -> &'static str {
 }
 
 /// Read the clipboard into `redirect` and, when it holds anything, hand it
-/// to `finish` (the daemon says if it is not the sign-in's address).
-pub fn paste_and_finish(redirect: Signal<String>, finish: impl FnOnce(String) + 'static) {
+/// to `finish` (the daemon says if it is not the sign-in's address). An
+/// empty clipboard, or one the browser would not let the page read, is
+/// said on `store`.
+pub fn paste_and_finish(
+    store: Store,
+    redirect: Signal<String>,
+    finish: impl FnOnce(String) + 'static,
+) {
     spawn(async move {
         let pasted = clipboard_string().await;
         let pasted = pasted.trim();
         if pasted.is_empty() {
+            store.say("Couldn't read the clipboard: paste the address into the field");
             return;
         }
         redirect.set(pasted.to_owned());

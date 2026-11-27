@@ -1596,11 +1596,16 @@ fn sign_in_card(
                             Variant::Secondary,
                             Size::Sm,
                             move || {
-                                chatgpt_sign_in::paste_and_finish(form.redirect, move |redirect| {
-                                    store
-                                        .change_settings(SettingsChange::FinishSignIn { redirect });
-                                    form.redirect.set(String::new());
-                                });
+                                chatgpt_sign_in::paste_and_finish(
+                                    store,
+                                    form.redirect,
+                                    move |redirect| {
+                                        store.change_settings(SettingsChange::FinishSignIn {
+                                            redirect,
+                                        });
+                                        form.redirect.set(String::new());
+                                    },
+                                );
                             },
                         )
                         .disabled(move || store.settings_busy()),
