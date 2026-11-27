@@ -466,7 +466,10 @@ async fn challenge(
         .challenge(&request.device_id, request.endpoint.as_deref())
         .await;
     match &result {
-        Ok(_) => tracing::info!(device = %request.device_id, "Device sign-in: challenge sent"),
+        // Debug: an app too old to bind its sign-in asks for one every few
+        // seconds (its refusal is logged hourly), and "Device signed in"
+        // already marks each sign-in.
+        Ok(_) => tracing::debug!(device = %request.device_id, "Device sign-in: challenge sent"),
         Err(error) => tracing::warn!(
             device = %request.device_id,
             reason = %error.message,
