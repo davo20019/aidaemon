@@ -1799,6 +1799,10 @@ impl ClientGateway {
             },
             other => other,
         };
+        // A sign-in's start answer ("finish signing in in the browser") is
+        // for the device starting it, which says it from the ack (protocol
+        // 1.60); how the sign-in ends is announced to every client.
+        let own_answer = matches!(change, SettingsChange::SignIn { .. });
         match self.host.settings_gate(&change).await.map_err(invalid)? {
             SettingsGate::Free => {
                 let done = self
@@ -1806,7 +1810,9 @@ impl ClientGateway {
                     .change_settings(change, false)
                     .await
                     .map_err(invalid)?;
-                self.settings_updated(true, done.message.clone());
+                if !own_answer {
+                    self.settings_updated(true, done.message.clone());
+                }
                 Ok(CommandResult::SettingsChanged {
                     outcome: SettingsOutcome::Done {
                         message: done.message,

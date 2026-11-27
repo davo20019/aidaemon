@@ -4018,7 +4018,7 @@
           "type": "object"
         },
         {
-          "description": "Ephemeral: the settings changed (or a change waiting for approval\nended): read them again (protocol 1.4).",
+          "description": "Ephemeral: the settings changed (or a change waiting for approval\nended): read them again (protocol 1.4). From 1.60 a sign-in's start\nsends none: its answer is for the device that started it, in the\nack; how the sign-in ends is sent to every client.",
           "properties": {
             "message": {
               "type": "string"

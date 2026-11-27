@@ -2417,7 +2417,9 @@ pub enum Event {
         reason: String,
     },
     /// Ephemeral: the settings changed (or a change waiting for approval
-    /// ended): read them again (protocol 1.4).
+    /// ended): read them again (protocol 1.4). From 1.60 a sign-in's start
+    /// sends none: its answer is for the device that started it, in the
+    /// ack; how the sign-in ends is sent to every client.
     SettingsUpdated {
         ok: bool,
         message: String,

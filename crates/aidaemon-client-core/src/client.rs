@@ -137,6 +137,9 @@ const GET_SETTINGS_MINOR: u16 = 4;
 const SEND_QUEUED_NOW_MINOR: u16 = 41;
 /// The protocol minor that deletes conversations.
 const DELETE_SESSION_MINOR: u16 = 59;
+/// The protocol minor from which a sign-in step's answer goes only to the
+/// device that took it (no `settings_updated` to every client).
+const OWN_SIGN_IN_ANSWER_MINOR: u16 = 60;
 
 /// Something read from the daemon, as last asked.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -443,6 +446,9 @@ pub struct Client {
     settings_again: bool,
     /// Settings changes sent and not yet answered.
     settings_changes: BTreeSet<String>,
+    /// The settings changes in flight that are steps of a sign-in: their
+    /// answer is said here, as only this device gets it.
+    sign_in_steps: BTreeSet<String>,
     /// Why the last settings change was refused, until dismissed or the
     /// next change.
     pub settings_error: Option<String>,
@@ -683,6 +689,7 @@ impl Client {
             Update::Disconnected(disconnect) => {
                 // Changes in flight get no answer now.
                 self.settings_changes.clear();
+                self.sign_in_steps.clear();
                 self.refreshing.clear();
                 let retry = u64::try_from(disconnect.retry_in.as_millis()).unwrap_or(0);
                 // Only a connection that worked drops quietly: one that
@@ -1343,7 +1350,13 @@ impl Client {
             } => {
                 self.settings_changes.remove(request_id);
                 // `Done`: the daemon announces what it did to every
-                // client (`settings_updated`), which says it here too.
+                // client (`settings_updated`), which says it here too;
+                // a sign-in step's answer is this device's alone.
+                if self.sign_in_steps.remove(request_id)
+                    && let SettingsOutcome::Done { message, .. } = outcome
+                {
+                    out.push(Effect::Say(message.clone()));
+                }
                 if let SettingsOutcome::AwaitingApproval {
                     approval_id,
                     other_device,
@@ -1367,6 +1380,7 @@ impl Client {
                 error,
             } if self.settings_changes.contains(request_id) => {
                 self.settings_changes.remove(request_id);
+                self.sign_in_steps.remove(request_id);
                 self.settings_error = Some(error.message.clone());
                 // A refusal may be for a page out of date: read it again.
                 if self.settings.is_ready() || cx.settings_open {
@@ -1663,7 +1677,14 @@ impl Client {
     /// the settings read again when it lands.
     pub fn change_settings(&mut self, change: SettingsChange) {
         self.settings_error = None;
+        let step = is_sign_in_step(&change)
+            && self
+                .daemon_version
+                .is_some_and(|v| v.major == 1 && v.minor >= OWN_SIGN_IN_ANSWER_MINOR);
         let id = self.send(Command::ChangeSettings { change });
+        if step {
+            self.sign_in_steps.insert(id.clone());
+        }
         self.settings_changes.insert(id);
     }
 
@@ -4158,6 +4179,12 @@ pub fn platform_name(id: &str) -> &'static str {
 /// another reason, right after fresh ones came, do not loop.
 pub const RESIGN_AGAIN_MS: u64 = 60_000;
 
+/// Whether `change` starts a ChatGPT sign-in, whose answer ("finish
+/// signing in in the browser") is for the device that took it.
+fn is_sign_in_step(change: &SettingsChange) -> bool {
+    matches!(change, SettingsChange::SignIn { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4869,6 +4896,33 @@ mod tests {
         client.setup_step_later(SetupAction::SkipChannel);
         let effects = client.update(created("app:synthetic-9"), &cx(None));
         assert!(!effects.iter().any(|e| matches!(e, Effect::OpenGreeting(_))));
+    }
+
+    /// A sign-in's start answer is said by the device that started it: a
+    /// daemon that speaks 1.60 sends it to no other device.
+    #[test]
+    fn a_sign_in_start_answer_is_said_by_the_device_that_started_it() {
+        for (minor, said) in [(59, false), (60, true)] {
+            let mut client = Client {
+                daemon_version: Some(aidaemon_client_protocol::ProtocolVersion { major: 1, minor }),
+                ..Client::default()
+            };
+            client.change_settings(SettingsChange::SignIn { paste: false });
+            let (id, _) = client.take_outgoing().pop().unwrap();
+            let effects = client.update(
+                frame(&format!(
+                    r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings_changed","outcome":{{"kind":"done","message":"Finish signing in in the browser."}}}}}}"#
+                )),
+                &cx(None),
+            );
+            assert_eq!(
+                effects.iter().any(
+                    |e| matches!(e, Effect::Say(m) if m == "Finish signing in in the browser.")
+                ),
+                said,
+                "1.{minor}: {effects:?}"
+            );
+        }
     }
 
     #[test]
