@@ -1614,51 +1614,29 @@ fn body(store: Store, detail: RunDetail, coding: bool, folds: Folds, run_id: Str
     page
 }
 
-/// How a step is shown among its neighbours.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowKind {
-    /// A row of its own: a failure, one still going, the agents working
-    /// together, or any step from a daemon that does not say its kind.
-    Alone,
-    /// Work handed to another agent: hand-offs in a row are one row naming
-    /// each agent, which opens its run.
-    HandOffs,
-    /// Finished work: an edit that names its file, a read, search,
-    /// command, lookup, other tool, or a call to the tools the agents work
-    /// together by (checking on one, the board). Work in a row is folded.
-    Work,
-}
-
-fn row_kind(step: &RunStepItem) -> RowKind {
-    if step.state != RunStepState::Done {
-        return RowKind::Alone;
-    }
-    match step.kind {
-        RunStepKind::Edit if step.path.is_some() => RowKind::Work,
-        RunStepKind::HandOff if step.run.is_some() => RowKind::HandOffs,
-        RunStepKind::Edit | RunStepKind::HandOff | RunStepKind::Delegate | RunStepKind::Unknown => {
-            RowKind::Alone
-        }
-        _ => RowKind::Work,
-    }
-}
-
 /// A row of the steps list.
 #[derive(Debug, Clone, PartialEq)]
 enum Row {
+    /// Finished work in a row, folded into one line that opens it.
     Work(Vec<RunStepItem>),
+    /// Work handed to other agents in a row: a row per thing done, naming
+    /// each agent, which opens its run.
     HandOffs(Vec<RunStepItem>),
+    /// A step that stands out: still going, or a failure nothing came after.
     Alone(RunStepItem),
 }
 
-/// The steps as rows. Finished work in a row folds into one line that
-/// opens it ([`row_kind`]); hand-offs in a row are one row. A failure the
-/// agent went on past (something finished after it) folds with the work
-/// around it, its fold saying how many failed, so a retried edit no longer
-/// splits the list; one with nothing finished after it keeps its own row.
-/// Steps still going are listed last, where the agent is now: one started
-/// earlier (a long build beside other work) no longer splits the folds
-/// above it.
+/// The steps as rows, by one rule: every step folds into the finished
+/// work around it, except what the owner needs to see on its own:
+/// - a step still going, listed last, where the agent is now (one started
+///   earlier, a long build beside other work, no longer splits the folds);
+/// - a failure nothing finished after (one the agent went on past folds,
+///   its fold counting it: "· 1 failed");
+/// - work handed to another agent, a link to its run.
+///
+/// Nothing else, so a new kind of step folds without a change here (live
+/// 2026-11-27: a rule listing what folds left each new shape of step, a
+/// retried edit, a coordination call, splitting the list).
 fn rows(steps: &[RunStepItem]) -> Vec<(usize, Row)> {
     let last_done = steps
         .iter()
@@ -1666,24 +1644,23 @@ fn rows(steps: &[RunStepItem]) -> Vec<(usize, Row)> {
     let mut rows: Vec<(usize, Row)> = Vec::new();
     let mut going: Vec<(usize, RunStepItem)> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
+        let step = step.clone();
         if step.state == RunStepState::Started {
-            going.push((index, step.clone()));
+            going.push((index, step));
             continue;
         }
-        let gone_past = step.state == RunStepState::Failed
-            && step.kind != RunStepKind::Unknown
-            && last_done.is_some_and(|done| done > index);
-        let kind = if gone_past {
-            RowKind::Work
-        } else {
-            row_kind(step)
-        };
-        match (kind, rows.last_mut()) {
-            (RowKind::Work, Some((_, Row::Work(group))))
-            | (RowKind::HandOffs, Some((_, Row::HandOffs(group)))) => group.push(step.clone()),
-            (RowKind::Work, _) => rows.push((index, Row::Work(vec![step.clone()]))),
-            (RowKind::HandOffs, _) => rows.push((index, Row::HandOffs(vec![step.clone()]))),
-            (RowKind::Alone, _) => rows.push((index, Row::Alone(step.clone()))),
+        let unrecovered =
+            step.state == RunStepState::Failed && !last_done.is_some_and(|done| done > index);
+        let hand_off = step.kind == RunStepKind::HandOff
+            && step.state == RunStepState::Done
+            && step.run.is_some()
+            && step.agent.is_some();
+        match rows.last_mut() {
+            _ if unrecovered => rows.push((index, Row::Alone(step))),
+            Some((_, Row::HandOffs(group))) if hand_off => group.push(step),
+            _ if hand_off => rows.push((index, Row::HandOffs(vec![step]))),
+            Some((_, Row::Work(group))) => group.push(step),
+            _ => rows.push((index, Row::Work(vec![step]))),
         }
     }
     rows.extend(
@@ -1860,13 +1837,7 @@ fn work(store: Store, steps: Vec<RunStepItem>, coding: bool, open: Signal<bool>)
         };
         line(glyph, tone, step.words.clone(), step.by_helper)
     };
-    // A failed step it went on past is listed among the rest, never as a
-    // changed file.
-    let rest: Vec<RunStepItem> = steps
-        .iter()
-        .filter(|step| step.kind != RunStepKind::Edit || step.state == RunStepState::Failed)
-        .cloned()
-        .collect();
+    let rest = rest_of_work(&steps);
     match (files.as_slice(), rest.as_slice()) {
         ([file], []) => return file_row(file),
         ([], [step]) => return other(step),
@@ -1887,13 +1858,28 @@ fn work(store: Store, steps: Vec<RunStepItem>, coding: bool, open: Signal<bool>)
         }))
 }
 
+/// A fold's steps other than the edits [`files_changed`] counts: each is
+/// listed as its own line, so every step of a fold is shown once.
+fn rest_of_work(steps: &[RunStepItem]) -> Vec<RunStepItem> {
+    steps
+        .iter()
+        .filter(|step| !is_file_change(step))
+        .cloned()
+        .collect()
+}
+
+/// An edit that changed a file it names: listed under that file.
+fn is_file_change(step: &RunStepItem) -> bool {
+    step.kind == RunStepKind::Edit && step.state != RunStepState::Failed && step.path.is_some()
+}
+
 /// The files edits changed, each once in the order first changed, with how
 /// many edits each took.
 fn files_changed(steps: &[RunStepItem]) -> Vec<(String, usize)> {
     let mut files: Vec<(String, usize)> = Vec::new();
     for path in steps
         .iter()
-        .filter(|step| step.kind == RunStepKind::Edit && step.state != RunStepState::Failed)
+        .filter(|step| is_file_change(step))
         .filter_map(|step| step.path.clone())
     {
         match files.iter_mut().find(|(seen, _)| *seen == path) {
@@ -1922,7 +1908,7 @@ fn work_summary(steps: &[RunStepItem]) -> String {
     let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
     for step in steps
         .iter()
-        .filter(|step| step.kind != RunStepKind::Edit && step.state != RunStepState::Failed)
+        .filter(|step| !is_file_change(step) && step.state != RunStepState::Failed)
     {
         match counts.iter_mut().find(|(kind, _)| *kind == step.kind) {
             Some((_, count)) => *count += 1,
@@ -1936,6 +1922,9 @@ fn work_summary(steps: &[RunStepItem]) -> String {
         RunStepKind::Fetch => format!("looked up {}", plural(n, "a page", "pages")),
         RunStepKind::Plan => "updated its plan".to_string(),
         RunStepKind::Coordinate => format!("coordinated {}", plural(n, "once", "times")),
+        RunStepKind::Edit => format!("made {}", plural(n, "an edit", "edits")),
+        RunStepKind::Delegate => format!("asked {}", plural(n, "a helper", "helpers")),
+        RunStepKind::HandOff => format!("handed off work {}", plural(n, "once", "times")),
         _ => format!("used {}", plural(n, "another tool", "other tools")),
     }));
     let failed = steps
@@ -1979,8 +1968,8 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
 #[cfg(test)]
 mod tests {
     use super::{
-        FOCUSED_REPLY_BUDGET, Row, RowKind, clean_asked_text, is_owner_prompt, markdown_preview,
-        row_kind, rows, work_summary,
+        FOCUSED_REPLY_BUDGET, Row, clean_asked_text, files_changed, is_owner_prompt,
+        markdown_preview, rest_of_work, rows, work_summary,
     };
     use aidaemon_client_protocol::{RunStepItem, RunStepKind, RunStepState};
 
@@ -2060,30 +2049,224 @@ mod tests {
         assert_eq!(laid[2].0, 1);
     }
 
-    #[test]
-    fn failures_running_steps_and_teamwork_keep_their_own_rows() {
+    /// Every kind of step in every state, with and without the file or run
+    /// it may name: the shapes a run's steps come in.
+    fn every_shape() -> Vec<RunStepItem> {
         use RunStepKind::*;
-        let kind = |kind, state| row_kind(&step(kind, state));
-        assert_eq!(kind(Read, RunStepState::Done), RowKind::Work);
-        assert_eq!(kind(Read, RunStepState::Failed), RowKind::Alone);
-        assert_eq!(kind(Run, RunStepState::Started), RowKind::Alone);
-        // Checking on another agent or reading the board is bookkeeping.
-        assert_eq!(kind(Coordinate, RunStepState::Done), RowKind::Work);
-        // A hand-off the daemon recorded goes with its neighbours.
-        let mut hand_off = step(HandOff, RunStepState::Done);
-        assert_eq!(row_kind(&hand_off), RowKind::Alone);
-        hand_off.run = Some("cli-agent-5e6f".into());
-        assert_eq!(row_kind(&hand_off), RowKind::HandOffs);
-        // A finished edit goes with its neighbours when it names its file;
-        // a failed one stands out.
-        let mut edit = step(Edit, RunStepState::Done);
-        assert_eq!(row_kind(&edit), RowKind::Alone);
-        edit.path = Some("/w/synthetic/slug.py".into());
-        assert_eq!(row_kind(&edit), RowKind::Work);
-        edit.state = RunStepState::Failed;
-        assert_eq!(row_kind(&edit), RowKind::Alone);
-        // An older daemon says no kind: nothing folds.
-        assert_eq!(kind(Unknown, RunStepState::Done), RowKind::Alone);
+        let mut shapes = Vec::new();
+        for kind in [
+            Read, Search, Edit, Run, Fetch, Delegate, Plan, Coordinate, HandOff, Other, Unknown,
+        ] {
+            for state in [
+                RunStepState::Started,
+                RunStepState::Done,
+                RunStepState::Failed,
+                RunStepState::Unknown,
+            ] {
+                let plain = step(kind, state);
+                shapes.push(plain.clone());
+                if matches!(kind, Read | Edit) {
+                    let mut named = plain.clone();
+                    named.path = Some("/w/synthetic/slug.py".into());
+                    shapes.push(named);
+                }
+                if kind == HandOff {
+                    let mut linked = plain.clone();
+                    linked.run = Some("cli-agent-5e6f".into());
+                    linked.agent = Some("Codex".into());
+                    linked.words = "Handed work to Codex".into();
+                    shapes.push(linked);
+                }
+            }
+        }
+        // Each step tells itself apart, so "shown once" can be checked.
+        shapes
+    }
+
+    /// The one rule's promises, for any steps: each step is shown once, in
+    /// its order (those still going last); no two folds or two hand-off
+    /// rows sit side by side; a row on its own is a step still going or a
+    /// failure nothing finished after; a fold is known by its first step.
+    fn check(steps: &[RunStepItem]) {
+        let steps: Vec<RunStepItem> = steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let mut step = step.clone();
+                step.at_ms = Some(index as u64);
+                step
+            })
+            .collect();
+        let laid = rows(&steps);
+        let mut shown: Vec<RunStepItem> = Vec::new();
+        for (index, (first, row)) in laid.iter().enumerate() {
+            let group = match row {
+                Row::Work(group) | Row::HandOffs(group) => group.clone(),
+                Row::Alone(step) => vec![step.clone()],
+            };
+            assert!(!group.is_empty(), "{laid:?}");
+            assert_eq!(steps[*first], group[0], "a row is known by its first step");
+            if let Some((_, before)) = index.checked_sub(1).map(|at| &laid[at]) {
+                let same = matches!(
+                    (before, row),
+                    (Row::Work(_), Row::Work(_)) | (Row::HandOffs(_), Row::HandOffs(_))
+                );
+                assert!(!same, "two folds side by side: {laid:?}");
+            }
+            match row {
+                Row::Alone(step) if step.state == RunStepState::Started => {}
+                Row::Alone(step) => {
+                    let at = step.at_ms.unwrap_or_default() as usize;
+                    assert_eq!(step.state, RunStepState::Failed, "{laid:?}");
+                    assert!(
+                        !steps[at + 1..]
+                            .iter()
+                            .any(|later| later.state == RunStepState::Done),
+                        "a failure the agent went on past stands alone: {laid:?}"
+                    );
+                }
+                Row::Work(group) => {
+                    assert!(group.iter().all(|step| step.state != RunStepState::Started));
+                    // Each of a fold's steps is listed once when it opens.
+                    let edits: usize = files_changed(group).iter().map(|(_, n)| n).sum();
+                    assert_eq!(edits + rest_of_work(group).len(), group.len(), "{group:?}");
+                    assert!(!work_summary(group).is_empty(), "{group:?}");
+                }
+                Row::HandOffs(group) => {
+                    assert!(group.iter().all(|step| step.run.is_some()), "{group:?}");
+                }
+            }
+            shown.extend(group);
+        }
+        let mut expected: Vec<RunStepItem> = steps
+            .iter()
+            .filter(|step| step.state != RunStepState::Started)
+            .cloned()
+            .collect();
+        expected.extend(
+            steps
+                .iter()
+                .filter(|step| step.state == RunStepState::Started)
+                .cloned(),
+        );
+        assert_eq!(
+            shown, expected,
+            "each step once, in order, those going last"
+        );
+    }
+
+    #[test]
+    fn any_steps_keep_the_one_grouping_rule() {
+        let shapes = every_shape();
+        // Every list of up to three steps.
+        check(&[]);
+        for a in &shapes {
+            check(std::slice::from_ref(a));
+            for b in &shapes {
+                check(&[a.clone(), b.clone()]);
+                for c in &shapes {
+                    check(&[a.clone(), b.clone(), c.clone()]);
+                }
+            }
+        }
+        // And long ones, as a run's hundreds of steps come.
+        let mut seed: u64 = 0x5eed;
+        for _ in 0..2_000 {
+            let steps: Vec<RunStepItem> = (0..40)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    shapes[(seed >> 33) as usize % shapes.len()].clone()
+                })
+                .collect();
+            check(&steps);
+        }
+    }
+
+    /// Real runs' steps hold the rule too: `RUN_SHAPES` names a file of
+    /// runs, one a line, each step `kind:state:names_file:has_run` (kinds
+    /// and states only, exported from a daemon's records). Run by hand:
+    /// `RUN_SHAPES=<file> cargo test --lib real_runs -- --ignored`.
+    #[test]
+    #[ignore]
+    fn real_runs_keep_the_one_grouping_rule() {
+        use RunStepKind::*;
+        let path = std::env::var("RUN_SHAPES").expect("RUN_SHAPES names a file");
+        let text = std::fs::read_to_string(path).expect("RUN_SHAPES is readable");
+        let (mut runs, mut steps_seen, mut rows_shown, mut alone) = (0, 0, 0, 0);
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let steps: Vec<RunStepItem> = line
+                .split_whitespace()
+                .map(|token| {
+                    let parts: Vec<&str> = token.split(':').collect();
+                    let kind = match parts[0] {
+                        "read" => Read,
+                        "search" => Search,
+                        "edit" => Edit,
+                        "run" => Run,
+                        "fetch" => Fetch,
+                        "delegate" => Delegate,
+                        "plan" => Plan,
+                        "coordinate" => Coordinate,
+                        "hand_off" => HandOff,
+                        "other" => Other,
+                        _ => Unknown,
+                    };
+                    let state = match parts[1] {
+                        "started" => RunStepState::Started,
+                        "done" => RunStepState::Done,
+                        "failed" => RunStepState::Failed,
+                        _ => RunStepState::Unknown,
+                    };
+                    let mut item = step(kind, state);
+                    if parts[2] == "1" {
+                        item.path = Some("/w/synthetic/file.rs".into());
+                    }
+                    if parts[3] == "1" {
+                        item.run = Some("cli-agent-synthetic".into());
+                        item.agent = Some("Codex".into());
+                    }
+                    item
+                })
+                .collect();
+            check(&steps);
+            let laid = rows(&steps);
+            runs += 1;
+            steps_seen += steps.len();
+            rows_shown += laid.len();
+            alone += laid
+                .iter()
+                .filter(|(_, row)| matches!(row, Row::Alone(_)))
+                .count();
+        }
+        eprintln!("{runs} runs, {steps_seen} steps, {rows_shown} rows, {alone} standing alone");
+    }
+
+    /// Live 2026-11-27, kinds and states only: hand-offs with their run
+    /// read as one row; the steps around them fold.
+    #[test]
+    fn hand_offs_in_a_row_are_one_row_between_folds() {
+        use RunStepKind::*;
+        let hand_off = |agent: &str| {
+            let mut step = step(HandOff, RunStepState::Done);
+            step.run = Some(format!("cli-agent-{agent}"));
+            step.agent = Some(agent.into());
+            step
+        };
+        let laid = rows(&[
+            step(Read, RunStepState::Done),
+            hand_off("Codex"),
+            hand_off("Gemini"),
+            step(Coordinate, RunStepState::Done),
+            step(Unknown, RunStepState::Done),
+            step(Delegate, RunStepState::Done),
+        ]);
+        assert!(
+            matches!(laid.as_slice(), [(_, Row::Work(_)), (_, Row::HandOffs(two)), (_, Row::Work(three))]
+                if two.len() == 2 && three.len() == 3),
+            "{laid:?}"
+        );
     }
     use aidaemon_client_protocol::{RunAsked, RunPhase, RunSummary};
 
