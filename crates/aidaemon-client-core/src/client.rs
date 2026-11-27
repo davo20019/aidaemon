@@ -454,6 +454,10 @@ pub struct Client {
     /// The model a new conversation's first message carried, until the
     /// daemon names the conversation.
     starting_model: Option<(ModelChoice, Effort)>,
+    /// What the message that starts a new session says: shown as sending
+    /// in that session as soon as the daemon names it, until its turn
+    /// shows it back (the session's history is still on its way then).
+    starting_echo: Option<(String, Vec<AttachmentRef>)>,
     /// The composer's sticky recipient per conversation: the session the
     /// owner last addressed (or explicitly chose), kept until changed.
     composer_targets: BTreeMap<String, ComposerTarget>,
@@ -908,6 +912,17 @@ impl Client {
                         effort,
                     }),
                 );
+            }
+            if let Some(sent) = self.starting_echo.take() {
+                self.echo(session_id, request_id, sent, None);
+                // Accepted: this Ack is the daemon taking it.
+                if let Some(last) = self
+                    .sending
+                    .get_mut(session_id.as_str())
+                    .and_then(|list| list.last_mut())
+                {
+                    last.accepted = true;
+                }
             }
             out.push(Effect::Started(session_id.clone()));
         }
@@ -3110,8 +3125,16 @@ impl Client {
                 if queueing {
                     self.queue_sends.insert(id.clone());
                 }
-                if let (Some(session), Some((text, attachments, thread))) = (session, echo) {
-                    self.echo(session, &id, (text, attachments), thread);
+                match (session, echo) {
+                    (Some(session), Some((text, attachments, thread))) => {
+                        self.echo(session, &id, (text, attachments), thread);
+                    }
+                    // No session to show it in yet: it shows once the
+                    // daemon names the new one.
+                    (None, echo) => {
+                        self.starting_echo = echo.map(|(text, attachments, _)| (text, attachments));
+                    }
+                    _ => {}
                 }
                 if session.is_none() {
                     // The draft is spent once the conversation exists.
@@ -5324,6 +5347,30 @@ mod tests {
         );
         assert_eq!(effects, [Effect::Started("app:new".into())]);
         assert_eq!(client.submit(None, "  ", None, None), Ok(false));
+    }
+
+    /// A new conversation's first message shows in it as soon as the
+    /// daemon names it, before its history or its turn arrive, and once.
+    #[test]
+    fn a_new_conversations_first_message_shows_as_sending_once_it_starts() {
+        let mut client = Client::new();
+        assert_eq!(client.submit(None, "hello there", None, None), Ok(false));
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:new"}}}}"#
+            )),
+            &cx(None),
+        );
+        let sending = client.sending("app:new");
+        assert_eq!(sending.len(), 1);
+        assert_eq!(sending[0].text, "hello there");
+        assert!(sending[0].accepted);
+        client.update(
+            frame(r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:new","event":{"type":"user_message","session_id":"app:new","text":"hello there","origin":"app"}}"#),
+            &cx(Some("app:new")),
+        );
+        assert!(client.sending("app:new").is_empty(), "shown back once");
     }
 
     #[test]
