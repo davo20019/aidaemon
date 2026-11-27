@@ -117,6 +117,9 @@ pub fn run_view(store: Store, id: String) -> View {
         draft: signal(String::new()),
         sent: signal(None),
     };
+    // What the owner opened or closed, kept here: a run's update draws its
+    // exchange again, and what was open stays open.
+    let folds: Folds = signal(Vec::new());
     view()
         .w_full()
         .flex_1()
@@ -165,8 +168,9 @@ pub fn run_view(store: Store, id: String) -> View {
                         }
                         first_visible = false;
                         let this = run.id == id;
-                        let exchange =
-                            exchange(store, composer, latest, run, index, total, this, direct);
+                        let exchange = exchange(
+                            store, composer, folds, latest, run, index, total, this, direct,
+                        );
                         list = list.child(if this {
                             exchange.element_ref(&opened)
                         } else {
@@ -406,6 +410,7 @@ fn state_with_tone(run: &RunSummary, waiting: bool) -> (String, Tone) {
 fn exchange(
     store: Store,
     composer: Composer,
+    folds: Folds,
     latest: Memo<Option<RunSummary>>,
     run: RunSummary,
     index: usize,
@@ -421,7 +426,7 @@ fn exchange(
         .child(asked(store, composer, latest, &run, this, direct))
         .child(answer(store, composer, latest, &run, this))
         .child(if this {
-            steps(store, &run)
+            steps(store, &run, folds)
         } else {
             more(store, &run)
         })
@@ -1164,13 +1169,18 @@ fn more(store: Store, run: &RunSummary) -> View {
 /// The steps, plan, permissions and cost of the run the view was opened
 /// on, folded once it has a reply (open while working or when it ended
 /// without a reply); nothing when it kept none.
-fn steps(store: Store, run: &RunSummary) -> View {
+fn steps(store: Store, run: &RunSummary, folds: Folds) -> View {
     let has_reply = run
         .result
         .as_ref()
         .is_some_and(|result| !result.text.trim().is_empty());
-    let open = signal(run.phase == RunPhase::Running || !has_reply);
+    let open = fold_state(
+        folds,
+        (run.id.clone(), Fold::Steps),
+        run.phase == RunPhase::Running || !has_reply,
+    );
     let coding = store.is_coding(&run.session_id);
+    let run_id = run.id.clone();
     view().child(dynamic(move || {
         let Read::Ready(detail) = store.run_view() else {
             return None;
@@ -1180,6 +1190,7 @@ fn steps(store: Store, run: &RunSummary) -> View {
             || !detail.permissions.is_empty()
             || detail.model.is_some()
             || detail.usage.is_some();
+        let run_id = run_id.clone();
         has.then(|| {
             untracked(move || {
                 let count = detail.steps.len();
@@ -1194,7 +1205,7 @@ fn steps(store: Store, run: &RunSummary) -> View {
                     .gap_1()
                     .child(ui::quiet_disclosure(label, open))
                     .child(ui::unfold(open, move || {
-                        body(store, detail.clone(), coding)
+                        body(store, detail.clone(), coding, folds, run_id.clone())
                     }))
             })
         })
@@ -1502,7 +1513,7 @@ fn note(words: String) -> View {
 }
 
 /// The run's steps, plan, permissions, and what it ran on and cost.
-fn body(store: Store, detail: RunDetail, coding: bool) -> View {
+fn body(store: Store, detail: RunDetail, coding: bool, folds: Folds, run_id: String) -> View {
     let mut page = view().gap_3().pt_1().pl(px(4.0));
     if !detail.plan.is_empty() {
         let mut plan = view().gap_1();
@@ -1518,9 +1529,14 @@ fn body(store: Store, detail: RunDetail, coding: bool) -> View {
     }
     if !detail.steps.is_empty() {
         let mut steps = view().gap_1();
-        for row in rows(&detail.steps) {
+        for (first, row) in rows(&detail.steps) {
             steps = steps.child(match row {
-                Row::Work(group) => work(store, group, coding),
+                Row::Work(group) => work(
+                    store,
+                    group,
+                    coding,
+                    fold_state(folds, (run_id.clone(), Fold::Work(first)), false),
+                ),
                 Row::HandOffs(group) => hand_offs(store, group),
                 Row::Alone(step) => step_row(store, &step, coding),
             });
@@ -1643,15 +1659,15 @@ enum Row {
 /// Steps still going are listed last, where the agent is now: one started
 /// earlier (a long build beside other work) no longer splits the folds
 /// above it.
-fn rows(steps: &[RunStepItem]) -> Vec<Row> {
+fn rows(steps: &[RunStepItem]) -> Vec<(usize, Row)> {
     let last_done = steps
         .iter()
         .rposition(|step| step.state == RunStepState::Done);
-    let mut rows: Vec<Row> = Vec::new();
-    let mut going: Vec<RunStepItem> = Vec::new();
+    let mut rows: Vec<(usize, Row)> = Vec::new();
+    let mut going: Vec<(usize, RunStepItem)> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         if step.state == RunStepState::Started {
-            going.push(step.clone());
+            going.push((index, step.clone()));
             continue;
         }
         let gone_past = step.state == RunStepState::Failed
@@ -1663,15 +1679,61 @@ fn rows(steps: &[RunStepItem]) -> Vec<Row> {
             row_kind(step)
         };
         match (kind, rows.last_mut()) {
-            (RowKind::Work, Some(Row::Work(group)))
-            | (RowKind::HandOffs, Some(Row::HandOffs(group))) => group.push(step.clone()),
-            (RowKind::Work, _) => rows.push(Row::Work(vec![step.clone()])),
-            (RowKind::HandOffs, _) => rows.push(Row::HandOffs(vec![step.clone()])),
-            (RowKind::Alone, _) => rows.push(Row::Alone(step.clone())),
+            (RowKind::Work, Some((_, Row::Work(group))))
+            | (RowKind::HandOffs, Some((_, Row::HandOffs(group)))) => group.push(step.clone()),
+            (RowKind::Work, _) => rows.push((index, Row::Work(vec![step.clone()]))),
+            (RowKind::HandOffs, _) => rows.push((index, Row::HandOffs(vec![step.clone()]))),
+            (RowKind::Alone, _) => rows.push((index, Row::Alone(step.clone()))),
         }
     }
-    rows.extend(going.into_iter().map(Row::Alone));
+    rows.extend(
+        going
+            .into_iter()
+            .map(|(index, step)| (index, Row::Alone(step))),
+    );
     rows
+}
+
+/// A fold in a run's view the owner can open or close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// Its "N steps" disclosure.
+    Steps,
+    /// A fold of finished work, by its first step: steps added after it
+    /// leave it the same fold.
+    Work(usize),
+}
+
+/// The folds the owner set in this view, by run, each with whether it is
+/// open; a fold not listed is as it starts.
+type Folds = Signal<Vec<((String, Fold), bool)>>;
+
+/// A fold's open state for this drawing: as the owner last set it, else
+/// `default`; what the owner sets is kept in `folds` for the next drawing.
+fn fold_state(folds: Folds, key: (String, Fold), default: bool) -> Signal<bool> {
+    let set = folds.with_untracked(|folds| {
+        folds
+            .iter()
+            .find(|(seen, _)| *seen == key)
+            .map(|(_, open)| *open)
+    });
+    let open = signal(set.unwrap_or(default));
+    let started = std::cell::Cell::new(false);
+    effect(move || {
+        let now = open.get();
+        // Its first run is its start, not the owner's press.
+        if !started.replace(true) {
+            return;
+        }
+        let key = key.clone();
+        folds.update(
+            |folds| match folds.iter_mut().find(|(seen, _)| *seen == key) {
+                Some((_, was)) => *was = now,
+                None => folds.push((key, now)),
+            },
+        );
+    });
+    open
 }
 
 /// Hand-offs in a row: one row, "Handed work to Claude Code and Codex",
@@ -1761,7 +1823,7 @@ fn step_row(store: Store, step: &RunStepItem, coding: bool) -> View {
 /// ("Changed 3 files · read 6 files · ran 2 commands") that opens them,
 /// the changed files first (one row per file, with how many edits it took,
 /// each opening its diff), then the rest in order.
-fn work(store: Store, steps: Vec<RunStepItem>, coding: bool) -> View {
+fn work(store: Store, steps: Vec<RunStepItem>, coding: bool, open: Signal<bool>) -> View {
     let files = files_changed(&steps);
     let file_row = move |(path, count): &(String, usize)| {
         let mut words = format!("Editing {}", super::files::file_name(path));
@@ -1800,7 +1862,6 @@ fn work(store: Store, steps: Vec<RunStepItem>, coding: bool) -> View {
         ([], [step]) => return other(step),
         _ => {}
     }
-    let open = signal(false);
     view()
         .gap_1()
         .child(ui::quiet_disclosure(work_summary(&steps), open))
@@ -1971,7 +2032,8 @@ mod tests {
         ];
         let laid = rows(&steps);
         assert_eq!(laid.len(), 3, "{laid:?}");
-        let Row::Work(group) = &laid[0] else {
+        assert_eq!(laid[0].0, 0);
+        let Row::Work(group) = &laid[0].1 else {
             panic!("{laid:?}")
         };
         assert_eq!(group.len(), 4);
@@ -1980,9 +2042,12 @@ mod tests {
             "Changed a file · read 2 files · 1 failed"
         );
         // Nothing finished after it: it stands out.
-        assert!(matches!(&laid[1], Row::Alone(step) if step.state == RunStepState::Failed));
+        assert!(matches!(&laid[1].1, Row::Alone(step) if step.state == RunStepState::Failed));
         // Still going: last, where the agent is now.
-        assert!(matches!(&laid[2], Row::Alone(step) if step.state == RunStepState::Started));
+        assert!(matches!(&laid[2].1, Row::Alone(step) if step.state == RunStepState::Started));
+        // A fold is known by its first step: steps added after it leave it
+        // the same fold, so an opened one stays open.
+        assert_eq!(laid[2].0, 1);
     }
 
     #[test]

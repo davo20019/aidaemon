@@ -902,6 +902,18 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.wait_for("text:Running pytest")?;
     app.wait_for("text:Checking on another agent")?;
     app.wait_for("text:Reading test_slug.py")?;
+    // The run moves and its steps are read again: the fold the owner
+    // opened stays open (live 2026-11-27: each update closed it).
+    let before = sent("get_run");
+    feed([frame(
+        r#"{"type":"event","seq":11,"at_ms":3,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-a","session_id":"app:synthetic-pair","label":"Truncate on branch a","agent":"Claude Code","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999991000,"group":"task-1","edited":["/w/synthetic/slug.py","/w/synthetic/test_slug.py"]}}}"#,
+    )]);
+    let id = wait_sent_new("get_run", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Reading slug.py","state":"done","kind":"read","path":"/w/synthetic/slug.py"}},{{"words":"Reading test_slug.py","state":"done","kind":"read","path":"/w/synthetic/test_slug.py"}},{{"words":"Running ls","state":"done","kind":"run"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing slug.py","state":"done","kind":"edit","path":"/w/synthetic/slug.py"}},{{"words":"Editing test_slug.py","state":"done","kind":"edit","path":"/w/synthetic/test_slug.py"}},{{"words":"Running pytest","state":"failed","kind":"run"}},{{"words":"Checking on another agent","state":"done","kind":"coordinate"}},{{"words":"Reading notes.md","state":"done","kind":"read","path":"/w/synthetic/notes.md"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}},{{"label":"write: /w/synthetic/test_slug.py","outcome":"allowed"}},{{"label":"command: rm -rf /w/synthetic/build","outcome":"refused","reason":"outside its folder"}}]}}}}}}"#
+    ))]);
+    app.wait_for("text:Reading notes.md")?;
+    app.wait_for("text:Editing slug.py · 2 edits")?;
     // Only what was not simply allowed gets a line; the rest is a count.
     app.wait_for("text:command: rm -rf /w/synthetic/build · refused: outside its folder")?;
     app.wait_for("text:2 other actions allowed")?;
@@ -912,7 +924,7 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     // Both ended: their line says how, what they changed and how long,
     // and stays in the conversation, folded, its rows a press away.
     feed([frame(
-        r#"{"type":"event","seq":11,"at_ms":4,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-b","session_id":"app:synthetic-pair","label":"Truncate on branch b","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999995000,"group":"task-1"}}}"#,
+        r#"{"type":"event","seq":12,"at_ms":4,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-b","session_id":"app:synthetic-pair","label":"Truncate on branch b","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999995000,"group":"task-1"}}}"#,
     )]);
     app.wait_for("text:2 agents finished · changed 2 files · 45s")?;
     app.press("2 agents finished · changed 2 files · 45s")?;
