@@ -202,6 +202,196 @@ pub fn plan_folds(candidates: &mut [FoldCandidate]) -> Vec<PlannedFold> {
     folds
 }
 
+/// Minimum full-fact similarity to flag two active facts as a probable
+/// conceptual duplicate/overlap for UI review when they did not auto-fold
+/// (e.g. different value shapes, different ranks, or cross-scope owner DMs).
+pub const OVERLAP_REVIEW_MIN_SIMILARITY: f32 = 0.78;
+
+/// Identify active facts that look like conceptual duplicates or overlaps of
+/// another active fact so the Memory UI can highlight them for review without
+/// mutating or losing distinct constraints automatically.
+///
+/// Returns `lower_priority_id -> representative_id` (authority order: highest
+/// `source_rank`, then pinned, then most recalled, then oldest id).
+pub fn detect_overlaps(candidates: &mut [FoldCandidate]) -> std::collections::HashMap<i64, i64> {
+    use std::collections::{HashMap, HashSet};
+
+    candidates.sort_by(|a, b| {
+        b.source_rank
+            .cmp(&a.source_rank)
+            .then(b.pinned.cmp(&a.pinned))
+            .then(b.recall_count.cmp(&a.recall_count))
+            .then(a.id.cmp(&b.id))
+    });
+
+    // Every fact's normalized forms are computed once: the Memory list runs
+    // this over thousands of facts, and normalizing both sides on every
+    // comparison made it quadratic in string work (tens of seconds).
+    let n = candidates.len();
+    let cats: Vec<String> = candidates
+        .iter()
+        .map(|c| c.category.trim().to_ascii_lowercase())
+        .collect();
+    let keys: Vec<String> = candidates
+        .iter()
+        .map(|c| canonicalize_fact_key(&c.key))
+        .collect();
+    let vals: Vec<String> = candidates
+        .iter()
+        .map(|c| crate::text::normalize_fact_value(&c.value))
+        .collect();
+    let words: Vec<HashSet<&str>> = vals
+        .iter()
+        .map(|v| v.split_whitespace().filter(|w| w.len() >= 3).collect())
+        .collect();
+    // Positive owner naming facet per fact (`None` when not an owner-name fact).
+    let naming: Vec<Option<String>> = candidates
+        .iter()
+        .zip(&cats)
+        .map(|(c, cat)| {
+            (crate::text::is_owner_name_key(&c.key)
+                && matches!(cat.as_str(), "user" | "preference" | "personal" | "profile"))
+            .then(|| crate::text::canonical_personal_key(&c.key))
+        })
+        .collect();
+    let norms: Vec<f32> = candidates
+        .iter()
+        .map(|c| c.vector.iter().map(|x| x * x).sum::<f32>().sqrt())
+        .collect();
+    // `crate::cosine` with both norms precomputed.
+    let similarity = |a: usize, b: usize| -> f32 {
+        let (va, vb) = (&candidates[a].vector, &candidates[b].vector);
+        if va.len() != vb.len() || va.is_empty() {
+            return 0.0;
+        }
+        if norms[a] * norms[a] <= f32::EPSILON || norms[b] * norms[b] <= f32::EPSILON {
+            return 0.0;
+        }
+        let dot: f32 = va.iter().zip(vb).map(|(x, y)| x * y).sum();
+        dot / (norms[a] * norms[b])
+    };
+    let is_positive_naming = |facet: &str| {
+        matches!(
+            facet,
+            "name" | "full_name" | "preferred_name" | "nickname" | "addressing"
+        )
+    };
+
+    // Representatives, indexed by what each rule matches on. Every list is
+    // in push order (ascending candidate index), so the first match found in
+    // a list is that rule's earliest representative.
+    let mut naming_reps: Vec<usize> = Vec::new();
+    let mut reps_by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut reps_by_val: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut reps_by_cat: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut overlaps = HashMap::new();
+
+    for index in 0..n {
+        // The earliest representative any rule matches, as the original
+        // single scan over all representatives in order found it.
+        let mut best: Option<usize> = None;
+        let offer = |rep: usize, best: &mut Option<usize>| {
+            if best.is_none_or(|b| rep < b) {
+                *best = Some(rep);
+            }
+        };
+
+        // 1. Two owner-name / addressing facts (e.g. `user/preferred_name = Alice`
+        // and `preference/address_as = Call the owner Alice, not Al.`) are typed
+        // overlaps when they map to the same canonical naming facet or both
+        // express positive owner naming/addressing (keeping `rejected_alias`
+        // distinct as a separate constraint).
+        if let Some(cand_facet) = &naming[index]
+            && let Some(&rep) = naming_reps.iter().find(|&&rep| {
+                let rep_facet = naming[rep].as_deref().unwrap_or_default();
+                cand_facet == rep_facet
+                    || (is_positive_naming(cand_facet) && is_positive_naming(rep_facet))
+            })
+        {
+            offer(rep, &mut best);
+        }
+
+        // 2. Same canonical key across different categories (e.g.
+        // `user/preferred_name` beside `preference/preferred_name`).
+        if !keys[index].is_empty()
+            && let Some(&rep) = reps_by_key
+                .get(keys[index].as_str())
+                .and_then(|list| list.iter().find(|&&rep| cats[rep] != cats[index]))
+        {
+            offer(rep, &mut best);
+        }
+
+        // 3. Same non-scalar normalized value across different keys or
+        // scopes (cross-writer owner-DM duplicates that could not auto-fold).
+        if !vals[index].is_empty()
+            && !is_bare_scalar(&vals[index])
+            && let Some(&rep) = reps_by_val.get(vals[index].as_str()).and_then(|list| {
+                list.iter().find(|&&rep| {
+                    candidates[index].vector.is_empty()
+                        || candidates[rep].vector.is_empty()
+                        || similarity(index, rep) >= ONE_VALUE_MIN_SIMILARITY
+                })
+            })
+        {
+            offer(rep, &mut best);
+        }
+
+        // 4. High semantic similarity within the same category where
+        // values share meaningful vocabulary (catches paraphrased or
+        // partially overlapping rules/preferences). Only representatives
+        // earlier than a match already found can change the answer.
+        if !candidates[index].vector.is_empty()
+            && !words[index].is_empty()
+            && let Some(list) = reps_by_cat.get(cats[index].as_str())
+        {
+            let personal = fact_category_is_personal(&cats[index]);
+            for &rep in list {
+                if best.is_some_and(|b| rep >= b) {
+                    break;
+                }
+                if candidates[rep].vector.is_empty()
+                    || words[index].is_disjoint(&words[rep])
+                    || similarity(index, rep) < OVERLAP_REVIEW_MIN_SIMILARITY
+                {
+                    continue;
+                }
+                if personal {
+                    let cand_tokens: HashSet<&str> =
+                        keys[index].split('_').filter(|t| !t.is_empty()).collect();
+                    let rep_tokens: HashSet<&str> =
+                        keys[rep].split('_').filter(|t| !t.is_empty()).collect();
+                    if keys_name_distinct_concepts(&cand_tokens, &rep_tokens) {
+                        continue;
+                    }
+                }
+                offer(rep, &mut best);
+                break;
+            }
+        }
+
+        if let Some(rep) = best {
+            overlaps.insert(candidates[index].id, candidates[rep].id);
+        } else {
+            if naming[index].is_some() {
+                naming_reps.push(index);
+            }
+            reps_by_key
+                .entry(keys[index].as_str())
+                .or_default()
+                .push(index);
+            reps_by_val
+                .entry(vals[index].as_str())
+                .or_default()
+                .push(index);
+            reps_by_cat
+                .entry(cats[index].as_str())
+                .or_default()
+                .push(index);
+        }
+    }
+    overlaps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +541,35 @@ mod tests {
             },
         ];
         assert!(plan_folds(&mut candidates).is_empty());
+    }
+
+    #[test]
+    fn detect_overlaps_flags_owner_name_and_addressing_duplicates() {
+        let mut candidates = vec![
+            FoldCandidate {
+                source_rank: 2,
+                pinned: true,
+                ..candidate(-2_000_000_001, "user", "preferred_name", "Alice")
+            },
+            FoldCandidate {
+                source_rank: 0,
+                pinned: false,
+                ..candidate(
+                    42,
+                    "preference",
+                    "address_as",
+                    "Call the owner Alice. Don't call her Ally or Al.",
+                )
+            },
+            FoldCandidate {
+                source_rank: 2,
+                pinned: false,
+                vector: vec![0.0, 1.0],
+                ..candidate(43, "preference", "favorite_dish", "ramen")
+            },
+        ];
+        let overlaps = detect_overlaps(&mut candidates);
+        assert_eq!(overlaps.get(&42), Some(&-2_000_000_001));
+        assert!(!overlaps.contains_key(&43));
     }
 }
