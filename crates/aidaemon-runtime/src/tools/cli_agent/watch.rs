@@ -406,6 +406,9 @@ pub(super) async fn watch_run(
             out_of_usage,
             exit_code,
             stopped: loop_detected || auth_failed,
+            turn_completed: agent_host_for_task
+                .as_ref()
+                .is_some_and(|host| host.completed()),
             timed_out,
             expects_change,
             changed_something,

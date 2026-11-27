@@ -214,6 +214,10 @@ pub struct ProgramEnd {
     pub exit_code: Option<i32>,
     /// The runtime stopped it (a loop, a stop, an authentication failure).
     pub stopped: bool,
+    /// Its turn ended finished, as its agent's protocol typed it (ACP's
+    /// `end_turn`), before the host closed it: an error exit after that is
+    /// how its program shut down, so its work is judged as an exit 0's.
+    pub turn_completed: bool,
     /// The runtime stopped it because it exceeded its background execution or
     /// silent-idle time limit.
     pub timed_out: bool,
@@ -262,7 +266,7 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
             RunEvidence::default(),
         );
     }
-    if end.exit_code != Some(0) {
+    if end.exit_code != Some(0) && !(end.turn_completed && end.exit_code.is_some()) {
         return (
             RunEnd::Failed(RunFailure::Exited {
                 code: end.exit_code,
@@ -524,6 +528,7 @@ mod tests {
         let refused = ProgramEnd {
             exit_code: Some(0),
             stopped: false,
+            turn_completed: false,
             timed_out: false,
             expects_change: true,
             changed_something: false,
@@ -556,6 +561,22 @@ mod tests {
         };
         let (end, _) = program_phase(&errored);
         assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: Some(2) }));
+        // Its turn ended finished (ACP's end_turn) before its program
+        // exited with an error: judged by its work, as an exit 0's is.
+        let finished_then_exited = ProgramEnd {
+            turn_completed: true,
+            ..errored.clone()
+        };
+        assert_eq!(program_phase(&finished_then_exited).0, RunEnd::Succeeded);
+        // Killed (no status) stays a failure even then.
+        let killed = ProgramEnd {
+            exit_code: None,
+            ..finished_then_exited.clone()
+        };
+        assert!(matches!(
+            program_phase(&killed).0,
+            RunEnd::Failed(RunFailure::Exited { code: None })
+        ));
         // Stopped by the runtime: stopped, whatever status it exited with.
         let stopped = ProgramEnd {
             exit_code: Some(0),

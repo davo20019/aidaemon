@@ -336,6 +336,13 @@ pub trait AgentHost: Send + Sync {
         false
     }
 
+    /// Whether the agent's turn ended finished, as its protocol typed it
+    /// (ACP's `end_turn`): the host closes it then, so an error exit after
+    /// that is how its program shut down, not how its work went.
+    fn completed(&self) -> bool {
+        false
+    }
+
     /// Whether this live host can accept mid-run notes while the agent works
     /// (for example Codex `turn/steer` or Claude Code `stream-json` user
     /// messages on stdin). `false` for agents whose protocol only takes a

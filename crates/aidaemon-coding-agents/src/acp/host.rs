@@ -774,8 +774,11 @@ impl AgentHost for AcpHost {
     }
 
     fn unfinished(&self) -> bool {
-        !self
-            .state
+        !self.completed()
+    }
+
+    fn completed(&self) -> bool {
+        self.state
             .lock()
             .is_ok_and(|state| state.completed == Some(true))
     }
