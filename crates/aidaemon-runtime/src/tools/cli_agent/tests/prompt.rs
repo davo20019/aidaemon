@@ -373,7 +373,7 @@ fn a_peer_is_told_its_lead_by_role() {
         &[],
     );
     assert!(
-        hint.contains("started by the lead (peer id `peer-root`)"),
+        hint.contains("started by the lead (peer id `lead`)"),
         "{hint}"
     );
     let lead = aidaemon_coding_agents::peer::coordination_prompt_hint(
@@ -382,7 +382,7 @@ fn a_peer_is_told_its_lead_by_role() {
         &[],
     );
     assert!(
-        lead.starts_with("You are the lead (peer id `peer-root`)"),
+        lead.starts_with("You are the lead (peer id `lead`)"),
         "{lead}"
     );
 }

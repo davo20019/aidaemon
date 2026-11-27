@@ -738,7 +738,10 @@ impl PeerTree {
                 .unwrap_or_default();
             out.push_str(&format!(
                 "- {} ({}): {} [{}]",
-                peer.peer_id, peer.agent, peer.title, state
+                shown_peer_id(&peer.peer_id),
+                peer.agent,
+                peer.title,
+                state
             ));
             if let Some(branch) = &peer.branch {
                 out.push_str(&format!(", branch {branch}"));
@@ -750,11 +753,11 @@ impl PeerTree {
             let max_body_chars = max_body_chars.min(share);
             out.push_str("Board:\n");
             for msg in board {
-                let to = msg.to_peer.as_deref().unwrap_or("all");
+                let to = msg.to_peer.as_deref().map_or("all", shown_peer_id);
                 out.push_str(&format!(
                     "[{}] {} -> {} ({}):\n{}\n",
                     msg.seq,
-                    msg.from_peer,
+                    shown_peer_id(&msg.from_peer),
                     to,
                     msg.topic,
                     clip_chars(&msg.body, max_body_chars)
@@ -821,6 +824,19 @@ impl PeerTree {
 /// The id of a tree's lead, the run every other peer descends from.
 pub const ROOT_PEER_ID: &str = "peer-root";
 
+/// What the coordination tools call the lead, in what they show and what
+/// they take: the owner sees agents quote it.
+pub const LEAD_PEER_NAME: &str = "lead";
+
+/// A peer id as shown to agents and the owner: the lead by its name.
+pub fn shown_peer_id(id: &str) -> &str {
+    if id == ROOT_PEER_ID {
+        LEAD_PEER_NAME
+    } else {
+        id
+    }
+}
+
 /// Build a concise prompt note telling a CLI agent about its peer-coordination
 /// MCP tools and peer identity.
 pub fn coordination_prompt_hint(
@@ -834,11 +850,10 @@ pub fn coordination_prompt_hint(
         available_agents.join(", ")
     };
     // How a peer id reads to the agent: the lead's id is a fixed internal
-    // one (machine format), so it is named by its role, the id kept for
-    // `message_peer` and `check_peer`.
+    // one (machine format), so it goes by its name, which the tools take.
     let named = |id: &str| {
         if id == ROOT_PEER_ID {
-            format!("the lead (peer id `{id}`)")
+            format!("the lead (peer id `{LEAD_PEER_NAME}`)")
         } else {
             format!("`{id}`")
         }
@@ -1630,7 +1645,10 @@ mod mcp_bridge {
         }
 
         async fn call_tool(&self, name: &str, arguments: Value) -> ServerToolResult {
-            let result = self.dispatch(name, arguments).await;
+            let mut arguments = arguments;
+            rename_peer_ids(&mut arguments, LEAD_PEER_NAME, ROOT_PEER_ID);
+            let mut result = self.dispatch(name, arguments).await;
+            show_lead_by_name(&mut result);
             if result.is_error {
                 // The agent sees why; the daemon's log keeps it too, since
                 // the run's record only says the step failed.
@@ -1648,6 +1666,55 @@ mod mcp_bridge {
                 );
             }
             result
+        }
+    }
+
+    /// The fields of a coordination call or result that hold a peer id
+    /// (machine format: the tools' own schema keys).
+    const PEER_ID_FIELDS: &[&str] = &[
+        "peer_id",
+        "parent_peer_id",
+        "self_peer_id",
+        "from_peer",
+        "to_peer",
+        "requested_by",
+    ];
+
+    /// Every peer-id field in `value` that is exactly `from`, set to `to`.
+    fn rename_peer_ids(value: &mut Value, from: &str, to: &str) {
+        match value {
+            Value::Object(map) => {
+                for (key, field) in map.iter_mut() {
+                    if PEER_ID_FIELDS.contains(&key.as_str()) && field.as_str() == Some(from) {
+                        *field = Value::String(to.to_string());
+                    } else {
+                        rename_peer_ids(field, from, to);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    rename_peer_ids(item, from, to);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A result's JSON shows the lead as [`LEAD_PEER_NAME`], the id its
+    /// tools also take for it: agents quote these ids to the owner.
+    fn show_lead_by_name(result: &mut ServerToolResult) {
+        for block in &mut result.content {
+            let Some(text) = block.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(mut parsed) = serde_json::from_str::<Value>(text) else {
+                continue;
+            };
+            rename_peer_ids(&mut parsed, ROOT_PEER_ID, LEAD_PEER_NAME);
+            let rendered =
+                serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| parsed.to_string());
+            block["text"] = Value::String(rendered);
         }
     }
 
@@ -1786,6 +1853,46 @@ mod tests {
         assert!(!result.is_error, "unexpected tool error: {:?}", result);
         let text = result.content[0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
+    }
+
+    /// The coordination tools show the lead as `lead` and take that name
+    /// for it: agents quote these ids to the owner.
+    #[tokio::test]
+    async fn the_lead_goes_by_its_name_in_the_coordination_tools() {
+        let server = LocalMcpServer::bind(ServerMeta::new("peers-test", "0.1.0"))
+            .await
+            .unwrap();
+        let ctx = PeerMcpContext::new(server, "aidaemon", vec!["mcp-bridge".into()]);
+        let launcher = FakeLauncher::new();
+        let tree = PeerTree::new("claude", "Lead", None, PeerLimits::default());
+        let root = PeerMcpHandler::new(tree.clone(), ROOT_PEER_ID, launcher.clone(), ctx.clone());
+        let (peer, _, _) = tree
+            .reserve_child(ROOT_PEER_ID, "codex", "Review", PeerWorkspaceMode::ReadOnly)
+            .unwrap();
+        let child = PeerMcpHandler::new(tree.clone(), &peer, launcher, ctx);
+        root.call_tool("post_board", json!({ "message": "Plan" }))
+            .await;
+        // A peer writes to the lead by its name.
+        let sent = parse_text(
+            child
+                .call_tool(
+                    "message_peer",
+                    json!({ "to_peer": "lead", "message": "Done" }),
+                )
+                .await,
+        );
+        assert_eq!(sent["message"]["to_peer"], "lead", "{sent}");
+        let board = parse_text(child.call_tool("read_board", json!({})).await);
+        let text = board.to_string();
+        assert!(!text.contains(ROOT_PEER_ID), "{text}");
+        assert_eq!(board["messages"][0]["from_peer"], "lead", "{board}");
+        // It reached the lead.
+        let mine = parse_text(
+            root.call_tool("read_board", json!({ "only_mine": true }))
+                .await,
+        );
+        assert_eq!(mine["self_peer_id"], "lead");
+        assert!(mine.to_string().contains("Done"), "{mine}");
     }
 
     #[tokio::test]
@@ -2000,15 +2107,15 @@ mod tests {
         .unwrap();
         let record = tree.record(2_000, 16_000).unwrap();
         assert!(
-            record.contains("- peer-root (claude): Lead [running]"),
+            record.contains("- lead (claude): Lead [running]"),
             "{record}"
         );
         assert!(
-            record.contains("[1] peer-root -> all (plan):\nbuild the cache"),
+            record.contains("[1] lead -> all (plan):\nbuild the cache"),
             "{record}"
         );
         assert!(
-            record.contains("[2] peer-root -> peer-root (note)"),
+            record.contains("[2] lead -> lead (note)"),
             "{record}"
         );
         assert!(record.contains("… [cut]"), "{record}");
