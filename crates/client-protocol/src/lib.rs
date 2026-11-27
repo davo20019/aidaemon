@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 59;
+pub const PROTOCOL_MINOR: u16 = 60;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1265,6 +1265,28 @@ pub struct RepoChanges {
     /// `patch` was cut short to stay small enough to send.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Commits made on the checked-out branch since the session began
+    /// working, newest first (protocol 1.60): a change an agent committed
+    /// is no longer among `files`, and shows here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<RepoCommit>,
+}
+
+/// A commit in a repository the session worked in (protocol 1.60). Who
+/// made it is not known: the owner may have committed in the same time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RepoCommit {
+    /// The short commit id.
+    pub id: String,
+    /// The first line of its message.
+    pub subject: String,
+    /// Its changed files, relative to the repository's root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Its unified diff, cut short when long.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub patch: String,
+    pub at_ms: u64,
 }
 
 /// One changed file.

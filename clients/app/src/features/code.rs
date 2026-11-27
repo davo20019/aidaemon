@@ -2,10 +2,12 @@
 //! (the last command run after it, and how it ended), then the uncommitted
 //! changes in the git repositories the selected conversation worked in.
 //! Each repository lists its changed files (those this conversation wrote
-//! first); pressing one shows its diff. Read when the tab opens, on
-//! Refresh, and after a tool that can change files finishes.
+//! first); pressing one shows its diff. Under them, the commits made since
+//! the conversation began working there, each file of one opening its
+//! diff, so a change an agent committed can still be seen. Read when the
+//! tab opens, on Refresh, and after a tool that can change files finishes.
 
-use aidaemon_client_protocol::{CheckRun, FileChange, FileStatus, RepoChanges};
+use aidaemon_client_protocol::{CheckRun, FileChange, FileStatus, RepoChanges, RepoCommit};
 use nsh_core::prelude::*;
 
 use crate::store::{ChangesRead, Store};
@@ -179,6 +181,8 @@ fn repo_view(store: Store, repo: RepoChanges, open: Signal<Option<(String, Strin
         header = header.child(ui::badge(branch.clone(), Tone::Neutral));
     }
     let files = repo.files.clone();
+    let commits = repo.commits.clone();
+    let commits_root = root.clone();
     view()
         .gap_1()
         .child(header)
@@ -197,6 +201,50 @@ fn repo_view(store: Store, repo: RepoChanges, open: Signal<Option<(String, Strin
             },
         ))
         .child(file_list(root, files, open))
+        .child(commit_list(commits_root, commits, open))
+}
+
+/// The commits made since the conversation began working in the
+/// repository, newest first, each with its files; one opens its diff.
+fn commit_list(
+    root: String,
+    commits: Vec<RepoCommit>,
+    open: Signal<Option<(String, String)>>,
+) -> View {
+    if commits.is_empty() {
+        return view();
+    }
+    let mut list = view()
+        .gap(px(2.0))
+        .pt_2()
+        .child(section_label("Committed while working here"));
+    for commit in commits {
+        let rows = commit
+            .files
+            .iter()
+            .map(|path| ui::TreeFile {
+                label: format!("{path}, committed in {}", commit.id),
+                path: path.clone(),
+                letter: "C",
+                tone: Tone::Neutral,
+                stats: String::new(),
+                marked: false,
+            })
+            .collect();
+        let root = root.clone();
+        list = list
+            .child(
+                text(format!("{} {}", commit.id, commit.subject))
+                    .number_of_lines(2)
+                    .font_family(ui::theme::MONO)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::MUTED),
+            )
+            .child(ui::file_tree("Committed files", rows, move |path| {
+                open.set(Some((root.clone(), path)))
+            }));
+    }
+    list
 }
 
 fn file_list(root: String, files: Vec<FileChange>, open: Signal<Option<(String, String)>>) -> View {
@@ -253,7 +301,7 @@ fn file_diff(
                 .repos
                 .iter()
                 .find(|repo| repo.root == root)
-                .map(|repo| file_patch(&repo.patch, &path))
+                .map(|repo| shown_patch(repo, &path).0)
                 .unwrap_or_default(),
             _ => String::new(),
         })
@@ -332,7 +380,12 @@ fn file_diff(
                 .border_color(colors::LINE)
                 .child({
                     let (root, path) = (root.clone(), path.clone());
-                    ui::btn("Undo changes…", Variant::Danger, Size::Sm, move || {
+                    if file_status(store, &root, &path).is_none()
+                        && let Some(commit) = committed_in(store, &root, &path)
+                    {
+                        commit_note(commit)
+                    } else {
+                        view().child(ui::btn("Undo changes…", Variant::Danger, Size::Sm, move || {
                         let new = file_status(store, &root, &path).is_some_and(|s| {
                             matches!(s, FileStatus::Untracked | FileStatus::Added)
                         });
@@ -355,9 +408,47 @@ fn file_diff(
                             },
                         );
                     })
-                    .disabled(move || store.reverting())
+                    .disabled(move || store.reverting()))
+                    }
                 }),
         )
+}
+
+/// Where a committed file's diff comes from: its commit's id and subject.
+fn commit_note(commit: RepoCommit) -> View {
+    view().flex_1().min_w(px(0.0)).child(
+        text(format!("Committed in {}: {}", commit.id, commit.subject))
+            .number_of_lines(2)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+    )
+}
+
+/// `path`'s diff in `repo`: its uncommitted change when it has one, else
+/// its change in the newest commit listed that touched it (and that commit).
+fn shown_patch<'a>(repo: &'a RepoChanges, path: &str) -> (String, Option<&'a RepoCommit>) {
+    if repo.files.iter().any(|file| file.path == path) {
+        return (file_patch(&repo.patch, path), None);
+    }
+    match repo
+        .commits
+        .iter()
+        .find(|commit| commit.files.iter().any(|file| file == path))
+    {
+        Some(commit) => (file_patch(&commit.patch, path), Some(commit)),
+        None => (String::new(), None),
+    }
+}
+
+/// The newest commit listed in repository `root` that changed `path`.
+fn committed_in(store: Store, root: &str, path: &str) -> Option<RepoCommit> {
+    match untracked(|| store.changes()) {
+        ChangesRead::Ready(changes) => {
+            let repo = changes.repos.iter().find(|r| r.root == root)?;
+            shown_patch(repo, path).1.cloned()
+        }
+        _ => None,
+    }
 }
 
 /// Whether a file's section of a diff has any hunk.
@@ -409,16 +500,19 @@ fn changed_file_named(
         let relative = path
             .strip_prefix(&format!("{root}/"))
             .unwrap_or(path.trim_start_matches("./"));
-        repo.files
-            .iter()
-            .any(|file| file.path == relative)
+        let committed = || {
+            repo.commits
+                .iter()
+                .any(|commit| commit.files.iter().any(|file| file == relative))
+        };
+        (repo.files.iter().any(|file| file.path == relative) || committed())
             .then(|| (repo.root.clone(), relative.to_string()))
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_file_named, file_patch, has_lines};
+    use super::{changed_file_named, file_patch, has_lines, shown_patch};
 
     #[test]
     fn file_patch_keeps_one_files_section() {
@@ -452,5 +546,21 @@ mod tests {
             None
         );
         assert_eq!(changed_file_named(&repos, "test_slug.py"), None);
+    }
+
+    /// A file an agent committed is found and shows its commit's diff.
+    #[test]
+    fn a_committed_file_is_found_and_shows_its_commits_diff() {
+        let repos: Vec<aidaemon_client_protocol::RepoChanges> = serde_json::from_str(
+            r#"[{"root":"/work/acme","commits":[{"id":"3e716db","subject":"Add farewell","files":["greet.py"],"patch":"diff --git a/greet.py b/greet.py\n@@ -1 +1,2 @@\n+def farewell(name):\n","at_ms":1}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            changed_file_named(&repos, "/work/acme/greet.py"),
+            Some(("/work/acme".to_string(), "greet.py".to_string()))
+        );
+        let (patch, commit) = shown_patch(&repos[0], "greet.py");
+        assert!(patch.contains("+def farewell(name):"), "{patch}");
+        assert_eq!(commit.map(|c| c.id.as_str()), Some("3e716db"));
     }
 }

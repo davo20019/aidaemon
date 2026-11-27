@@ -11,6 +11,17 @@
       "repos": [
         {
           "branch": "feature/contact-form",
+          "commits": [
+            {
+              "at_ms": 1700000000000,
+              "files": [
+                "src/form.rs"
+              ],
+              "id": "3e716db",
+              "patch": "diff --git a/src/form.rs b/src/form.rs\n+fn form() {}\n",
+              "subject": "Add the contact form"
+            }
+          ],
           "files": [
             {
               "added": 2,

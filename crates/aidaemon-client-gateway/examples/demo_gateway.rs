@@ -587,6 +587,7 @@ impl ClientHost for Host {
                         @@ -1 +1 @@\n-# Acme site\n+# Acme Corp site\n"
                     .into(),
                 truncated: false,
+                commits: Vec::new(),
             }],
         })
     }

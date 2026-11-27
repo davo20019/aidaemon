@@ -5926,6 +5926,13 @@
             "null"
           ]
         },
+        "commits": {
+          "description": "Commits made on the checked-out branch since the session began\nworking, newest first (protocol 1.60): a change an agent committed\nis no longer among `files`, and shows here.",
+          "items": {
+            "$ref": "#/$defs/RepoCommit"
+          },
+          "type": "array"
+        },
         "files": {
           "items": {
             "$ref": "#/$defs/FileChange"
@@ -5947,6 +5954,41 @@
       },
       "required": [
         "root"
+      ],
+      "type": "object"
+    },
+    "RepoCommit": {
+      "description": "A commit in a repository the session worked in (protocol 1.60). Who\nmade it is not known: the owner may have committed in the same time.",
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files": {
+          "description": "Its changed files, relative to the repository's root.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "The short commit id.",
+          "type": "string"
+        },
+        "patch": {
+          "description": "Its unified diff, cut short when long.",
+          "type": "string"
+        },
+        "subject": {
+          "description": "The first line of its message.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "subject",
+        "at_ms"
       ],
       "type": "object"
     },

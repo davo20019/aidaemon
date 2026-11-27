@@ -1482,6 +1482,13 @@ fn server_samples() -> Vec<ServerFrame> {
                     ],
                     patch: "diff --git a/src/contact.rs b/src/contact.rs\n--- a/src/contact.rs\n+++ b/src/contact.rs\n@@ -1,2 +1,3 @@\n-fn send() {}\n+fn send() {\n+}\n fn main() {}\n".into(),
                     truncated: false,
+                    commits: vec![RepoCommit {
+                        id: "3e716db".into(),
+                        subject: "Add the contact form".into(),
+                        files: vec!["src/form.rs".into()],
+                        patch: "diff --git a/src/form.rs b/src/form.rs\n+fn form() {}\n".into(),
+                        at_ms: 1_700_000_000_000,
+                    }],
                 }],
             },
         }),

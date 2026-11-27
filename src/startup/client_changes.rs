@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use aidaemon_client_protocol::{CheckRun, FileChange, FileStatus, RepoChanges, SessionChanges};
+use aidaemon_client_protocol::{
+    CheckRun, FileChange, FileStatus, RepoChanges, RepoCommit, SessionChanges,
+};
 use serde_json::Value;
 
 /// How many of the session's latest tool calls are read.
@@ -68,6 +70,17 @@ pub(crate) async fn session_changes(
             .or_else(|| data.get("name")?.as_str().map(str::to_string))?;
         Some((name, data))
     }));
+    // When it began working: commits since then show with its changes.
+    let began: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(created_at) FROM events \
+         WHERE session_id = ? AND event_type = 'tool_call'",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .ok()
+    .flatten();
+    touched.since_ms = began.as_deref().and_then(stored_ms);
     let mut changes = changes_for(touched).await?;
     if let Some((call_id, command)) = check {
         changes.last_check = check_result(pool, session_id, &call_id, command).await;
@@ -155,6 +168,9 @@ use super::client_gateway::stored_ms;
 pub(crate) struct Touched {
     pub written: BTreeSet<PathBuf>,
     pub seen: Vec<PathBuf>,
+    /// When the session began working (its first tool call), in Unix
+    /// milliseconds: the commits since are listed with its changes.
+    pub since_ms: Option<u64>,
 }
 
 /// The paths in `calls` (tool name, arguments), latest first.
@@ -253,7 +269,10 @@ pub(crate) async fn changes_for(touched: Touched) -> anyhow::Result<SessionChang
             .iter()
             .filter_map(|path| relative(&root, path))
             .collect();
-        if let Some(repo) = repo_changes(&root, &written).await {
+        if let Some(mut repo) = repo_changes(&root, &written).await {
+            if let Some(since) = touched.since_ms {
+                repo.commits = commits_since(&root, since).await;
+            }
             repos.push(repo);
         }
     }
@@ -370,7 +389,94 @@ async fn repo_changes(root: &Path, written: &BTreeSet<String>) -> Option<RepoCha
         files,
         patch,
         truncated,
+        commits: Vec::new(),
     })
+}
+
+/// Commits listed per repository at most.
+const MAX_COMMITS: usize = 10;
+/// Each commit's patch is cut at about this many bytes.
+const MAX_COMMIT_PATCH_BYTES: usize = 64 * 1024;
+
+/// The commits on `root`'s checked-out branch since `since_ms`, newest
+/// first, merges left out.
+async fn commits_since(root: &Path, since_ms: u64) -> Vec<RepoCommit> {
+    let since = format!("--since=@{}", since_ms / 1000);
+    let max = format!("-n{MAX_COMMITS}");
+    let Some(log) = git(
+        root,
+        &[
+            "log",
+            &since,
+            &max,
+            "--no-merges",
+            "--format=%h%x1f%ct%x1f%s",
+            "HEAD",
+        ],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let mut commits = Vec::new();
+    for line in String::from_utf8_lossy(&log).lines() {
+        // `%h US %ct US %s`: the format asked for above (machine format).
+        let mut fields = line.splitn(3, '\u{1f}');
+        let (Some(id), Some(at), Some(subject)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let files = git(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                "--root",
+                id,
+            ],
+        )
+        .await
+        .map(|out| {
+            out.split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+        let mut patch = String::from_utf8_lossy(
+            &git(
+                root,
+                &[
+                    "show",
+                    "--format=",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "-M",
+                    id,
+                ],
+            )
+            .await
+            .unwrap_or_default(),
+        )
+        .into_owned();
+        if patch.len() > MAX_COMMIT_PATCH_BYTES {
+            let cut = patch.floor_char_boundary(MAX_COMMIT_PATCH_BYTES);
+            let cut = patch[..cut].rfind('\n').map_or(cut, |at| at + 1);
+            patch.truncate(cut);
+        }
+        commits.push(RepoCommit {
+            id: id.to_string(),
+            subject: subject.to_string(),
+            files,
+            patch,
+            at_ms: at.parse::<u64>().unwrap_or(0) * 1000,
+        });
+    }
+    commits
 }
 
 pub(crate) use aidaemon_client_gateway::git::parse_status;
@@ -680,6 +786,55 @@ mod tests {
         assert!(found.patch.contains("+fn send() {"), "{}", found.patch);
         assert!(found.patch.contains("+++ b/notes.md"), "{}", found.patch);
         assert!(!found.truncated);
+    }
+
+    /// A change committed since the session began working shows with its
+    /// changes; a commit from before it does not.
+    #[tokio::test]
+    async fn a_commit_made_while_the_session_worked_is_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("acme-site");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("old.rs"), "fn old() {}\n").unwrap();
+        run(&repo, &["add", "."]);
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-q", "-m", "before"])
+            .env("GIT_AUTHOR_NAME", "Alice Rivera")
+            .env("GIT_AUTHOR_EMAIL", "alice@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Alice Rivera")
+            .env("GIT_COMMITTER_EMAIL", "alice@example.invalid")
+            .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        std::fs::write(repo.join("greet.rs"), "fn farewell() {}\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-q", "-m", "Add farewell"]);
+
+        let mut touched = touched_paths([(
+            "cli_agent".to_string(),
+            json!({"working_dir": repo.to_string_lossy()}),
+        )]);
+        // Began working in 2020: after the first commit, before the second.
+        touched.since_ms = Some(1_577_836_800_000);
+        let changes = changes_for(touched).await.unwrap();
+        let found = &changes.repos[0];
+        assert!(found.files.is_empty());
+        assert_eq!(found.commits.len(), 1, "{:?}", found.commits);
+        let commit = &found.commits[0];
+        assert_eq!(commit.subject, "Add farewell");
+        assert_eq!(commit.files, ["greet.rs"]);
+        assert!(
+            commit.patch.contains("+fn farewell() {}"),
+            "{}",
+            commit.patch
+        );
+        assert!(commit.at_ms > 1_577_836_800_000);
     }
 
     #[tokio::test]

@@ -235,6 +235,7 @@ impl ClientHost for Host {
                 files: Vec::new(),
                 patch: String::new(),
                 truncated: false,
+                commits: Vec::new(),
             }],
         })
     }
