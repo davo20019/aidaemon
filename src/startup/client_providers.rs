@@ -243,6 +243,8 @@ struct FlowState {
     /// The sign-in a pasted address may finish (its loopback wait, if any,
     /// holds it too).
     pasted: Option<Arc<aidaemon_providers::chatgpt_login::LoginAttempt>>,
+    /// The sign-in under way, which another "Sign in" joins.
+    attempt: Option<Arc<aidaemon_providers::chatgpt_login::LoginAttempt>>,
     /// The loopback wait, stopped when the sign-in ends another way.
     waiting: Option<tokio::task::AbortHandle>,
     checked: Option<CheckedKey>,
@@ -256,6 +258,7 @@ impl FlowState {
     fn end_sign_in(&mut self) -> bool {
         self.generation += 1;
         self.pasted = None;
+        self.attempt = None;
         if let Some(waiting) = self.waiting.take() {
             waiting.abort();
         }
@@ -310,12 +313,27 @@ impl ProviderFlow {
     /// so a browser here finishes it by itself (`finished` is told how it
     /// went). With `paste` (the owner may be on another device, whose
     /// browser cannot reach that port), or when no port can be bound, the
-    /// address the browser ends on finishes it too.
+    /// address the browser ends on finishes it too. One already under way
+    /// is joined, not replaced (another device, or a second press, would
+    /// otherwise cancel the page its owner is signing in on); Cancel starts
+    /// over.
     pub(crate) async fn sign_in(
         &self,
         paste: bool,
         finished: impl FnOnce(bool, String) + Send + 'static,
     ) -> Result<String, String> {
+        {
+            let mut state = self.0.lock().await;
+            if let Some(attempt) = state.attempt.clone()
+                && let Some(sign_in) = state.sign_in.as_mut()
+            {
+                if paste && !sign_in.paste {
+                    sign_in.paste = true;
+                    state.pasted = Some(attempt);
+                }
+                return Ok("Finish the sign-in under way, or cancel it to start over.".to_string());
+            }
+        }
         let manager = crate::providers::chatgpt_login::shared_credential_manager();
         let (attempt, fell_back) = match manager.start_login(true).await {
             Ok(attempt) => (attempt, false),
@@ -339,6 +357,7 @@ impl ProviderFlow {
                 paste,
             });
             state.pasted = paste.then(|| attempt.clone());
+            state.attempt = Some(attempt.clone());
             state.generation
         };
         if !loopback {
@@ -419,6 +438,41 @@ mod tests {
 
     fn table(text: &str) -> toml::Table {
         text.parse().unwrap()
+    }
+
+    /// A second "Sign in" (another device, or a second press) joins the
+    /// sign-in under way instead of cancelling its page; one from a device
+    /// that may be elsewhere lets an address be pasted from then on.
+    #[tokio::test]
+    async fn a_second_sign_in_joins_the_one_under_way() {
+        use aidaemon_providers::chatgpt_login::{ChatGptCredentialManager, LoginSettings};
+        let manager = ChatGptCredentialManager::new(
+            Arc::new(aidaemon_secrets::MemorySecretStore::new()),
+            LoginSettings::new("aidaemon", "aidaemon auth login openai"),
+        );
+        let attempt = Arc::new(manager.start_login(false).await.unwrap());
+        let flow = ProviderFlow::default();
+        {
+            let mut state = flow.0.lock().await;
+            state.sign_in = Some(SignIn {
+                url: attempt.url.clone(),
+                paste: false,
+            });
+            state.attempt = Some(attempt.clone());
+            state.generation = 7;
+        }
+
+        let message = flow
+            .sign_in(true, |_, _| panic!("a joined sign-in starts no wait"))
+            .await
+            .unwrap();
+        assert!(message.contains("under way"), "{message}");
+        let state = flow.0.lock().await;
+        let sign_in = state.sign_in.as_ref().unwrap();
+        assert_eq!(sign_in.url, attempt.url);
+        assert!(sign_in.paste);
+        assert!(Arc::ptr_eq(state.pasted.as_ref().unwrap(), &attempt));
+        assert_eq!(state.generation, 7);
     }
 
     #[test]

@@ -737,7 +737,7 @@ struct ProviderForm {
     sent: Signal<bool>,
     /// "Sign in" was pressed here (holding the sign-in page shown then, if
     /// any): the new page opens once the daemon names it.
-    open_sign_in: Signal<Option<Option<String>>>,
+    open_sign_in: Signal<bool>,
     /// Where the form opened: under connected row `n`, or (`BELOW`) under
     /// the list.
     at: Signal<usize>,
@@ -764,7 +764,7 @@ impl ProviderForm {
             hard: signal(String::new()),
             quick: signal(String::new()),
             sent: signal(false),
-            open_sign_in: signal(None),
+            open_sign_in: signal(false),
             at: signal(BELOW),
         }
     }
@@ -781,18 +781,17 @@ impl ProviderForm {
                 self.close();
             }
         });
-        // The device that pressed "Sign in" opens the page by itself; the
-        // card's button stays for opening it again.
+        // The device that pressed "Sign in" opens the page by itself once
+        // the daemon has answered: a new sign-in's, or the one under way
+        // that it joined. The card's button stays for opening it again.
         effect(move || {
-            let Some(before) = self.open_sign_in.get() else {
+            if !self.open_sign_in.get() || store.settings_busy() {
                 return;
-            };
+            }
             if store.settings_error().is_some() {
-                self.open_sign_in.set(None);
-            } else if let Some(url) = sign_in_url(store)
-                && Some(&url) != before.as_ref()
-            {
-                self.open_sign_in.set(None);
+                self.open_sign_in.set(false);
+            } else if let Some(url) = sign_in_url(store) {
+                self.open_sign_in.set(false);
                 crate::features::links::open_https(url);
             }
         });
@@ -800,7 +799,7 @@ impl ProviderForm {
 
     /// Start a ChatGPT sign-in and open its page once the daemon names it.
     fn sign_in(self, store: Store) {
-        self.open_sign_in.set(Some(sign_in_url(store)));
+        self.open_sign_in.set(true);
         store.change_settings(SettingsChange::SignIn { paste: false });
     }
 

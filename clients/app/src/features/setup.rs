@@ -477,19 +477,18 @@ fn choices(
     connect: impl Fn() + Copy + 'static,
 ) -> View {
     let redirect = signal(String::new());
-    // "Sign in" was pressed here (holding the page shown then, if any): the
-    // new page opens once the daemon names it.
-    let open_sign_in = signal(None::<Option<String>>);
-    let shown = move || store.setup().and_then(|s| s.sign_in).map(|s| s.url);
+    // "Sign in" was pressed here: its page (a new sign-in's, or the one
+    // under way that it joined) opens once the daemon has answered.
+    let open_sign_in = signal(false);
     effect(move || {
-        let Some(before) = open_sign_in.get() else {
+        if !open_sign_in.get() || store.setup_busy() {
             return;
-        };
-        if let Some(url) = shown()
-            && Some(&url) != before.as_ref()
-        {
-            open_sign_in.set(None);
-            crate::features::links::open_https(url);
+        }
+        if store.setup_error().is_some() {
+            open_sign_in.set(false);
+        } else if let Some(sign_in) = store.setup().and_then(|s| s.sign_in) {
+            open_sign_in.set(false);
+            crate::features::links::open_https(sign_in.url);
         }
     });
     view()
@@ -633,7 +632,7 @@ fn choices(
                     let sign_in = !option.needs_key && !local;
                     let action = move || {
                         if sign_in {
-                            open_sign_in.set(Some(shown()));
+                            open_sign_in.set(true);
                             store.setup_step(SetupAction::SignIn { paste: false });
                         } else {
                             chosen.set(Some(preset.clone()));

@@ -388,6 +388,8 @@ struct Inner {
     /// The sign-in a pasted address may finish (its loopback wait, if any,
     /// holds it too).
     pasted: Option<Arc<aidaemon_providers::chatgpt_login::LoginAttempt>>,
+    /// The sign-in under way, which another "Sign in" joins.
+    attempt: Option<Arc<aidaemon_providers::chatgpt_login::LoginAttempt>>,
     /// The loopback wait, stopped when its sign-in ends another way.
     waiting: Option<tokio::task::AbortHandle>,
     /// Bumped by each sign-in started or finished, so a loopback wait that
@@ -601,6 +603,22 @@ impl ModelSetup {
     /// on another device), or when no port can be bound, the address the
     /// browser ends on finishes it too.
     async fn sign_in(self: &Arc<Self>, paste: bool) -> Result<(), String> {
+        // One under way is joined, not replaced (another device's press
+        // would cancel the page its owner is signing in on).
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(attempt) = inner.attempt.clone()
+                && let Some(sign_in) = inner.sign_in.as_mut()
+            {
+                if paste && !sign_in.paste {
+                    sign_in.paste = true;
+                    inner.pasted = Some(attempt);
+                }
+                drop(inner);
+                self.changed();
+                return Ok(());
+            }
+        }
         let manager = crate::providers::chatgpt_login::shared_credential_manager();
         let mut notice = None;
         let attempt = match manager.start_login(true).await {
@@ -630,6 +648,7 @@ impl ModelSetup {
             });
             inner.notices = notice.into_iter().collect();
             inner.pasted = paste.then(|| attempt.clone());
+            inner.attempt = Some(attempt.clone());
             inner.generation
         };
         if !loopback {
@@ -647,6 +666,7 @@ impl ModelSetup {
                 inner.generation += 1;
                 inner.waiting = None;
                 inner.pasted = None;
+                inner.attempt = None;
             }
             let outcome = match result {
                 Ok(_) => this.connect(Self::chatgpt(), false).await,
@@ -689,6 +709,7 @@ impl ModelSetup {
             if inner.generation == generation {
                 inner.generation += 1;
                 inner.pasted = None;
+                inner.attempt = None;
                 if let Some(waiting) = inner.waiting.take() {
                     waiting.abort();
                 }
