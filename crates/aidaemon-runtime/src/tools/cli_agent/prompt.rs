@@ -17,7 +17,9 @@ impl CliAgentTool {
         with_prior_conversation(&history, prompt)
     }
 
-    /// Build an enriched prompt with context from memory and conversation history.
+    /// Build an enriched prompt with context from memory and conversation
+    /// history. A known coding agent (`native_agent`) explores its folder
+    /// itself, so it is given no file listing.
     pub(super) async fn build_enriched_prompt(
         &self,
         session_id: &str,
@@ -25,6 +27,7 @@ impl CliAgentTool {
         task_prompt: &str,
         working_dir: Option<&str>,
         project: Option<&aidaemon_core::ProjectRef>,
+        native_agent: bool,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -40,53 +43,48 @@ impl CliAgentTool {
             parts.iter().map(|p| p.len()).sum::<usize>() + 200, // headroom for section headers
         );
 
-        // Conversation context (truncated first if over budget)
-        let mut context_text = String::new();
-        if let Ok(history) = self.state.get_history(session_id, 10).await
-            && !history.is_empty()
-        {
-            let mut lines = Vec::new();
-            for msg in history.iter().rev().take(10) {
-                let role = &msg.role;
-                let content: String = msg
-                    .content
-                    .as_deref()
-                    .unwrap_or("")
-                    .chars()
-                    .take(400)
-                    .collect();
-                lines.push(format!("{}: {}", role, content));
-            }
-            context_text = lines.join("\n");
-        }
+        let history = self
+            .state
+            .get_history(session_id, 10)
+            .await
+            .unwrap_or_default();
 
-        // Relevant facts (query both task prompt and recent user message)
+        // Conversation context, oldest first: the owner's and the
+        // assistant's turns only (tool output is not context for this run).
+        let mut context_text = conversation_lines(&history).join("\n");
+
+        // Relevant facts (query both task prompt and recent user message).
+        // Facts about the owner and the people around them stay out: this
+        // prompt goes to an outside agent, and they are not about the task.
         let mut facts_text = String::new();
         if let Some(store) = &self.context_facts {
             let mut seen = HashSet::new();
             let mut facts_accum = Vec::new();
-
-            if let Ok(facts) = store.get_relevant_facts(task_prompt, 15).await {
+            let mut take = |facts: Vec<aidaemon_memory::records::Fact>, accum: &mut Vec<_>| {
                 for fact in facts {
-                    if seen.insert((fact.category.clone(), fact.key.clone())) {
-                        facts_accum.push(fact);
+                    if !aidaemon_memory::project::category_is_personal_only(&fact.category)
+                        && seen.insert((fact.category.clone(), fact.key.clone()))
+                    {
+                        accum.push(fact);
                     }
                 }
+            };
+
+            if let Ok(facts) = store.get_relevant_facts(task_prompt, 15).await {
+                take(facts, &mut facts_accum);
             }
 
-            if let Ok(history) = self.state.get_history(session_id, 10).await
-                && let Some(last_user_msg) = history.iter().rev().find(|m| m.role == "user")
-                && let Some(content) = last_user_msg.content.as_deref()
+            if let Some(content) = history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.as_deref())
             {
                 let user_text: String = content.chars().take(500).collect();
                 if user_text != task_prompt
                     && let Ok(facts) = store.get_relevant_facts(&user_text, 10).await
                 {
-                    for fact in facts {
-                        if seen.insert((fact.category.clone(), fact.key.clone())) {
-                            facts_accum.push(fact);
-                        }
-                    }
+                    take(facts, &mut facts_accum);
                 }
             }
 
@@ -134,9 +132,10 @@ impl CliAgentTool {
             }
         }
 
-        // Native file listing from working directory (up to 3 levels)
+        // File listing from the working directory (up to 3 levels), for an
+        // agent that does not explore its folder itself.
         let mut files_text = String::new();
-        if let Some(dir) = working_dir {
+        if let Some(dir) = working_dir.filter(|_| !native_agent) {
             let skip: HashSet<&str> = [
                 ".git",
                 "node_modules",
@@ -158,56 +157,19 @@ impl CliAgentTool {
             }
         }
 
-        // Spatial awareness: list ~/projects/ contents so sub-agents can discover
-        // files/projects outside the current working directory.
-        let mut projects_listing_text = String::new();
-        if let Ok(home) = self.backend.home_dir().await {
-            let projects_dir = home.join("projects");
-            if let Ok(entries) = self.backend.read_dir(&projects_dir).await {
-                let mut dirs_list: Vec<String> = Vec::new();
-                let mut files_list: Vec<String> = Vec::new();
-                for entry in entries {
-                    let name = entry.path.file_name().unwrap_or_default().to_string();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    if entry.metadata.file_type == BackendFileType::Directory {
-                        dirs_list.push(format!("  {}/", name));
-                    } else if entry.metadata.file_type == BackendFileType::File {
-                        files_list.push(format!("  {}", name));
-                    }
-                    if dirs_list.len() + files_list.len() >= 80 {
-                        break;
-                    }
-                }
-                dirs_list.sort();
-                files_list.sort();
-                if !dirs_list.is_empty() || !files_list.is_empty() {
-                    let mut listing = format!("{}:\n", projects_dir);
-                    let mut all_entries = dirs_list;
-                    all_entries.append(&mut files_list);
-                    listing.push_str(&all_entries.join("\n"));
-                    projects_listing_text = listing;
-                }
-            }
-        }
-
         // Fit within budget by truncating lower-priority sections first.
         let total = active_goal_text.len()
             + project_instructions_text.len()
             + facts_text.len()
             + files_text.len()
-            + projects_listing_text.len()
             + context_text.len();
         if total > budget {
             let goal_budget = budget / 10;
             let docs_budget = budget * 3 / 10;
             let facts_budget = budget * 2 / 10;
             let files_budget = budget * 2 / 10;
-            let projects_budget = budget / 10;
-            let context_budget = budget.saturating_sub(
-                goal_budget + docs_budget + facts_budget + files_budget + projects_budget,
-            );
+            let context_budget =
+                budget.saturating_sub(goal_budget + docs_budget + facts_budget + files_budget);
 
             if active_goal_text.len() > goal_budget {
                 active_goal_text = active_goal_text.chars().take(goal_budget).collect();
@@ -228,16 +190,13 @@ impl CliAgentTool {
                 files_text = files_text.chars().take(files_budget).collect();
                 files_text.push_str("...[truncated]");
             }
-            if projects_listing_text.len() > projects_budget {
-                projects_listing_text = projects_listing_text
-                    .chars()
-                    .take(projects_budget)
-                    .collect();
-                projects_listing_text.push_str("...[truncated]");
-            }
             if context_text.len() > context_budget {
-                context_text = context_text.chars().take(context_budget).collect();
-                context_text.push_str("...[truncated]");
+                // Keep the newest turns: cut from the start.
+                let skip = context_text.chars().count().saturating_sub(context_budget);
+                context_text = format!(
+                    "[earlier turns cut]...{}",
+                    context_text.chars().skip(skip).collect::<String>()
+                );
             }
         }
 
@@ -263,14 +222,11 @@ impl CliAgentTool {
         if !files_text.is_empty() {
             parts.push(format!("## Project Files\n{}", files_text));
         }
-        if !projects_listing_text.is_empty() {
-            parts.push(format!(
-                "## Available Project Directories\n{}",
-                projects_listing_text
-            ));
-        }
         if !context_text.is_empty() {
-            parts.push(format!("## Conversation Context\n{}", context_text));
+            parts.push(format!(
+                "## Conversation Context (oldest first)\n{}",
+                context_text
+            ));
         }
 
         parts.push(
@@ -472,44 +428,48 @@ pub(super) struct DiffBase {
 /// (`history`, oldest first; the current message itself left out), for an
 /// agent that starts a new session and so has none of it.
 pub(super) fn with_prior_conversation(history: &[Message], prompt: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    // Whether the newest entry is the current message itself, judged
+    let mut lines = conversation_lines(history);
+    // Drop the trailing entry if it is the current message itself, judged
     // on the whole message (a snippet of a long one never matches).
-    let mut last_is_current = false;
-    let trimmed_prompt = prompt.trim();
-    for msg in history {
-        if !matches!(msg.role.as_str(), "user" | "assistant") {
-            continue;
-        }
-        let Some(content) = msg.content.as_deref().map(str::trim) else {
-            continue;
-        };
-        if content.is_empty() {
-            continue;
-        }
-        // Skip background-launch handoff notices; they add noise, not context.
-        if msg.role == "assistant" && crate::background_run::is_launch_line(content) {
-            continue;
-        }
-        let snippet: String = content.chars().take(400).collect();
-        lines.push(format!("{}: {snippet}", msg.role));
-        last_is_current = msg.role == "user" && content == trimmed_prompt;
-    }
-    // Drop the trailing entry if it is the current message itself.
+    let last_is_current = history
+        .iter()
+        .rev()
+        .find(|msg| shown_turn(msg).is_some())
+        .is_some_and(|msg| msg.role == "user" && shown_turn(msg) == Some(prompt.trim()));
     if last_is_current {
         lines.pop();
     }
     if lines.is_empty() {
         return prompt.to_string();
     }
-    let prior = lines
-        .into_iter()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prior = lines[lines.len().saturating_sub(8)..].join("\n");
     format!("## Prior conversation\n{prior}\n\n## Current request\n{prompt}")
+}
+
+/// A history entry's text when it is a turn worth showing an agent: the
+/// owner's or the assistant's, not empty, not a background-launch notice.
+fn shown_turn(msg: &Message) -> Option<&str> {
+    if !matches!(msg.role.as_str(), "user" | "assistant") {
+        return None;
+    }
+    let content = msg.content.as_deref().map(str::trim)?;
+    if content.is_empty()
+        || (msg.role == "assistant" && crate::background_run::is_launch_line(content))
+    {
+        return None;
+    }
+    Some(content)
+}
+
+/// `history`'s turns (oldest first) as `role: text` lines, each cut to 400
+/// characters.
+pub(super) fn conversation_lines(history: &[Message]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(|msg| {
+            let content = shown_turn(msg)?;
+            let snippet: String = content.chars().take(400).collect();
+            Some(format!("{}: {snippet}", msg.role))
+        })
+        .collect()
 }

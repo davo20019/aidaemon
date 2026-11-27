@@ -440,6 +440,9 @@ pub(super) struct PeerRootContext {
     /// The run works for the owner in their own private conversation, the
     /// only place its peers may send files (`send_file`).
     pub(super) may_send_files: bool,
+    /// What the lead run was asked to do, shown to each peer it starts as
+    /// background to its own brief ([`lead_context_header`]).
+    pub(super) lead_task: Option<String>,
 }
 
 /// Active peer-coordination session attached to a root CLI run.
@@ -471,6 +474,27 @@ pub(super) struct ActivePeerBinding {
     pub(super) rebind: Option<Arc<RootRebind>>,
     /// The conversation whose tree a lead run leads, saved when it ends.
     pub(super) conversation: Option<(Arc<PeerCoordinator>, ConversationLead)>,
+}
+
+/// How much of the lead's task a peer it starts is shown.
+const LEAD_TASK_CHARS: usize = 2_000;
+
+/// `brief` after what the peer's lead was asked (`lead_task`, cut to
+/// [`LEAD_TASK_CHARS`]), marked as background so the brief stays the task.
+pub(super) fn lead_context_header(lead_task: &str, brief: &str) -> String {
+    let lead_task = lead_task.trim();
+    if lead_task.is_empty() {
+        return brief.to_string();
+    }
+    let mut shown: String = lead_task.chars().take(LEAD_TASK_CHARS).collect();
+    if shown.len() < lead_task.len() {
+        shown.push_str("…[cut]");
+    }
+    format!(
+        "## What your lead was asked (background only; do your own task below)\n{shown}\n\n\
+         ## Your task\n{}",
+        brief.trim()
+    )
 }
 
 /// How much of each board post a lead run's result keeps.
@@ -1064,12 +1088,19 @@ impl PeerLauncher for RuntimePeerLauncher {
                 .unwrap_or_else(|| request.agent.clone()),
             follow_up: request.continue_run.is_some(),
         };
+        // A new peer starts with no context but its brief: it is told what
+        // its lead was asked, so a thin brief is not all it knows. A message
+        // to a peer that runs on already has it.
+        let briefed = match (&self.root.lead_task, &request.continue_run) {
+            (Some(task), None) => lead_context_header(task, &prompt),
+            _ => prompt.clone(),
+        };
         let full_prompt = if has_known_agent && request.mcp_endpoint.is_some() {
             let hint =
                 coordination_prompt_hint(&request.peer_id, Some(&request.parent_peer_id), &[]);
-            format!("{}\n\n{hint}", prompt.trim_end())
+            format!("{}\n\n{hint}", briefed.trim_end())
         } else {
-            prompt.clone()
+            briefed
         };
 
         let spec = crate::helper_run::HelperSpec {

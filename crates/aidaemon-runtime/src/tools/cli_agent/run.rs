@@ -642,6 +642,7 @@ impl CliAgentTool {
                 spawn_family: spawn_family.clone(),
                 status_tx: status_tx.clone(),
                 may_send_files,
+                lead_task: Some(spec.mission.clone()),
             };
             // An owner's conversation with its agent keeps one tree from
             // exchange to exchange: a follow-up reads the board and resumes

@@ -153,6 +153,7 @@ async fn test_build_enriched_prompt_basic() {
             "Audit this codebase",
             None,
             None,
+            false,
         )
         .await;
 
@@ -167,7 +168,7 @@ async fn test_build_enriched_prompt_no_instruction() {
     let (tool, _db) = setup_echo_tool().await;
 
     let prompt = tool
-        .build_enriched_prompt("test-session", "", "Just do the task", None, None)
+        .build_enriched_prompt("test-session", "", "Just do the task", None, None, false)
         .await;
 
     // Empty instruction should not appear
@@ -198,6 +199,7 @@ async fn test_enriched_prompt_uses_scoped_agents_instead_of_readme() {
             "Review this codebase",
             project.path().to_str(),
             None,
+            false,
         )
         .await;
 
@@ -307,4 +309,80 @@ fn prior_conversation_leaves_out_the_current_message_even_when_long() {
         "only this",
     );
     assert_eq!(alone, "only this");
+}
+
+/// A specialist's conversation context reads oldest first, the owner's and
+/// the assistant's turns only: tool output and launch notices are not
+/// context for the run.
+#[test]
+fn a_specialists_conversation_context_is_oldest_first_and_only_the_turns() {
+    let message = |role: &str, content: &str| Message {
+        role: role.to_string(),
+        content: Some(content.to_string()),
+        ..Message::default()
+    };
+    let history = vec![
+        message("user", "first question"),
+        message("tool", "TOOL_OUTPUT_IS_NOT_CONTEXT"),
+        message("assistant", "first answer"),
+        message("user", "second question"),
+    ];
+    let lines = crate::tools::cli_agent::prompt::conversation_lines(&history);
+    assert_eq!(
+        lines,
+        [
+            "user: first question",
+            "assistant: first answer",
+            "user: second question"
+        ]
+    );
+}
+
+/// A known coding agent explores its folder itself: its specialist prompt
+/// lists no files, and no run is shown the owner's other projects.
+#[tokio::test]
+async fn a_coding_agents_specialist_prompt_lists_no_files_or_other_projects() {
+    let (tool, _db) = setup_echo_tool().await;
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(project.path().join("LISTED_FILE.rs"), "fn main() {}").unwrap();
+    let dir = project.path().to_str();
+    let native = tool
+        .build_enriched_prompt("test-session", "You review", "Review", dir, None, true)
+        .await;
+    assert!(!native.contains("LISTED_FILE.rs"), "{native}");
+    assert!(!native.contains("## Project Files"), "{native}");
+    let custom = tool
+        .build_enriched_prompt("test-session", "You review", "Review", dir, None, false)
+        .await;
+    assert!(custom.contains("LISTED_FILE.rs"), "{custom}");
+    for prompt in [native, custom] {
+        assert!(
+            !prompt.contains("Available Project Directories"),
+            "{prompt}"
+        );
+    }
+}
+
+/// A peer's coordination note names the lead by its role, keeping its id
+/// for the peer tools.
+#[test]
+fn a_peer_is_told_its_lead_by_role() {
+    let hint = aidaemon_coding_agents::peer::coordination_prompt_hint(
+        "peer-1",
+        Some(aidaemon_coding_agents::peer::ROOT_PEER_ID),
+        &[],
+    );
+    assert!(
+        hint.contains("started by the lead (peer id `peer-root`)"),
+        "{hint}"
+    );
+    let lead = aidaemon_coding_agents::peer::coordination_prompt_hint(
+        aidaemon_coding_agents::peer::ROOT_PEER_ID,
+        None,
+        &[],
+    );
+    assert!(
+        lead.starts_with("You are the lead (peer id `peer-root`)"),
+        "{lead}"
+    );
 }

@@ -323,6 +323,7 @@ async fn enable_peer_coordination_and_run_child_peer_in_direct_agent_session() {
             spawn_family: None,
             status_tx: None,
             may_send_files: false,
+            lead_task: None,
         },
         &["bash-agent".into()],
         None,
@@ -407,6 +408,7 @@ async fn a_peer_sends_files_only_to_a_private_owner_chat_from_its_folders() {
         spawn_family: None,
         status_tx: None,
         may_send_files,
+        lead_task: None,
     };
 
     let shared = coord.start_root_tree("bash-agent", "Lead", root(false), &[], None);
@@ -483,6 +485,7 @@ async fn a_peer_shares_files_into_the_recipients_folder() {
             spawn_family: None,
             status_tx: None,
             may_send_files: false,
+            lead_task: None,
         },
         &[],
         None,
@@ -586,6 +589,7 @@ async fn a_conversations_next_lead_run_continues_its_tree() {
         spawn_family: None,
         status_tx: None,
         may_send_files: false,
+        lead_task: None,
     };
     let continuity = |fresh: bool, run: &str| {
         Some(peer_mod::TreeContinuity {
@@ -852,6 +856,7 @@ async fn a_conversations_tree_survives_a_restart() {
         spawn_family: None,
         status_tx: None,
         may_send_files: false,
+        lead_task: None,
     };
     let lead = peer_mod::ConversationLead {
         session_id: "app:synthetic-restart".into(),
@@ -958,4 +963,18 @@ async fn a_conversations_tree_survives_a_restart() {
     let after = coord.start_root_tree("bash-agent", "Lead", root(), &[], wiped_continuity("run-5"));
     assert_ne!(after.tree.id(), before.tree.id());
     assert!(after.tree.read_messages("peer-root", 0, false).is_empty());
+}
+
+/// A new peer is told what its lead was asked, as background before its
+/// own brief, so a thin brief is not all it knows.
+#[test]
+fn a_new_peer_is_told_what_its_lead_was_asked() {
+    let prompt =
+        peer_mod::lead_context_header("Add dark mode to the settings page", "Write the CSS tokens");
+    let background = prompt.find("Add dark mode").unwrap();
+    let task = prompt.find("## Your task\nWrite the CSS tokens").unwrap();
+    assert!(background < task, "{prompt}");
+    let long = "x".repeat(5_000);
+    assert!(peer_mod::lead_context_header(&long, "brief").len() < 2_200);
+    assert_eq!(peer_mod::lead_context_header("  ", "brief"), "brief");
 }

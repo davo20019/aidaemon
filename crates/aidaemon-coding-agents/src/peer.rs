@@ -818,6 +818,9 @@ impl PeerTree {
     }
 }
 
+/// The id of a tree's lead, the run every other peer descends from.
+pub const ROOT_PEER_ID: &str = "peer-root";
+
 /// Build a concise prompt note telling a CLI agent about its peer-coordination
 /// MCP tools and peer identity.
 pub fn coordination_prompt_hint(
@@ -830,12 +833,24 @@ pub fn coordination_prompt_hint(
     } else {
         available_agents.join(", ")
     };
+    // How a peer id reads to the agent: the lead's id is a fixed internal
+    // one (machine format), so it is named by its role, the id kept for
+    // `message_peer` and `check_peer`.
+    let named = |id: &str| {
+        if id == ROOT_PEER_ID {
+            format!("the lead (peer id `{id}`)")
+        } else {
+            format!("`{id}`")
+        }
+    };
     let role = match parent_peer_id {
         Some(parent) => format!(
-            "You are peer `{peer_id}` (spawned by `{parent}`) in a coordinated multi-CLI run."
+            "You are peer `{peer_id}`, started by {} in a coordinated multi-CLI run.",
+            named(parent)
         ),
         None => format!(
-            "You are `{peer_id}` with MCP server `{COORD_MCP_SERVER_NAME}` available for coordinating with other CLI agents ({agents})."
+            "You are {} with MCP server `{COORD_MCP_SERVER_NAME}` available for coordinating with other CLI agents ({agents}).",
+            named(peer_id)
         ),
     };
     format!(

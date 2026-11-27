@@ -393,6 +393,7 @@ impl CliAgentTool {
                 prompt,
                 canonical_working_dir.as_deref(),
                 project,
+                coding_agent.launch_arguments().is_some(),
             )
             .await
         } else {
