@@ -524,6 +524,7 @@ async fn folder_waiter_blocks_subfolder_waiter_but_allows_disjoint_write_paths()
         direct_agent: true,
         fresh_session: false,
         is_peer_run: false,
+        continues_session: false,
         peer_binding: None,
     };
     let earlier_at = Instant::now() - Duration::from_secs(5);
@@ -757,6 +758,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         direct_agent: true,
         fresh_session: false,
         is_peer_run: false,
+        continues_session: false,
         peer_binding: None,
     };
 
@@ -878,6 +880,7 @@ async fn continue_run_steers_live_host_that_accepts_mid_run_notes() {
         direct_agent: false,
         fresh_session: false,
         is_peer_run: false,
+        continues_session: false,
         peer_binding: None,
     };
     tool.running.lock().await.insert(

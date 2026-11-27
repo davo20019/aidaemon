@@ -57,7 +57,10 @@ pub(super) async fn watch_run(
     // nothing changed is ending short. The owner's own follow-up and
     // direct-agent conversations are given their folder as leave to write,
     // not as a requirement to change files: the owner may only ask a question.
-    let expects_change = sent_to_write && !call.owner_follow_up && !call.direct_agent;
+    // So is a run continuing its agent's session (a peer answering another
+    // peer's message): the message may be a question too.
+    let expects_change =
+        sent_to_write && !call.owner_follow_up && !call.direct_agent && !call.continues_session;
     let auth_failed_for_task = shared.auth_failed.clone();
     let task_context = call.label.clone();
     let coding_agent_for_task = coding_agent;

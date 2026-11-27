@@ -251,6 +251,10 @@ pub(super) struct RunCall {
     pub(super) fresh_session: bool,
     /// Run spawned by another CLI via the peer-coordination MCP server.
     pub(super) is_peer_run: bool,
+    /// It continues an earlier session of its agent (a peer answering a
+    /// message, a run continued): leave to write, not a fresh assignment
+    /// to change files, since what it was asked may be a question.
+    pub(super) continues_session: bool,
     /// Tree binding for permit parking, completion updates, and cascading cancel.
     pub(super) peer_binding: Option<peers::ActivePeerBinding>,
 }
@@ -745,6 +749,7 @@ impl CliAgentTool {
             direct_agent,
             fresh_session,
             is_peer_run: false,
+            continues_session: spec.continues.is_some(),
             peer_binding: root_peer_binding,
         };
 
@@ -1248,6 +1253,7 @@ impl CliAgentTool {
             direct_agent: false,
             fresh_session: false,
             is_peer_run: true,
+            continues_session: spec.spec.continues.is_some(),
             peer_binding: Some(spec.peer_binding),
         };
 
