@@ -642,7 +642,12 @@ impl CliAgentTool {
                 spawn_family: spawn_family.clone(),
                 status_tx: status_tx.clone(),
                 may_send_files,
-                lead_task: Some(spec.mission.clone()),
+                // What the run was asked, as recorded (the owner's message
+                // for a direct agent; a helper's mission otherwise).
+                lead_task: [task_prompt, spec.mission.as_str()]
+                    .into_iter()
+                    .find(|task| !task.trim().is_empty())
+                    .map(str::to_string),
             };
             // An owner's conversation with its agent keeps one tree from
             // exchange to exchange: a follow-up reads the board and resumes
