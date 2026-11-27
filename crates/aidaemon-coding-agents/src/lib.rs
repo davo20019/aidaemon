@@ -56,5 +56,5 @@ pub use models::{ModelListing, list_models};
 pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, check_models};
 pub use registry::CodingAgents;
 pub use report::{Check, Report};
-pub use sign_in::{SignIn, SignInMethod, SignInNote, SignedIn};
+pub use sign_in::{Delegation, SignIn, SignInMethod, SignInNote, SignedIn};
 pub use usage::{UsageCheck, UsageLimit, usage_limit};

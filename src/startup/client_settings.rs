@@ -1828,7 +1828,8 @@ allowed_user_ids = [1]
             .iter()
             .find(|a| a.name == "synthetic-sign-in-codex")
             .unwrap();
-        assert!(codex.sign_ins.is_empty() && codex.sign_in_note.is_none());
+        // Only its own sign-in, with a word on its maker's terms there.
+        assert!(codex.sign_ins.is_empty() && codex.sign_in_note.is_some());
 
         let key_sign_in = |agent: &str, key: Option<&str>| SettingsChange::SetAgentSignIn {
             agent: agent.into(),

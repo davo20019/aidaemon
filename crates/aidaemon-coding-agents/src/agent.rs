@@ -80,10 +80,18 @@ pub trait CodingAgent: Send + Sync {
         crate::SignInMethod::Own
     }
 
+    /// Whether the embedding agent may hand it work on `sign_in` (its
+    /// maker's terms). Defaults to allowed; work the owner drives directly
+    /// is never refused by it.
+    fn delegation(&self, sign_in: crate::SignInMethod) -> crate::Delegation {
+        let _ = sign_in;
+        crate::Delegation::Allowed
+    }
+
     /// A word about running it on its own sign-in, when there is one to
-    /// say (shown while that is the choice).
+    /// say (shown while that is the choice): its delegation note there.
     fn sign_in_note(&self) -> Option<crate::SignInNote> {
-        None
+        self.delegation(crate::SignInMethod::Own).note()
     }
 
     /// What `sign_in` adds to its launch, for a run and for its readiness

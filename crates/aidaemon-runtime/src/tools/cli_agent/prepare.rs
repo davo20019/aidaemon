@@ -120,11 +120,24 @@ impl CliAgentTool {
         }
         // How it signs in (Settings, Coding agents): its own sign-in adds
         // nothing; a key the owner gave it is handed to it at launch.
-        let signed = match self
-            .permissions()
-            .sign_in_of_for(tool_name, &*coding_agent)
-            .and_then(|sign_in| coding_agent.signed_in(&sign_in))
+        let sign_in = self.permissions().sign_in_of_for(tool_name, &*coding_agent);
+        // Its maker's terms on that sign-in: work handed to it by an agent
+        // (not the owner's own prompts, passed through) may be refused.
+        if !direct_agent
+            && let Ok(sign_in) = &sign_in
+            && let aidaemon_coding_agents::Delegation::Refused(note) =
+                coding_agent.delegation(sign_in.method())
         {
+            mark_refused_before_launch(PrelaunchRefusal::Policy);
+            return Ok(Err(format!(
+                "Blocked: {} (`{tool_name}`) can't be handed work on this sign-in: {} ({}). \
+                 Use another coding agent.",
+                coding_agent.name(),
+                note.text,
+                note.link
+            )));
+        }
+        let signed = match sign_in.and_then(|sign_in| coding_agent.signed_in(&sign_in)) {
             Ok(signed) => signed,
             Err(reason) => {
                 mark_refused_before_launch(PrelaunchRefusal::Policy);

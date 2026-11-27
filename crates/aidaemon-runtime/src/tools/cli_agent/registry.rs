@@ -20,7 +20,11 @@ impl CliAgentTool {
             return None;
         }
 
-        let mut names: Vec<String> = tools.keys().cloned().collect();
+        let mut names: Vec<String> = tools
+            .iter()
+            .filter(|(name, entry)| self.may_hand_work(name, entry))
+            .map(|(name, _)| name.clone())
+            .collect();
         names.sort_by(|a, b| {
             Self::tool_priority(a)
                 .cmp(&Self::tool_priority(b))
@@ -73,6 +77,20 @@ impl CliAgentTool {
             "Whether a coding agent's requests can be answered for this call"
         );
         host && local
+    }
+
+    /// Whether an agent may be picked for delegated work on the sign-in
+    /// the owner chose for it (its maker's terms, [`CodingAgent::delegation`]).
+    /// A run that names it is refused at launch instead, with the reason.
+    ///
+    /// [`CodingAgent::delegation`]: aidaemon_coding_agents::CodingAgent::delegation
+    pub(super) fn may_hand_work(&self, name: &str, entry: &CliToolEntry) -> bool {
+        let agent = self.entry_agent(entry);
+        self.permissions()
+            .sign_in_of_for(name, &*agent)
+            .map_or(true, |sign_in| {
+                !agent.delegation(sign_in.method()).is_refused()
+            })
     }
 
     /// The coding agent an entry launches, by its program.
@@ -133,7 +151,7 @@ impl CliAgentTool {
         }
         let mut compatible = tools
             .iter()
-            .filter(|(_, entry)| supports_split_access(entry))
+            .filter(|(name, entry)| supports_split_access(entry) && self.may_hand_work(name, entry))
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         compatible.sort();

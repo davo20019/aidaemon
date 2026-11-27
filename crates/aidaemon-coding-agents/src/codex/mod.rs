@@ -271,6 +271,20 @@ impl CodingAgent for Codex {
         "Its own Codex sign-in: ChatGPT or an OpenAI API key."
     }
 
+    /// OpenAI allows ChatGPT plans in third-party apps but points
+    /// programmatic Codex use at API keys: a grey area for delegated runs
+    /// on a ChatGPT sign-in.
+    fn delegation(&self, sign_in: crate::SignInMethod) -> crate::Delegation {
+        match sign_in {
+            crate::SignInMethod::Own => crate::Delegation::Warned(crate::SignInNote {
+                text: "On a ChatGPT sign-in, OpenAI recommends an API key for automated Codex use; \
+                       work AIdaemon hands it counts.",
+                link: "https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites",
+            }),
+            _ => crate::Delegation::Allowed,
+        }
+    }
+
     fn takes_model(&self) -> bool {
         true
     }

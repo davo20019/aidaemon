@@ -55,7 +55,19 @@ pub struct AcpAgent {
     gemini_key_folder: Option<&'static str>,
     /// Sign-in method used when the owner has not chosen one explicitly.
     default_sign_in: crate::SignInMethod,
+    /// Whether the embedding agent may hand it work on its own sign-in
+    /// (its maker's terms); a key AIdaemon hands it is always allowed.
+    own_delegation: crate::Delegation,
 }
+
+/// Google's Antigravity FAQ and Terms (section 6): wrapping `agy` in a
+/// third-party agent on a consumer sign-in is prohibited and risks
+/// suspension; a Gemini API key is the supported path.
+const AGY_OWN_SIGN_IN: crate::SignInNote = crate::SignInNote {
+    text: "Google's terms bar other AI agents from handing it work on its own sign-in, so \
+           AIdaemon runs it only when you use it directly. A Gemini API key lifts that.",
+    link: "https://antigravity.google/docs/faq",
+};
 
 impl AcpAgent {
     /// Any agent: its name, the program it launches, and the arguments
@@ -72,6 +84,7 @@ impl AcpAgent {
             supports_gemini_key: false,
             gemini_key_folder: None,
             default_sign_in: crate::SignInMethod::Own,
+            own_delegation: crate::Delegation::Allowed,
         }
     }
 
@@ -95,6 +108,7 @@ impl AcpAgent {
             supports_gemini_key: true,
             gemini_key_folder: Some(AGY_KEY_FOLDER),
             default_sign_in: crate::SignInMethod::Own,
+            own_delegation: crate::Delegation::Refused(AGY_OWN_SIGN_IN),
             ..Self::custom("Antigravity CLI", "agy", &["acp"])
         }
     }
@@ -193,14 +207,13 @@ impl CodingAgent for AcpAgent {
         self.default_sign_in
     }
 
-    /// Google's Antigravity terms/FAQ: consumer OAuth in third-party clients
-    /// is prohibited and risks account suspension; a Gemini API key is the
-    /// supported path (enterprise accounts may still opt into Own).
-    fn sign_in_note(&self) -> Option<crate::SignInNote> {
-        self.gemini_key_folder.map(|_| crate::SignInNote {
-            text: "Consumer OAuth risks suspension under Google's terms; use a Gemini API key.",
-            link: "https://antigravity.google/docs/faq",
-        })
+    /// Its own sign-in follows its maker's terms (`own_delegation`); a key
+    /// AIdaemon hands it is an API sign-in, which they allow.
+    fn delegation(&self, sign_in: crate::SignInMethod) -> crate::Delegation {
+        match sign_in {
+            crate::SignInMethod::Own => self.own_delegation,
+            crate::SignInMethod::GeminiApiKey => crate::Delegation::Allowed,
+        }
     }
 
     /// On a Gemini API key: when a dedicated data folder is configured
@@ -417,6 +430,38 @@ mod tests {
         assert!(plan.host.is_some());
         // Whether it can is the agent's own word, once it runs.
         assert!(!plan.keeps_session);
+    }
+
+    /// Delegation follows each maker's terms: Antigravity refuses work an
+    /// agent hands it on its own (consumer) sign-in and takes it on a key;
+    /// Claude Code and Codex take it on theirs with a warning; an agent the
+    /// owner added takes it.
+    #[test]
+    fn delegation_follows_each_makers_terms_by_sign_in() {
+        use crate::{CodingAgent as _, Delegation, SignInMethod};
+        let agy = AcpAgent::antigravity();
+        assert!(agy.delegation(SignInMethod::Own).is_refused());
+        assert_eq!(
+            agy.delegation(SignInMethod::GeminiApiKey),
+            Delegation::Allowed
+        );
+        assert_eq!(agy.sign_in_note(), agy.delegation(SignInMethod::Own).note());
+        assert_eq!(
+            AcpAgent::gemini().delegation(SignInMethod::Own),
+            Delegation::Allowed
+        );
+        for agent in [
+            &crate::claude::ClaudeCode as &dyn crate::CodingAgent,
+            &crate::codex::Codex,
+        ] {
+            assert!(matches!(
+                agent.delegation(SignInMethod::Own),
+                Delegation::Warned(_)
+            ));
+            assert!(agent.sign_in_note().is_some());
+        }
+        let other = AcpAgent::custom("Synthetic Agent", "synthetic-agent", &["--acp"]);
+        assert_eq!(other.delegation(SignInMethod::Own), Delegation::Allowed);
     }
 
     #[test]

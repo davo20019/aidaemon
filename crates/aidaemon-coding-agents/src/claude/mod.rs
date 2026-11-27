@@ -373,6 +373,21 @@ impl CodingAgent for ClaudeCode {
         "Its own Claude Code sign-in: a Claude subscription or an Anthropic API key."
     }
 
+    /// Anthropic's Consumer Terms (3.7) bar automated access except where it
+    /// permits it, and its plans assume individual use: a grey area for
+    /// delegated runs on a subscription (an API key is plainly allowed).
+    fn delegation(&self, sign_in: crate::SignInMethod) -> crate::Delegation {
+        match sign_in {
+            crate::SignInMethod::Own => crate::Delegation::Warned(crate::SignInNote {
+                text: "On a Claude subscription, Anthropic's terms limit automated use; work \
+                       AIdaemon hands it counts. An Anthropic API key is the clear path for heavy \
+                       delegation.",
+                link: "https://code.claude.com/docs/en/legal-and-compliance",
+            }),
+            _ => crate::Delegation::Allowed,
+        }
+    }
+
     fn takes_model(&self) -> bool {
         true
     }

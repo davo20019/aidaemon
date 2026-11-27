@@ -8,7 +8,8 @@
 //! path.
 
 use aidaemon_client_protocol::{
-    AgentMode, AgentReadiness, AgentSignIn, CodingAgent, PermissionLevel, SecretText, Setting,
+    AgentMode, AgentReadiness, AgentSignIn, AgentSignInNote, CodingAgent, PermissionLevel,
+    SecretText, Setting,
     Settings, SettingsChange,
 };
 use nsh_core::prelude::*;
@@ -527,6 +528,10 @@ pub fn agent_models(store: Store, agents: &[CodingAgent]) -> View {
         // not, since a sign-in is how one becomes usable.
         if !agent.sign_ins.is_empty() {
             row = row.child(agent_sign_in(store, agent));
+        } else if let Some(note) = agent.sign_in_note.clone() {
+            // One with only its own sign-in still says what its maker's
+            // terms allow there.
+            row = row.child(sign_in_note(note));
         }
         list = list.child(row);
     }
@@ -549,6 +554,19 @@ fn sign_in_choice(way: AgentSignIn) -> Option<(&'static str, &'static str)> {
         AgentSignIn::GeminiApiKey => Some(("gemini_api_key", "Gemini API key")),
         AgentSignIn::Unknown => None,
     }
+}
+
+/// A word about an agent's own sign-in, with where to read more. Stacked:
+/// a row would keep the note on one line, wider than a phone.
+fn sign_in_note(note: AgentSignInNote) -> View {
+    let link = note.link.clone();
+    view()
+        .items_start()
+        .gap_1()
+        .child(faint(note.text))
+        .child(ui::btn("Learn more", Variant::Ghost, Size::Sm, move || {
+            drop(open_url(&link));
+        }))
 }
 
 /// How an agent that can be given a key signs in: its own sign-in, with
@@ -603,16 +621,7 @@ fn agent_sign_in(store: Store, agent: &CodingAgent) -> View {
                 let Some(note) = note else {
                     return view();
                 };
-                let link = note.link.clone();
-                // Stacked: a row would keep the note on one line, wider
-                // than a phone.
-                return view()
-                    .items_start()
-                    .gap_1()
-                    .child(faint(note.text))
-                    .child(ui::btn("Learn more", Variant::Ghost, Size::Sm, move || {
-                        drop(open_url(&link));
-                    }));
+                return sign_in_note(note);
             }
             let key = signal(String::new());
             let save = {

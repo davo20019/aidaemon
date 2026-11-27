@@ -96,6 +96,34 @@ pub struct SignInNote {
     pub link: &'static str,
 }
 
+/// Whether the embedding agent may hand an agent work on a sign-in: the
+/// agent maker's terms for its consumer plans, declared once by its adapter
+/// and checked by every delegated launch. A run the owner drives directly
+/// (their own prompts, passed through) is never refused by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delegation {
+    /// Its maker allows it.
+    Allowed,
+    /// Allowed, with a word for the owner (a grey area in its maker's terms).
+    Warned(SignInNote),
+    /// Its maker's terms prohibit it: only the owner drives it on this sign-in.
+    Refused(SignInNote),
+}
+
+impl Delegation {
+    /// The word for the owner, when there is one.
+    pub fn note(self) -> Option<SignInNote> {
+        match self {
+            Self::Allowed => None,
+            Self::Warned(note) | Self::Refused(note) => Some(note),
+        }
+    }
+
+    pub fn is_refused(self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+}
+
 /// The Google credential variables a Gemini-based agent reads besides
 /// `GEMINI_API_KEY` (which a key sign-in sets; a removal wins over a set):
 /// removed so the key AIdaemon hands it is the only credential it sees.

@@ -185,3 +185,66 @@ async fn test_run_without_tool_and_no_agents_errors() {
 // -----------------------------------------------------------------------
 // Enriched prompt test
 // -----------------------------------------------------------------------
+
+/// Antigravity on its own (consumer) sign-in: Google's terms bar another
+/// agent handing it work. The automatic pick passes it over, and a run
+/// that names it is refused before launch; the owner's own prompts in Code
+/// mode (`direct_agent`) still reach it.
+#[tokio::test]
+async fn agy_on_its_own_sign_in_is_never_handed_work_but_still_runs_directly() {
+    let (tool, _db) = setup_bash_tool().await;
+    tool.tools.write().unwrap().insert(
+        "agy".to_string(),
+        CliToolEntry {
+            command: "agy".to_string(),
+            args: vec!["acp".to_string()],
+            description: "Antigravity CLI".to_string(),
+            timeout: Duration::from_secs(10),
+            max_output_chars: 10000,
+            is_dynamic: false,
+        },
+    );
+    // Ranked above an unknown agent, yet passed over.
+    assert!(CliAgentTool::tool_priority("agy") < CliAgentTool::tool_priority("bash-agent"));
+    assert_eq!(tool.default_tool_name().as_deref(), Some("bash-agent"));
+
+    let prepare = |direct_agent: bool| {
+        let tool = &tool;
+        async move {
+            tool.prepare_run(
+                "agy",
+                "agyrun12",
+                "fix the build",
+                "fix the build",
+                None,
+                "synthetic-session",
+                None,
+                None,
+                CliWorkspaceMode::ReadWrite,
+                &[],
+                &[],
+                false,
+                &crate::helper_run::HelperSpec::default(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                direct_agent,
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let Err(message) = prepare(false).await else {
+        panic!("delegated work must not reach agy on its own sign-in");
+    };
+    assert!(message.contains("can't be handed work"), "{message}");
+    if let Err(message) = prepare(true).await {
+        assert!(!message.contains("can't be handed work"), "{message}");
+    }
+}
