@@ -113,6 +113,10 @@ pub fn run_view(store: Store, id: String) -> View {
         });
     });
     let nav_id = id.clone();
+    let composer = Composer {
+        draft: signal(String::new()),
+        sent: signal(None),
+    };
     view()
         .w_full()
         .flex_1()
@@ -161,7 +165,8 @@ pub fn run_view(store: Store, id: String) -> View {
                         }
                         first_visible = false;
                         let this = run.id == id;
-                        let exchange = exchange(store, run, index, total, this, direct);
+                        let exchange =
+                            exchange(store, composer, latest, run, index, total, this, direct);
                         list = list.child(if this {
                             exchange.element_ref(&opened)
                         } else {
@@ -172,7 +177,29 @@ pub fn run_view(store: Store, id: String) -> View {
                 }))
             })),
         ))
-        .child(follow_up(store, latest, who, direct_agent))
+        .child(follow_up(store, composer, latest, who, direct_agent))
+}
+
+/// The follow-up composer's state, shared with the exchanges above it: a
+/// prompt's Edit puts its words in the draft, and Try again sends them.
+#[derive(Clone, Copy)]
+struct Composer {
+    draft: Signal<String>,
+    /// What was sent, and to which run, until a run continues it.
+    sent: Signal<Option<(String, String)>>,
+}
+
+impl Composer {
+    /// Send `words` as a follow-up to `latest`, the thread's latest run;
+    /// the composer shows them as sending until a run continues it.
+    fn send(self, store: Store, latest: &RunSummary, words: &str) -> bool {
+        let words = words.trim();
+        if words.is_empty() || !store.follow_up(&latest.session_id, &latest.id, words) {
+            return false;
+        }
+        self.sent.set(Some((words.to_string(), latest.id.clone())));
+        true
+    }
 }
 
 /// Top bar: back button, agent name with tone-coded status dot, a desktop
@@ -375,8 +402,11 @@ fn state_with_tone(run: &RunSummary, waiting: bool) -> (String, Tone) {
 /// One run as an exchange: optional multi-exchange strip, what it was asked,
 /// then what the agent answered; `this`: the run the view was opened on,
 /// with its steps.
+#[allow(clippy::too_many_arguments)]
 fn exchange(
     store: Store,
+    composer: Composer,
+    latest: Memo<Option<RunSummary>>,
     run: RunSummary,
     index: usize,
     total: usize,
@@ -388,8 +418,8 @@ fn exchange(
         block = block.child(exchange_meta(store, &run, index, this));
     }
     block
-        .child(asked(store, &run, this, direct))
-        .child(answer(store, &run, this))
+        .child(asked(store, composer, latest, &run, this, direct))
+        .child(answer(store, composer, latest, &run, this))
         .child(if this {
             steps(store, &run)
         } else {
@@ -499,7 +529,14 @@ fn clean_asked_text(raw: &str) -> String {
 /// What it was asked: the owner's prompt or follow-up as a right-aligned
 /// bubble clearly attributed to "You"; aidaemon's delegation on the left in
 /// a recessed inset block labeled "aidaemon asked".
-fn asked(store: Store, run: &RunSummary, this: bool, direct: bool) -> View {
+fn asked(
+    store: Store,
+    composer: Composer,
+    latest: Memo<Option<RunSummary>>,
+    run: &RunSummary,
+    this: bool,
+    direct: bool,
+) -> View {
     // A record from before runs kept what they were asked: the task the
     // opened run's record has, else its label.
     let task = match untracked(|| store.run_view()) {
@@ -516,6 +553,7 @@ fn asked(store: Store, run: &RunSummary, this: bool, direct: bool) -> View {
         let open = signal(false);
         let long = words.chars().count() > 420 || words.lines().count() > 6;
         let short = words.clone();
+        let actions = prompt_actions(store, composer, latest, words.clone());
         return view()
             .w_full()
             .items_end()
@@ -561,11 +599,22 @@ fn asked(store: Store, run: &RunSummary, this: bool, direct: bool) -> View {
                             )
                         },
                     )),
-            );
+            )
+            .child(actions);
     }
     let open = signal(false);
     let long = words.chars().count() > 240 || words.lines().count() > 4;
     let short = words.clone();
+    let actions = prompt_actions(store, composer, latest, words.clone());
+    view()
+        .w_full()
+        .gap_1()
+        .child(asked_box(words, short, open, long))
+        .child(actions)
+}
+
+/// What aidaemon asked the agent, in its quiet box.
+fn asked_box(words: String, short: String, open: Signal<bool>, long: bool) -> View {
     view()
         .w_full()
         .rounded(px(ui::radius::CONTROL))
@@ -613,7 +662,13 @@ const INLINE_EDITED_MAX: usize = 3;
 /// What the agent answered: working while it runs; once ended, its reply
 /// first (previewed and collapsible when verbose), then Copy / Read aloud,
 /// then its checks/warnings and changed files (folded when more than 3).
-fn answer(store: Store, run: &RunSummary, this: bool) -> View {
+fn answer(
+    store: Store,
+    composer: Composer,
+    latest: Memo<Option<RunSummary>>,
+    run: &RunSummary,
+    this: bool,
+) -> View {
     let mut said = view().gap_2();
     if run.phase == RunPhase::Running {
         let step = if run.step.is_empty() {
@@ -732,6 +787,7 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
             said = said.child(note("It ended without a reply.".into()));
         }
     }
+    said = said.child(try_again(store, composer, latest, run));
     let coding = store.is_coding(&run.session_id);
     let facts: Vec<(Glyph, Tone, String)> =
         run.result.as_ref().map(result_facts).unwrap_or_default();
@@ -863,6 +919,86 @@ fn truncate_at_word(s: &str, max_chars: usize) -> &str {
         .filter(|&pos| pos > byte_at / 2)
         .unwrap_or(byte_at);
     head[..cut].trim_end()
+}
+
+/// Under the owner's prompt: Copy, and Edit while the agent takes a
+/// follow-up, which puts the words in the composer to change and send
+/// again. A coding agent cannot take back what it already did, so an edit
+/// is sent as a new follow-up, never as a rewrite of the thread.
+fn prompt_actions(
+    store: Store,
+    composer: Composer,
+    latest: Memo<Option<RunSummary>>,
+    words: String,
+) -> View {
+    let copied = words.clone();
+    let can_follow_up = computed(move || {
+        latest.with(|run| {
+            run.as_ref()
+                .is_some_and(|run| run.can_continue || run.phase == RunPhase::Running)
+        })
+    });
+    view()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
+            drop(set_clipboard(copied.clone()));
+            store.say("Copied your message");
+        }))
+        .child(when(
+            move || can_follow_up.get(),
+            move || {
+                let words = words.clone();
+                ui::icon_btn(Glyph::Pen, "Edit and send again", Size::Sm, move || {
+                    composer.draft.set(words.clone());
+                })
+            },
+        ))
+}
+
+/// Under the latest exchange when it failed or was stopped and its agent
+/// takes a follow-up: Try again sends the same words again (live
+/// 2026-11-27: a stopped run left the owner to retype a long prompt).
+fn try_again(
+    store: Store,
+    composer: Composer,
+    latest: Memo<Option<RunSummary>>,
+    run: &RunSummary,
+) -> View {
+    let id = run.id.clone();
+    let words = run
+        .asked
+        .as_ref()
+        .map(|asked| clean_asked_text(&asked.text))
+        .unwrap_or_default();
+    let shown = computed(move || {
+        composer.sent.with(Option::is_none)
+            && latest.with(|latest| {
+                latest.as_ref().is_some_and(|latest| {
+                    latest.id == id
+                        && latest.can_continue
+                        && matches!(latest.phase, RunPhase::Failed | RunPhase::Stopped)
+                })
+            })
+    });
+    let has_words = !words.trim().is_empty();
+    view().child(when(
+        move || has_words && shown.get(),
+        move || {
+            let words = words.clone();
+            view().flex_row().child(ui::btn(
+                "Try again",
+                Variant::Outline,
+                Size::Sm,
+                move || {
+                    if let Some(latest) = latest.get_untracked() {
+                        composer.send(store, &latest, &words);
+                    }
+                },
+            ))
+        },
+    ))
 }
 
 /// Under the agent's reply: Copy and Read aloud, as under a model's.
@@ -1088,18 +1224,18 @@ fn thread_of(runs: &[RunSummary], id: &str) -> Vec<RunSummary> {
 /// that takes it starts, and the view moves to that run.
 fn follow_up(
     store: Store,
+    composer: Composer,
     latest: Memo<Option<RunSummary>>,
     who: Memo<(String, String, bool)>,
     direct_agent: Memo<bool>,
 ) -> View {
-    let draft = signal(String::new());
+    let draft = composer.draft;
     let sent_tick = signal(0u64);
     let dragging = signal(false);
     let touch = ui::touch();
     let terminal = idiom() == Idiom::Terminal;
     let height = signal(ui::fit::body_lh());
-    // What was sent, and to which run, until a run continues it.
-    let sent: Signal<Option<(String, String)>> = signal(None);
+    let sent = composer.sent;
     let continued = computed(move || {
         let (_, earlier) = sent.get()?;
         store
@@ -1382,29 +1518,13 @@ fn body(store: Store, detail: RunDetail, coding: bool) -> View {
     }
     if !detail.steps.is_empty() {
         let mut steps = view().gap_1();
-        // Finished work between milestones folds into one line that opens
-        // it ([`row_kind`]); hand-offs in a row are one row; the rest (a
-        // failure, the step still going) keep a row each.
-        let mut group: Vec<RunStepItem> = Vec::new();
-        let mut group_kind = RowKind::Alone;
-        let flush = |steps: View, group: &mut Vec<RunStepItem>, kind: RowKind| match kind {
-            _ if group.is_empty() => steps,
-            RowKind::Work => steps.child(work(store, std::mem::take(group), coding)),
-            RowKind::HandOffs => steps.child(hand_offs(store, std::mem::take(group))),
-            RowKind::Alone => steps,
-        };
-        for step in &detail.steps {
-            let kind = row_kind(step);
-            if kind != group_kind {
-                steps = flush(steps, &mut group, group_kind);
-                group_kind = kind;
-            }
-            match kind {
-                RowKind::Alone => steps = steps.child(step_row(store, step, coding)),
-                _ => group.push(step.clone()),
-            }
+        for row in rows(&detail.steps) {
+            steps = steps.child(match row {
+                Row::Work(group) => work(store, group, coding),
+                Row::HandOffs(group) => hand_offs(store, group),
+                Row::Alone(step) => step_row(store, &step, coding),
+            });
         }
-        steps = flush(steps, &mut group, group_kind);
         page = page.child(steps);
     }
     // Only what was not simply allowed is worth a line: a run that may do
@@ -1505,6 +1625,53 @@ fn row_kind(step: &RunStepItem) -> RowKind {
         }
         _ => RowKind::Work,
     }
+}
+
+/// A row of the steps list.
+#[derive(Debug, Clone, PartialEq)]
+enum Row {
+    Work(Vec<RunStepItem>),
+    HandOffs(Vec<RunStepItem>),
+    Alone(RunStepItem),
+}
+
+/// The steps as rows. Finished work in a row folds into one line that
+/// opens it ([`row_kind`]); hand-offs in a row are one row. A failure the
+/// agent went on past (something finished after it) folds with the work
+/// around it, its fold saying how many failed, so a retried edit no longer
+/// splits the list; one with nothing finished after it keeps its own row.
+/// Steps still going are listed last, where the agent is now: one started
+/// earlier (a long build beside other work) no longer splits the folds
+/// above it.
+fn rows(steps: &[RunStepItem]) -> Vec<Row> {
+    let last_done = steps
+        .iter()
+        .rposition(|step| step.state == RunStepState::Done);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut going: Vec<RunStepItem> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        if step.state == RunStepState::Started {
+            going.push(step.clone());
+            continue;
+        }
+        let gone_past = step.state == RunStepState::Failed
+            && step.kind != RunStepKind::Unknown
+            && last_done.is_some_and(|done| done > index);
+        let kind = if gone_past {
+            RowKind::Work
+        } else {
+            row_kind(step)
+        };
+        match (kind, rows.last_mut()) {
+            (RowKind::Work, Some(Row::Work(group)))
+            | (RowKind::HandOffs, Some(Row::HandOffs(group))) => group.push(step.clone()),
+            (RowKind::Work, _) => rows.push(Row::Work(vec![step.clone()])),
+            (RowKind::HandOffs, _) => rows.push(Row::HandOffs(vec![step.clone()])),
+            (RowKind::Alone, _) => rows.push(Row::Alone(step.clone())),
+        }
+    }
+    rows.extend(going.into_iter().map(Row::Alone));
+    rows
 }
 
 /// Hand-offs in a row: one row, "Handed work to Claude Code and Codex",
@@ -1614,16 +1781,18 @@ fn work(store: Store, steps: Vec<RunStepItem>, coding: bool) -> View {
         )
     };
     let other = |step: &RunStepItem| {
-        line(
-            Glyph::Check,
-            Tone::Success,
-            step.words.clone(),
-            step.by_helper,
-        )
+        let (glyph, tone) = if step.state == RunStepState::Failed {
+            (Glyph::Warning, Tone::Danger)
+        } else {
+            (Glyph::Check, Tone::Success)
+        };
+        line(glyph, tone, step.words.clone(), step.by_helper)
     };
+    // A failed step it went on past is listed among the rest, never as a
+    // changed file.
     let rest: Vec<RunStepItem> = steps
         .iter()
-        .filter(|step| step.kind != RunStepKind::Edit)
+        .filter(|step| step.kind != RunStepKind::Edit || step.state == RunStepState::Failed)
         .cloned()
         .collect();
     match (files.as_slice(), rest.as_slice()) {
@@ -1653,7 +1822,7 @@ fn files_changed(steps: &[RunStepItem]) -> Vec<(String, usize)> {
     let mut files: Vec<(String, usize)> = Vec::new();
     for path in steps
         .iter()
-        .filter(|step| step.kind == RunStepKind::Edit)
+        .filter(|step| step.kind == RunStepKind::Edit && step.state != RunStepState::Failed)
         .filter_map(|step| step.path.clone())
     {
         match files.iter_mut().find(|(seen, _)| *seen == path) {
@@ -1680,7 +1849,10 @@ fn work_summary(steps: &[RunStepItem]) -> String {
         parts.push(format!("changed {}", plural(changed, "a file", "files")));
     }
     let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
-    for step in steps.iter().filter(|step| step.kind != RunStepKind::Edit) {
+    for step in steps
+        .iter()
+        .filter(|step| step.kind != RunStepKind::Edit && step.state != RunStepState::Failed)
+    {
         match counts.iter_mut().find(|(kind, _)| *kind == step.kind) {
             Some((_, count)) => *count += 1,
             None => counts.push((step.kind, 1)),
@@ -1695,6 +1867,13 @@ fn work_summary(steps: &[RunStepItem]) -> String {
         RunStepKind::Coordinate => format!("coordinated {}", plural(n, "once", "times")),
         _ => format!("used {}", plural(n, "another tool", "other tools")),
     }));
+    let failed = steps
+        .iter()
+        .filter(|step| step.state == RunStepState::Failed)
+        .count();
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
     let words = parts.join(" · ");
     let mut chars = words.chars();
     match chars.next() {
@@ -1729,8 +1908,8 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
 #[cfg(test)]
 mod tests {
     use super::{
-        FOCUSED_REPLY_BUDGET, RowKind, clean_asked_text, is_owner_prompt, markdown_preview,
-        row_kind, work_summary,
+        FOCUSED_REPLY_BUDGET, Row, RowKind, clean_asked_text, is_owner_prompt, markdown_preview,
+        row_kind, rows, work_summary,
     };
     use aidaemon_client_protocol::{RunStepItem, RunStepKind, RunStepState};
 
@@ -1770,6 +1949,40 @@ mod tests {
             "{}",
             work_summary(&with_edits)
         );
+    }
+
+    /// Live 2026-11-27: a retried edit's failure and a build started
+    /// earlier split 172 steps into many small folds.
+    #[test]
+    fn failures_gone_past_fold_and_steps_still_going_come_last() {
+        use RunStepKind::*;
+        let edit = |path: &str, state| {
+            let mut edit = step(Edit, state);
+            edit.path = Some(path.into());
+            edit
+        };
+        let steps = vec![
+            step(Read, RunStepState::Done),
+            step(Run, RunStepState::Started),
+            edit("/w/client.rs", RunStepState::Failed),
+            edit("/w/client.rs", RunStepState::Done),
+            step(Read, RunStepState::Done),
+            edit("/w/mod.rs", RunStepState::Failed),
+        ];
+        let laid = rows(&steps);
+        assert_eq!(laid.len(), 3, "{laid:?}");
+        let Row::Work(group) = &laid[0] else {
+            panic!("{laid:?}")
+        };
+        assert_eq!(group.len(), 4);
+        assert_eq!(
+            work_summary(group),
+            "Changed a file · read 2 files · 1 failed"
+        );
+        // Nothing finished after it: it stands out.
+        assert!(matches!(&laid[1], Row::Alone(step) if step.state == RunStepState::Failed));
+        // Still going: last, where the agent is now.
+        assert!(matches!(&laid[2], Row::Alone(step) if step.state == RunStepState::Started));
     }
 
     #[test]

@@ -887,19 +887,20 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     ))]);
     app.wait_for("text:Add truncate_slug on branch a")?;
     // Finished work between milestones folds into one line that opens it:
-    // the changed files first (one row each), then the rest; a failure
-    // keeps its own row.
-    app.wait_for("text:Changed 2 files · read 2 files · ran a command")?;
-    app.wait_for("text:Running pytest")?;
+    // the changed files first (one row each), then the rest; a failure the
+    // agent went on past folds with it, counted.
+    let fold = "Changed 2 files · read 2 files · ran a command · coordinated once · 1 failed";
+    app.wait_for(&format!("text:{fold}"))?;
     // Hand-offs in a row are one row naming each agent, which opens its
-    // run; checking on one is bookkeeping (alone, a plain line).
+    // run.
     app.wait_for("text:Handed work to")?;
     app.wait_for("label:Claude Code, open its run")?;
     app.wait_for("label:Codex, open its run")?;
-    app.wait_for("text:Checking on another agent")?;
-    app.press("Changed 2 files · read 2 files · ran a command")?;
+    app.press(fold)?;
     app.wait_for("text:Editing slug.py · 2 edits")?;
     app.wait_for("text:Editing test_slug.py")?;
+    app.wait_for("text:Running pytest")?;
+    app.wait_for("text:Checking on another agent")?;
     app.wait_for("text:Reading test_slug.py")?;
     // Only what was not simply allowed gets a line; the rest is a count.
     app.wait_for("text:command: rm -rf /w/synthetic/build · refused: outside its folder")?;
@@ -916,6 +917,47 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.wait_for("text:2 agents finished · changed 2 files · 45s")?;
     app.press("2 agents finished · changed 2 files · 45s")?;
     app.wait_for("text:Codex · Finished")?;
+    Ok(())
+}
+
+/// A stopped run is no dead end: it says why, the owner's message can be
+/// copied or edited into the composer, and Try again sends it again
+/// (live 2026-11-27).
+#[test]
+fn a_stopped_run_offers_try_again_and_its_prompt_copy_and_edit() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-retry","channel":"app","title":"Tidy the synthetic notes","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-r1","session_id":"app:synthetic-retry","label":"Tidy the notes","agent":"Codex","phase":"stopped","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-r","can_continue":true,"reason":"aidaemon stopped it because it ran `rm aidaemon.db`.","asked":{"text":"Tidy the notes in notes.md"}}]}}"#,
+        ),
+    ]);
+    settle(&mut app)?;
+    let before = sent("get_history");
+    app.press("Tidy the synthetic notes >> nth=0")?;
+    let id = wait_sent_new("get_history", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"history","session_id":"app:synthetic-retry","messages":[]}}}}"#
+    ))]);
+    let line = "Codex · Stopped: aidaemon stopped it because it ran `rm aidaemon.db`.";
+    app.wait_for(&format!("text:{line}"))?;
+    let before = sent("get_run");
+    app.press(&format!("{line}, show its steps"))?;
+    let id = wait_sent_new("get_run", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-r1","can_continue":true,"task":"Tidy the notes","steps":[]}}}}}}"#
+    ))]);
+    app.wait_for("text:Ready for a follow-up")?;
+    app.wait_for("text:Tidy the notes in notes.md")?;
+    app.press("label:Copy >> nth=0")?;
+    app.press("Edit and send again")?;
+    app.wait_for("label:Follow-up for the agent")?;
+    let before = sent("send_message");
+    app.press("Try again")?;
+    wait_sent_new("send_message", before)?;
+    app.wait_for("text:Sending to Codex…")?;
     Ok(())
 }
 
