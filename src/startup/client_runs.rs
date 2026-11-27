@@ -67,6 +67,8 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool
         permissions: Vec::new(),
         usage: None,
     };
+    // The steps that are the agent's calls handing work to another agent.
+    let mut hand_off_calls: Vec<usize> = Vec::new();
     // Each step's place by the agent's own id, for its end.
     let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for event in events {
@@ -91,6 +93,13 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool
                 }
                 let tool = data.get("tool");
                 let (kind, path) = step_kind(tool);
+                if tool
+                    .and_then(|tool| tool.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(aidaemon_coding_agents::is_hand_off_tool)
+                {
+                    hand_off_calls.push(detail.steps.len());
+                }
                 detail.steps.push(RunStepItem {
                     words: text("words").unwrap_or_default(),
                     state: RunStepState::Started,
@@ -182,6 +191,22 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool
                 step.state = RunStepState::Done;
             }
         }
+    }
+    // A hand-off call that went through is said by the daemon's own
+    // record of the run it started (agent and run, which opens it): the
+    // call's own step would say it twice, and between two records it kept
+    // them from reading as one row (live 2026-11-27). A failed one stays.
+    if detail
+        .steps
+        .iter()
+        .any(|step| step.kind == RunStepKind::HandOff)
+    {
+        let mut index = 0;
+        detail.steps.retain(|step| {
+            let keep = !(hand_off_calls.contains(&index) && step.state == RunStepState::Done);
+            index += 1;
+            keep
+        });
     }
     // A follow-up goes on in the session its agent kept.
     detail.can_continue = run.keeps_session && detail.agent_session_id.is_some();
@@ -468,6 +493,12 @@ mod tests {
                 "step",
                 r#"{"id":"i4","parent":null,"tool":{"kind":"other","name":"mcp__synthetic__lookup"},"words":"Using mcp__synthetic__lookup"}"#,
             ),
+            event(
+                9,
+                "step",
+                r#"{"id":"i5","parent":null,"tool":{"kind":"other","name":"mcp_aidaemon_peers_delegate_cli"},"words":"Handing work to another agent"}"#,
+            ),
+            event(9, "step_ended", r#"{"id":"i5","failed":false}"#),
             event(
                 9,
                 "peer_run",

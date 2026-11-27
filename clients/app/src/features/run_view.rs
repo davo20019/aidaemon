@@ -1736,31 +1736,41 @@ fn fold_state(folds: Folds, key: (String, Fold), default: bool) -> Signal<bool> 
     open
 }
 
-/// Hand-offs in a row: one row, "Handed work to Claude Code and Codex",
-/// each name opening the run it started; a lone one keeps its own words.
+/// Hand-offs in a row: one row per thing done, "Handed work to Claude Code
+/// and Codex", "Sent a follow-up to Codex", each name opening the run it
+/// started. The words before the agent's name are the daemon's own
+/// ("Handed work to", "Sent a follow-up to"), so rows group by them.
 fn hand_offs(store: Store, steps: Vec<RunStepItem>) -> View {
-    let mut runs: Vec<(String, String)> = Vec::new();
+    let mut leads: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for step in &steps {
         let (Some(run), Some(agent)) = (step.run.clone(), step.agent.clone()) else {
             continue;
         };
-        if !runs.iter().any(|(seen, _)| *seen == run) {
-            runs.push((run, agent));
+        // Machine format: the daemon writes these words and ends them with
+        // the agent's name.
+        let lead = step
+            .words
+            .strip_suffix(agent.as_str())
+            .unwrap_or(&step.words)
+            .trim_end()
+            .to_string();
+        match leads.last_mut() {
+            Some((seen, runs)) if *seen == lead => {
+                if !runs.iter().any(|(known, _)| *known == run) {
+                    runs.push((run, agent));
+                }
+            }
+            _ => leads.push((lead, vec![(run, agent)])),
         }
     }
-    // A lone hand-off keeps the daemon's own words ("Sent a follow-up to
-    // Codex"), its agent's name, which ends them, made the link.
-    let lead = if steps.len() == 1 {
-        let words = &steps[0].words;
-        let agent = steps[0].agent.as_deref().unwrap_or_default();
-        words
-            .strip_suffix(agent)
-            .unwrap_or(words)
-            .trim_end()
-            .to_string()
-    } else {
-        "Handed work to".to_string()
-    };
+    let mut rows = view().gap_1();
+    for (lead, runs) in leads {
+        rows = rows.child(hand_off_row(store, lead, runs));
+    }
+    rows
+}
+
+fn hand_off_row(store: Store, lead: String, runs: Vec<(String, String)>) -> View {
     let mut row = view()
         .flex_row()
         .flex_wrap()

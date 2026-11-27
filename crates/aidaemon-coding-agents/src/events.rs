@@ -238,21 +238,39 @@ pub fn is_coordination_tool(name: &str) -> bool {
     coordination_words(name).is_some()
 }
 
+/// Whether `name` is the daemon's own coordination tool that starts or
+/// continues another agent's run (`delegate_cli`, `message_peer`): the
+/// daemon records each such run itself (a `peer_run` record naming its
+/// agent and run), so the call is the same hand-off said twice. Exact
+/// tool-call protocol names of the daemon's own server.
+pub fn is_hand_off_tool(name: &str) -> bool {
+    matches!(
+        coordination_tool(name),
+        Some("delegate_cli" | "message_peer")
+    )
+}
+
+/// The daemon's own coordination tool `name` calls, by the tool's name as
+/// each agent spells an MCP tool: `mcp__<server>__<tool>` (Claude Code),
+/// `<server>.<tool>` (Codex) and `mcp_<server>_<tool>` (Antigravity).
+fn coordination_tool(name: &str) -> Option<&str> {
+    let server = crate::peer::COORD_MCP_SERVER_NAME;
+    [
+        format!("mcp__{server}__"),
+        format!("{server}."),
+        format!("mcp_{server}_"),
+    ]
+    .iter()
+    .find_map(|prefix| name.strip_prefix(prefix.as_str()))
+}
+
 /// A call to the daemon's own coordination tools ([`crate::peer`]) in
 /// plain words, by the tool's name as each agent spells an MCP tool:
 /// `mcp__<server>__<tool>` (Claude Code), `<server>.<tool>` (Codex) and
 /// `mcp_<server>_<tool>` (Antigravity). Exact tool-call protocol names of
 /// the daemon's own server, never prose.
 fn coordination_words(name: &str) -> Option<&'static str> {
-    let server = crate::peer::COORD_MCP_SERVER_NAME;
-    let tool = [
-        format!("mcp__{server}__"),
-        format!("{server}."),
-        format!("mcp_{server}_"),
-    ]
-    .iter()
-    .find_map(|prefix| name.strip_prefix(prefix.as_str()))?;
-    Some(match tool {
+    Some(match coordination_tool(name)? {
         "list_peers" => "Looking at the other agents",
         "delegate_cli" => "Handing work to another agent",
         "message_peer" => "Messaging another agent",
