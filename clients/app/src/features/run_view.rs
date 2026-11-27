@@ -1632,7 +1632,10 @@ enum Row {
 ///   earlier, a long build beside other work, no longer splits the folds);
 /// - a failure nothing finished after (one the agent went on past folds,
 ///   its fold counting it: "· 1 failed");
-/// - work handed to another agent, a link to its run.
+/// - the first work handed to each other agent, a link to its run: when it
+///   joined. Later follow-ups to it fold, counted, their links inside (a
+///   lead messaging its helpers again and again chopped the list into
+///   pieces, live 2026-11-27).
 ///
 /// Nothing else, so a new kind of step folds without a change here (live
 /// 2026-11-27: a rule listing what folds left each new shape of step, a
@@ -1643,6 +1646,7 @@ fn rows(steps: &[RunStepItem]) -> Vec<(usize, Row)> {
         .rposition(|step| step.state == RunStepState::Done);
     let mut rows: Vec<(usize, Row)> = Vec::new();
     let mut going: Vec<(usize, RunStepItem)> = Vec::new();
+    let mut joined: Vec<String> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         let step = step.clone();
         if step.state == RunStepState::Started {
@@ -1654,7 +1658,13 @@ fn rows(steps: &[RunStepItem]) -> Vec<(usize, Row)> {
         let hand_off = step.kind == RunStepKind::HandOff
             && step.state == RunStepState::Done
             && step.run.is_some()
-            && step.agent.is_some();
+            && step
+                .agent
+                .as_ref()
+                .is_some_and(|agent| !joined.contains(agent));
+        if hand_off && let Some(agent) = &step.agent {
+            joined.push(agent.clone());
+        }
         match rows.last_mut() {
             _ if unrecovered => rows.push((index, Row::Alone(step))),
             Some((_, Row::HandOffs(group))) if hand_off => group.push(step),
@@ -1829,7 +1839,19 @@ fn work(store: Store, steps: Vec<RunStepItem>, coding: bool, open: Signal<bool>)
                 .child(row),
         )
     };
-    let other = |step: &RunStepItem| {
+    let other = move |step: &RunStepItem| {
+        if let (Some(run), Some(agent), RunStepState::Done) =
+            (step.run.clone(), step.agent.clone(), step.state)
+        {
+            return hand_offs(
+                store,
+                vec![RunStepItem {
+                    run: Some(run),
+                    agent: Some(agent),
+                    ..step.clone()
+                }],
+            );
+        }
         let (glyph, tone) = if step.state == RunStepState::Failed {
             (Glyph::Warning, Tone::Danger)
         } else {
@@ -1905,11 +1927,24 @@ fn work_summary(steps: &[RunStepItem]) -> String {
     if changed > 0 {
         parts.push(format!("changed {}", plural(changed, "a file", "files")));
     }
-    let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
-    for step in steps
+    // Work handed to an agent, by agent: "handed Codex work 2 times".
+    let mut handed: Vec<(String, usize)> = Vec::new();
+    for agent in steps
         .iter()
-        .filter(|step| !is_file_change(step) && step.state != RunStepState::Failed)
+        .filter(|step| step.kind == RunStepKind::HandOff && step.state != RunStepState::Failed)
+        .filter_map(|step| step.agent.clone())
     {
+        match handed.iter_mut().find(|(seen, _)| *seen == agent) {
+            Some((_, count)) => *count += 1,
+            None => handed.push((agent, 1)),
+        }
+    }
+    let mut counts: Vec<(RunStepKind, usize)> = Vec::new();
+    for step in steps.iter().filter(|step| {
+        !is_file_change(step)
+            && step.state != RunStepState::Failed
+            && !(step.kind == RunStepKind::HandOff && step.agent.is_some())
+    }) {
         match counts.iter_mut().find(|(kind, _)| *kind == step.kind) {
             Some((_, count)) => *count += 1,
             None => counts.push((step.kind, 1)),
@@ -1927,6 +1962,11 @@ fn work_summary(steps: &[RunStepItem]) -> String {
         RunStepKind::HandOff => format!("handed off work {}", plural(n, "once", "times")),
         _ => format!("used {}", plural(n, "another tool", "other tools")),
     }));
+    parts.extend(
+        handed
+            .into_iter()
+            .map(|(agent, n)| format!("handed {agent} work {}", plural(n, "once", "times"))),
+    );
     let failed = steps
         .iter()
         .filter(|step| step.state == RunStepState::Failed)
@@ -2075,6 +2115,9 @@ mod tests {
                     linked.run = Some("cli-agent-5e6f".into());
                     linked.agent = Some("Codex".into());
                     linked.words = "Handed work to Codex".into();
+                    shapes.push(linked.clone());
+                    linked.agent = Some("Gemini".into());
+                    linked.words = "Sent a follow-up to Gemini".into();
                     shapes.push(linked);
                 }
             }
@@ -2134,6 +2177,19 @@ mod tests {
                 }
                 Row::HandOffs(group) => {
                     assert!(group.iter().all(|step| step.run.is_some()), "{group:?}");
+                    // Only an agent's first hand-off stands out.
+                    for step in group {
+                        let at = step.at_ms.unwrap_or_default() as usize;
+                        assert!(
+                            !steps[..at]
+                                .iter()
+                                .any(|earlier| earlier.kind == RunStepKind::HandOff
+                                    && earlier.state == RunStepState::Done
+                                    && earlier.run.is_some()
+                                    && earlier.agent == step.agent),
+                            "{laid:?}"
+                        );
+                    }
                 }
             }
             shown.extend(group);
@@ -2260,12 +2316,21 @@ mod tests {
             hand_off("Gemini"),
             step(Coordinate, RunStepState::Done),
             step(Unknown, RunStepState::Done),
+            // A follow-up to an agent already at work folds, counted.
+            hand_off("Codex"),
             step(Delegate, RunStepState::Done),
         ]);
         assert!(
-            matches!(laid.as_slice(), [(_, Row::Work(_)), (_, Row::HandOffs(two)), (_, Row::Work(three))]
-                if two.len() == 2 && three.len() == 3),
+            matches!(laid.as_slice(), [(_, Row::Work(_)), (_, Row::HandOffs(two)), (_, Row::Work(four))]
+                if two.len() == 2 && four.len() == 4),
             "{laid:?}"
+        );
+        let Row::Work(folded) = &laid[2].1 else {
+            unreachable!()
+        };
+        assert_eq!(
+            work_summary(folded),
+            "Coordinated once · used another tool · asked a helper · handed Codex work once"
         );
     }
     use aidaemon_client_protocol::{RunAsked, RunPhase, RunSummary};
