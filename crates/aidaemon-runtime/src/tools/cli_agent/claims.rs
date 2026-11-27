@@ -76,7 +76,7 @@ impl WriteScope {
 }
 
 /// `outer` is `inner` or a folder holding it.
-fn holds(outer: &str, inner: &str) -> bool {
+pub(super) fn holds(outer: &str, inner: &str) -> bool {
     let outer = std::path::Path::new(outer.trim_end_matches(['/', '\\']));
     std::path::Path::new(inner).starts_with(outer)
 }

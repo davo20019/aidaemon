@@ -667,6 +667,21 @@ struct HandOff {
     follow_up: bool,
 }
 
+/// Whether a run that has not finished holds a claim on `folder` or a folder
+/// inside it.
+async fn folder_in_use(tool: &CliAgentTool, folder: &str) -> bool {
+    let running = tool.running.lock().await;
+    let claims = super::claims::lock_claims(&tool.working_dir_claims);
+    claims.iter().any(|(dir, held)| {
+        super::claims::holds(folder, dir)
+            && held.iter().any(|claim| {
+                running
+                    .get(&claim.task_id)
+                    .is_some_and(|agent| !agent.finished.load(Ordering::Acquire))
+            })
+    })
+}
+
 /// Host [`PeerLauncher`] implementation bridging [`PeerMcpHandler`] directly
 /// onto [`CliAgentTool`].
 pub(super) struct RuntimePeerLauncher {
@@ -691,6 +706,31 @@ impl RuntimePeerLauncher {
             return;
         };
         for worktree in worktrees {
+            // A run still working in it (the owner's follow-up to the peer,
+            // which outlives this tree's root) keeps it until that run ends:
+            // released now, its folder would vanish under it.
+            if folder_in_use(&tool, &worktree.path).await {
+                info!(
+                    worktree = %worktree.path,
+                    "A peer worktree is still in use: released once its run ends"
+                );
+                let tool = tool.clone();
+                tokio::spawn(async move {
+                    while folder_in_use(&tool, &worktree.path).await {
+                        let changed = tool.claims_changed.notified();
+                        tokio::select! {
+                            () = changed => {}
+                            () = tokio::time::sleep(Duration::from_secs(10)) => {}
+                        }
+                    }
+                    if let Err(error) =
+                        release_peer_worktree(tool.backend.as_ref(), &worktree).await
+                    {
+                        tracing::warn!(%error, worktree = %worktree.path, "Could not release a peer worktree");
+                    }
+                });
+                continue;
+            }
             if let Err(error) = release_peer_worktree(tool.backend.as_ref(), &worktree).await {
                 tracing::warn!(%error, worktree = %worktree.path, "Could not release a peer worktree");
             }
