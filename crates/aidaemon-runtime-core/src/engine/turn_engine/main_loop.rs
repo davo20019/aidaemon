@@ -51,6 +51,30 @@ pub fn owner_fallback_scopes(
     }
 }
 
+/// `scopes` and, for the owner's typed follow-up to a run (`in_run`), the
+/// folder that run's record names: the follow-up continues its agent there
+/// (a peer's worktree outside the project, say), and the owner already let
+/// it work there when it started. Nothing is added to an empty `scopes`
+/// (no boundary stays no boundary), nor for anyone but the owner.
+pub fn with_followed_up_run_folder(
+    mut scopes: Vec<String>,
+    user_role: aidaemon_tools::semantics::UserRole,
+    in_run: Option<&aidaemon_channels::context::RunThread>,
+) -> Vec<String> {
+    let folder = in_run
+        .and_then(|thread| thread.working_dir.as_deref())
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty());
+    if let Some(folder) = folder
+        && user_role == aidaemon_tools::semantics::UserRole::Owner
+        && !scopes.is_empty()
+        && !scopes.iter().any(|scope| scope == folder)
+    {
+        scopes.push(folder.to_string());
+    }
+    scopes
+}
+
 /// Whether the turn's scopes are only a guess from conversation text: an
 /// owner's own request, with no workspace grant or bound workspace.
 pub fn scopes_are_only_a_guess(
@@ -1176,11 +1200,15 @@ impl TurnEngine<'_> {
                 projected_source_message_ids,
                 projected_source_turn_ids,
                 user_message_turns,
-                authorized_scopes: owner_fallback_scopes(
-                    &turn_context.authorized_project_scopes,
-                    channel_ctx
-                        .active_workspace_grant(user_role)
-                        .map(|grant| grant.project_root.clone()),
+                authorized_scopes: with_followed_up_run_folder(
+                    owner_fallback_scopes(
+                        &turn_context.authorized_project_scopes,
+                        channel_ctx
+                            .active_workspace_grant(user_role)
+                            .map(|grant| grant.project_root.clone()),
+                    ),
+                    user_role,
+                    channel_ctx.in_run.as_ref(),
                 ),
                 // Only a person's request is queued: a channel turn on the
                 // root agent, or a queued request's own re-run. Goal
@@ -1433,5 +1461,50 @@ impl TurnEngine<'_> {
             .await;
         }
         Ok(reply)
+    }
+}
+
+#[cfg(test)]
+mod followed_up_run_folder_tests {
+    use super::with_followed_up_run_folder;
+    use aidaemon_channels::context::RunThread;
+    use aidaemon_tools::semantics::UserRole;
+
+    fn thread(dir: Option<&str>) -> RunThread {
+        RunThread {
+            run: "run-1".into(),
+            working_dir: dir.map(str::to_owned),
+            queue_only: false,
+        }
+    }
+
+    #[test]
+    fn the_owners_follow_up_may_work_in_its_runs_folder() {
+        let project = vec!["/work/acme".to_string()];
+        let peer = thread(Some("/cache/peer-worktrees/t1/peer-1-abc123"));
+        assert_eq!(
+            with_followed_up_run_folder(project.clone(), UserRole::Owner, Some(&peer)),
+            ["/work/acme", "/cache/peer-worktrees/t1/peer-1-abc123"]
+        );
+        // Already inside the scopes, no folder, someone else, or no
+        // boundary at all: unchanged.
+        let inside = thread(Some("/work/acme"));
+        assert_eq!(
+            with_followed_up_run_folder(project.clone(), UserRole::Owner, Some(&inside)),
+            project
+        );
+        assert_eq!(
+            with_followed_up_run_folder(project.clone(), UserRole::Owner, Some(&thread(None))),
+            project
+        );
+        assert_eq!(
+            with_followed_up_run_folder(project.clone(), UserRole::Guest, Some(&peer)),
+            project
+        );
+        assert!(with_followed_up_run_folder(Vec::new(), UserRole::Owner, Some(&peer)).is_empty());
+        assert_eq!(
+            with_followed_up_run_folder(project.clone(), UserRole::Owner, None),
+            project
+        );
     }
 }
