@@ -477,6 +477,21 @@ fn choices(
     connect: impl Fn() + Copy + 'static,
 ) -> View {
     let redirect = signal(String::new());
+    // "Sign in" was pressed here (holding the page shown then, if any): the
+    // new page opens once the daemon names it.
+    let open_sign_in = signal(None::<Option<String>>);
+    let shown = move || store.setup().and_then(|s| s.sign_in).map(|s| s.url);
+    effect(move || {
+        let Some(before) = open_sign_in.get() else {
+            return;
+        };
+        if let Some(url) = shown()
+            && Some(&url) != before.as_ref()
+        {
+            open_sign_in.set(None);
+            crate::features::links::open_https(url);
+        }
+    });
     view()
         .gap_4()
         // Found on this machine, tested.
@@ -551,13 +566,11 @@ fn choices(
                 if sign_in.paste {
                     card = card
                         .child(lead(
-                            "When the browser shows it cannot reach the page it ends on, \
-                                 copy that page's address and paste it here.",
+                            "Signed in on another device? When its browser shows it cannot \
+                                 reach the page it ends on, copy that page's address and paste \
+                                 it here.",
                         ))
-                        .child(field(
-                            "http://127.0.0.1:1455/auth/callback?code=…",
-                            redirect,
-                        ))
+                        .child(field("http://127.0.0.1:…/auth/callback?code=…", redirect))
                         .child(
                             btn("Finish sign-in", Variant::Secondary, Size::Sm, move || {
                                 store.setup_step(SetupAction::FinishSignIn {
@@ -597,6 +610,7 @@ fn choices(
                     let sign_in = !option.needs_key && !local;
                     let action = move || {
                         if sign_in {
+                            open_sign_in.set(Some(shown()));
                             store.setup_step(SetupAction::SignIn { paste: false });
                         } else {
                             chosen.set(Some(preset.clone()));

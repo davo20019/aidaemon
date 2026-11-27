@@ -1790,8 +1790,9 @@ impl ClientGateway {
         caller: &Caller,
     ) -> Result<CommandResult, ProtocolError> {
         let invalid = |message: String| ProtocolError::new(ErrorCode::Invalid, message);
-        // Only a client on the daemon's machine (the local token) can finish
-        // a sign-in on its loopback port; any other pastes the address.
+        // A browser on the daemon's machine finishes a sign-in on its
+        // loopback port; a paired device's may be elsewhere, so it may also
+        // paste the address its browser ends on.
         let change = match change {
             SettingsChange::SignIn { paste } => SettingsChange::SignIn {
                 paste: paste || !caller.principal.is_owner(),

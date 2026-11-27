@@ -240,12 +240,27 @@ pub(crate) fn chatgpt_signed_in() -> bool {
 #[derive(Default)]
 struct FlowState {
     sign_in: Option<SignIn>,
-    /// The sign-in waiting for a pasted address.
-    pasted: Option<aidaemon_providers::chatgpt_login::LoginAttempt>,
+    /// The sign-in a pasted address may finish (its loopback wait, if any,
+    /// holds it too).
+    pasted: Option<Arc<aidaemon_providers::chatgpt_login::LoginAttempt>>,
+    /// The loopback wait, stopped when the sign-in ends another way.
+    waiting: Option<tokio::task::AbortHandle>,
     checked: Option<CheckedKey>,
-    /// Bumped by each sign-in started or cancelled, so a loopback wait
-    /// that outlived its sign-in changes nothing.
+    /// Bumped by each sign-in started, finished or cancelled, so a loopback
+    /// wait that outlived its sign-in changes nothing.
     generation: u64,
+}
+
+impl FlowState {
+    /// Drop the sign-in under way (and stop its loopback wait).
+    fn end_sign_in(&mut self) -> bool {
+        self.generation += 1;
+        self.pasted = None;
+        if let Some(waiting) = self.waiting.take() {
+            waiting.abort();
+        }
+        self.sign_in.take().is_some()
+    }
 }
 
 /// What the Providers tab has under way, shared with the loopback wait.
@@ -291,76 +306,86 @@ impl ProviderFlow {
         self.0.lock().await.checked = None;
     }
 
-    /// Start a ChatGPT sign-in. On the daemon's machine it finishes on the
-    /// loopback port by itself (`finished` is told how it went); else the
-    /// owner pastes the address the browser ends on.
+    /// Start a ChatGPT sign-in. It waits on this machine's loopback port,
+    /// so a browser here finishes it by itself (`finished` is told how it
+    /// went). With `paste` (the owner may be on another device, whose
+    /// browser cannot reach that port), or when no port can be bound, the
+    /// address the browser ends on finishes it too.
     pub(crate) async fn sign_in(
         &self,
         paste: bool,
         finished: impl FnOnce(bool, String) + Send + 'static,
     ) -> Result<String, String> {
         let manager = crate::providers::chatgpt_login::shared_credential_manager();
-        let (attempt, fell_back) = match manager.start_login(!paste).await {
+        let (attempt, fell_back) = match manager.start_login(true).await {
             Ok(attempt) => (attempt, false),
-            // The callback port is taken: paste instead.
-            Err(_) if !paste => (
+            // No loopback port: paste instead.
+            Err(_) => (
                 manager
                     .start_login(false)
                     .await
                     .map_err(|e| e.to_string())?,
                 true,
             ),
-            Err(error) => return Err(error.to_string()),
         };
+        let attempt = Arc::new(attempt);
         let loopback = attempt.on_loopback();
+        let paste = paste || !loopback;
         let generation = {
             let mut state = self.0.lock().await;
-            state.generation += 1;
+            state.end_sign_in();
             state.sign_in = Some(SignIn {
                 url: attempt.url.clone(),
-                paste: !loopback,
+                paste,
             });
-            state.pasted = None;
+            state.pasted = paste.then(|| attempt.clone());
             state.generation
         };
         if !loopback {
-            self.0.lock().await.pasted = Some(attempt);
             return Ok(if fell_back {
                 "The sign-in port on the daemon's computer is busy: sign in, then paste the \
                  address the browser ends on."
                     .to_string()
             } else {
-                "Open the sign-in page, then paste the address the browser ends on.".to_string()
+                "Sign in, then paste the address the browser ends on.".to_string()
             });
         }
         let flow = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let client = reqwest::Client::new();
-            let result = manager.finish_on_loopback(&client, attempt).await;
+            let result = manager.finish_on_loopback(&client, &attempt).await;
             {
                 let mut state = flow.0.lock().await;
                 if state.generation != generation {
                     return;
                 }
-                state.sign_in = None;
+                state.waiting = None;
+                state.end_sign_in();
             }
             match result {
                 Ok(_) => finished(true, "Signed in to ChatGPT.".to_string()),
                 Err(error) => finished(false, format!("The sign-in did not finish: {error}")),
             }
         });
+        {
+            let mut state = self.0.lock().await;
+            if state.generation == generation {
+                state.waiting = Some(task.abort_handle());
+            }
+        }
         Ok("Finish signing in in the browser.".to_string())
     }
 
-    /// Finish a pasted sign-in with the address its browser ended on.
+    /// Finish a sign-in with the address its browser ended on.
     pub(crate) async fn finish_sign_in(&self, redirect: &str) -> Result<String, String> {
-        let attempt = self
-            .0
-            .lock()
-            .await
-            .pasted
-            .take()
-            .ok_or("There is no sign-in waiting for an address; start it again")?;
+        let (attempt, generation) = {
+            let state = self.0.lock().await;
+            let attempt = state
+                .pasted
+                .clone()
+                .ok_or("There is no sign-in waiting for an address; start it again")?;
+            (attempt, state.generation)
+        };
         let manager = crate::providers::chatgpt_login::shared_credential_manager();
         let client = reqwest::Client::new();
         match manager
@@ -369,23 +394,18 @@ impl ProviderFlow {
         {
             Ok(_) => {
                 let mut state = self.0.lock().await;
-                state.sign_in = None;
-                state.generation += 1;
+                if state.generation == generation {
+                    state.end_sign_in();
+                }
                 Ok("Signed in to ChatGPT.".to_string())
             }
-            Err(error) => {
-                // The same sign-in may be pasted again.
-                self.0.lock().await.pasted = Some(attempt);
-                Err(format!("That did not finish the sign-in: {error}"))
-            }
+            // The same sign-in may be pasted again.
+            Err(error) => Err(format!("That did not finish the sign-in: {error}")),
         }
     }
 
     pub(crate) async fn cancel_sign_in(&self) -> String {
-        let mut state = self.0.lock().await;
-        state.generation += 1;
-        state.pasted = None;
-        if state.sign_in.take().is_some() {
+        if self.0.lock().await.end_sign_in() {
             "Stopped the sign-in.".to_string()
         } else {
             "No sign-in was under way.".to_string()

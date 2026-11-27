@@ -735,6 +735,9 @@ struct ProviderForm {
     quick: Signal<String>,
     /// The form's change was sent: it closes once the daemon takes it.
     sent: Signal<bool>,
+    /// "Sign in" was pressed here (holding the sign-in page shown then, if
+    /// any): the new page opens once the daemon names it.
+    open_sign_in: Signal<Option<Option<String>>>,
     /// Where the form opened: under connected row `n`, or (`BELOW`) under
     /// the list.
     at: Signal<usize>,
@@ -761,6 +764,7 @@ impl ProviderForm {
             hard: signal(String::new()),
             quick: signal(String::new()),
             sent: signal(false),
+            open_sign_in: signal(None),
             at: signal(BELOW),
         }
     }
@@ -777,6 +781,27 @@ impl ProviderForm {
                 self.close();
             }
         });
+        // The device that pressed "Sign in" opens the page by itself; the
+        // card's button stays for opening it again.
+        effect(move || {
+            let Some(before) = self.open_sign_in.get() else {
+                return;
+            };
+            if store.settings_error().is_some() {
+                self.open_sign_in.set(None);
+            } else if let Some(url) = sign_in_url(store)
+                && Some(&url) != before.as_ref()
+            {
+                self.open_sign_in.set(None);
+                crate::features::links::open_https(url);
+            }
+        });
+    }
+
+    /// Start a ChatGPT sign-in and open its page once the daemon names it.
+    fn sign_in(self, store: Store) {
+        self.open_sign_in.set(Some(sign_in_url(store)));
+        store.change_settings(SettingsChange::SignIn { paste: false });
     }
 
     /// Start over with `preset`.
@@ -815,6 +840,14 @@ impl ProviderForm {
     fn key(self) -> Option<SecretText> {
         let key = self.key.get_untracked();
         (!key.trim().is_empty()).then(|| SecretText(key.trim().to_string()))
+    }
+}
+
+/// The page of the sign-in under way, if any.
+fn sign_in_url(store: Store) -> Option<String> {
+    match store.settings() {
+        SettingsRead::Ready(s) => s.sign_in.map(|s| s.url),
+        _ => None,
     }
 }
 
@@ -1300,7 +1333,7 @@ fn connected_row(
     if provider.credential == CredentialState::SignedOut && !signed_in {
         actions = actions.child(
             ui::btn("Sign in", Variant::Primary, Size::Sm, move || {
-                store.change_settings(SettingsChange::SignIn { paste: false })
+                form.sign_in(store)
             })
             .disabled(move || store.settings_busy()),
         );
@@ -1521,7 +1554,9 @@ fn sign_in_card(
                 .font_weight(FontWeight::MEDIUM),
         )
         .child(muted(if sign_in.paste {
-            "1. Open the sign-in page and sign in with your ChatGPT account."
+            "Sign in with your ChatGPT account on the page that opened. If this page \
+             does not update when you are done (you signed in on another device), \
+             follow step 2."
         } else {
             "Open the sign-in page and sign in with your ChatGPT account. This page \
              updates when you are done."
@@ -1548,10 +1583,10 @@ fn sign_in_card(
         card = card
             .child(muted(
                 "2. The browser then lands on a page that does not load (its address starts \
-                 with http://127.0.0.1:1455). Copy that whole address and paste it here.",
+                 with http://127.0.0.1). Copy that whole address and paste it here.",
             ))
             .child(
-                ui::field("http://127.0.0.1:1455/auth/callback?code=…", form.redirect)
+                ui::field("http://127.0.0.1:…/auth/callback?code=…", form.redirect)
                     .label("Address the browser ended on")
                     .w_full(),
             )
@@ -1842,7 +1877,7 @@ fn provider_form(
                         "Sign in with ChatGPT",
                         Variant::Primary,
                         Size::Sm,
-                        move || store.change_settings(SettingsChange::SignIn { paste: false }),
+                        move || form.sign_in(store),
                     )
                     .disabled(move || store.settings_busy()),
                 ),

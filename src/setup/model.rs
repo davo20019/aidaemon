@@ -385,8 +385,14 @@ pub(crate) async fn save(
 struct Inner {
     step: SetupStep,
     found: Vec<(FoundModel, Candidate)>,
-    /// The sign-in waiting for a pasted address.
-    pasted: Option<aidaemon_providers::chatgpt_login::LoginAttempt>,
+    /// The sign-in a pasted address may finish (its loopback wait, if any,
+    /// holds it too).
+    pasted: Option<Arc<aidaemon_providers::chatgpt_login::LoginAttempt>>,
+    /// The loopback wait, stopped when its sign-in ends another way.
+    waiting: Option<tokio::task::AbortHandle>,
+    /// Bumped by each sign-in started or finished, so a loopback wait that
+    /// outlived its sign-in changes nothing.
+    generation: u64,
     sign_in: Option<SignIn>,
     /// A key checked, with its account's models.
     checked: Option<CheckedKey>,
@@ -590,12 +596,16 @@ impl ModelSetup {
         }
     }
 
+    /// Start a ChatGPT sign-in. It waits on this machine's loopback port,
+    /// so a browser here finishes it by itself; with `paste` (the owner is
+    /// on another device), or when no port can be bound, the address the
+    /// browser ends on finishes it too.
     async fn sign_in(self: &Arc<Self>, paste: bool) -> Result<(), String> {
         let manager = crate::providers::chatgpt_login::shared_credential_manager();
         let mut notice = None;
-        let attempt = match manager.start_login(!paste).await {
+        let attempt = match manager.start_login(true).await {
             Ok(attempt) => attempt,
-            Err(error) if !paste => {
+            Err(error) => {
                 notice = Some(format!(
                     "{error}. Sign in on any device and paste the address the browser ends on."
                 ));
@@ -604,26 +614,40 @@ impl ModelSetup {
                     .await
                     .map_err(|e| e.to_string())?
             }
-            Err(error) => return Err(error.to_string()),
         };
-        let sign_in = SignIn {
-            url: attempt.url.clone(),
-            paste: !attempt.on_loopback(),
-        };
-        {
+        let attempt = Arc::new(attempt);
+        let loopback = attempt.on_loopback();
+        let paste = paste || !loopback;
+        let generation = {
             let mut inner = self.inner.lock().await;
-            inner.sign_in = Some(sign_in);
-            inner.notices = notice.into_iter().collect();
-            inner.pasted = None;
-            if !attempt.on_loopback() {
-                inner.pasted = Some(attempt);
-                return Ok(());
+            inner.generation += 1;
+            if let Some(waiting) = inner.waiting.take() {
+                waiting.abort();
             }
+            inner.sign_in = Some(SignIn {
+                url: attempt.url.clone(),
+                paste,
+            });
+            inner.notices = notice.into_iter().collect();
+            inner.pasted = paste.then(|| attempt.clone());
+            inner.generation
+        };
+        if !loopback {
+            return Ok(());
         }
         let this = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let client = reqwest::Client::new();
-            let result = manager.finish_on_loopback(&client, attempt).await;
+            let result = manager.finish_on_loopback(&client, &attempt).await;
+            {
+                let mut inner = this.inner.lock().await;
+                if inner.generation != generation {
+                    return;
+                }
+                inner.generation += 1;
+                inner.waiting = None;
+                inner.pasted = None;
+            }
             let outcome = match result {
                 Ok(_) => this.connect(Self::chatgpt(), false).await,
                 Err(error) => Err(error.to_string()),
@@ -635,26 +659,40 @@ impl ModelSetup {
             }
             this.changed();
         });
+        let mut inner = self.inner.lock().await;
+        if inner.generation == generation {
+            inner.waiting = Some(task.abort_handle());
+        }
         Ok(())
     }
 
     async fn finish_sign_in(&self, redirect: &str) -> Result<(), String> {
-        let attempt = self
-            .inner
-            .lock()
-            .await
-            .pasted
-            .take()
-            .ok_or("There is no sign-in waiting for an address; start it again")?;
+        let (attempt, generation) = {
+            let inner = self.inner.lock().await;
+            let attempt = inner
+                .pasted
+                .clone()
+                .ok_or("There is no sign-in waiting for an address; start it again")?;
+            (attempt, inner.generation)
+        };
         let manager = crate::providers::chatgpt_login::shared_credential_manager();
         let client = reqwest::Client::new();
+        // The same sign-in may be pasted again after a failure.
         if let Err(error) = manager
             .finish_with_redirect(&client, &attempt, redirect)
             .await
         {
-            // The same sign-in may be pasted again.
-            self.inner.lock().await.pasted = Some(attempt);
             return Err(format!("That did not finish the sign-in: {error}"));
+        }
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.generation == generation {
+                inner.generation += 1;
+                inner.pasted = None;
+                if let Some(waiting) = inner.waiting.take() {
+                    waiting.abort();
+                }
+            }
         }
         self.connect(Self::chatgpt(), false).await
     }

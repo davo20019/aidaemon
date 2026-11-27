@@ -280,7 +280,7 @@ impl ChatGptCredentialManager {
             .await?;
         announce(&attempt.url);
         match mode {
-            CallbackMode::Loopback => self.finish_on_loopback(client, attempt).await,
+            CallbackMode::Loopback => self.finish_on_loopback(client, &attempt).await,
             CallbackMode::Paste(read) => {
                 let pasted = read(&attempt.url)?;
                 self.finish_with_redirect(client, &attempt, &pasted).await
@@ -291,8 +291,10 @@ impl ChatGptCredentialManager {
     /// Start a sign-in in two steps, for a host that shows the address in
     /// an app instead of a terminal. With `loopback`, an ephemeral loopback
     /// port on `127.0.0.1` is bound now; finish with
-    /// [`Self::finish_on_loopback`]. Otherwise finish with the address the
-    /// browser ended on ([`Self::finish_with_redirect`]).
+    /// [`Self::finish_on_loopback`]. Either way the address the browser
+    /// ended on also finishes it ([`Self::finish_with_redirect`]): a browser
+    /// on another device cannot reach this machine's loopback port, so its
+    /// owner pastes that address instead, and both may wait on one attempt.
     pub async fn start_login(&self, loopback: bool) -> Result<LoginAttempt> {
         let host_id = self.host_id()?;
         let pkce = PkceChallenge::generate();
@@ -349,24 +351,29 @@ impl ChatGptCredentialManager {
             redirect_uri,
             pending_client_id,
             expected_subject,
-            listener,
+            loopback: listener.is_some(),
+            listener: std::sync::Mutex::new(listener),
         })
     }
 
     /// Wait for the browser to come back to the loopback listener, then
-    /// exchange the code and store the credentials.
+    /// exchange the code and store the credentials. The attempt is only
+    /// borrowed, so a pasted address may finish it meanwhile (the caller
+    /// then drops this future).
     pub async fn finish_on_loopback(
         &self,
         client: &reqwest::Client,
-        mut attempt: LoginAttempt,
+        attempt: &LoginAttempt,
     ) -> Result<ChatGptCredentials> {
         let listener = attempt
             .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .ok_or_else(|| anyhow!("this sign-in does not listen on this machine"))?;
         let callback =
             await_callback(listener, &attempt.pkce.state, &self.settings.app_name).await?;
-        self.finish_with_callback(client, &attempt, &callback).await
+        self.finish_with_callback(client, attempt, &callback).await
     }
 
     /// Complete a pasted sign-in with the redirect URL the browser ended on.
@@ -783,14 +790,17 @@ pub struct LoginAttempt {
     redirect_uri: String,
     pending_client_id: Option<String>,
     expected_subject: Option<String>,
-    listener: Option<TcpListener>,
+    loopback: bool,
+    /// Taken by [`ChatGptCredentialManager::finish_on_loopback`].
+    listener: std::sync::Mutex<Option<TcpListener>>,
 }
 
 impl LoginAttempt {
-    /// It waits on this machine's loopback callback listener (else for a
-    /// pasted redirect address).
+    /// It redirects to this machine's loopback callback port, so a browser
+    /// on this machine finishes it by itself (any browser's address may
+    /// still be pasted).
     pub fn on_loopback(&self) -> bool {
-        self.listener.is_some()
+        self.loopback
     }
 }
 
@@ -1734,6 +1744,53 @@ mod tests {
             load_registered_client_id(secrets.as_ref()).as_deref(),
             Some("oaiapp_issued_once")
         );
+    }
+
+    /// A sign-in waiting on the loopback port also takes the address a
+    /// browser on another device ended on (that device's 127.0.0.1 does not
+    /// load, so its owner pastes it), while the loopback wait holds it.
+    #[tokio::test]
+    async fn loopback_attempt_is_also_finished_by_a_pasted_address() {
+        let secrets = Arc::new(aidaemon_secrets::MemorySecretStore::new());
+        let settings = LoginSettings::new("aidaemon", "aidaemon auth login openai");
+        let mut manager = ChatGptCredentialManager::new(secrets.clone(), settings);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+        manager.token_url = format!("http://{closed_addr}/token");
+        let manager = Arc::new(manager);
+
+        let attempt = Arc::new(manager.start_login(true).await.unwrap());
+        assert!(attempt.on_loopback());
+        assert_ne!(attempt.redirect_uri, PASTE_REDIRECT_URI);
+        let waiting = tokio::spawn({
+            let (manager, attempt) = (manager.clone(), attempt.clone());
+            async move {
+                let client = reqwest::Client::new();
+                manager.finish_on_loopback(&client, &attempt).await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let redirect = format!(
+            "{}?code=synthetic-code&state={}&client_id=oaiapp_pasted",
+            attempt.redirect_uri, attempt.pkce.state
+        );
+        let client = reqwest::Client::new();
+        // The exchange reaches the (closed) token endpoint: the pasted
+        // address was accepted for this attempt.
+        assert!(
+            manager
+                .finish_with_redirect(&client, &attempt, &redirect)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            load_registered_client_id(secrets.as_ref()).as_deref(),
+            Some("oaiapp_pasted")
+        );
+        assert!(!waiting.is_finished());
+        waiting.abort();
     }
 
     #[test]
