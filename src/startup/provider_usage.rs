@@ -95,11 +95,13 @@ fn source_of(
         CredentialState::KeyStored => {
             key(&crate::config::keychain_name_for(&provider.key_setting)?)?
         }
-        CredentialState::KeyInFile => table
-            .get("api_key")
-            .and_then(toml::Value::as_str)?
-            .trim()
-            .to_string(),
+        // The file as written: a `${ENV_VAR}` reference is expanded here,
+        // as loading the config does, or the reference itself would go out
+        // as the key (OpenRouter: 401 on each read). Unset: no usage.
+        CredentialState::KeyInFile => crate::config::expand_env_vars(
+            table.get("api_key").and_then(toml::Value::as_str)?.trim(),
+        )
+        .ok()?,
         _ => return None,
     };
     (!api_key.is_empty()).then_some(Source::OpenRouter { base_url, api_key })
@@ -274,6 +276,25 @@ mod tests {
         assert!(
             matches!(source, Some(Source::OpenRouter { api_key, .. }) if api_key == "sk-in-file")
         );
+    }
+
+    /// A key written as an unset `${ENV_VAR}` reference reads no usage:
+    /// the reference itself never goes out as the key.
+    #[test]
+    fn an_unset_env_reference_in_the_file_is_not_sent_as_the_key() {
+        let table: toml::Table = r#"api_key = "${AIDAEMON_USAGE_TEST_NEVER_SET_KEY}""#
+            .parse()
+            .unwrap();
+        let source = source_of(
+            &provider(
+                CredentialState::KeyInFile,
+                "",
+                "https://openrouter.ai/api/v1/",
+            ),
+            &table,
+            &|_| None,
+        );
+        assert!(source.is_none());
     }
 
     #[test]
