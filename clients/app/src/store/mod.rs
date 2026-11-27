@@ -2815,6 +2815,9 @@ impl Store {
             self.sidebar.set(false);
         }
         self.inspector.set(true);
+        // A medium window has no details beside the page: they slide in
+        // (a changed file's chip opened nothing there otherwise).
+        self.details_drawer.set(true);
         self.refresh_changes();
     }
 
