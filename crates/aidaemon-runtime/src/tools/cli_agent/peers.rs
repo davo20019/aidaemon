@@ -1665,17 +1665,33 @@ pub(super) async fn restore_peer_worktree(
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(16)
         .collect();
-    let unique = uuid::Uuid::new_v4().simple().to_string();
     let root = peer_worktrees_root();
     aidaemon_coding_agents::private_files::private_dir(&root)
         .map_err(|e| format!("failed to create the private worktree dir: {e}"))?;
     let worktree_parent = root.join(&safe_tree);
     std::fs::create_dir_all(&worktree_parent)
         .map_err(|e| format!("failed to create worktree parent dir: {e}"))?;
-    let worktree_path = worktree_parent
-        .join(format!("{safe_peer}-{}", &unique[..6]))
-        .to_string_lossy()
-        .into_owned();
+    // Back where it was: an agent that resumes its own session (agy over
+    // ACP, Codex, Claude Code) keeps working in the folder that session
+    // recorded, so a checkout anywhere else leaves it in a folder that no
+    // longer exists. A worktree's folder is named as its branch ends
+    // (`provision_peer_worktree`); only when that folder is taken does the
+    // checkout go elsewhere.
+    let worktree_path = match resumed_worktree_dir(&worktree_parent, &safe_tree, branch) {
+        Some(dir) if !dir.exists() => {
+            // The removed worktree may still be registered (its folder
+            // deleted by hand or by a cache sweep): drop the stale entry so
+            // `worktree add` can take the path again.
+            let _ = git_cmd(backend, &git_root, vec!["worktree".into(), "prune".into()]).await;
+            dir
+        }
+        _ => {
+            let unique = uuid::Uuid::new_v4().simple().to_string();
+            worktree_parent.join(format!("{safe_peer}-{}", &unique[..6]))
+        }
+    }
+    .to_string_lossy()
+    .into_owned();
     git_cmd(
         backend,
         &git_root,
@@ -1701,6 +1717,22 @@ pub(super) async fn restore_peer_worktree(
         base: Some(head),
         peer_id: peer_id.to_string(),
     })
+}
+
+/// The folder a kept peer branch was checked out in, under `parent`:
+/// `aidaemon/peer-<tree>-<peer>-<uid>` was made at `<tree>/<peer>-<uid>`.
+/// None for a branch not named that way.
+fn resumed_worktree_dir(
+    parent: &std::path::Path,
+    safe_tree: &str,
+    branch: &str,
+) -> Option<std::path::PathBuf> {
+    // A machine format: the branch name this module itself writes.
+    let name = branch.strip_prefix(&format!("aidaemon/peer-{safe_tree}-"))?;
+    let safe = !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-');
+    safe.then(|| parent.join(name))
 }
 
 /// The root of every peer worktree this daemon provisions.

@@ -193,7 +193,8 @@ async fn worktree_provisioning_creates_isolated_branch_and_directory() {
 }
 
 /// A worktree peer resumed in a later exchange, after its lead's end
-/// released its worktree, gets its kept branch checked out again; a branch
+/// released its worktree, gets its kept branch checked out again, in the
+/// same folder (its agent's own session resumes there); a branch
 /// that held nothing (deleted) gives it a fresh worktree.
 #[tokio::test]
 async fn a_released_peer_worktree_is_restored_from_its_branch() {
@@ -237,7 +238,10 @@ async fn a_released_peer_worktree_is_restored_from_its_branch() {
             .await
             .unwrap();
     assert_eq!(restored.branch, first.branch);
-    assert_ne!(restored.path, first.path);
+    assert_eq!(
+        restored.path, first.path,
+        "back in the folder the agent's own resumed session recorded"
+    );
     assert_eq!(
         std::fs::read_to_string(std::path::Path::new(&restored.path).join("notes.md")).unwrap(),
         "peer work\n",
