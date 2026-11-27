@@ -80,7 +80,7 @@ and targeted patches. When unrelated files are modified, leave them alone.
 ## Releases
 
 The next release has an integration branch, `release/X.Y.Z` (now
-`release/0.25.1`): feature branches start from it and their pull requests
+`release/0.25.2`): feature branches start from it and their pull requests
 target it (CI runs on `release/**`), and it merges to `master` when the
 release is ready. Do not push feature work straight to `master`.
 
