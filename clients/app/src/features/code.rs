@@ -24,22 +24,21 @@ pub fn code(store: Store) -> View {
         open.set(None);
     });
     // A changed file asked for (a run's "Changed" list): its diff, once the
-    // changes are read, when it is among them.
+    // changes are read, when it is among them. Each ask once per view.
+    let handled = std::cell::Cell::new(0u64);
     effect(move || {
         let ChangesRead::Ready(changes) = store.changes() else {
             return;
         };
-        let Some(path) = store.take_change_to_open() else {
+        let Some((number, path)) = store.change_to_open() else {
             return;
         };
-        for repo in changes.repos {
-            let root = repo.root.trim_end_matches('/');
-            if let Some(relative) = path.strip_prefix(&format!("{root}/"))
-                && repo.files.iter().any(|file| file.path == relative)
-            {
-                open.set(Some((repo.root.clone(), relative.to_string())));
-                return;
-            }
+        if number <= handled.get() {
+            return;
+        }
+        handled.set(number);
+        if let Some(found) = changed_file_named(&changes.repos, &path) {
+            open.set(Some(found));
         }
     });
     view().flex_1().child(dynamic(move || {
@@ -398,9 +397,28 @@ fn file_status(store: Store, root: &str, path: &str) -> Option<FileStatus> {
     }
 }
 
+/// The repository root and repository-relative path of changed file `path`:
+/// a full path under a repository's root, or (a run's report names files
+/// from where it worked) a path relative to one.
+fn changed_file_named(
+    repos: &[aidaemon_client_protocol::RepoChanges],
+    path: &str,
+) -> Option<(String, String)> {
+    repos.iter().find_map(|repo| {
+        let root = repo.root.trim_end_matches('/');
+        let relative = path
+            .strip_prefix(&format!("{root}/"))
+            .unwrap_or(path.trim_start_matches("./"));
+        repo.files
+            .iter()
+            .any(|file| file.path == relative)
+            .then(|| (repo.root.clone(), relative.to_string()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{file_patch, has_lines};
+    use super::{changed_file_named, file_patch, has_lines};
 
     #[test]
     fn file_patch_keeps_one_files_section() {
@@ -414,5 +432,25 @@ mod tests {
         assert!(file_patch(patch, "b.md").ends_with("@@ -0,0 +1 @@\n+note\n"));
         assert!(file_patch(patch, "c.rs").is_empty());
         assert!(!has_lines("diff --git a/x b/x\nBinary files differ\n"));
+    }
+
+    #[test]
+    fn a_changed_file_is_found_by_full_or_relative_path() {
+        let repos: Vec<aidaemon_client_protocol::RepoChanges> = serde_json::from_str(
+            r#"[{"root":"/work/acme","files":[{"path":"tests/test_slug.py","status":"modified","added":1,"removed":0}]}]"#,
+        )
+        .unwrap();
+        let found = Some(("/work/acme".to_string(), "tests/test_slug.py".to_string()));
+        assert_eq!(
+            changed_file_named(&repos, "/work/acme/tests/test_slug.py"),
+            found
+        );
+        assert_eq!(changed_file_named(&repos, "tests/test_slug.py"), found);
+        assert_eq!(changed_file_named(&repos, "./tests/test_slug.py"), found);
+        assert_eq!(
+            changed_file_named(&repos, "/elsewhere/tests/test_slug.py"),
+            None
+        );
+        assert_eq!(changed_file_named(&repos, "test_slug.py"), None);
     }
 }

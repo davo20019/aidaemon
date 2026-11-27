@@ -511,9 +511,11 @@ pub struct Store {
     project_editing: Signal<Option<String>>,
     /// The details pane's open tab (an index of [`DETAIL_TABS`]).
     inspector_tab: Signal<usize>,
-    /// A changed file the Changes tab is asked to open (its full path),
-    /// until the tab finds it among the changes.
-    change_to_open: Signal<Option<String>>,
+    /// A changed file the Changes tab is asked to open (its path), with
+    /// the ask's number: each Changes view mounted (the side pane's, a
+    /// medium window's drawer) acts on an ask once, so a hidden one cannot
+    /// take it from the one on screen.
+    change_to_open: Signal<Option<(u64, String)>>,
     /// The sidebar's source filter.
     source: Signal<Source>,
     /// The automation whose edit form is open: the page's timed refresh
@@ -3493,17 +3495,15 @@ impl Store {
     /// when it is among the changes, else on the list.
     pub fn show_change(&self, path: &str) {
         self.close_run();
-        self.change_to_open.set(Some(path.to_string()));
+        let number = untracked(|| self.change_to_open.get()).map_or(1, |(number, _)| number + 1);
+        self.change_to_open.set(Some((number, path.to_string())));
         self.show_changes();
     }
 
-    /// The changed file the Changes tab is asked to open, taken once.
-    pub fn take_change_to_open(&self) -> Option<String> {
-        let path = self.change_to_open.get();
-        if path.is_some() {
-            untracked(|| self.change_to_open.set(None));
-        }
-        path
+    /// The changed file the Changes tab was last asked to open, and the
+    /// ask's number (see `change_to_open`).
+    pub fn change_to_open(&self) -> Option<(u64, String)> {
+        self.change_to_open.get()
     }
 
     /// The run whose view is open.
