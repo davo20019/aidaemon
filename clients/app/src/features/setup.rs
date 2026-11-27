@@ -564,22 +564,44 @@ fn choices(
                     ))
                     .child(ui::code(sign_in.url.clone()).number_of_lines(2));
                 if sign_in.paste {
+                    use crate::features::chatgpt_sign_in;
                     card = card
-                        .child(lead(
-                            "Signed in on another device? When its browser shows it cannot \
-                                 reach the page it ends on, copy that page's address and paste \
-                                 it here.",
-                        ))
+                        .child(lead(chatgpt_sign_in::intro()))
+                        .child(lead(chatgpt_sign_in::paste_step()))
                         .child(field("http://127.0.0.1:…/auth/callback?code=…", redirect))
                         .child(
-                            btn("Finish sign-in", Variant::Secondary, Size::Sm, move || {
-                                store.setup_step(SetupAction::FinishSignIn {
-                                    redirect: redirect.get_untracked(),
-                                })
-                            })
-                            .disabled(move || {
-                                store.setup_busy() || redirect.with(|r| r.trim().is_empty())
-                            }),
+                            view()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    btn(
+                                        "Paste and finish",
+                                        Variant::Secondary,
+                                        Size::Sm,
+                                        move || {
+                                            chatgpt_sign_in::paste_and_finish(
+                                                redirect,
+                                                move |redirect| {
+                                                    store.setup_step(SetupAction::FinishSignIn {
+                                                        redirect,
+                                                    })
+                                                },
+                                            );
+                                        },
+                                    )
+                                    .disabled(move || store.setup_busy()),
+                                )
+                                .child(
+                                    btn("Finish sign-in", Variant::Outline, Size::Sm, move || {
+                                        store.setup_step(SetupAction::FinishSignIn {
+                                            redirect: redirect.get_untracked(),
+                                        })
+                                    })
+                                    .disabled(move || {
+                                        store.setup_busy() || redirect.with(|r| r.trim().is_empty())
+                                    }),
+                                ),
                         );
                 } else {
                     card = card.child(ui::working("Waiting for you to finish in the browser"));

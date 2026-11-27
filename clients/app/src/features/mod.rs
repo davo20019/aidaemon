@@ -3,6 +3,7 @@
 pub mod approvals;
 pub mod automations;
 pub mod browser_tab;
+pub mod chatgpt_sign_in;
 pub mod code;
 pub mod config_nav;
 pub mod conversation;

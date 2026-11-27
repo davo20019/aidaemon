@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use nsh_core::prelude::*;
 
-use crate::features::settings_general;
+use crate::features::{chatgpt_sign_in, settings_general};
 use crate::store::{AnswerSurface, SettingsRead, SettingsTab, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, type_scale};
 
@@ -1554,9 +1554,7 @@ fn sign_in_card(
                 .font_weight(FontWeight::MEDIUM),
         )
         .child(muted(if sign_in.paste {
-            "Sign in with your ChatGPT account on the page that opened. If this page \
-             does not update when you are done (you signed in on another device), \
-             follow step 2."
+            chatgpt_sign_in::intro()
         } else {
             "Open the sign-in page and sign in with your ChatGPT account. This page \
              updates when you are done."
@@ -1581,29 +1579,45 @@ fn sign_in_card(
         );
     if sign_in.paste {
         card = card
-            .child(muted(
-                "2. The browser then lands on a page that does not load (its address starts \
-                 with http://127.0.0.1). Copy that whole address and paste it here.",
-            ))
+            .child(muted(chatgpt_sign_in::paste_step()))
             .child(
                 ui::field("http://127.0.0.1:…/auth/callback?code=…", form.redirect)
                     .label("Address the browser ended on")
                     .w_full(),
             )
             .child(
-                view().flex_row().child(
-                    ui::btn("Finish sign-in", Variant::Secondary, Size::Sm, move || {
-                        let redirect = form.redirect.get_untracked();
-                        if redirect.trim().is_empty() {
-                            return;
-                        }
-                        store.change_settings(SettingsChange::FinishSignIn { redirect });
-                        form.redirect.set(String::new());
-                    })
-                    .disabled(move || {
-                        store.settings_busy() || form.redirect.with(|r| r.trim().is_empty())
-                    }),
-                ),
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        ui::btn(
+                            "Paste and finish",
+                            Variant::Secondary,
+                            Size::Sm,
+                            move || {
+                                chatgpt_sign_in::paste_and_finish(form.redirect, move |redirect| {
+                                    store
+                                        .change_settings(SettingsChange::FinishSignIn { redirect });
+                                    form.redirect.set(String::new());
+                                });
+                            },
+                        )
+                        .disabled(move || store.settings_busy()),
+                    )
+                    .child(
+                        ui::btn("Finish sign-in", Variant::Outline, Size::Sm, move || {
+                            let redirect = form.redirect.get_untracked();
+                            if redirect.trim().is_empty() {
+                                return;
+                            }
+                            store.change_settings(SettingsChange::FinishSignIn { redirect });
+                            form.redirect.set(String::new());
+                        })
+                        .disabled(move || {
+                            store.settings_busy() || form.redirect.with(|r| r.trim().is_empty())
+                        }),
+                    ),
             );
     } else {
         card = card.child(ui::working("Waiting for you to finish in the browser"));
