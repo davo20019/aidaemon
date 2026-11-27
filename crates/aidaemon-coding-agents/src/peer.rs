@@ -2114,10 +2114,7 @@ mod tests {
             record.contains("[1] lead -> all (plan):\nbuild the cache"),
             "{record}"
         );
-        assert!(
-            record.contains("[2] lead -> lead (note)"),
-            "{record}"
-        );
+        assert!(record.contains("[2] lead -> lead (note)"), "{record}");
         assert!(record.contains("… [cut]"), "{record}");
         assert!(record.len() < 2_500, "{}", record.len());
     }
