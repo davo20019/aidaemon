@@ -291,12 +291,22 @@ impl Sending {
     /// shown back: the same text and files, or (text the daemon rewrote
     /// around files) the same files.
     fn shown_as(&self, text: &str, files: &[AttachmentRef]) -> bool {
-        let same_files = self
-            .attachments
+        Self::matches(&self.text, &self.attachments, text, files)
+    }
+
+    /// Whether a message sent as `sent` with `sent_files` is the daemon's
+    /// `text` with `files` (see [`Sending::shown_as`]).
+    fn matches(
+        sent: &str,
+        sent_files: &[AttachmentRef],
+        text: &str,
+        files: &[AttachmentRef],
+    ) -> bool {
+        let same_files = sent_files
             .iter()
             .map(|a| &a.id)
             .eq(files.iter().map(|a| &a.id));
-        same_files && (self.text.trim() == text.trim() || !self.attachments.is_empty())
+        same_files && (sent.trim() == text.trim() || !sent_files.is_empty())
     }
 }
 
@@ -930,7 +940,14 @@ impl Client {
                     }),
                 );
             }
-            if let Some(sent) = self.starting_echo.take() {
+            // Its turn may have shown it back before this ack came (the
+            // daemon starts the turn as it accepts it): then nothing to show.
+            if let Some(sent) = self.starting_echo.take().filter(|(text, files)| {
+                !self.lines(session_id).iter().any(|line| {
+                    matches!(line, Line::User { text: shown, attachments, .. }
+                        if Sending::matches(text, files, shown, attachments))
+                })
+            }) {
                 self.echo(session_id, request_id, sent, None);
                 // Accepted: this Ack is the daemon taking it.
                 if let Some(last) = self
@@ -5364,6 +5381,26 @@ mod tests {
         );
         assert_eq!(effects, [Effect::Started("app:new".into())]);
         assert_eq!(client.submit(None, "  ", None, None), Ok(false));
+    }
+
+    /// The new conversation's turn may show its first message back before
+    /// the ack names the conversation: then no sending copy is left behind.
+    #[test]
+    fn a_first_message_shown_back_before_its_ack_leaves_no_sending_copy() {
+        let mut client = Client::new();
+        assert_eq!(client.submit(None, "hello there", None, None), Ok(false));
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:new","event":{"type":"user_message","session_id":"app:new","text":"hello there","origin":"app"}}"#),
+            &cx(None),
+        );
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:new"}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(client.sending("app:new").is_empty());
     }
 
     /// A coding agent's run that fails reads the agents again (the daemon
