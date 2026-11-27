@@ -250,35 +250,158 @@ pub(super) fn extract_progress_from_json(line: &str) -> Option<String> {
     None
 }
 
-pub(super) fn prohibited_cli_agent_command_reason(command: &str) -> Option<&'static str> {
-    let lower = command.trim().to_ascii_lowercase();
+/// The daemon's state database's file names: the database and SQLite's
+/// side files beside it.
+const DAEMON_DB_FILES: &[&str] = &[
+    "aidaemon.db",
+    "aidaemon.db-wal",
+    "aidaemon.db-shm",
+    "aidaemon.db-journal",
+];
 
-    // E2E incidents: external coding agents tried to "fix scheduling" by hacking the
-    // SQLCipher DB directly (sqlite/sqlcipher + key hunting). This tool runs in an
-    // auto-approve mode and outside any path sandbox, so no typed filesystem
-    // guard covers the daemon's state database here; the command is checked
-    // for machine formats only: the database's file name (`aidaemon.db`, and
-    // its `-wal`/`-shm` siblings), the SQLCipher tool, and SQLCipher's key
-    // pragmas. A project's own `sqlite3 app.db` is not the daemon's database
-    // and runs.
-    if lower.contains("aidaemon.db")
-        || lower.contains("sqlcipher")
-        || lower.contains("pragma key")
-        || lower.contains("pragma cipher")
+/// Programs that run code given in an argument (`python3 -c`, `bash -c`,
+/// `sqlite3 file 'SQL'`): their code is text, so a database path inside it
+/// is not its own token.
+const INLINE_CODE_PROGRAMS: &[&str] = &[
+    "python",
+    "python3",
+    "node",
+    "perl",
+    "ruby",
+    "php",
+    "bash",
+    "sh",
+    "zsh",
+    "sqlite3",
+    "sqlcipher",
+    "osascript",
+];
+
+/// Why a coding agent's shell command is stopped, when it is: it changes or
+/// opens the daemon's own state database, or reaches for its encryption key.
+///
+/// E2E incidents: external coding agents tried to "fix scheduling" by
+/// hacking the SQLCipher DB directly (sqlite/sqlcipher + key hunting). This
+/// tool runs in an auto-approve mode and outside any path sandbox, so no
+/// typed filesystem guard covers the database here: the command is read as a
+/// shell command line (machine format), never as prose.
+///
+/// The daemon's own harness works on its own code, so only what would touch
+/// the live state is stopped (live 2026-11-27: a memory-improvement run was
+/// killed for `ls -la aidaemon.db*`). A command that only reads
+/// ([`aidaemon_tools::command_effects::only_reads`]: `ls`, `stat`, `du`,
+/// `rg`, `cat`) runs, whatever it names; so does a change whose path operands
+/// are not the database (editing source that mentions it, `cargo test`).
+/// A project's own `sqlite3 app.db` is not the daemon's database and runs.
+pub(super) fn prohibited_cli_agent_command_reason(command: &str) -> Option<&'static str> {
+    if aidaemon_tools::command_effects::only_reads(command) {
+        return None;
+    }
+    for (segment, _) in aidaemon_tools::command_risk::split_by_operators(command) {
+        if let Some(reason) = segment_reason(&segment) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+fn segment_reason(segment: &str) -> Option<&'static str> {
+    let segment = segment.trim();
+    if segment.is_empty() || aidaemon_tools::command_effects::only_reads(segment) {
+        return None;
+    }
+    // Unparsable quoting: read the whole text as one token, so a path in it
+    // still counts.
+    let tokens = shell_words::split(segment).unwrap_or_else(|_| vec![segment.to_string()]);
+    let program_at = tokens.iter().position(|token| !is_env_assignment(token))?;
+    let program = token_basename(&tokens[program_at]).to_ascii_lowercase();
+    let args = &tokens[program_at + 1..];
+    let inline_code = INLINE_CODE_PROGRAMS.contains(&program.as_str());
+
+    // SQLCipher's key pragmas (machine format: SQL), in code it runs.
+    if inline_code
+        && args.iter().any(|arg| {
+            let lower = arg.to_ascii_lowercase();
+            lower.contains("pragma key")
+                || lower.contains("pragma rekey")
+                || lower.contains("pragma cipher")
+        })
     {
         return Some(
-            "Direct manipulation of aidaemon's state database is prohibited. Use manage_memories / built-in tools instead of terminal SQL.",
+            "Reading or setting aidaemon's database key is prohibited. Use aidaemon's built-in tools \
+             (manage_memories and the like) instead of terminal SQL.",
         );
     }
-
-    // Narrow install block for sqlcipher specifically (common rabbit-hole).
-    if lower.contains("install") && lower.contains("sqlcipher") {
+    // Installing the SQLCipher shell: the first step of opening the
+    // database by hand (a common rabbit hole).
+    if is_installer(&program)
+        && args
+            .iter()
+            .any(|arg| arg.to_ascii_lowercase().contains("sqlcipher"))
+    {
         return Some(
-            "Installing sqlcipher is prohibited in cli_agent runs. Use aidaemon tools instead.",
+            "Installing sqlcipher is prohibited in coding-agent runs: aidaemon's database is \
+             changed through its own tools.",
         );
     }
+    let names_db = tokens
+        .iter()
+        .any(|token| names_daemon_db_path(token) || (inline_code && mentions_daemon_db(token)));
+    names_db.then_some(
+        "Changing or opening aidaemon's live state database is prohibited (reading its file \
+         listing is fine). Use manage_memories / built-in tools, or `db_probe` read-only, \
+         instead of terminal SQL or file operations on it.",
+    )
+}
 
-    None
+fn is_env_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+fn token_basename(token: &str) -> &str {
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
+}
+
+fn is_installer(program: &str) -> bool {
+    matches!(
+        program,
+        "brew"
+            | "apt"
+            | "apt-get"
+            | "yum"
+            | "dnf"
+            | "port"
+            | "pip"
+            | "pip3"
+            | "npm"
+            | "cargo"
+            | "nix-env"
+            | "apk"
+    )
+}
+
+/// A token that is a path to the database: its last component is one of
+/// its files, a glob over them (`aidaemon.db*`), or a redirection into one
+/// (`>aidaemon.db`, `2>>aidaemon.db-wal`).
+fn names_daemon_db_path(token: &str) -> bool {
+    let token =
+        token.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '>' | '<' | '&'));
+    let name = token_basename(token).to_ascii_lowercase();
+    let name = name.trim_end_matches(['*', '?']);
+    DAEMON_DB_FILES.contains(&name)
+}
+
+/// Code text that names the database file (`sqlite3.connect('aidaemon.db')`,
+/// `ATTACH 'aidaemon.db'`): the name bounded by anything a file name does
+/// not continue with.
+fn mentions_daemon_db(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    lower.match_indices("aidaemon.db").any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    })
 }
 
 pub(super) fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {

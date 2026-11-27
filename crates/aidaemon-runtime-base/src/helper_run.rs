@@ -214,6 +214,10 @@ pub struct ProgramEnd {
     pub exit_code: Option<i32>,
     /// The runtime stopped it (a loop, a stop, an authentication failure).
     pub stopped: bool,
+    /// The runtime stopped it for a command a guard forbids.
+    pub blocked: Option<crate::run_state::BlockedCommand>,
+    /// The runtime stopped it for looping on the same output.
+    pub looped: bool,
     /// Its turn ended finished, as its agent's protocol typed it (ACP's
     /// `end_turn`), before the host closed it: an error exit after that is
     /// how its program shut down, so its work is judged as an exit 0's.
@@ -257,6 +261,16 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
             RunEnd::Failed(RunFailure::NoProgress),
             RunEvidence::default(),
         );
+    }
+    // Stopped by the runtime for something it did: that, said, is why.
+    if let Some(blocked) = &end.blocked {
+        return (
+            RunEnd::Failed(RunFailure::Blocked(blocked.clone())),
+            RunEvidence::default(),
+        );
+    }
+    if end.looped {
+        return (RunEnd::Failed(RunFailure::Looped), RunEvidence::default());
     }
     // Stopped by the runtime, its exit status says nothing about the work
     // (a stopped program can still exit 0): it was stopped.
@@ -528,6 +542,8 @@ mod tests {
         let refused = ProgramEnd {
             exit_code: Some(0),
             stopped: false,
+            blocked: None,
+            looped: false,
             turn_completed: false,
             timed_out: false,
             expects_change: true,
@@ -585,6 +601,23 @@ mod tests {
         };
         let (end, _) = program_phase(&stopped);
         assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: None }));
+        // Stopped by a guard for a command it ran, or for looping: that
+        // cause, never a bare "stopped" (live 2026-11-27).
+        let blocked = crate::run_state::BlockedCommand {
+            command: "rm aidaemon.db".into(),
+            why: "Changing aidaemon's database is prohibited.".into(),
+        };
+        let guarded = ProgramEnd {
+            blocked: Some(blocked.clone()),
+            ..stopped.clone()
+        };
+        let (end, _) = program_phase(&guarded);
+        assert_eq!(end, RunEnd::Failed(RunFailure::Blocked(blocked)));
+        let looped = ProgramEnd {
+            looped: true,
+            ..stopped.clone()
+        };
+        assert_eq!(program_phase(&looped).0, RunEnd::Failed(RunFailure::Looped));
         // Timed out (idle or background wall-clock limit): NoProgress.
         let timed_out = ProgramEnd {
             exit_code: None,

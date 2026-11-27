@@ -92,6 +92,8 @@ pub(super) async fn watch_run(
     let mut loop_detected = false;
     let mut loop_pattern_count: Option<usize> = None;
     let mut timed_out_reason: Option<String> = None;
+    // A command a guard stopped it for: its end says so.
+    let mut blocked_command: Option<crate::run_state::BlockedCommand> = None;
 
     loop {
         if stdout_done && stderr_done {
@@ -139,6 +141,10 @@ pub(super) async fn watch_run(
                                         BUFFER_CAP,
                                     );
                                 }
+                                blocked_command = Some(crate::run_state::BlockedCommand {
+                                    command: cmd,
+                                    why: reason.to_string(),
+                                });
                                 kill_process(
                                     &backend_for_task,
                                     &process_handle_for_task,
@@ -314,7 +320,8 @@ pub(super) async fn watch_run(
     }
 
     let timed_out = timed_out_reason.is_some();
-    let exit_code = if loop_detected || timed_out {
+    let blocked = blocked_command.is_some();
+    let exit_code = if loop_detected || timed_out || blocked {
         None
     } else {
         match child.wait().await {
@@ -382,7 +389,7 @@ pub(super) async fn watch_run(
             "It couldn't sign in on its last run.",
             None,
         );
-    } else if exit_code == Some(0) && !loop_detected && !timed_out {
+    } else if exit_code == Some(0) && !loop_detected && !timed_out && !blocked {
         crate::tools::agent_mode::mark_ready_after_run(&tool_name_owned);
     }
     // A run that failed on its own (not stopped by the runtime): its
@@ -390,6 +397,7 @@ pub(super) async fn watch_run(
     let out_of_usage = if exit_code.is_some_and(|code| code != 0)
         && !loop_detected
         && !timed_out
+        && !blocked
         && !auth_failed
     {
         crate::tools::agent_mode::check_usage(&tool_name_owned).await
@@ -408,7 +416,9 @@ pub(super) async fn watch_run(
         crate::helper_run::program_phase(&crate::helper_run::ProgramEnd {
             out_of_usage,
             exit_code,
-            stopped: loop_detected || auth_failed,
+            stopped: loop_detected || auth_failed || blocked,
+            blocked: blocked_command.clone(),
+            looped: loop_detected,
             turn_completed: agent_host_for_task
                 .as_ref()
                 .is_some_and(|host| host.completed()),
@@ -437,7 +447,8 @@ pub(super) async fn watch_run(
         changed_something,
     });
     {
-        let status = if loop_detected || timed_out || auth_failed || exit_code.is_none() {
+        let status = if loop_detected || timed_out || blocked || auth_failed || exit_code.is_none()
+        {
             aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
         } else if exit_code == Some(0) {
             aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded
@@ -469,6 +480,18 @@ pub(super) async fn watch_run(
                 persisted_output: "Killed - infinite loop detected".to_string(),
                 response: None,
                 error: Some("Killed - infinite loop detected".to_string()),
+            }
+        } else if let Some(failure) = blocked_command
+            .clone()
+            .map(crate::run_state::RunFailure::Blocked)
+        {
+            let reason = failure.reason();
+            CliCompletionResult {
+                success: false,
+                authentication_failed: false,
+                persisted_output: reason.clone(),
+                response: None,
+                error: Some(reason),
             }
         } else if let Some(ref reason) = timed_out_reason {
             CliCompletionResult {

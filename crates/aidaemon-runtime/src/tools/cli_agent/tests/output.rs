@@ -6,12 +6,47 @@ use super::*;
 /// project's own SQLite database is the agent's to use.
 #[test]
 fn only_the_daemons_database_is_a_prohibited_command() {
-    assert!(
-        prohibited_cli_agent_command_reason("sqlite3 ~/.aidaemon/aidaemon.db .tables").is_some()
-    );
-    assert!(prohibited_cli_agent_command_reason("sqlcipher data.db").is_some());
-    assert!(prohibited_cli_agent_command_reason("sqlite3 app.db 'select 1'").is_none());
-    assert!(prohibited_cli_agent_command_reason("python3 -c 'import sqlite3'").is_none());
+    let blocked = |command: &str| prohibited_cli_agent_command_reason(command).is_some();
+    // Opening or changing it, or its key.
+    assert!(blocked("sqlite3 ~/.aidaemon/aidaemon.db .tables"));
+    assert!(blocked("sqlcipher ~/projects/aidaemon/aidaemon.db"));
+    assert!(blocked("rm -f aidaemon.db-wal"));
+    assert!(blocked("cp backup.db ~/projects/aidaemon/aidaemon.db"));
+    assert!(blocked("echo x > aidaemon.db"));
+    assert!(blocked("cd /x && mv aidaemon.db old.db"));
+    assert!(blocked(
+        "python3 -c \"import sqlite3; sqlite3.connect('aidaemon.db').execute('delete from facts')\""
+    ));
+    assert!(blocked("sqlite3 x.db \"PRAGMA key = 'abc'\""));
+    assert!(blocked("brew install sqlcipher"));
+    // A project's own database.
+    assert!(!blocked("sqlite3 app.db 'select 1'"));
+    assert!(!blocked("python3 -c 'import sqlite3'"));
+    assert!(!blocked("sqlcipher data.db"));
+}
+
+/// The harness working on its own code reads and searches freely (live
+/// 2026-11-27: a memory-improvement run was killed for listing the file).
+#[test]
+fn reading_or_working_on_the_harness_code_is_not_prohibited() {
+    let allowed = |command: &str| prohibited_cli_agent_command_reason(command).is_none();
+    assert!(allowed(
+        "rg -n \"struct ToolExecCtx\" crates/ && rg -n \"v1\\.schema\\.json|UPDATE_SCHEMA\" crates/ scripts/ \
+         && echo \"---DB_PROBE---\" && ls -la src/bin/ && echo \"---AIDAEMON_DATA---\" \
+         && ls -la ~/projects/aidaemon/aidaemon.db* ~/.aidaemon/aidaemon.db* 2>/dev/null || true"
+    ));
+    assert!(allowed("stat aidaemon.db && du -sh aidaemon.db-wal"));
+    assert!(allowed(
+        "rg -n 'aidaemon.db|pragma key|sqlcipher' crates src"
+    ));
+    assert!(allowed("cargo test -q --lib memory"));
+    assert!(allowed("cargo tree -e features | grep sqlcipher"));
+    assert!(allowed(
+        "sed -i '' 's/default.db/aidaemon.db.example/' docs/notes.md"
+    ));
+    assert!(allowed(
+        "git diff -- crates/aidaemon-memory/src/sqlite/schema.rs"
+    ));
 }
 
 #[test]

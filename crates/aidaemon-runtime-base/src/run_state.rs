@@ -221,6 +221,13 @@ pub enum RunFailure {
     Cancelled { by: CancelledBy },
     /// It made no progress for its limit and was stopped.
     NoProgress,
+    /// The runtime stopped it for a command it ran that a guard forbids
+    /// (live 2026-11-27: a coding agent killed for touching the daemon's
+    /// database read "Its program was stopped before it finished", with no
+    /// cause the owner or its lead could act on).
+    Blocked(BlockedCommand),
+    /// The runtime stopped it for repeating the same output in a loop.
+    Looped,
     /// A delegated coding agent's own permission check refused these
     /// actions (typed by the agent: Claude Code's `permission_denials`),
     /// and it changed nothing. Each is the tool and what it targeted, e.g.
@@ -238,6 +245,17 @@ pub enum RunFailure {
         resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
 }
+
+/// A command a guard stopped a run for: the command as it ran, and why
+/// the guard forbids it, in plain words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedCommand {
+    pub command: String,
+    pub why: String,
+}
+
+/// The most of a blocked command a failure reason quotes.
+pub const BLOCKED_COMMAND_CHARS: usize = 160;
 
 /// Who stopped a run before it finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +375,18 @@ impl RunFailure {
             } => "You stopped it before it finished.".to_string(),
             Self::NoProgress => {
                 "It made no progress for its time limit, so it was stopped.".to_string()
+            }
+            Self::Blocked(BlockedCommand { command, why }) => {
+                let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+                let command = aidaemon_events::text::truncate_str(&command, BLOCKED_COMMAND_CHARS);
+                format!(
+                    "aidaemon stopped it because it ran `{}`. {}",
+                    command.replace('`', "'"),
+                    why.trim()
+                )
+            }
+            Self::Looped => {
+                "aidaemon stopped it because it kept repeating the same output.".to_string()
             }
             Self::AgentRefused { actions } => format!(
                 "Its coding agent's own permission check refused {}, so nothing was changed: {}.",
@@ -2010,6 +2040,11 @@ mod tests {
                 by: CancelledBy::Owner,
             },
             RunFailure::NoProgress,
+            RunFailure::Blocked(BlockedCommand {
+                command: "rm aidaemon.db".into(),
+                why: "Changing aidaemon's database is prohibited.".into(),
+            }),
+            RunFailure::Looped,
             RunFailure::AgentRefused {
                 actions: vec!["Bash: touch notes.txt".into()],
             },
