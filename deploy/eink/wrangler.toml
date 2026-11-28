@@ -1,0 +1,12 @@
+# The project's e-ink page (https://eink.aidaemon.ai): static files only, on
+# a site of its own so nothing else shares its origin. The page talks to the
+# bridge, end to end encrypted to its owner's daemon; nothing here sees that
+# traffic. Build with ./build.sh, then `npx wrangler deploy` from here.
+name = "aidaemon-eink"
+compatibility_date = "2026-11-01"
+workers_dev = false
+routes = [{ pattern = "eink.aidaemon.ai", custom_domain = true }]
+
+[assets]
+directory = "./dist"
+not_found_handling = "none"
