@@ -109,11 +109,78 @@
   }
 
   function note(text) { $('global-note').textContent = text || ''; }
-  function setLink(text) { $('link-state').textContent = text; }
+  function busyButton(id, label) {
+    var button = $(id);
+    var original = button.textContent;
+    button.disabled = true;
+    button.textContent = label;
+    return function () {
+      button.textContent = original;
+      button.disabled = false;
+    };
+  }
+  // The link's state in plain words (connect() and the rest pass a key).
+  var LINK_WORD = { connecting: 'Connecting…', connected: 'Connected', offline: 'Offline – tap Refresh',
+    'not paired': 'Not paired' };
+  function setLink(text) { setText($('link-state'), LINK_WORD[text] || text); }
+  // Set a text only when it changes (each change redraws on e-ink).
+  function setText(node, text) { if (node.textContent !== text) node.textContent = text; }
   function timeOf(ms) {
     if (!ms) return '';
     var d = new Date(ms), h = d.getHours(), m = d.getMinutes();
     return ((h % 12) || 12) + ':' + (m < 10 ? '0' : '') + m + (h < 12 ? ' AM' : ' PM');
+  }
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  // When something happened: "3:15 PM" today, "Yesterday 3:15 PM",
+  // "Nov 21" this year, "Nov 21, 2025" before. Days are the Kindle's own
+  // midnights (built from the date, so a daylight-saving change is right).
+  function whenOf(ms) {
+    if (!ms) return '';
+    var d = new Date(ms), now = new Date();
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    var yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+    if (ms >= today) return timeOf(ms);
+    if (ms >= yesterday) return 'Yesterday ' + timeOf(ms);
+    var day = MONTHS[d.getMonth()] + ' ' + d.getDate();
+    return d.getFullYear() === now.getFullYear() ? day : day + ', ' + d.getFullYear();
+  }
+
+  // ------------------------------------------------------------ plain words
+  // The daemon's typed values (snake_case) as the owner reads them.
+  function plainWord(value) {
+    var s = String(value || '').replace(/_/g, ' ');
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+  var RISK_WORD = { low: 'Low risk', medium: 'Medium risk', high: 'High risk', critical: 'Critical risk' };
+  function riskWord(risk) { return RISK_WORD[risk] || plainWord(risk); }
+  // ApprovalKind (client-protocol), plus tool-style names a card may carry.
+  var KIND_WORD = {
+    command: 'Allow an action', goal_confirmation: 'Confirm a scheduled goal',
+    autopilot_confirmation: 'Confirm an Autopilot setting', handoff: 'Something for you to do',
+    write_file: 'Write a file', edit_file: 'Change a file', read_file: 'Read a file', delete_file: 'Delete a file',
+    run_command: 'Run a command', terminal: 'Run a command', web_fetch: 'Fetch a web page', send_email: 'Send an email'
+  };
+  function kindWord(kind) { return KIND_WORD[kind] || plainWord(kind); }
+  var CHANNEL_WORD = {
+    app: 'App', telegram: 'Telegram', kindle: 'Kindle', eink: 'Kindle', slack: 'Slack', discord: 'Discord',
+    whatsapp: 'WhatsApp', signal: 'Signal', imessage: 'iMessage', email: 'Email', sms: 'SMS', matrix: 'Matrix',
+    web: 'Web', cli: 'Terminal', watch: 'Watch'
+  };
+  function channelWord(channel) { return CHANNEL_WORD[String(channel || '').toLowerCase()] || plainWord(channel); }
+  // An error as a sentence: the channel's own technical ones (socketTo,
+  // makeLink) in plain words; the daemon's messages, already plain, as
+  // they are, after `what` ("Could not refresh") when given.
+  function plainError(e, what) {
+    var m = String((e && e.message) || e || '');
+    if (/^closed \(\d+\)$/.test(m) || m === 'unexpected message from the bridge') {
+      return 'Lost the connection to your computer. Tap Refresh.';
+    }
+    if (m === 'Could not reach the bridge') return 'Could not connect. Check the Kindle’s Wi-Fi, then tap Refresh.';
+    if (m === 'timed out') return 'Your computer did not answer in time. Tap Refresh to try again.';
+    if (m === 'Sign-in refused') return 'Your computer did not let this Kindle sign in. If this keeps happening, pair it again.';
+    if (/^Refused \(\d+\)$/.test(m)) return 'Your computer turned that down. Try again.';
+    if (m === 'Could not load a file') return 'Could not load that file.';
+    return what ? what + ': ' + m : m;
   }
 
   var TAB_OF = { pair: null, reader: null, chat: 'chat', convo: 'chat', code: 'code', newcode: 'code', run: 'code',
@@ -129,8 +196,15 @@
     return TAB_OF[view];
   }
 
-  function show(view) {
+  function show(view, replaceRoute) {
+    if (current.view === 'convo' && view !== 'convo') {
+      current.convoScroll = window.scrollY;
+      $('convo-note').textContent = '';
+    }
+    if (view !== current.view) note('');
     if (view !== 'convo' && view !== 'reader') stopWatching();
+    if (view === 'approvals') startApprovalPolling();
+    else stopApprovalPolling();
     current.view = view;
     var views = document.querySelectorAll('.view');
     for (var i = 0; i < views.length; i++) views[i].className = 'view';
@@ -139,9 +213,10 @@
     var tabs = document.querySelectorAll('.tab');
     for (var j = 0; j < tabs.length; j++) {
       tabs[j].className = tabs[j].getAttribute('data-view') === tabFor(view) ? 'tab active' : 'tab';
+      tabs[j].setAttribute('aria-selected', tabs[j].getAttribute('data-view') === tabFor(view) ? 'true' : 'false');
     }
     window.scrollTo(0, 0);
-    remember(view);
+    remember(view, replaceRoute);
   }
 
   // ---------------------------------------------------------------- address
@@ -159,13 +234,17 @@
     return null;
   }
 
-  function remember(view) {
+  function remember(view, replaceRoute) {
     var route = routeOf(view);
-    if (!route || route === window.location.hash || !window.history || !history.pushState) return;
-    // Opening a conversation or a form is a step back can undo; switching
-    // tabs is not.
-    if (view === 'convo' || view === 'newcode') { history.pushState(null, '', route); current.pushed = true; }
-    else history.replaceState(null, '', route);
+    if (!route || !window.history || !history.pushState) return;
+    if (route !== window.location.hash) {
+      if (!replaceRoute && (view === 'convo' || view === 'newcode')) {
+        history.pushState({ einkBack: true }, '', route);
+      } else {
+        history.replaceState(replaceRoute ? history.state : null, '', route);
+      }
+    }
+    current.pushed = !!(history.state && history.state.einkBack);
   }
 
   // Go where the address says (on load, and when the back button changes it).
@@ -190,6 +269,10 @@
   // ------------------------------------------------------------- the channel
   // One WebSocket to the bridge, one request at a time (SPEC §8).
   var link = null;
+  // What the last sign-in said this device may approve up to: a Risk
+  // ('medium' for a new e-ink device, more if the owner gave it more),
+  // 'none' for no limit, null before any sign-in.
+  var riskCeiling = null;
 
   function socketTo(url) {
     var ws = new WebSocket(url);
@@ -277,6 +360,9 @@
       if (grant.status !== 200 || !grant.json || !grant.json.access_token) throw new Error('Sign-in refused');
       token = grant.json.access_token;
       tokenExpires = grant.json.expires_at_ms || 0;
+      // The highest risk this device may approve (AccessGrant.risk_ceiling,
+      // from the device's record; absent: no limit).
+      riskCeiling = grant.json.risk_ceiling || 'none';
     }
     function run(job) {
       var result = busy.then(job);
@@ -342,7 +428,7 @@
 
   // ---------------------------------------------------------------- pairing
   async function pair() {
-    $('btn-pair').disabled = true;
+    var ready = busyButton('btn-pair', 'Pairing…');
     $('pair-note').textContent = '';
     try {
       var key = await B.generateDeviceKey();
@@ -381,7 +467,7 @@
       $('pair-note').textContent = 'Pairing did not finish (' + e.message + '). Tap Pair to start again.';
       $('pair-code-box').style.display = 'none';
     } finally {
-      $('btn-pair').disabled = false;
+      ready();
     }
   }
 
@@ -422,6 +508,11 @@
     return !!(s.project_id && folderProjects && folderProjects[s.project_id]);
   }
 
+  // What each list last drew, so a refresh that brings the same rows (a
+  // tab switch, mostly) leaves it alone: e-ink redraws every change.
+  var listSigs = { chat: null, running: null, done: null, approvals: null };
+  function listSig(rows) { return JSON.stringify(rows); }
+
   function sortedSessions(list) {
     return (list || []).filter(function (s) { return !s.archived; }).sort(function (a, b) {
       return (b.last_activity_ms || 0) - (a.last_activity_ms || 0);
@@ -433,13 +524,17 @@
     sessions = all.slice(0, shown.chat);
     moreButton('chat', all.length);
     var ul = $('chat-list');
+    // The same rows as on screen: leave the list alone (e-ink).
+    var sig = listSig(sessions.map(function (s) { return [s.id, s.title, s.channel, whenOf(s.last_activity_ms)]; }));
+    if (sig === listSigs.chat) return;
+    listSigs.chat = sig;
     clear(ul);
     sessions.forEach(function (s) {
       var li = el('li');
       var b = el('button', 'item');
       b.type = 'button';
       b.appendChild(el('span', 'title', s.title || 'Untitled chat'));
-      b.appendChild(el('span', 'meta', s.channel + ' · ' + timeOf(s.last_activity_ms)));
+      b.appendChild(el('span', 'meta', channelWord(s.channel) + ' · ' + whenOf(s.last_activity_ms)));
       b.addEventListener('click', function () { openChat(s); });
       li.appendChild(b);
       ul.appendChild(li);
@@ -466,7 +561,8 @@
     }
   }
 
-  async function openChat(s, from) {
+  async function openChat(s, from, started) {
+    stopWatching();
     if (writing.form !== 'convo') setMode('type', 'convo');
     current.session = s;
     current.historyLimit = 8;
@@ -474,15 +570,39 @@
     current.from = from || 'chat';
     $('convo-title').textContent = (s && s.title) || (s && s.id ? 'Conversation' : 'New chat');
     $('convo-note').textContent = '';
-    show('convo');
+    show('convo', started);
     inlineSig = null;
     renderInlineApprovals();
     current.toEnd = true;
+    if (s && s.id && (started || conversationActive(s.id))) watchConversation(s.id, !started);
     await loadHistory();
-    var busyNow = ((overview && overview.running_tasks) || []).some(function (t) {
-      return s && t.session_id === s.id;
-    });
-    if (s && s.id && busyNow) watchConversation(s.id, true);
+  }
+
+  function conversationActive(id) {
+    return overview.running_tasks.some(function (t) { return t.session_id === id; }) ||
+      overview.pending_approvals.some(function (a) { return a.session_id === id; });
+  }
+
+  async function resumeConversation(expectWork) {
+    var session = current.session;
+    var scroll = current.convoScroll;
+    current.toEnd = false;
+    show('convo');
+    renderInlineApprovals();
+    window.scrollTo(0, scroll);
+    var restored = window.scrollY;
+    // Check for work that may have started while the detail screen was open.
+    if (session && session.id) watchConversation(session.id, !expectWork && conversationActive(session.id), true);
+    try {
+      await loadHistory();
+      if (current.view === 'convo' && current.session === session && window.scrollY === restored) {
+        window.scrollTo(0, scroll);
+      }
+    } catch (e) {
+      if (current.view === 'convo' && current.session === session && !$('convo-note').textContent) {
+        $('convo-note').textContent = plainError(e);
+      }
+    }
   }
 
 
@@ -524,12 +644,40 @@
     clear(body);
     richText(body, text);
     show('reader');
+    readerPage();
   }
 
+  // A screen at a time, keeping two lines from the last one.
+  function pageStep() { return Math.max(200, window.innerHeight - 140); }
+
   function pageBy(direction) {
-    // A screen at a time, keeping two lines from the last one.
-    window.scrollBy(0, direction * Math.max(200, window.innerHeight - 140));
+    window.scrollBy(0, direction * pageStep());
+    readerPage();
   }
+
+  // "Page N of M" from where the reader is scrolled to, and no Previous on
+  // the first page or Next on the last.
+  function readerPage() {
+    if (current.view !== 'reader') return;
+    var step = pageStep();
+    var last = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+    var at = window.pageYOffset;
+    var pages = 1 + Math.ceil(last / step);
+    // At the end is the last page even when the last step was a short one.
+    var page = at >= last - 2 ? pages : Math.min(pages, 1 + Math.round(at / step));
+    setText($('reader-page'), pages > 1 ? 'Page ' + page + ' of ' + pages : '');
+    var first = page <= 1, end = page >= pages;
+    if ($('btn-page-up').disabled !== first) $('btn-page-up').disabled = first;
+    if ($('btn-page-down').disabled !== end) $('btn-page-down').disabled = end;
+  }
+  // A swipe scrolls too: count the page once it settles, not on every
+  // scroll event (each change redraws).
+  var readerSettle = null;
+  window.addEventListener('scroll', function () {
+    if (current.view !== 'reader') return;
+    if (readerSettle) clearTimeout(readerSettle);
+    readerSettle = setTimeout(function () { readerSettle = null; readerPage(); }, 250);
+  });
 
   // While work runs in the open conversation, a small glance every few
   // seconds; when it ends, the conversation reloads once and shows the new
@@ -538,17 +686,23 @@
   var FIRST_LOOK_MS = 4000;
   var watching = null;
 
-  function watchConversation(id, expectWork) {
+  function watchConversation(id, expectWork, preserveScroll) {
     stopWatching();
     var sawWork = !!expectWork;
     var quietChecks = 0;
+    var checking = false;
+    // This watch's own token: a check that ends after another watch began
+    // (or after watching stopped) changes nothing.
+    var token = {};
+    watchToken = token;
     var tick = async function () {
+      if (checking || watchToken !== token) return;
       if (current.view !== 'convo' || !current.session || current.session.id !== id) { stopWatching(); return; }
+      checking = true;
       try {
         var glance = (await (await ensureLink()).command({ type: 'get_glance' })).glance || {};
-        overview.pending_approvals = glance.pending_approvals || [];
-        overview.running_tasks = glance.running_tasks || [];
-        renderApprovals(overview);
+        if (watchToken !== token || current.view !== 'convo') return;
+        applyGlance(glance);
         renderInlineApprovals();
         var busy = (glance.running_tasks || []).some(function (t) { return t.session_id === id; });
         var waiting = (glance.pending_approvals || []).some(function (a) { return a.session_id === id; });
@@ -557,19 +711,23 @@
         // at once): look at the conversation now, redrawn only if something
         // changed, and keep watching while an agent runs. Just after sending,
         // give the daemon a few checks to start before stopping.
-        current.toEnd = true;
+        current.toEnd = !preserveScroll;
         var agentsRunning = await loadHistory();
+        if (watchToken !== token) return;
         if (agentsRunning) { sawWork = true; quietChecks = 0; return; }
         if (!sawWork && ++quietChecks < 4) return;
         stopWatching();
       } catch (e) {
-        stopWatching();
+        if (watchToken === token) stopWatching();
+      } finally {
+        checking = false;
       }
     };
     watching = setInterval(tick, WATCH_MS);
     firstLook = setTimeout(tick, FIRST_LOOK_MS);
   }
   var firstLook = null;
+  var watchToken = null;
 
   // A waiting approval for the open conversation shows on top of the
   // message box, so it is never missed while reading the conversation.
@@ -584,7 +742,7 @@
     clear(box);
     mine.forEach(function (a) {
       var card = el('div', 'inline-approval');
-      card.appendChild(el('div', 'msg-from', 'Needs your OK · ' + a.risk + ' risk'));
+      card.appendChild(el('div', 'msg-from', 'Needs your OK · ' + riskWord(a.risk)));
       var text = el('div', 'msg-text');
       richText(text, preview(a.detail || a.summary).text);
       card.appendChild(text);
@@ -605,15 +763,17 @@
   function stopWatching() {
     if (firstLook) { clearTimeout(firstLook); firstLook = null; }
     if (watching) { clearInterval(watching); watching = null; }
+    watchToken = null;
   }
 
   async function loadHistory() {
     var mine = ++loads.history;
     var box = $('convo-messages');
     if (!current.session || !current.session.id) { clear(box); return; }
+    var id = current.session.id;
     var l = await ensureLink();
-    var result = await l.command({ type: 'get_history', session_id: current.session.id, limit: current.historyLimit || 8 });
-    if (mine !== loads.history) return;
+    var result = await l.command({ type: 'get_history', session_id: id, limit: current.historyLimit || 8 });
+    if (mine !== loads.history || current.view !== 'convo' || !current.session || current.session.id !== id) return;
     var running = (result.runs || []).some(function (r) { return r.phase === 'running'; });
     // Same messages and runs as on screen: leave the page alone (e-ink).
     var sig = (result.messages || []).map(function (m) { return m.id; }).join(',') + '|' +
@@ -817,11 +977,8 @@
     copy.height = strip().height;
     copy.getContext('2d').drawImage(strip(), 0, 0);
     writing.lines.push(copy);
-    var img = document.createElement('canvas');
-    img.width = copy.width;
-    img.height = copy.height;
-    img.getContext('2d').drawImage(copy, 0, 0);
-    $('write-lines').appendChild(img);
+    var count = writing.lines.length;
+    $('write-lines').textContent = count + (count === 1 ? ' line kept' : ' lines kept');
     clearStrip();
     return true;
   }
@@ -888,34 +1045,40 @@
   }
 
   async function send() {
-    var text = $('convo-text').value.trim();
+    var session = current.session;
+    var text = writing.mode === 'write' ? '' : $('convo-text').value.trim();
     if (writing.mode === 'write' && !keepLine()) return;
     var handwriting = writing.mode === 'write' && writing.lines.length > 0;
     if (!text && !handwriting) {
       $('convo-note').textContent = writing.mode === 'write' ? 'Write something first.' : 'Type something first.';
       return;
     }
-    $('btn-send').disabled = true;
+    var ready = busyButton('btn-send', 'Sending…');
     try {
       var l = await ensureLink();
       var attachments = [];
       if (handwriting) attachments = await uploadHandwriting(l, $('convo-note'));
       var command = { type: 'send_message', text: text };
       if (attachments.length) command.attachments = attachments;
-      if (current.session && current.session.id) command.session_id = current.session.id;
+      if (session && session.id) command.session_id = session.id;
       var result = await l.command(command);
+      if (current.view !== 'convo' || current.session !== session) return;
       // Strokes are kept until the daemon took the message.
       if (handwriting) clearAllLines();
-      $('convo-text').value = '';
-      if (!current.session || !current.session.id) current.session = { id: result.session_id, title: text.slice(0, 40) };
+      else $('convo-text').value = '';
+      if (!session || !session.id) {
+        current.session = { id: result.session_id, title: text.slice(0, 40) || 'Handwritten chat' };
+        $('convo-title').textContent = current.session.title;
+        remember('convo', true);
+      }
       $('convo-note').textContent = 'Sent. The reply appears here when it is ready.';
       current.toEnd = true;
-      await loadHistory();
       watchConversation(current.session.id, false);
+      await loadHistory();
     } catch (e) {
-      $('convo-note').textContent = e.message;
+      $('convo-note').textContent = plainError(e);
     } finally {
-      $('btn-send').disabled = false;
+      ready();
     }
   }
 
@@ -971,22 +1134,22 @@
   }
 
   async function loadMore(kind) {
-    var button = $('btn-more-' + kind);
-    button.disabled = true;
+    var ready = busyButton('btn-more-' + kind, 'Loading…');
     try {
       shown[kind] += PAGE;
       await fillTo(kind, shown[kind], 5);
       renderSnapshot(overview);
     } catch (e) {
-      note('Could not load more: ' + e.message);
+      note(plainError(e, 'Could not load more'));
     } finally {
-      button.disabled = false;
+      ready();
     }
   }
 
   function moreButton(kind, total) {
     var more = total > shown[kind] || !overview.done;
-    $('btn-more-' + kind).className = more ? 'btn' : 'btn hidden';
+    var cls = more ? 'btn' : 'btn hidden';
+    if ($('btn-more-' + kind).className !== cls) $('btn-more-' + kind).className = cls;
   }
 
   function renderSnapshot(state) {
@@ -1004,13 +1167,20 @@
     (overview.running_tasks || []).forEach(function (t) { working[t.session_id] = t; });
     var busy = coding.filter(function (s) { return working[s.id]; });
     var rest = coding.filter(function (s) { return !working[s.id]; });
-    $('code-running').textContent = busy.length ? String(busy.length) : '';
-    fillSessions($('running-list'), busy, working);
-    fillSessions($('done-list'), rest.slice(0, shown.code), working);
+    setText($('code-running'), busy.length ? String(busy.length) : '');
+    fillSessions($('running-list'), busy, working, 'running');
+    fillSessions($('done-list'), rest.slice(0, shown.code), working, 'done');
     moreButton('code', rest.length);
   }
 
-  function fillSessions(ul, list, working) {
+  function fillSessions(ul, list, working, which) {
+    // The same rows as on screen: leave the list alone (e-ink).
+    var sig = listSig(list.map(function (s) {
+      var task = working[s.id];
+      return [s.id, s.title, s.agent, whenOf(s.last_activity_ms), task ? task.description : null];
+    }));
+    if (sig === listSigs[which]) return;
+    listSigs[which] = sig;
     clear(ul);
     list.forEach(function (s) {
       var li = el('li');
@@ -1018,7 +1188,7 @@
       b.type = 'button';
       b.appendChild(el('span', 'title', s.title || 'Untitled'));
       var task = working[s.id];
-      b.appendChild(el('span', 'meta', (s.agent || 'aidaemon') + ' · ' + timeOf(s.last_activity_ms)));
+      b.appendChild(el('span', 'meta', (s.agent || 'aidaemon') + ' · ' + whenOf(s.last_activity_ms)));
       if (task && task.description) b.appendChild(el('span', 'meta', 'Working: ' + task.description));
       b.addEventListener('click', function () { openChat(s, 'code'); });
       li.appendChild(b);
@@ -1027,29 +1197,35 @@
     if (!list.length) ul.appendChild(el('li', 'empty muted', 'Nothing here.'));
   }
 
-  function runRow(r) {
-      var li = el('li');
-      var b = el('button', 'item');
-      b.type = 'button';
-      b.appendChild(el('span', 'title', r.label));
-      b.appendChild(el('span', 'meta', (r.agent || 'aidaemon') + ' · ' + (PHASE_WORD[r.phase] || r.phase) +
-        ' · ' + (r.took || timeOf(r.started_at_ms))));
-      if (r.phase === 'running' && r.step) b.appendChild(el('span', 'meta', 'Now: ' + r.step));
-      b.addEventListener('click', function () { openRun(r); });
-      li.appendChild(b);
-      return li;
+  // The run screen's line under its title: who, where it is, when, and
+  // from its record (`detail`, once loaded) the model and the folder.
+  function runMeta(r, detail) {
+    var parts = [r.agent || 'aidaemon'];
+    // A hand-off's run opened from its step has no phase until it is known.
+    if (r.phase && r.phase !== 'unknown') parts.push(PHASE_WORD[r.phase] || plainWord(r.phase));
+    if (r.took) parts.push(r.took);
+    else if (r.started_at_ms) parts.push(whenOf(r.started_at_ms));
+    if (detail && detail.model) parts.push(detail.model);
+    if (detail && detail.working_dir) parts.push(detail.working_dir);
+    return parts.join(' · ');
   }
 
   async function openRun(r) {
+    var fromRun = current.view === 'run';
     current.run = r;
     var back = document.querySelector('#view-run [data-back]');
-    back.setAttribute('data-back', current.view === 'convo' ? 'convo' : 'code');
-    $('run-title').textContent = r.label;
-    $('run-meta').textContent = (r.agent || 'aidaemon') + ' · ' + (PHASE_WORD[r.phase] || r.phase);
+    // A hand-off's run, opened from its step, goes back where the run
+    // that handed off would have.
+    if (!fromRun) back.setAttribute('data-back', current.view === 'convo' ? 'convo' : 'code');
+    $('run-title').textContent = r.label || ((r.agent || 'Agent') + ' run');
+    $('run-meta').textContent = runMeta(r, null);
     $('run-note').textContent = '';
     $('steer-text').value = '';
     clear($('run-steps'));
+    clear($('run-extra'));
     clear($('run-result'));
+    // The message box shows once the run's record says what it takes.
+    $('steer-box').className = 'hidden';
     show('run');
     var actions = $('run-actions');
     clear(actions);
@@ -1059,7 +1235,11 @@
       stop.addEventListener('click', function () { stopRun(r); });
       actions.appendChild(stop);
     }
-    await loadRun();
+    try {
+      await loadRun();
+    } catch (e) {
+      $('run-note').textContent = plainError(e, 'Could not load the run');
+    }
   }
 
   // Finished steps fold together; the step still going and failures stay
@@ -1080,7 +1260,7 @@
       if (!group.length) return;
       var g = group;
       group = [];
-      if (g.length === 1) { ul.appendChild(stepItem(g[0], '\u2713 ')); return; }
+      if (g.length === 1) { ul.appendChild(stepItem(g[0], markOf(g[0]), running)); return; }
       var li = el('li');
       var b = el('button', 'item');
       b.type = 'button';
@@ -1089,44 +1269,103 @@
       b.addEventListener('click', function () {
         var next = li.nextSibling;
         ul.removeChild(li);
-        g.forEach(function (st) { ul.insertBefore(stepItem(st, '\u2713 '), next); });
+        g.forEach(function (st) { ul.insertBefore(stepItem(st, markOf(st), running), next); });
       });
       li.appendChild(b);
       ul.appendChild(li);
     }
+    // RunStepState is snake_case: 'started' (no end on record yet), 'done',
+    // 'failed', or 'unknown' from a newer daemon. A started step is going
+    // only while the run runs; in an ended run it just has no end recorded.
+    var running = r.phase === 'running';
+    function markOf(st) {
+      if (st.state === 'done') return '\u2713 ';
+      if (st.state === 'failed') return '\u2717 ';
+      if (st.state === 'started' && running) return '\u25b6 ';
+      return '\u2022 ';
+    }
     var lastDone = -1;
     steps.forEach(function (st, i) { if (st.state === 'done') lastDone = i; });
     steps.forEach(function (st, i) {
+      // A hand-off opens its run: it never folds out of reach.
+      if (st.run) { flush(); ul.appendChild(stepItem(st, markOf(st), running)); return; }
       // A failure something finished after was recovered from: it folds.
       if (st.state === 'done' || (st.state === 'failed' && i < lastDone)) { group.push(st); return; }
       flush();
-      ul.appendChild(stepItem(st, st.state === 'failed' ? '\u2717 ' : '\u25b6 '));
+      ul.appendChild(stepItem(st, markOf(st), running));
     });
     flush();
     if (!steps.length) ul.appendChild(el('li', 'empty muted', run.task ? 'Task: ' + run.task : 'No steps recorded.'));
+    $('run-meta').textContent = runMeta(r, run);
+    runExtra(run);
     var res = $('run-result');
     clear(res);
-    if (run.result) {
+    // RunDetail.result is a String (what it reported at its end).
+    if (typeof run.result === 'string' && run.result) {
       res.appendChild(el('h3', null, 'Result'));
       res.appendChild(el('pre', 'exact', run.result));
     }
+    steerBox(r, run);
   }
 
-  function stepItem(st, mark) {
+  // A run's plan (as it last wrote it) and what it asked permission for,
+  // one short line each.
+  var PLAN_MARK = { done: '\u2713 ', in_progress: '\u25b6 ', pending: '\u25cb ' };
+  var PERMISSION_WORD = { allowed: 'Allowed', refused: 'Refused', declined: 'Declined', unanswered: 'Not answered' };
+  function runExtra(run) {
+    var box = $('run-extra');
+    clear(box);
+    var plan = run.plan || [];
+    if (plan.length) {
+      box.appendChild(el('h3', null, 'Plan'));
+      var ul = el('ul', 'steps plain');
+      plan.forEach(function (p) { ul.appendChild(el('li', null, (PLAN_MARK[p.status] || '\u2022 ') + p.text)); });
+      box.appendChild(ul);
+    }
+    var asked = run.permissions || [];
+    if (asked.length) {
+      box.appendChild(el('h3', null, 'Permissions it asked for'));
+      var pl = el('ul', 'steps plain');
+      asked.forEach(function (p) {
+        var said = PERMISSION_WORD[p.outcome] || plainWord(p.outcome);
+        pl.appendChild(el('li', null, p.label + ' \u2014 ' + said + (p.reason ? ' (' + p.reason + ')' : '')));
+      });
+      box.appendChild(pl);
+    }
+  }
+
+  // A step: what it did and the file it names. Only a hand-off (it names
+  // the run it started) opens something; the rest are plain lines.
+  function stepItem(st, mark, running) {
     var li = el('li');
-    var b = el('button', 'item step');
-    b.type = 'button';
+    var cls = 'item step' + (st.state === 'failed' ? ' step-failed' : '') +
+      (st.state === 'started' && running ? ' step-running' : '') + (st.run ? ' step-handoff' : '');
+    var b = el(st.run ? 'button' : 'div', cls);
     b.appendChild(el('span', 'title', mark + st.words));
-    var detail = st.detail || st.output || st.command || '';
-    if (detail) b.appendChild(el('span', 'meta', 'tap for details'));
-    b.addEventListener('click', function () {
-      if (!detail) return;
-      $('detail-title').textContent = st.words;
-      $('detail-body').textContent = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
-      show('detail');
-    });
+    if (st.path) b.appendChild(el('span', 'meta', st.path));
+    if (st.run) {
+      b.type = 'button';
+      b.appendChild(el('span', 'meta', 'Open ' + (st.agent ? st.agent + '\u2019s' : 'its') + ' run \u25b8'));
+      var parent = current.run;
+      b.addEventListener('click', function () {
+        // All a step knows of the run; loadRun fetches the rest. It
+        // reports to the conversation the run that handed off does.
+        openRun({ id: st.run, label: (st.agent || 'Agent') + ' run', agent: st.agent || null,
+          session_id: parent && parent.session_id, phase: null });
+      });
+    }
     li.appendChild(b);
     return li;
+  }
+
+  // The message box under a run: steer a running one; continue an ended
+  // one whose agent kept its session (RunDetail.can_continue: send_message
+  // with in_run, no mid_run); else none.
+  function steerBox(r, run) {
+    var mode = r.phase === 'running' ? 'steer' : (run.can_continue ? 'continue' : null);
+    current.runMode = mode;
+    $('steer-box').className = mode ? '' : 'hidden';
+    setText($('steer-label'), mode === 'continue' ? 'Continue it' : 'Steer it');
   }
 
   async function stopRun(r) {
@@ -1135,19 +1374,26 @@
       await l.command({ type: 'stop_turn', session_id: r.session_id });
       $('run-note').textContent = 'Asked it to stop.';
       await loadSnapshot();
-    } catch (e) { $('run-note').textContent = e.message; }
+    } catch (e) { $('run-note').textContent = plainError(e); }
   }
 
   async function steer() {
     var r = current.run;
+    var mode = current.runMode;
     var text = $('steer-text').value.trim();
-    if (!r || !text) { $('run-note').textContent = 'Type a message first.'; return; }
+    if (!r || !mode) return;
+    // Without its conversation the message would start a new one.
+    if (!r.session_id) { $('run-note').textContent = 'Open this run from its conversation to message it.'; return; }
+    if (!text) { $('run-note').textContent = 'Type a message first.'; return; }
     try {
       var l = await ensureLink();
-      await l.command({ type: 'send_message', session_id: r.session_id, text: text, in_run: r.id, mid_run: 'steer' });
+      var command = { type: 'send_message', session_id: r.session_id, text: text, in_run: r.id };
+      // Into the work running now; a continued run starts from its end.
+      if (mode === 'steer') command.mid_run = 'steer';
+      await l.command(command);
       $('steer-text').value = '';
-      $('run-note').textContent = 'Sent to the agent.';
-    } catch (e) { $('run-note').textContent = e.message; }
+      $('run-note').textContent = mode === 'steer' ? 'Sent to the agent.' : 'Sent. It goes on from where it ended.';
+    } catch (e) { $('run-note').textContent = plainError(e); }
   }
 
   async function openNewCode() {
@@ -1173,7 +1419,7 @@
         a.appendChild(o);
       });
       if (!p.options.length) $('newcode-note').textContent = 'No project with a folder yet.';
-    } catch (e) { $('newcode-note').textContent = e.message; }
+    } catch (e) { $('newcode-note').textContent = plainError(e); }
   }
 
   async function startCode() {
@@ -1187,39 +1433,86 @@
       $('newcode-note').textContent = 'Pick a project and an agent, and say what to do.';
       return;
     }
-    $('btn-start-code').disabled = true;
+    var ready = busyButton('btn-start-code', 'Starting…');
     try {
       var l = await ensureLink();
       var command = { type: 'send_message', text: text, project_id: project, model: { mode: 'agent', agent: agent } };
       if (handwriting) command.attachments = await uploadHandwriting(l, $('newcode-note'));
-      await l.command(command);
+      var result = await l.command(command);
+      if (current.view !== 'newcode') return;
       if (handwriting) clearAllLines();
-      $('newcode-text').value = '';
-      show('code');
-      setTimeout(function () { loadSnapshot().catch(function () {}); }, 3000);
+      else $('newcode-text').value = '';
+      await openChat({ id: result.session_id, title: text.slice(0, 40) || 'Handwritten session' }, 'code', true);
     } catch (e) {
-      $('newcode-note').textContent = e.message;
+      $(current.view === 'convo' ? 'convo-note' : 'newcode-note').textContent = plainError(e);
     } finally {
-      $('btn-start-code').disabled = false;
+      ready();
     }
   }
 
   // -------------------------------------------------------------- approvals
   var approvals = [];
+  var approvalPoll = null;
+
+  function applyGlance(glance) {
+    overview.pending_approvals = glance.pending_approvals || [];
+    overview.running_tasks = glance.running_tasks || [];
+    renderApprovals(overview);
+  }
+
+  function startApprovalPolling() {
+    if (approvalPoll !== null) return;
+    var checking = false;
+    var timer = setInterval(async function () {
+      if (checking || approvalPoll !== timer) return;
+      checking = true;
+      try {
+        var glance = (await (await ensureLink()).command({ type: 'get_glance' })).glance || {};
+        if (approvalPoll === timer) applyGlance(glance);
+      } catch (e) {
+        // Retry on the next poll.
+      } finally {
+        checking = false;
+      }
+    }, 45000);
+    approvalPoll = timer;
+  }
+
+  function stopApprovalPolling() {
+    if (approvalPoll === null) return;
+    clearInterval(approvalPoll);
+    approvalPoll = null;
+  }
 
   function renderApprovals(state) {
     approvals = state.pending_approvals || [];
-    $('approval-count').textContent = approvals.length ? String(approvals.length) : '';
-    var running = (state.running_tasks || []).length;
-    $('chat-working').textContent = running ? String(running) : '';
+    setText($('approval-count'), approvals.length ? String(approvals.length) : '');
+    // Chat's count: the conversations with work running that are not
+    // coding ones (Code counts those). A task whose conversation is not
+    // among the pages loaded counts here: the busy conversation is nearly
+    // always a recent one, so it is loaded and its kind known; and work
+    // whose kind is unknown should still show somewhere rather than nowhere.
+    var known = {};
+    (state.sessions || []).forEach(function (s) { known[s.id] = s; });
+    var chatBusy = {};
+    (state.running_tasks || []).forEach(function (t) {
+      var s = known[t.session_id];
+      if (!s || !isCoding(s)) chatBusy[t.session_id] = true;
+    });
+    var running = Object.keys(chatBusy).length;
+    setText($('chat-working'), running ? String(running) : '');
     var ul = $('approval-list');
+    // The same cards as on screen: leave the list alone (e-ink).
+    var sig = listSig(approvals.map(function (a) { return [a.id, a.summary, a.risk, whenOf(a.requested_at_ms)]; }));
+    if (sig === listSigs.approvals) return;
+    listSigs.approvals = sig;
     clear(ul);
     approvals.forEach(function (a) {
       var li = el('li');
       var b = el('button', 'item');
       b.type = 'button';
       b.appendChild(el('span', 'title', a.summary));
-      b.appendChild(el('span', 'meta', 'Risk: ' + a.risk));
+      b.appendChild(el('span', 'meta', riskWord(a.risk) + ' · Asked ' + whenOf(a.requested_at_ms)));
       b.addEventListener('click', function () { current.approvalFrom = null; openApproval(a); });
       li.appendChild(b);
       ul.appendChild(li);
@@ -1236,14 +1529,29 @@
     $('ap-title').textContent = a.summary;
     var t = $('ap-details');
     clear(t);
-    [['Risk', a.risk], ['Kind', a.kind], ['Asked', timeOf(a.requested_at_ms)]].forEach(function (row) {
+    var rows = [['Risk', riskWord(a.risk)], ['Kind', kindWord(a.kind)], ['Asked', whenOf(a.requested_at_ms)]];
+    if (a.channel) rows.push(['Also in', channelWord(a.channel)]);
+    rows.forEach(function (row) {
       var tr = el('tr');
       tr.appendChild(el('th', null, row[0]));
       tr.appendChild(el('td', null, row[1]));
       t.appendChild(tr);
     });
     $('ap-exact').textContent = a.detail || a.summary;
-    var mayApprove = (a.options || []).indexOf('approve_once') >= 0 && (a.risk === 'low' || a.risk === 'medium');
+    // Whether to offer Approve. The daemon (approvals.rs `resolve`) lets an
+    // e-ink device allow only an agent's call ('command'), once, at or
+    // below the device's risk ceiling; the sign-in's grant says that
+    // ceiling (AccessGrant.risk_ceiling: Medium for a new e-ink device,
+    // higher if the owner raised it). The card's `options` are not
+    // filtered per device, so the page judges with the ceiling, and the
+    // daemon still decides: a refusal comes back as its own message.
+    // Critical is never approved from here. Before any sign-in (a page
+    // drawn from the cache) the ceiling is taken as Medium.
+    var RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+    var ceiling = riskCeiling === 'none' ? 3 : (RANK[riskCeiling || 'medium'] || 2);
+    var rank = RANK[a.risk] || 4;
+    var mayApprove = (a.options || []).indexOf('approve_once') >= 0 && a.kind === 'command' &&
+      rank < 4 && rank <= ceiling;
     $('btn-approve').style.display = mayApprove ? '' : 'none';
     $('ap-note').textContent = mayApprove ? '' : 'Approve this on your phone or computer. You can deny it from here.';
     show('approval');
@@ -1251,24 +1559,32 @@
 
   async function resolve(decision) {
     var a = current.approval;
+    var back = current.approvalFrom || 'approvals';
+    var view = current.view;
+    var session = current.session;
+    var feedback;
     try {
       var l = await ensureLink();
       await l.command({ type: 'resolve_approval', approval_id: a.id, decision: decision });
-      note((decision === 'deny' ? 'Denied: ' : 'Approved once: ') + a.summary);
+      feedback = (decision === 'deny' ? 'Denied: ' : 'Approved once: ') + a.summary;
+      overview.pending_approvals = overview.pending_approvals.filter(function (x) { return x.id !== a.id; });
+      renderApprovals(overview);
     } catch (e) {
-      note(e.message);
+      feedback = plainError(e);
     }
-    var back = current.approvalFrom || 'approvals';
+    if (current.view !== view || current.session !== session || current.approval !== a) return;
     current.approvalFrom = null;
     if (back === 'convo') {
-      overview.pending_approvals = (overview.pending_approvals || []).filter(function (x) { return x.id !== a.id; });
-      show('convo');
-      renderInlineApprovals();
-      renderApprovals(overview);
+      if (view !== 'convo') resumeConversation(true);
+      else {
+        renderInlineApprovals();
+        watchConversation(session.id, false, true);
+      }
+      $('convo-note').textContent = feedback;
       return;
     }
     show('approvals');
-    loadSnapshot().catch(function (e) { note(e.message); });
+    note(feedback);
   }
 
   // ------------------------------------------------------------------ setup
@@ -1284,7 +1600,7 @@
       else if (current.view === 'run') await loadRun();
       else await loadSnapshot();
     } catch (e) {
-      if (e.message !== 'Not paired') { link = null; note('Could not refresh: ' + e.message); setLink('offline'); }
+      if (e.message !== 'Not paired') { link = null; note(plainError(e, 'Could not refresh')); setLink('offline'); }
     }
   }
 
@@ -1298,7 +1614,11 @@
     }
     var backs = document.querySelectorAll('[data-back]');
     for (var j = 0; j < backs.length; j++) {
-      backs[j].addEventListener('click', function () { show(this.getAttribute('data-back')); });
+      backs[j].addEventListener('click', function () {
+        var back = this.getAttribute('data-back');
+        if (back === 'convo') resumeConversation(false);
+        else show(back);
+      });
     }
     var refreshes = document.querySelectorAll('[data-refresh]');
     for (var k = 0; k < refreshes.length; k++) refreshes[k].addEventListener('click', refreshAll);

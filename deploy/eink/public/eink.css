@@ -5,7 +5,8 @@ body { font-family: Georgia, "Bookerly", serif; font-size: 20px; line-height: 1.
 
 .top { border-bottom: 3px solid #000; padding: 12px 16px 0; }
 .brand { font-weight: bold; font-size: 22px; margin-bottom: 10px; }
-.mocktag { font-weight: normal; font-size: 15px; border: 1px solid #000; padding: 1px 6px; margin-left: 8px; }
+/* How the link to the computer is (setLink). */
+.linktag { font-weight: normal; font-size: 15px; border: 1px solid #000; padding: 1px 6px; margin-left: 8px; }
 .tabs { display: flex; }
 .tab {
   flex: 1; font: inherit; font-size: 20px; background: #fff; color: #000;
@@ -38,6 +39,7 @@ h3 { font-size: 19px; margin: 18px 0 6px; }
   padding: 12px 18px; min-height: 56px; margin: 0 10px 10px 0;
 }
 .btn-strong { background: #000; color: #fff; font-weight: bold; }
+.btn:disabled { background: #fff; color: #555; border-color: #666; border-style: dashed; }
 .actions { margin-top: 14px; }
 
 .steps { padding-left: 26px; font-size: 18px; }
@@ -63,7 +65,8 @@ select { min-height: 56px; }
   display: block; width: 100%; height: 120px; border: 2px solid #000; background: #fff;
   touch-action: none; -webkit-user-select: none; user-select: none;
 }
-.lines img { display: block; width: 100%; height: auto; border: 1px solid #000; border-bottom: none; }
+.lines { font-size: 16px; margin-bottom: 4px; }
+.lines:empty, #global-note:empty { display: none; }
 .note { font-size: 18px; font-weight: bold; min-height: 1em; }
 
 .msg { border: 2px solid #000; padding: 10px 12px; margin: 0 0 10px; }
@@ -87,6 +90,9 @@ select { min-height: 56px; }
 .step-running .title, .step-failed .title, .step-handoff .title { font-weight: bold; }
 .step-failed { border-style: dashed; }
 .fold .title { font-weight: normal; }
+/* A step with nothing to open is a plain line, not a box to tap. */
+div.step { border-width: 0 0 1px; min-height: 0; padding: 8px 2px; margin: 0; }
+div.step-running { border-bottom-width: 3px; }
 
 .confirmbox { display: none; border: 3px solid #000; padding: 12px 14px; margin-top: 14px; }
 
@@ -102,9 +108,6 @@ select { min-height: 56px; }
 }
 
 .count:empty { display: none; }
-.step { min-height: 52px; padding: 10px 14px; }
-
-.lines canvas { display: block; width: 100%; height: auto; border: 1px solid #000; border-bottom: none; }
 
 .hidden { display: none !important; }
 
@@ -137,6 +140,9 @@ select { min-height: 56px; }
   background: #fff; border-top: 3px solid #000; padding: 8px 0;
 }
 .pager .btn { margin: 0; }
+.pager #reader-page { align-self: center; }
+.steps.plain { list-style: none; padding-left: 0; }
 
+#convo-approvals { max-height: 110px; overflow-y: auto; }
 .inline-approval { border: 3px solid #000; padding: 8px 10px; margin: 0 0 8px; background: #fff; }
 .inline-approval .actions { margin-top: 6px; }

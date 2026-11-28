@@ -13,15 +13,16 @@
 </head>
 <body>
   <header class="top">
-    <div class="brand">aidaemon <span id="link-state" class="mocktag">starting</span></div>
+    <div class="brand">aidaemon <span id="link-state" class="linktag">Starting</span></div>
     <nav class="tabs" role="tablist" id="tabs">
-      <button type="button" class="tab" data-view="chat" role="tab">Chat <span id="chat-working" class="count"></span></button>
-      <button type="button" class="tab" data-view="code" role="tab">Code <span id="code-running" class="count"></span></button>
-      <button type="button" class="tab" data-view="approvals" role="tab">Approvals <span id="approval-count" class="count"></span></button>
+      <button type="button" class="tab" data-view="chat" role="tab" aria-selected="false">Chat <span id="chat-working" class="count"></span></button>
+      <button type="button" class="tab" data-view="code" role="tab" aria-selected="false">Code <span id="code-running" class="count"></span></button>
+      <button type="button" class="tab" data-view="approvals" role="tab" aria-selected="false">Approvals <span id="approval-count" class="count"></span></button>
     </nav>
   </header>
 
   <main id="main">
+    <p id="global-note" class="note" role="status"></p>
     <!-- PAIR -->
     <section id="view-pair" class="view">
       <h2>Pair this Kindle</h2>
@@ -127,11 +128,14 @@
       <p id="run-meta" class="muted"></p>
       <h3>Steps</h3>
       <ul class="list" id="run-steps"></ul>
+      <div id="run-extra"></div>
       <div id="run-result"></div>
       <div class="actions" id="run-actions"></div>
-      <h3>Steer it</h3>
-      <textarea id="steer-text" rows="2" placeholder="e.g. also add a test"></textarea>
-      <div class="actions"><button type="button" class="btn" id="btn-steer">Send to the agent</button></div>
+      <div id="steer-box" class="hidden">
+        <h3 id="steer-label">Steer it</h3>
+        <textarea id="steer-text" rows="2" placeholder="e.g. also add a test"></textarea>
+        <div class="actions"><button type="button" class="btn" id="btn-steer">Send to the agent</button></div>
+      </div>
       <p id="run-note" class="note"></p>
     </section>
 
@@ -142,15 +146,9 @@
       <div id="reader-body" class="msg-text reader"></div>
       <div class="pager">
         <button type="button" class="btn" id="btn-page-up">&#9650; Previous page</button>
+        <span id="reader-page" class="muted"></span>
         <button type="button" class="btn btn-strong" id="btn-page-down">Next page &#9660;</button>
       </div>
-    </section>
-
-    <!-- STEP DETAIL -->
-    <section id="view-detail" class="view">
-      <div class="bar"><button type="button" class="btn" data-back="run">&larr; Run</button></div>
-      <h2 id="detail-title"></h2>
-      <pre id="detail-body" class="exact"></pre>
     </section>
 
     <!-- APPROVALS -->
@@ -188,7 +186,6 @@
       </div>
     </section>
 
-    <p id="global-note" class="note"></p>
   </main>
 </body>
 </html>
