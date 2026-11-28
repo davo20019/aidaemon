@@ -730,17 +730,47 @@
     return { x: x - r.left, y: y - r.top };
   }
 
+  // The Kindle reports the pen as a "touch", like a finger or a resting
+  // palm. So: one pointer draws a stroke at a time; a large contact (a
+  // palm) never draws, and a smaller one (the pen) takes over from it; and
+  // while the strip is out, two touches at once (pen plus palm) never become
+  // a page scroll or zoom, which would cancel the pen's stroke.
+  var PALM_PX = 24;
+  var strokePointer = null;
+  var strokeIsPalm = false;
+
+  function isPalm(e) {
+    // Width and height are the contact's size in CSS pixels (0 or 1 when
+    // the browser does not know).
+    return (e.width || 0) > PALM_PX || (e.height || 0) > PALM_PX;
+  }
+
+  function writingOpen() {
+    return writing.mode === 'write' && $('write-box').className !== 'hidden';
+  }
+
   function setupStrip() {
     var c = strip();
     c.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      var palm = isPalm(e);
+      if (strokePointer !== null && strokePointer !== e.pointerId) {
+        // Another contact is already stroking: a large one never takes over;
+        // a small one (the pen) takes over from a large one (a palm).
+        if (palm || !strokeIsPalm) return;
+        try { c.releasePointerCapture(strokePointer); } catch (err) { /* gone */ }
+      }
       sizeStrip();
+      strokePointer = e.pointerId;
+      // A large contact alone still draws (in case the pen reports a large
+      // size); any smaller contact replaces it.
+      strokeIsPalm = palm;
       writing.drawing = true;
       writing.last = stripPoint(e.clientX, e.clientY);
       try { c.setPointerCapture(e.pointerId); } catch (err) { /* old browser */ }
-      e.preventDefault();
     });
     c.addEventListener('pointermove', function (e) {
-      if (!writing.drawing) return;
+      if (!writing.drawing || e.pointerId !== strokePointer) return;
       // The browser batches pen samples; take them all for smooth curves.
       var list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
       if (!list || !list.length) list = [e];
@@ -751,11 +781,24 @@
       }
       e.preventDefault();
     });
-    function end() { writing.drawing = false; writing.last = null; }
+    function end(e) {
+      if (e.pointerId !== strokePointer) return;
+      strokePointer = null;
+      writing.drawing = false;
+      writing.last = null;
+    }
     c.addEventListener('pointerup', end);
     c.addEventListener('pointercancel', end);
     c.addEventListener('touchstart', function (e) { e.preventDefault(); }, { passive: false });
     c.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+    // Page-wide: while writing, a resting palm plus the pen must not scroll
+    // or zoom the page (one finger alone still scrolls).
+    function guard(e) {
+      if (!writingOpen()) return;
+      if (writing.drawing || (e.touches && e.touches.length > 1)) e.preventDefault();
+    }
+    document.addEventListener('touchstart', guard, { passive: false });
+    document.addEventListener('touchmove', guard, { passive: false });
   }
 
   function keepLine() {
