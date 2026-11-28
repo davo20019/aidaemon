@@ -69,7 +69,8 @@ select { min-height: 56px; }
 .msg { border: 2px solid #000; padding: 10px 12px; margin: 0 0 10px; }
 .msg-you { margin-left: 12%; border-style: dashed; }
 .msg-from { font-weight: bold; font-size: 16px; margin-bottom: 2px; }
-.msg-text { white-space: pre-wrap; }
+.msg-text { white-space: normal; word-wrap: break-word; }
+.msg-text code { font-family: "Courier New", monospace; font-size: 17px; }
 .composer { margin-top: 12px; border-top: 2px solid #000; padding-top: 6px; }
 .composer textarea { margin-top: 4px; }
 

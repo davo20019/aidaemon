@@ -71,6 +71,36 @@
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
   }
+  // Symbols the Kindle's fonts lack (they draw as empty boxes): emoji
+  // outside the basic plane, media-control symbols, emoji presentation
+  // selectors. Machine format: Unicode ranges.
+  function drawable(text) {
+    return String(text)
+      .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
+      .replace(/[\u23E9-\u23FA\uFE0F\u200D]/g, '');
+  }
+
+  // A little Markdown, built from DOM nodes and text only (never HTML):
+  // headings lose their #, **bold** and `code` show as such, lines stay.
+  function richText(container, text) {
+    var lines = drawable(text).split('\n');
+    lines.forEach(function (line, i) {
+      if (i) container.appendChild(document.createElement('br'));
+      var heading = /^\s{0,3}#{1,6}\s+/.exec(line);
+      if (heading) line = line.slice(heading[0].length);
+      var parts = line.split(/(\*\*[^*]+\*\*|`[^`]+`)/);
+      parts.forEach(function (part) {
+        if (!part) return;
+        var node;
+        if (/^\*\*[^*]+\*\*$/.test(part)) node = el('b', null, part.slice(2, -2));
+        else if (/^`[^`]+`$/.test(part)) node = el('code', null, part.slice(1, -1));
+        else node = document.createTextNode(part);
+        if (heading && node.nodeType === 3) { var b = el('b'); b.appendChild(node); node = b; }
+        container.appendChild(node);
+      });
+    });
+  }
+
   function note(text) { $('global-note').textContent = text || ''; }
   function setLink(text) { $('link-state').textContent = text; }
   function timeOf(ms) {
@@ -379,7 +409,9 @@
     (result.messages || []).forEach(function (m) {
       var d = el('div', m.role === 'user' ? 'msg msg-you' : 'msg');
       d.appendChild(el('div', 'msg-from', m.role === 'user' ? 'You' : 'aidaemon'));
-      d.appendChild(el('div', 'msg-text', m.text));
+      var body = el('div', 'msg-text');
+      richText(body, m.text);
+      d.appendChild(body);
       box.appendChild(d);
     });
   }
