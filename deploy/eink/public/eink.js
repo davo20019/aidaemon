@@ -516,10 +516,11 @@
 
   function setMode(mode) {
     writing.mode = mode;
-    $('write-box').style.display = mode === 'write' ? 'block' : 'none';
+    // One input at a time: the strip, or the text box.
+    $('write-box').className = mode === 'write' ? '' : 'hidden';
+    $('convo-text').className = mode === 'type' ? '' : 'hidden';
     $('mode-type').className = mode === 'type' ? 'btn mode active' : 'btn mode';
     $('mode-write').className = mode === 'write' ? 'btn mode active' : 'btn mode';
-    $('convo-text').placeholder = mode === 'write' ? 'Add typed words (optional)' : 'Type here';
     if (mode === 'write') sizeStrip();
   }
 
@@ -905,6 +906,7 @@
     $('btn-clear-line').addEventListener('click', clearStrip);
     $('btn-clear-all').addEventListener('click', clearAllLines);
     setupStrip();
+    setMode('type');
     $('btn-new-code').addEventListener('click', openNewCode);
     $('btn-start-code').addEventListener('click', startCode);
     $('btn-steer').addEventListener('click', steer);

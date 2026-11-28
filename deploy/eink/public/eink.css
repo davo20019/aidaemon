@@ -107,3 +107,5 @@ select { min-height: 56px; }
 .step { min-height: 52px; padding: 10px 14px; }
 
 .lines canvas { display: block; width: 100%; height: auto; border: 1px solid #000; border-bottom: none; }
+
+.hidden { display: none !important; }
