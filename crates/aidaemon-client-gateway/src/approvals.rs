@@ -44,6 +44,20 @@ struct Open {
     /// The paired device that asked, when only another one (or the owner
     /// at the computer) may approve.
     not_from: Option<String>,
+    /// What raised the card: an e-ink device may answer only an agent's
+    /// command cards.
+    class: CardClass,
+}
+
+/// What raised a card, for who may answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardClass {
+    /// The agent asks to run a call (a command, a request, a tool use).
+    AgentCommand,
+    /// The agent asks something else (a goal, autopilot, a hand-off).
+    AgentOther,
+    /// The gateway asks for itself (a settings change from a client).
+    Gateway,
 }
 
 #[derive(Default)]
@@ -107,6 +121,7 @@ impl Approvals {
         device: Option<String>,
         device_id: Option<&str>,
         ceiling: Option<Risk>,
+        eink: bool,
     ) -> Result<ApprovalOutcome, ProtocolError> {
         let mut book = self.book();
         if let Some(outcome) = book.settled.get(id) {
@@ -135,6 +150,20 @@ impl Approvals {
                 ErrorCode::Forbidden,
                 "Approve this from another device, or on the computer the daemon runs on \
                      (denying it from here is fine)",
+            ));
+        }
+        // An e-ink device (its page and browser are not trusted like an
+        // app) may allow one call the agent asked for, once: never a
+        // lasting grant, a settings change or another kind of card. A
+        // device pairing card is High risk, above its ceiling below.
+        if eink
+            && decision != ApprovalDecision::Deny
+            && (decision != ApprovalDecision::ApproveOnce || open.class != CardClass::AgentCommand)
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "Answer this on your phone or computer: this e-ink device may only allow a \
+                     single call once (denying it from here is fine)",
             ));
         }
         if let Some(ceiling) = ceiling
@@ -203,6 +232,7 @@ impl Approvals {
                 answer: Some(answer),
                 answered: None,
                 not_from: ask.not_from,
+                class: CardClass::Gateway,
             },
         );
         self.publisher.publish(
@@ -417,6 +447,12 @@ impl ApprovalTap for Approvals {
                 answer: Some(answer),
                 answered: None,
                 not_from: None,
+                class: match tapped.kind {
+                    ApprovalKind::Command | ApprovalKind::CommandOnce => CardClass::AgentCommand,
+                    ApprovalKind::Handoff
+                    | ApprovalKind::GoalConfirmation
+                    | ApprovalKind::AutopilotConfirmation => CardClass::AgentOther,
+                },
             },
         );
         self.publisher.publish(
@@ -504,12 +540,26 @@ mod tests {
         let book = approvals();
         let (id, mut answer) = book.ask(own(Some("dv-1")));
         let refused = book
-            .resolve(&id, ApprovalDecision::ApproveOnce, None, Some("dv-1"), None)
+            .resolve(
+                &id,
+                ApprovalDecision::ApproveOnce,
+                None,
+                Some("dv-1"),
+                None,
+                false,
+            )
             .unwrap_err();
         assert_eq!(refused.code, ErrorCode::Forbidden);
         assert!(answer.try_recv().is_err(), "nothing was answered");
-        book.resolve(&id, ApprovalDecision::ApproveOnce, None, Some("dv-2"), None)
-            .unwrap();
+        book.resolve(
+            &id,
+            ApprovalDecision::ApproveOnce,
+            None,
+            Some("dv-2"),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             answer.try_recv(),
             Ok((ApprovalResponse::AllowOnce, _))
@@ -540,11 +590,98 @@ mod tests {
     fn the_owners_local_token_approves_and_the_asker_may_deny() {
         let book = approvals();
         let (id, _answer) = book.ask(own(Some("dv-1")));
-        book.resolve(&id, ApprovalDecision::ApproveOnce, None, None, None)
+        book.resolve(&id, ApprovalDecision::ApproveOnce, None, None, None, false)
             .unwrap();
         let (id, mut answer) = book.ask(own(Some("dv-1")));
-        book.resolve(&id, ApprovalDecision::Deny, None, Some("dv-1"), None)
+        book.resolve(&id, ApprovalDecision::Deny, None, Some("dv-1"), None, false)
             .unwrap();
         assert!(matches!(answer.try_recv(), Ok((ApprovalResponse::Deny, _))));
+    }
+
+    /// An agent's command card, as the hub tap would open it.
+    fn agent_command(
+        book: &Approvals,
+        risk: Risk,
+    ) -> (String, oneshot::Receiver<(ApprovalResponse, String)>) {
+        let (id, answered) = book.ask(OwnAsk { risk, ..own(None) });
+        let mut open = book.book();
+        let card = open.open.get_mut(&id).unwrap();
+        card.class = CardClass::AgentCommand;
+        card.approval.options = vec![
+            ApprovalDecision::ApproveOnce,
+            ApprovalDecision::ApproveSession,
+            ApprovalDecision::ApproveAlways,
+            ApprovalDecision::Deny,
+        ];
+        drop(open);
+        (id, answered)
+    }
+
+    #[test]
+    fn an_eink_device_allows_one_agent_call_once_and_nothing_else() {
+        let book = approvals();
+        let medium = Some(Risk::Medium);
+        // A settings card the gateway asks for: deny only.
+        let (id, _answer) = book.ask(OwnAsk {
+            risk: Risk::Low,
+            ..own(None)
+        });
+        let refused = book
+            .resolve(
+                &id,
+                ApprovalDecision::ApproveOnce,
+                None,
+                Some("dv-k"),
+                medium,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+        book.resolve(
+            &id,
+            ApprovalDecision::Deny,
+            None,
+            Some("dv-k"),
+            medium,
+            true,
+        )
+        .unwrap();
+        // An agent's command card: once, never a lasting grant.
+        let (id, mut answer) = agent_command(&book, Risk::Medium);
+        for lasting in [
+            ApprovalDecision::ApproveSession,
+            ApprovalDecision::ApproveAlways,
+        ] {
+            let refused = book
+                .resolve(&id, lasting, None, Some("dv-k"), medium, true)
+                .unwrap_err();
+            assert_eq!(refused.code, ErrorCode::Forbidden);
+        }
+        book.resolve(
+            &id,
+            ApprovalDecision::ApproveOnce,
+            None,
+            Some("dv-k"),
+            medium,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            answer.try_recv(),
+            Ok((ApprovalResponse::AllowOnce, _))
+        ));
+        // Above its ceiling (a device pairing card is High): deny only.
+        let (id, _answer) = agent_command(&book, Risk::High);
+        let refused = book
+            .resolve(
+                &id,
+                ApprovalDecision::ApproveOnce,
+                None,
+                Some("dv-k"),
+                medium,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
     }
 }

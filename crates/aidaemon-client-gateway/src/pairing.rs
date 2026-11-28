@@ -54,6 +54,9 @@ const MAX_SOCKET_SIGN_INS: usize = 4096;
 /// and then, never this many.
 const MAX_SOCKET_SIGN_INS_PER_DEVICE: usize = 32;
 
+/// What a bridge (e-ink) device may do, whatever it asks for.
+const EINK_SCOPES: [Scope; 3] = [Scope::Observe, Scope::Chat, Scope::Approve];
+
 fn ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -76,6 +79,10 @@ pub struct Principal {
     pub device_name: Option<String>,
     pub scopes: Vec<Scope>,
     pub ceiling: Option<Risk>,
+    /// A device paired over the bridge (an e-ink reader): limited to
+    /// [`crate::eink`]'s commands and approvals. From the device's record,
+    /// never from what a request says.
+    pub eink: bool,
     /// Revoking the device cancels this.
     pub revoked: CancellationToken,
 }
@@ -87,6 +94,7 @@ impl Principal {
             device_name: None,
             scopes: ALL_SCOPES.to_vec(),
             ceiling: None,
+            eink: false,
             revoked: CancellationToken::new(),
         }
     }
@@ -1018,6 +1026,7 @@ impl Pairing {
             device_name: Some(device.name.clone()),
             scopes: scopes.clone(),
             ceiling,
+            eink: device.kind == crate::eink::EINK_KIND,
             revoked,
         };
         {
@@ -1051,6 +1060,53 @@ impl Pairing {
         let found = access.get(&sha(token))?;
         (found.expires_at_ms > now_ms() && !found.principal.revoked.is_cancelled())
             .then(|| found.principal.clone())
+    }
+
+    /// Pair a device over the bridge (an e-ink reader), after the owner
+    /// approved it in a trusted app. Its authority is fixed here, whatever
+    /// it asked for: Observe, Chat and Approve, a Medium ceiling, and the
+    /// kind that limits it to [`crate::eink`]'s commands.
+    pub async fn add_bridge_device(
+        &self,
+        name: &str,
+        public_key_hex: &str,
+    ) -> Result<String, ProtocolError> {
+        let name: String = name.trim().chars().take(60).collect();
+        if name.is_empty() {
+            return Err(ProtocolError::new(ErrorCode::Invalid, "Name the device"));
+        }
+        let device_id = format!("dv-{}", &random_hex()[..20]);
+        self.log
+            .add_device(&DeviceRow {
+                device_id: device_id.clone(),
+                name,
+                kind: crate::eink::EINK_KIND.to_string(),
+                public_key: public_key_hex.to_string(),
+                scopes: scopes_text(&EINK_SCOPES),
+                risk_ceiling: serde_json::to_value(Risk::Medium)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string)),
+                created_at_ms: now_ms(),
+                last_seen_ms: None,
+                revoked_at_ms: None,
+            })
+            .await
+            .map_err(internal)?;
+        info!(device_id, "Paired an e-ink device over the bridge");
+        Ok(device_id)
+    }
+
+    /// Whether a paired device other than `device_id` may answer the
+    /// approvals the gateway opens: an e-ink device never counts.
+    pub async fn another_approver(&self, device_id: &str) -> bool {
+        let Ok(rows) = self.log.devices().await else {
+            return false;
+        };
+        rows.iter().any(|d| {
+            d.revoked_at_ms.is_none()
+                && d.device_id != device_id
+                && d.kind != crate::eink::EINK_KIND
+        })
     }
 
     pub async fn devices(&self) -> Result<Vec<DeviceInfo>, ProtocolError> {

@@ -51,6 +51,7 @@ mod bus;
 pub mod client_feature;
 pub mod client_view;
 mod config;
+mod eink;
 pub mod files;
 pub mod git;
 mod observer;
@@ -953,6 +954,16 @@ impl ClientGateway {
         command: Command,
         caller: &Caller,
     ) -> ServerFrame {
+        // An e-ink device's limits come first, even before a remembered
+        // reply: what it may do is judged from its record on every request.
+        if caller.principal.eink
+            && let Err(error) = eink::check(&command, dirs::home_dir().as_deref())
+        {
+            return ServerFrame::Error {
+                request_id: Some(request_id.to_string()),
+                error,
+            };
+        }
         let log = self.bus.log();
         // Remembered per caller: one device never reads the reply another
         // got (history, memories, a live-view ticket) by presenting its
@@ -1286,6 +1297,7 @@ impl ClientGateway {
                     device,
                     caller.principal.device_id.as_deref(),
                     ceiling,
+                    caller.principal.eink,
                 )
             }
             Command::ListSessions { cursor, limit } => self.list_sessions(cursor, limit).await,
@@ -1985,10 +1997,7 @@ impl ClientGateway {
     /// gateway opens: another paired device. A chat cannot (these cards
     /// reach the owner's apps only), so it does not count.
     async fn another_approver(&self, device_id: &str) -> bool {
-        let devices = self.pairing.devices().await.unwrap_or_default();
-        devices
-            .iter()
-            .any(|d| !d.revoked && d.device_id != device_id)
+        self.pairing.another_approver(device_id).await
     }
 
     /// Start an app conversation with a message from the daemon itself (the
@@ -2157,10 +2166,11 @@ impl ClientGateway {
         device: Option<String>,
         device_id: Option<&str>,
         ceiling: Option<Risk>,
+        eink: bool,
     ) -> Result<CommandResult, ProtocolError> {
-        let outcome = self
-            .approvals
-            .resolve(approval_id, decision, device, device_id, ceiling)?;
+        let outcome =
+            self.approvals
+                .resolve(approval_id, decision, device, device_id, ceiling, eink)?;
         Ok(CommandResult::ApprovalResolved {
             approval_id: approval_id.to_string(),
             outcome,
