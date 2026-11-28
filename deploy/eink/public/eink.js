@@ -86,7 +86,11 @@
   // A little Markdown, built from DOM nodes and text only (never HTML):
   // headings lose their #, **bold** and `code` show as such, lines stay.
   function richText(container, text) {
-    var lines = drawable(text).split('\n');
+    // Links show as their text (no links leave this page); bullets as •.
+    var lines = drawable(text)
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .split('\n')
+      .map(function (line) { return line.replace(/^(\s*)[*-]\s+/, '$1\u2022 '); });
     lines.forEach(function (line, i) {
       if (i) container.appendChild(document.createElement('br'));
       var heading = /^\s{0,3}#{1,6}\s+/.exec(line);
@@ -468,7 +472,9 @@
         card.appendChild(el('div', 'msg-from', (r.agent || 'Agent') + ' · ' + (PHASE_WORD[r.phase] || r.phase) +
           (r.took ? ' · ' + r.took : '')));
         var answer = el('div', 'msg-text');
-        richText(answer, r.result || (r.phase === 'running' ? 'Working…' : 'No answer recorded.'));
+        // A run's result is { text, report, mismatches }: its answer is text.
+        var said = r.result && typeof r.result.text === 'string' ? r.result.text : '';
+        richText(answer, said || (r.phase === 'running' ? 'Working…' : 'No answer recorded.'));
         card.appendChild(answer);
         var steps = el('button', 'btn btn-small', 'Steps \u25b8');
         steps.type = 'button';
