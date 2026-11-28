@@ -461,6 +461,7 @@
   }
 
   async function openChat(s, from) {
+    if (writing.form !== 'convo') setMode('type', 'convo');
     current.session = s;
     current.historyLimit = 8;
     current.historySig = null;
@@ -777,14 +778,41 @@
     clearStrip();
   }
 
-  function setMode(mode) {
+  // One writing strip, moved into whichever form is open: a conversation's
+  // message box, or a new coding session.
+  var FORMS = {
+    convo: { slot: 'convo-write-slot', text: 'convo-text', type: 'mode-type', write: 'mode-write' },
+    newcode: { slot: 'newcode-write-slot', text: 'newcode-text', type: 'nc-mode-type', write: 'nc-mode-write' }
+  };
+  writing.form = 'convo';
+
+  function setMode(mode, form) {
+    form = form || writing.form;
+    if (form !== writing.form) clearAllLines();
+    writing.form = form;
     writing.mode = mode;
+    var f = FORMS[form];
+    $(f.slot).appendChild($('write-box'));
     // One input at a time: the strip, or the text box.
     $('write-box').className = mode === 'write' ? '' : 'hidden';
-    $('convo-text').className = mode === 'type' ? '' : 'hidden';
-    $('mode-type').className = mode === 'type' ? 'btn mode active' : 'btn mode';
-    $('mode-write').className = mode === 'write' ? 'btn mode active' : 'btn mode';
-    if (mode === 'write') sizeStrip();
+    $(f.text).className = mode === 'type' ? '' : 'hidden';
+    $(f.type).className = mode === 'type' ? 'btn mode active' : 'btn mode';
+    $(f.write).className = mode === 'write' ? 'btn mode active' : 'btn mode';
+    if (mode === 'write') { writing.inked = false; strip().width = 0; sizeStrip(); }
+  }
+
+  // The written lines, uploaded as PNG sheets: their attachments.
+  async function uploadHandwriting(l, noteEl) {
+    noteEl.textContent = 'Sending your handwriting…';
+    var pngs = await sheets();
+    var attachments = [];
+    for (var i = 0; i < pngs.length; i++) {
+      var up = await l.command({
+        type: 'upload_file', name: 'handwriting-' + (i + 1) + '.png', mime: 'image/png', data: pngs[i]
+      });
+      attachments.push(up.attachment);
+    }
+    return attachments;
   }
 
   // The kept lines as PNG sheets (base64), at most MAX_SHEETS.
@@ -817,16 +845,7 @@
     try {
       var l = await ensureLink();
       var attachments = [];
-      if (handwriting) {
-        $('convo-note').textContent = 'Sending your handwriting…';
-        var pngs = await sheets();
-        for (var i = 0; i < pngs.length; i++) {
-          var up = await l.command({
-            type: 'upload_file', name: 'handwriting-' + (i + 1) + '.png', mime: 'image/png', data: pngs[i]
-          });
-          attachments.push(up.attachment);
-        }
-      }
+      if (handwriting) attachments = await uploadHandwriting(l, $('convo-note'));
       var command = { type: 'send_message', text: text };
       if (attachments.length) command.attachments = attachments;
       if (current.session && current.session.id) command.session_id = current.session.id;
@@ -1079,6 +1098,7 @@
 
   async function openNewCode() {
     $('newcode-note').textContent = '';
+    setMode('type', 'newcode');
     show('newcode');
     try {
       var l = await ensureLink();
@@ -1103,14 +1123,23 @@
   }
 
   async function startCode() {
-    var text = $('newcode-text').value.trim();
+    var writingHere = writing.form === 'newcode' && writing.mode === 'write';
+    if (writingHere && !keepLine()) return;
+    var text = writingHere ? '' : $('newcode-text').value.trim();
+    var handwriting = writingHere && writing.lines.length > 0;
     var project = $('project').value;
     var agent = $('agent').value;
-    if (!text || !project || !agent) { $('newcode-note').textContent = 'Pick a project and an agent, and say what to do.'; return; }
+    if ((!text && !handwriting) || !project || !agent) {
+      $('newcode-note').textContent = 'Pick a project and an agent, and say what to do.';
+      return;
+    }
     $('btn-start-code').disabled = true;
     try {
       var l = await ensureLink();
-      await l.command({ type: 'send_message', text: text, project_id: project, model: { mode: 'agent', agent: agent } });
+      var command = { type: 'send_message', text: text, project_id: project, model: { mode: 'agent', agent: agent } };
+      if (handwriting) command.attachments = await uploadHandwriting(l, $('newcode-note'));
+      await l.command(command);
+      if (handwriting) clearAllLines();
       $('newcode-text').value = '';
       show('code');
       setTimeout(function () { loadSnapshot().catch(function () {}); }, 3000);
@@ -1228,8 +1257,10 @@
       refreshAll();
     });
     $('btn-send').addEventListener('click', send);
-    $('mode-type').addEventListener('click', function () { setMode('type'); });
-    $('mode-write').addEventListener('click', function () { setMode('write'); });
+    $('mode-type').addEventListener('click', function () { setMode('type', 'convo'); });
+    $('mode-write').addEventListener('click', function () { setMode('write', 'convo'); });
+    $('nc-mode-type').addEventListener('click', function () { setMode('type', 'newcode'); });
+    $('nc-mode-write').addEventListener('click', function () { setMode('write', 'newcode'); });
     $('btn-next-line').addEventListener('click', keepLine);
     $('btn-clear-line').addEventListener('click', clearStrip);
     $('btn-clear-all').addEventListener('click', clearAllLines);
@@ -1240,7 +1271,7 @@
       show('convo');
       window.scrollTo(0, readerReturn);
     });
-    setMode('type');
+    setMode('type', 'convo');
     $('btn-new-code').addEventListener('click', openNewCode);
     $('btn-more-chat').addEventListener('click', function () { loadMore('chat'); });
     $('btn-more-code').addEventListener('click', function () { loadMore('code'); });

@@ -67,6 +67,7 @@
           <button type="button" class="btn mode" id="mode-write">Write</button>
           <button type="button" class="btn btn-strong send" id="btn-send">Send</button>
         </div>
+        <div id="convo-write-slot"></div>
         <div id="write-box" class="hidden">
           <div id="write-lines" class="lines"></div>
           <canvas id="strip" class="strip"></canvas>
@@ -106,6 +107,11 @@
       <label class="field-label" for="agent">Agent</label>
       <select id="agent"></select>
       <label class="field-label" for="newcode-text">What should it do?</label>
+      <div class="modes">
+        <button type="button" class="btn mode active" id="nc-mode-type">Type</button>
+        <button type="button" class="btn mode" id="nc-mode-write">Write</button>
+      </div>
+      <div id="newcode-write-slot"></div>
       <textarea id="newcode-text" rows="4"></textarea>
       <div class="actions"><button type="button" class="btn btn-strong" id="btn-start-code">Start session</button></div>
       <p id="newcode-note" class="note"></p>
