@@ -112,3 +112,5 @@ select { min-height: 56px; }
 
 #pair-qr { display: block; margin: 12px auto; image-rendering: pixelated; }
 .paircheck { font-family: "Courier New", monospace; font-size: 28px; letter-spacing: 3px; }
+
+.msg-image { display: block; max-width: 100%; border: 1px solid #000; margin-top: 6px; }

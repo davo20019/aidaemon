@@ -198,7 +198,7 @@
       if (auth) headers.push(['authorization', 'Bearer ' + auth]);
       var bytes = B.encodeRequest({
         requestId: requestId, method: method, pathAndQuery: path, headers: headers,
-        body: enc.encode(JSON.stringify(body))
+        body: method === 'GET' ? new Uint8Array(0) : enc.encode(JSON.stringify(body))
       });
       var frames = await channel.sealer.sealMessage(bytes);
       for (var i = 0; i < frames.length; i++) sock.send(frames[i]);
@@ -207,10 +207,12 @@
         if (!msg) continue;
         var m = B.decodeFromDaemon(msg);
         if (m.type !== 'response' || m.requestId !== requestId) continue;
-        var text = dec.decode(m.body);
         var json = null;
-        try { json = text ? JSON.parse(text) : null; } catch (e) { json = null; }
-        return { status: m.status, json: json };
+        var type = B.header(m, 'content-type') || '';
+        if (type.indexOf('json') >= 0) {
+          try { json = JSON.parse(dec.decode(m.body)); } catch (e) { json = null; }
+        }
+        return { status: m.status, json: json, body: m.body, type: type };
       }
     }
     async function signIn() {
@@ -246,6 +248,15 @@
             throw new Error(error.message || 'Refused (' + reply.status + ')');
           }
           return frame.result;
+        });
+      },
+      // A message's file (its signed link), as bytes, through the channel.
+      file: function (path) {
+        return run(async function () {
+          if (!token || Date.now() > tokenExpires - 60000) await signIn();
+          var reply = await raw('GET', path, {}, token);
+          if (reply.status !== 200) throw new Error('Could not load a file');
+          return { body: reply.body, type: reply.type };
         });
       },
       close: function () { sock.close(); }
@@ -387,6 +398,25 @@
     if (!sessions.length) ul.appendChild(el('li', 'empty muted', 'No chats yet.'));
   }
 
+  var blobUrls = [];
+
+  // Pictures in messages (handwriting, screenshots), one at a time through
+  // the channel, shown as blob: URLs (the content policy allows those).
+  async function loadImages(images, mine) {
+    for (var i = 0; i < images.length; i++) {
+      if (mine !== loads.history) return;
+      try {
+        var path = images[i].url.replace(/^https?:\/\/[^\/]+/, '');
+        var f = await (await ensureLink()).file(path);
+        var url = URL.createObjectURL(new Blob([f.body], { type: f.type || 'image/png' }));
+        blobUrls.push(url);
+        images[i].img.src = url;
+      } catch (e) {
+        images[i].img.alt = 'Could not load the picture';
+      }
+    }
+  }
+
   async function openChat(s, from) {
     current.session = s;
     current.from = from || 'chat';
@@ -421,14 +451,29 @@
     var result = await l.command({ type: 'get_history', session_id: current.session.id, limit: 20 });
     if (mine !== loads.history) return;
     clear(box);
+    blobUrls.forEach(function (u) { URL.revokeObjectURL(u); });
+    blobUrls = [];
+    var images = [];
     (result.messages || []).forEach(function (m) {
       var d = el('div', m.role === 'user' ? 'msg msg-you' : 'msg');
       d.appendChild(el('div', 'msg-from', m.role === 'user' ? 'You' : 'aidaemon'));
       var body = el('div', 'msg-text');
       richText(body, m.text);
       d.appendChild(body);
+      (m.attachments || []).forEach(function (a) {
+        if (!a.url || !/^image\//.test(a.mime || '')) {
+          d.appendChild(el('div', 'meta', 'File: ' + a.name));
+          return;
+        }
+        var img = document.createElement('img');
+        img.className = 'msg-image';
+        img.alt = a.name;
+        d.appendChild(img);
+        images.push({ img: img, url: a.url });
+      });
       box.appendChild(d);
     });
+    loadImages(images, mine);
   }
 
   // ---------------------------------------------------------- writing strip
