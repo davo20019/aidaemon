@@ -86,6 +86,12 @@
   // never adds to what a newer one drew.
   var loads = { history: 0, chats: 0, code: 0, run: 0 };
 
+  // A conversation (or a run inside one) belongs to the tab it was opened from.
+  function tabFor(view) {
+    if (view === 'convo') return current.from || 'chat';
+    return TAB_OF[view];
+  }
+
   function show(view) {
     current.view = view;
     var views = document.querySelectorAll('.view');
@@ -94,7 +100,7 @@
     $('tabs').style.display = view === 'pair' ? 'none' : 'flex';
     var tabs = document.querySelectorAll('.tab');
     for (var j = 0; j < tabs.length; j++) {
-      tabs[j].className = tabs[j].getAttribute('data-view') === TAB_OF[view] ? 'tab active' : 'tab';
+      tabs[j].className = tabs[j].getAttribute('data-view') === tabFor(view) ? 'tab active' : 'tab';
     }
     window.scrollTo(0, 0);
   }
@@ -300,11 +306,27 @@
 
   // ------------------------------------------------------------------- chat
   var sessions = [];
+  // Project ids whose project has a folder (read once per connection).
+  var folderProjects = null;
+  var lastRuns = [];
 
-  function renderChats(list) {
-    sessions = (list || []).slice().sort(function (a, b) {
+  // The app's rule (aidaemon-client-core's Client::is_coding): a
+  // conversation works on code when it is set to a coding agent, is in a
+  // project with a folder, or a coding agent ran in it.
+  function isCoding(s, runs) {
+    if (s.agent) return true;
+    if (s.project_id && folderProjects && folderProjects[s.project_id]) return true;
+    return (runs || []).some(function (r) { return r.session_id === s.id && r.agent; });
+  }
+
+  function sortedSessions(list) {
+    return (list || []).filter(function (s) { return !s.archived; }).sort(function (a, b) {
       return (b.last_activity_ms || 0) - (a.last_activity_ms || 0);
-    }).slice(0, 30);
+    });
+  }
+
+  function renderChats(list, runs) {
+    sessions = sortedSessions(list).filter(function (s) { return !isCoding(s, runs); }).slice(0, 30);
     var ul = $('chat-list');
     clear(ul);
     sessions.forEach(function (s) {
@@ -320,12 +342,30 @@
     if (!sessions.length) ul.appendChild(el('li', 'empty muted', 'No chats yet.'));
   }
 
-  async function openChat(s) {
+  async function openChat(s, from) {
     current.session = s;
+    current.from = from || 'chat';
     $('convo-title').textContent = (s && s.title) || 'New chat';
     $('convo-note').textContent = '';
+    renderConvoRuns();
     show('convo');
     await loadHistory();
+  }
+
+  // A coding conversation's agents' runs, newest first, above its messages.
+  function renderConvoRuns() {
+    var box = $('convo-runs');
+    clear(box);
+    var s = current.session;
+    if (!s || !s.id) return;
+    var runs = lastRuns.filter(function (r) { return r.session_id === s.id; })
+      .sort(function (a, b) { return (b.started_at_ms || 0) - (a.started_at_ms || 0); });
+    if (!runs.length) return;
+    box.appendChild(el('h3', null, 'Agents\u2019 runs'));
+    var ul = el('ul', 'list');
+    runs.slice(0, 8).forEach(function (r) { ul.appendChild(runRow(r)); });
+    box.appendChild(ul);
+    box.appendChild(el('h3', null, 'Messages'));
   }
 
   async function loadHistory() {
@@ -374,7 +414,13 @@
     var result = await l.command({ type: 'get_snapshot' });
     if (mine !== loads.code) return;
     var state = result.state || {};
+    if (!folderProjects) {
+      var projects = (await l.command({ type: 'list_projects' })).projects || [];
+      folderProjects = {};
+      projects.forEach(function (p) { if (p.path) folderProjects[p.id] = true; });
+    }
     var keep = {
+      folder_projects: folderProjects,
       sessions: state.sessions || [], pending_approvals: state.pending_approvals || [],
       running_tasks: state.running_tasks || [], runs: state.runs || []
     };
@@ -384,24 +430,44 @@
   }
 
   function renderSnapshot(state) {
-    renderChats(state.sessions);
+    if (state.folder_projects) folderProjects = state.folder_projects;
+    renderChats(state.sessions, state.runs);
     renderApprovals(state);
-    renderCode(state.runs);
+    renderCode(state.sessions, state.runs);
   }
 
-  function renderCode(runs) {
+  // Code: the coding conversations, those with an agent at work first.
+  function renderCode(list, runs) {
     runs = runs || [];
-    var running = runs.filter(function (r) { return r.phase === 'running'; });
-    var done = runs.filter(function (r) { return r.phase !== 'running'; })
-      .sort(function (a, b) { return (b.ended_at_ms || 0) - (a.ended_at_ms || 0); }).slice(0, 15);
-    $('code-running').textContent = running.length ? String(running.length) : '';
-    fillRuns($('running-list'), running);
-    fillRuns($('done-list'), done);
+    lastRuns = runs;
+    var coding = sortedSessions(list).filter(function (s) { return isCoding(s, runs); });
+    var working = {};
+    runs.forEach(function (r) { if (r.phase === 'running') working[r.session_id] = r; });
+    var busy = coding.filter(function (s) { return working[s.id]; });
+    var rest = coding.filter(function (s) { return !working[s.id]; }).slice(0, 20);
+    $('code-running').textContent = busy.length ? String(busy.length) : '';
+    fillSessions($('running-list'), busy, working);
+    fillSessions($('done-list'), rest, working);
   }
 
-  function fillRuns(ul, runs) {
+  function fillSessions(ul, list, working) {
     clear(ul);
-    runs.forEach(function (r) {
+    list.forEach(function (s) {
+      var li = el('li');
+      var b = el('button', 'item');
+      b.type = 'button';
+      b.appendChild(el('span', 'title', s.title || 'Untitled'));
+      var run = working[s.id];
+      b.appendChild(el('span', 'meta', (s.agent || (run && run.agent) || 'aidaemon') + ' · ' + timeOf(s.last_activity_ms)));
+      if (run && run.step) b.appendChild(el('span', 'meta', 'Now: ' + run.step));
+      b.addEventListener('click', function () { openChat(s, 'code'); });
+      li.appendChild(b);
+      ul.appendChild(li);
+    });
+    if (!list.length) ul.appendChild(el('li', 'empty muted', 'Nothing here.'));
+  }
+
+  function runRow(r) {
       var li = el('li');
       var b = el('button', 'item');
       b.type = 'button';
@@ -411,13 +477,13 @@
       if (r.phase === 'running' && r.step) b.appendChild(el('span', 'meta', 'Now: ' + r.step));
       b.addEventListener('click', function () { openRun(r); });
       li.appendChild(b);
-      ul.appendChild(li);
-    });
-    if (!runs.length) ul.appendChild(el('li', 'empty muted', 'Nothing here.'));
+      return li;
   }
 
   async function openRun(r) {
     current.run = r;
+    var back = document.querySelector('#view-run [data-back]');
+    back.setAttribute('data-back', current.view === 'convo' ? 'convo' : 'code');
     $('run-title').textContent = r.label;
     $('run-meta').textContent = (r.agent || 'aidaemon') + ' · ' + (PHASE_WORD[r.phase] || r.phase);
     $('run-note').textContent = '';
@@ -654,7 +720,8 @@
     var refreshes = document.querySelectorAll('[data-refresh]');
     for (var k = 0; k < refreshes.length; k++) refreshes[k].addEventListener('click', refreshAll);
     $('btn-pair').addEventListener('click', pair);
-    $('btn-new-chat').addEventListener('click', function () { openChat(null); });
+    $('btn-new-chat').addEventListener('click', function () { openChat(null, 'chat'); });
+    $('btn-convo-back').addEventListener('click', function () { show(current.from || 'chat'); refreshAll(); });
     $('btn-send').addEventListener('click', send);
     $('btn-new-code').addEventListener('click', openNewCode);
     $('btn-start-code').addEventListener('click', startCode);

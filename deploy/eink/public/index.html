@@ -49,10 +49,11 @@
     <!-- CONVERSATION -->
     <section id="view-convo" class="view">
       <div class="bar">
-        <button type="button" class="btn" data-back="chat">&larr; Chats</button>
+        <button type="button" class="btn" id="btn-convo-back">&larr; Back</button>
         <button type="button" class="btn" data-refresh>Refresh</button>
       </div>
       <h2 id="convo-title"></h2>
+      <div id="convo-runs"></div>
       <div id="convo-messages"></div>
       <div class="composer">
         <textarea id="convo-text" rows="3" placeholder="Type here"></textarea>
@@ -70,9 +71,9 @@
           <button type="button" class="btn btn-strong" id="btn-new-code">New session</button>
         </span>
       </div>
-      <h2>Running</h2>
+      <h2>Working</h2>
       <ul class="list" id="running-list"></ul>
-      <h2>Finished</h2>
+      <h2>Recent</h2>
       <ul class="list" id="done-list"></ul>
     </section>
 
