@@ -51,6 +51,17 @@
     });
   }
 
+  // What the last visit showed, so a reopened page has something on screen
+  // at once (marked with its time) while it refreshes. Per device only;
+  // a private window or cleared storage just starts empty.
+  var CACHE_KEY = 'aidaemon-eink-last';
+  function cacheLoad() {
+    try { return JSON.parse(localStorage.getItem(CACHE_KEY) || 'null'); } catch (e) { return null; }
+  }
+  function cacheSave(snapshot) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), snapshot: snapshot })); } catch (e) { /* full or blocked */ }
+  }
+
   // -------------------------------------------------------------------- dom
   function $(id) { return document.getElementById(id); }
   function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
@@ -290,12 +301,10 @@
   // ------------------------------------------------------------------- chat
   var sessions = [];
 
-  async function loadChats() {
-    var l = await ensureLink();
-    var mine = ++loads.chats;
-    var result = await l.command({ type: 'list_sessions', limit: 30 });
-    if (mine !== loads.chats) return;
-    sessions = result.sessions || [];
+  function renderChats(list) {
+    sessions = (list || []).slice().sort(function (a, b) {
+      return (b.last_activity_ms || 0) - (a.last_activity_ms || 0);
+    }).slice(0, 30);
     var ul = $('chat-list');
     clear(ul);
     sessions.forEach(function (s) {
@@ -358,12 +367,30 @@
   // ------------------------------------------------------------------- code
   var PHASE_WORD = { running: 'running', succeeded: 'done', failed: 'failed', stopped: 'stopped' };
 
-  async function loadCode() {
+  // One request for chats, approvals and runs together.
+  async function loadSnapshot() {
     var l = await ensureLink();
     var mine = ++loads.code;
     var result = await l.command({ type: 'get_snapshot' });
     if (mine !== loads.code) return;
-    var runs = (result.state && result.state.runs) || [];
+    var state = result.state || {};
+    var keep = {
+      sessions: state.sessions || [], pending_approvals: state.pending_approvals || [],
+      running_tasks: state.running_tasks || [], runs: state.runs || []
+    };
+    renderSnapshot(keep);
+    cacheSave(keep);
+    updated(Date.now());
+  }
+
+  function renderSnapshot(state) {
+    renderChats(state.sessions);
+    renderApprovals(state);
+    renderCode(state.runs);
+  }
+
+  function renderCode(runs) {
+    runs = runs || [];
     var running = runs.filter(function (r) { return r.phase === 'running'; });
     var done = runs.filter(function (r) { return r.phase !== 'running'; })
       .sort(function (a, b) { return (b.ended_at_ms || 0) - (a.ended_at_ms || 0); }).slice(0, 15);
@@ -481,7 +508,7 @@
       var l = await ensureLink();
       await l.command({ type: 'stop_turn', session_id: r.session_id });
       $('run-note').textContent = 'Asked it to stop.';
-      await loadCode();
+      await loadSnapshot();
     } catch (e) { $('run-note').textContent = e.message; }
   }
 
@@ -533,7 +560,7 @@
       await l.command({ type: 'send_message', text: text, project_id: project, model: { mode: 'agent', agent: agent } });
       $('newcode-text').value = '';
       show('code');
-      setTimeout(function () { loadCode().catch(function () {}); }, 3000);
+      setTimeout(function () { loadSnapshot().catch(function () {}); }, 3000);
     } catch (e) {
       $('newcode-note').textContent = e.message;
     } finally {
@@ -544,13 +571,10 @@
   // -------------------------------------------------------------- approvals
   var approvals = [];
 
-  async function loadGlance() {
-    var l = await ensureLink();
-    var result = await l.command({ type: 'get_glance' });
-    var glance = result.glance || {};
-    approvals = glance.pending_approvals || [];
+  function renderApprovals(state) {
+    approvals = state.pending_approvals || [];
     $('approval-count').textContent = approvals.length ? String(approvals.length) : '';
-    var running = (glance.running_tasks || []).length;
+    var running = (state.running_tasks || []).length;
     $('chat-working').textContent = running ? String(running) : '';
     var ul = $('approval-list');
     clear(ul);
@@ -595,24 +619,21 @@
       note(e.message);
     }
     show('approvals');
-    loadGlance().catch(function (e) { note(e.message); });
+    loadSnapshot().catch(function (e) { note(e.message); });
   }
 
   // ------------------------------------------------------------------ setup
-  function updated() {
+  function updated(at) {
     var labels = document.querySelectorAll('.updated');
-    for (var i = 0; i < labels.length; i++) labels[i].textContent = 'Updated ' + timeOf(Date.now());
+    for (var i = 0; i < labels.length; i++) labels[i].textContent = 'Updated ' + timeOf(at);
   }
 
   async function refreshAll() {
     note('');
     try {
-      await loadGlance();
       if (current.view === 'convo') await loadHistory();
-      else if (current.view === 'code') await loadCode();
       else if (current.view === 'run') await loadRun();
-      else if (current.view === 'chat') await loadChats();
-      updated();
+      else await loadSnapshot();
     } catch (e) {
       if (e.message !== 'Not paired') { link = null; note('Could not refresh: ' + e.message); setLink('offline'); }
     }
@@ -647,9 +668,16 @@
     $('btn-deny').addEventListener('click', function () { resolve('deny'); });
 
     if (!BRIDGE || !B) { note('This page is missing its configuration.'); return; }
+    // Paint the last visit's screen at once, then refresh it.
+    var last = cacheLoad();
+    if (last && last.snapshot) {
+      show('chat');
+      renderSnapshot(last.snapshot);
+      updated(last.at);
+    }
     dbGet('pinned').then(function (pinned) {
       if (!pinned) { show('pair'); setLink('not paired'); return; }
-      show('chat');
+      if (!last) show('chat');
       refreshAll();
     }).catch(function () { show('pair'); });
   }
