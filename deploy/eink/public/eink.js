@@ -416,15 +416,159 @@
     });
   }
 
+  // ---------------------------------------------------------- writing strip
+  // Handwriting goes as pictures the model reads. Lines are written on a
+  // short strip with "fast ink" (pure black squares, no smoothing: what the
+  // Scribe redraws fastest), kept as canvases, and combined at send time
+  // into a few sheets within the daemon's upload limits.
+  var LINES_PER_SHEET = 8;
+  var MAX_SHEETS = 4;
+  var writing = { mode: 'type', lines: [], inked: false, drawing: false, last: null };
+
+  function strip() { return $('strip'); }
+  function stripCtx() { return strip().getContext('2d'); }
+
+  function sizeStrip() {
+    var c = strip();
+    if (!c.clientWidth) return;
+    if (c.width === c.clientWidth && c.height === c.clientHeight) return;
+    c.width = c.clientWidth;
+    c.height = c.clientHeight;
+    clearStrip();
+  }
+
+  function clearStrip() {
+    var ctx = stripCtx();
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, strip().width, strip().height);
+    writing.inked = false;
+  }
+
+  function plot(a, b) {
+    var ctx = stripCtx();
+    ctx.fillStyle = '#000';
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var n = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))));
+    for (var i = 0; i <= n; i++) {
+      ctx.fillRect(Math.round(a.x + dx * i / n) - 1, Math.round(a.y + dy * i / n) - 1, 3, 3);
+    }
+    writing.inked = true;
+  }
+
+  function stripPoint(x, y) {
+    var r = strip().getBoundingClientRect();
+    return { x: x - r.left, y: y - r.top };
+  }
+
+  function setupStrip() {
+    var c = strip();
+    c.addEventListener('pointerdown', function (e) {
+      sizeStrip();
+      writing.drawing = true;
+      writing.last = stripPoint(e.clientX, e.clientY);
+      try { c.setPointerCapture(e.pointerId); } catch (err) { /* old browser */ }
+      e.preventDefault();
+    });
+    c.addEventListener('pointermove', function (e) {
+      if (!writing.drawing) return;
+      // The browser batches pen samples; take them all for smooth curves.
+      var list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
+      if (!list || !list.length) list = [e];
+      for (var i = 0; i < list.length; i++) {
+        var p = stripPoint(list[i].clientX, list[i].clientY);
+        plot(writing.last, p);
+        writing.last = p;
+      }
+      e.preventDefault();
+    });
+    function end() { writing.drawing = false; writing.last = null; }
+    c.addEventListener('pointerup', end);
+    c.addEventListener('pointercancel', end);
+    c.addEventListener('touchstart', function (e) { e.preventDefault(); }, { passive: false });
+    c.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+  }
+
+  function keepLine() {
+    if (!writing.inked) return true;
+    if (writing.lines.length >= LINES_PER_SHEET * MAX_SHEETS) {
+      $('convo-note').textContent = 'That is as many lines as one message takes. Send it, then write more.';
+      return false;
+    }
+    var copy = document.createElement('canvas');
+    copy.width = strip().width;
+    copy.height = strip().height;
+    copy.getContext('2d').drawImage(strip(), 0, 0);
+    writing.lines.push(copy);
+    var img = document.createElement('canvas');
+    img.width = copy.width;
+    img.height = copy.height;
+    img.getContext('2d').drawImage(copy, 0, 0);
+    $('write-lines').appendChild(img);
+    clearStrip();
+    return true;
+  }
+
+  function clearAllLines() {
+    writing.lines = [];
+    clear($('write-lines'));
+    clearStrip();
+  }
+
+  function setMode(mode) {
+    writing.mode = mode;
+    $('write-box').style.display = mode === 'write' ? 'block' : 'none';
+    $('mode-type').className = mode === 'type' ? 'btn mode active' : 'btn mode';
+    $('mode-write').className = mode === 'write' ? 'btn mode active' : 'btn mode';
+    $('convo-text').placeholder = mode === 'write' ? 'Add typed words (optional)' : 'Type here';
+    if (mode === 'write') sizeStrip();
+  }
+
+  // The kept lines as PNG sheets (base64), at most MAX_SHEETS.
+  async function sheets() {
+    var out = [];
+    for (var i = 0; i < writing.lines.length; i += LINES_PER_SHEET) {
+      var group = writing.lines.slice(i, i + LINES_PER_SHEET);
+      var sheet = document.createElement('canvas');
+      sheet.width = group[0].width;
+      sheet.height = group.reduce(function (h, c) { return h + c.height; }, 0);
+      var ctx = sheet.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, sheet.width, sheet.height);
+      var y = 0;
+      group.forEach(function (c) { ctx.drawImage(c, 0, y); y += c.height; });
+      out.push(sheet.toDataURL('image/png').split(',')[1]);
+    }
+    return out;
+  }
+
   async function send() {
     var text = $('convo-text').value.trim();
-    if (!text) { $('convo-note').textContent = 'Type something first.'; return; }
+    if (writing.mode === 'write' && !keepLine()) return;
+    var handwriting = writing.mode === 'write' && writing.lines.length > 0;
+    if (!text && !handwriting) {
+      $('convo-note').textContent = writing.mode === 'write' ? 'Write something first.' : 'Type something first.';
+      return;
+    }
     $('btn-send').disabled = true;
     try {
       var l = await ensureLink();
+      var attachments = [];
+      if (handwriting) {
+        $('convo-note').textContent = 'Sending your handwriting…';
+        var pngs = await sheets();
+        for (var i = 0; i < pngs.length; i++) {
+          var up = await l.command({
+            type: 'upload_file', name: 'handwriting-' + (i + 1) + '.png', mime: 'image/png', data: pngs[i]
+          });
+          attachments.push(up.attachment);
+        }
+      }
       var command = { type: 'send_message', text: text };
+      if (attachments.length) command.attachments = attachments;
       if (current.session && current.session.id) command.session_id = current.session.id;
       var result = await l.command(command);
+      // Strokes are kept until the daemon took the message.
+      if (handwriting) clearAllLines();
       $('convo-text').value = '';
       if (!current.session || !current.session.id) current.session = { id: result.session_id, title: text.slice(0, 40) };
       $('convo-note').textContent = 'Sent. Tap Refresh for the reply.';
@@ -755,6 +899,12 @@
     $('btn-new-chat').addEventListener('click', function () { openChat(null, 'chat'); });
     $('btn-convo-back').addEventListener('click', function () { show(current.from || 'chat'); refreshAll(); });
     $('btn-send').addEventListener('click', send);
+    $('mode-type').addEventListener('click', function () { setMode('type'); });
+    $('mode-write').addEventListener('click', function () { setMode('write'); });
+    $('btn-next-line').addEventListener('click', keepLine);
+    $('btn-clear-line').addEventListener('click', clearStrip);
+    $('btn-clear-all').addEventListener('click', clearAllLines);
+    setupStrip();
     $('btn-new-code').addEventListener('click', openNewCode);
     $('btn-start-code').addEventListener('click', startCode);
     $('btn-steer').addEventListener('click', steer);

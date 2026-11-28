@@ -56,6 +56,20 @@
       <div id="convo-runs"></div>
       <div id="convo-messages"></div>
       <div class="composer">
+        <div class="modes">
+          <button type="button" class="btn mode active" id="mode-type">Type</button>
+          <button type="button" class="btn mode" id="mode-write">Write</button>
+        </div>
+        <div id="write-box" style="display:none">
+          <p class="muted">Write one line, then tap Next line.</p>
+          <div id="write-lines" class="lines"></div>
+          <canvas id="strip" class="strip"></canvas>
+          <div class="actions">
+            <button type="button" class="btn" id="btn-next-line">Next line</button>
+            <button type="button" class="btn" id="btn-clear-line">Clear line</button>
+            <button type="button" class="btn" id="btn-clear-all">Clear all</button>
+          </div>
+        </div>
         <textarea id="convo-text" rows="3" placeholder="Type here"></textarea>
         <div class="actions"><button type="button" class="btn btn-strong" id="btn-send">Send</button></div>
         <p id="convo-note" class="note"></p>
