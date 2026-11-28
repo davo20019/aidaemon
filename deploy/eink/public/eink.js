@@ -534,14 +534,15 @@
   // While work runs in the open conversation, a small glance every few
   // seconds; when it ends, the conversation reloads once and shows the new
   // messages at the end. Nothing redraws while nothing changed (e-ink).
-  var WATCH_MS = 8000;
+  var WATCH_MS = 6000;
+  var FIRST_LOOK_MS = 4000;
   var watching = null;
 
   function watchConversation(id, expectWork) {
     stopWatching();
     var sawWork = !!expectWork;
     var quietChecks = 0;
-    watching = setInterval(async function () {
+    var tick = async function () {
       if (current.view !== 'convo' || !current.session || current.session.id !== id) { stopWatching(); return; }
       try {
         var glance = (await (await ensureLink()).command({ type: 'get_glance' })).glance || {};
@@ -552,20 +553,23 @@
         var busy = (glance.running_tasks || []).some(function (t) { return t.session_id === id; });
         var waiting = (glance.pending_approvals || []).some(function (a) { return a.session_id === id; });
         if (busy || waiting) { sawWork = true; quietChecks = 0; return; }
-        // Just sent: give the daemon a few checks to start before giving up.
-        if (!sawWork && ++quietChecks < 4) return;
-        // The turn is done; a coding agent may still be running in the
-        // background. Reload (redrawn only if something changed) and keep
-        // watching while one is.
+        // aidaemon's own turn is over (handing work to a coding agent ends it
+        // at once): look at the conversation now, redrawn only if something
+        // changed, and keep watching while an agent runs. Just after sending,
+        // give the daemon a few checks to start before stopping.
         current.toEnd = true;
         var agentsRunning = await loadHistory();
-        if (!agentsRunning) stopWatching();
-        else sawWork = true;
+        if (agentsRunning) { sawWork = true; quietChecks = 0; return; }
+        if (!sawWork && ++quietChecks < 4) return;
+        stopWatching();
       } catch (e) {
         stopWatching();
       }
-    }, WATCH_MS);
+    };
+    watching = setInterval(tick, WATCH_MS);
+    firstLook = setTimeout(tick, FIRST_LOOK_MS);
   }
+  var firstLook = null;
 
   // A waiting approval for the open conversation shows on top of the
   // message box, so it is never missed while reading the conversation.
@@ -599,6 +603,7 @@
   }
 
   function stopWatching() {
+    if (firstLook) { clearTimeout(firstLook); firstLook = null; }
     if (watching) { clearInterval(watching); watching = null; }
   }
 
