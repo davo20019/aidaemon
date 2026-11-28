@@ -1146,8 +1146,11 @@ impl TurnEngine<'_> {
                 calls: calls_tx.clone(),
             },
         };
-        let chain =
-            turn_hooks::with_device_ceiling(hooks.chain(), spawn_family.device_cap().clone());
+        let chain = turn_hooks::with_device_ceiling(
+            hooks.chain(),
+            spawn_family.device_cap().clone(),
+            rules.tools.clone(),
+        );
         let detached_hooks: Vec<Arc<dyn sdk::Hook>> = chain
             .iter()
             .filter(|(slot, _)| {

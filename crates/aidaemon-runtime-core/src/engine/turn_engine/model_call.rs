@@ -932,10 +932,28 @@ fn direct_agent_response(
         }
         return sdk::ModelResponse {
             tool_calls: vec![sdk::ToolCall::new(
-                format!("direct-agent-{}", scope.turn_id),
+                direct_agent_call_id(scope.turn_id),
                 "cli_agent",
                 arguments,
             )],
+            ..sdk::ModelResponse::default()
+        };
+    }
+    // Only a delivered call is reported as sent: the call's own result in
+    // the transcript says whether it ran (typed: its id, `is_error`).
+    let latest = scope
+        .latest_tool_output
+        .lock()
+        .ok()
+        .and_then(|output| output.clone());
+    if let Some(undelivered) = undelivered_reply(
+        agent,
+        &request.messages,
+        &direct_agent_call_id(scope.turn_id),
+        latest.as_deref(),
+    ) {
+        return sdk::ModelResponse {
+            text: undelivered,
             ..sdk::ModelResponse::default()
         };
     }
@@ -959,5 +977,108 @@ fn direct_agent_response(
     sdk::ModelResponse {
         text: output.unwrap_or_else(|| format!("Sent to {agent}.")),
         ..sdk::ModelResponse::default()
+    }
+}
+
+/// The id of the one `cli_agent` call a coding-agent conversation's turn
+/// makes.
+fn direct_agent_call_id(turn_id: &str) -> String {
+    format!("direct-agent-{turn_id}")
+}
+
+/// What the owner is told when the turn's call to its coding agent did not
+/// run: its result is missing from the transcript, or is an error (refused,
+/// its approval declined or never given). `None`: it ran, and the agent's
+/// own output (or "Sent to") is the reply. A refusal the tool itself gave
+/// is said as the tool wrote it (`latest_output`, its raw output), else as
+/// the transcript holds it.
+fn undelivered_reply(
+    agent: &str,
+    messages: &[sdk::Message],
+    call_id: &str,
+    latest_output: Option<&str>,
+) -> Option<String> {
+    let result = messages.iter().rev().find(|message| {
+        message.role == sdk::Role::Tool && message.tool_call_id.as_deref() == Some(call_id)
+    });
+    let Some(result) = result else {
+        return Some(format!(
+            "{agent} did not get your message: it was not sent before the turn ended. Send it \
+             again to try once more."
+        ));
+    };
+    if !result.is_error {
+        return None;
+    }
+    // Daemon-written markers (`OWNER_UNANSWERED`, `OWNER_DECLINED`) the
+    // kernel puts on a call an owner's card held: what the card's answer was.
+    let why = if result.content.contains(sdk::OWNER_UNANSWERED) {
+        "it needed your OK on your phone or computer, and no answer came before the approval \
+         expired. Send it again to try once more."
+            .to_string()
+    } else if result.content.contains(sdk::OWNER_DECLINED) {
+        "the approval was declined.".to_string()
+    } else {
+        let refusal = latest_output
+            .map(str::trim)
+            .filter(|output| !output.is_empty())
+            .unwrap_or_else(|| result.content.trim());
+        if refusal.is_empty() {
+            "it was refused.".to_string()
+        } else {
+            refusal.to_string()
+        }
+    };
+    Some(format!("{agent} did not get your message: {why}"))
+}
+
+#[cfg(test)]
+mod direct_agent_reply_tests {
+    use super::*;
+
+    fn result(content: &str, is_error: bool) -> sdk::Message {
+        let mut message = sdk::Message::tool_result("direct-agent-turn-1", content);
+        message.is_error = is_error;
+        message
+    }
+
+    /// A call whose card expired, was declined or was refused is never
+    /// reported as sent; a call that ran is.
+    #[test]
+    fn only_a_delivered_message_is_reported_sent() {
+        let id = "direct-agent-turn-1";
+        let expired = result(
+            &format!(
+                "{} `cli_agent` was not run: no answer",
+                sdk::OWNER_UNANSWERED
+            ),
+            true,
+        );
+        let said = undelivered_reply("Antigravity", &[expired], id, None).unwrap();
+        assert!(!said.contains("Sent to"), "{said}");
+        assert!(said.contains("no answer came"), "{said}");
+        let declined = result(
+            &format!("{} declined by the owner", sdk::OWNER_DECLINED),
+            true,
+        );
+        assert!(
+            undelivered_reply("Antigravity", &[declined], id, None)
+                .unwrap()
+                .contains("declined")
+        );
+        let refused = result("Blocked: Antigravity is unavailable", true);
+        assert!(
+            undelivered_reply("Antigravity", &[refused], id, None)
+                .unwrap()
+                .contains("Blocked: Antigravity is unavailable")
+        );
+        // No result at all: not sent either.
+        assert!(undelivered_reply("Antigravity", &[], id, None).is_some());
+        // Another call's result does not count.
+        let other = sdk::Message::tool_result("call-2", "done");
+        assert!(undelivered_reply("Antigravity", &[other], id, None).is_some());
+        // It ran: the usual reply stands.
+        let ran = result("Started in the background: Antigravity", false);
+        assert_eq!(undelivered_reply("Antigravity", &[ran], id, None), None);
     }
 }

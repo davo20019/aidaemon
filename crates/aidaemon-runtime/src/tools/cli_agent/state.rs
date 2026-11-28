@@ -97,6 +97,9 @@ pub(super) struct RunningCliAgent {
     /// While it waits for another run to leave its folder: that run's
     /// agent ([`FolderWait`]).
     pub(super) folder_wait: FolderWaitOn,
+    /// It runs with full access (set as its process starts): nothing it
+    /// does is judged.
+    pub(super) unchecked: Arc<AtomicBool>,
 }
 
 /// The agent a run waits on to leave its folder, while it does.

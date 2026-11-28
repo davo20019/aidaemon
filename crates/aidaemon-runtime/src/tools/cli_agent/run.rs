@@ -292,6 +292,9 @@ pub(super) struct RunShared {
     /// Number of owner approval prompts currently in flight for this hosted
     /// run (pauses background idle/wall-clock timeouts while the owner decides).
     pub(super) in_flight_approvals: Arc<std::sync::atomic::AtomicUsize>,
+    /// It runs with full access: nothing it does is judged, so a note
+    /// from a run capped by its device never goes into it.
+    pub(super) unchecked: Arc<AtomicBool>,
 }
 
 /// Who answers for a run's end. A foreground run's caller waits for it; if
@@ -516,6 +519,7 @@ pub(super) fn tracked(
         verdict: shared.verdict.clone(),
         max_output,
         folder_wait: shared.folder_wait.clone(),
+        unchecked: shared.unchecked.clone(),
     }
 }
 
@@ -1438,6 +1442,10 @@ impl RunHandles {
     ) -> anyhow::Result<StartedRun> {
         let tool_name = call.tool_name.as_str();
         let task_id = call.task_id.as_str();
+        shared.unchecked.store(
+            prep.mode == aidaemon_coding_agents::PermissionMode::FullAccess,
+            Ordering::SeqCst,
+        );
         if let Some(ref claim_dir) = prep.claim_dir {
             activate_claim(&mut lock_claims(&self.claims), claim_dir, task_id);
         }

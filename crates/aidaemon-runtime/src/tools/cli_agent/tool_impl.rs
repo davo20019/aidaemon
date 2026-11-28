@@ -118,6 +118,12 @@ impl Tool for CliAgentTool {
         })
     }
 
+    /// In a run its device capped, the agent is launched checked
+    /// (`ceiling`), so the launch is no card of its own.
+    fn holds_to_medium_ceiling(&self, arguments: &str) -> bool {
+        self.holds_launch_to_ceiling(arguments)
+    }
+
     async fn execute(
         &self,
         arguments: &str,
@@ -873,13 +879,20 @@ impl CliAgentTool {
                                         agent.tool_name.clone(),
                                         agent.process.host(),
                                         agent.finished.load(Ordering::Acquire),
+                                        agent.unchecked.load(Ordering::Acquire),
                                     )
                                 })
                             } else {
                                 None
                             };
-                            if let Some((live_tool, live_host, finished)) = live_entry {
+                            if let Some((live_tool, live_host, finished, unchecked)) = live_entry {
+                                // A run capped by its device never adds to
+                                // work nothing judges (full access): its note
+                                // waits, and goes on from that session checked
+                                // once the run ends.
+                                let note_allowed = !(unchecked && Self::device_capped(facts));
                                 if !finished
+                                    && note_allowed
                                     && owner_follow_up_call
                                     && !read_only_run
                                     && !args.queue_only
@@ -1178,7 +1191,13 @@ impl CliAgentTool {
                 } else {
                     let recipient = super::shared_files::Recipient {
                         folder: working_dir.clone().map(std::path::PathBuf::from),
-                        reads_anywhere: self.reads_anywhere(&tool, enforce_native_access, None),
+                        // A run its device capped is launched checked: it
+                        // reads only its folder.
+                        reads_anywhere: self.reads_anywhere(
+                            &tool,
+                            enforce_native_access,
+                            self.ceiling_cap_for(&tool, facts, read_only_run),
+                        ),
                     };
                     let cwd = working_dir.clone().map(std::path::PathBuf::from);
                     let shared =

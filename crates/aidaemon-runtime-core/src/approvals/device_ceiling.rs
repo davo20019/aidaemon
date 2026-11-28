@@ -16,6 +16,13 @@
 //!   understood): a delegated coding agent or an opaque script may do any
 //!   of the above.
 //!
+//! A tool may hold a call to the ceiling itself
+//! (`OutcomeTool::holds_to_medium_ceiling`, a typed method of the tool the
+//! call names, as the approval rules consult it): `cli_agent` launches its
+//! coding agent in a checked mode in a capped run, so every request the
+//! agent makes comes back here as a nested call. Such a call is not asked
+//! about unless its own tool rated it High.
+//!
 //! The hook sits after `ApprovalPolicy` in the turn's chain
 //! (`engine::turn_engine::turn_hooks::with_device_ceiling`). The kernel asks every `before_tool` hook in
 //! order and runs a call only when all of them allow it: an allow by a
@@ -82,11 +89,29 @@ const CAPPED_WARNING: &str = "Asked from a device that may not allow this (an e-
 /// owner. Declares [`sdk::Safeguard::Approval`].
 pub struct DeviceCeilingHook {
     cap: DeviceCap,
+    tools: super::ApprovalTools,
 }
 
 impl DeviceCeilingHook {
     pub fn new(cap: DeviceCap) -> Self {
-        Self { cap }
+        Self {
+            cap,
+            tools: super::ApprovalTools::default(),
+        }
+    }
+
+    /// The turn's tools, whose own word that a call holds to the ceiling
+    /// (`holds_to_medium_ceiling`) the hook takes.
+    pub fn with_tools(mut self, tools: super::ApprovalTools) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// The call's own tool holds it to the ceiling.
+    fn held_by_its_tool(&self, call: &sdk::ToolCall) -> bool {
+        self.tools
+            .find(&call.name)
+            .is_some_and(|tool| tool.holds_to_medium_ceiling(&call.arguments.to_string()))
     }
 }
 
@@ -110,9 +135,15 @@ impl sdk::Hook for DeviceCeilingHook {
             return sdk::ToolDecision::Allow;
         }
         let key = call_key(call);
-        let Some(why) = above_medium(info, self.cap.rating(ctx.run_id, &key)) else {
+        let rated = self.cap.rating(ctx.run_id, &key);
+        let Some(why) = above_medium(info, rated) else {
             return sdk::ToolDecision::Allow;
         };
+        // Its tool runs it under the ceiling (a coding agent in a checked
+        // mode); a High rating of its own still asks.
+        if !rated.is_some_and(risk_above_medium) && self.held_by_its_tool(call) {
+            return sdk::ToolDecision::Allow;
+        }
         // The owner already allowed this exact call on a card the capped
         // device could not answer (another rule's High card).
         if self.cap.take_pass(ctx.run_id, &key) {
@@ -181,6 +212,7 @@ mod tests {
         ToolAnnotations, ToolCall, ToolDecision, ToolInfo,
     };
     use aidaemon_tools::semantics::ApprovalKind;
+    use std::sync::Arc;
 
     fn info(annotations: ToolAnnotations, effects: CallEffects) -> ToolInfo {
         ToolInfo {
@@ -298,6 +330,65 @@ mod tests {
             above_medium(&local_write(), Some(sdk::ApprovalRisk::Medium)),
             None
         );
+    }
+
+    /// A tool that launches what it holds to the ceiling itself (as
+    /// `cli_agent` does with a checked coding agent).
+    struct HeldLauncher;
+
+    impl aidaemon_tools::semantics::ToolSemantics for HeldLauncher {}
+
+    #[async_trait]
+    impl aidaemon_tools::OutcomeTool for HeldLauncher {
+        fn name(&self) -> &str {
+            "launcher"
+        }
+        fn description(&self) -> &str {
+            "Launches a checked helper"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"name": "launcher", "description": "Launches a checked helper",
+                "parameters": {"type": "object", "properties": {}}})
+        }
+        async fn execute(
+            &self,
+            _arguments: &str,
+            _facts: &aidaemon_tools::semantics::ToolCallContext,
+        ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
+            anyhow::bail!("not run in this test")
+        }
+        fn holds_to_medium_ceiling(&self, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// A call its own tool holds to the ceiling is no card in a capped run,
+    /// unless that tool rated it High; another tool's opaque call still asks.
+    #[tokio::test]
+    async fn a_call_its_tool_holds_to_the_ceiling_is_no_card() {
+        let cap = DeviceCap::new();
+        cap.raise();
+        let launcher: Arc<dyn aidaemon_tools::OutcomeTool> = Arc::new(HeldLauncher);
+        let hook = DeviceCeilingHook::new(cap.clone())
+            .with_tools(super::super::ApprovalTools::new([launcher]));
+        let run = RunId::new();
+        let opaque = info(ToolAnnotations::DESTRUCTIVE, CallEffects::unknown());
+        assert_eq!(
+            hook.before_tool(&ctx(run, &[]), &call("launcher"), &opaque)
+                .await,
+            ToolDecision::Allow
+        );
+        assert!(
+            asked(
+                &hook
+                    .before_tool(&ctx(run, &[]), &call("other"), &opaque)
+                    .await
+            )
+            .is_some()
+        );
+        let rated = call("launcher");
+        cap.rate(run, &call_key(&rated), sdk::ApprovalRisk::High);
+        assert!(asked(&hook.before_tool(&ctx(run, &[]), &rated, &opaque).await).is_some());
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ use aidaemon_tools::{BackendFileType, BackendPath, ExecutionRequest, ProcessHand
 
 mod args;
 mod background;
+mod ceiling;
 mod claims;
 mod delivery;
 mod launch;

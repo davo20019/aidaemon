@@ -1203,6 +1203,13 @@ impl DetachedNestedJudge {
         }
     }
 
+    /// The device ceiling of the turn this judge answers for
+    /// ([`crate::device_cap`]): a tool that launches a program holds its
+    /// launch to it (`cli_agent` runs its agent checked in a capped run).
+    pub fn device_cap(&self) -> &crate::device_cap::DeviceCap {
+        &self.rules.device_cap
+    }
+
     /// Create a child cancellation token bound to this detached judge so a
     /// single background run can cancel its own pending approval cards when
     /// stopped without cancelling sibling runs from the same turn.

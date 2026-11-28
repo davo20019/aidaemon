@@ -191,3 +191,66 @@ async fn tool_results_of(harness: &crate::testing::TestHarness) -> Vec<String> {
         .map(|message| message["content"].as_str().unwrap_or_default().to_string())
         .collect()
 }
+
+/// A message into a conversation set to a coding agent, from a capped
+/// device, whose launch card was declined or got no answer: the reply says
+/// the agent did not get it, never "Sent to". Allowed, it is delivered as
+/// before.
+#[tokio::test]
+async fn an_undelivered_coding_agent_message_is_never_reported_sent() {
+    use aidaemon_runtime::session_model::{self, SessionModelSetting};
+    for (answer, delivered) in [
+        (Some(crate::types::ApprovalResponse::Deny), false),
+        (None, false),
+        (Some(crate::types::ApprovalResponse::AllowOnce), true),
+    ] {
+        // A launch its tool does not hold to the ceiling (this tool says
+        // nothing), so the cap asks on the phone.
+        let launcher: Arc<dyn crate::traits::Tool> =
+            Arc::new(MockTool::new("cli_agent", "delegation tool", ""));
+        let mut harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(
+            MockProvider::with_responses(vec![]),
+            vec![launcher],
+            None,
+        )
+        .await
+        .unwrap();
+        // No answer: the card's wait runs out at once.
+        harness.agent.set_owner_approvals(Arc::new(
+            crate::agent::approvals::OwnerApprovals::with_timeout(
+                std::time::Duration::from_millis(200),
+            ),
+        ));
+        let (broker, approver) = crate::testing::ScriptedApprover::start(vec![answer.clone()]);
+        harness.agent.owner_approvals().set_broker(broker);
+        session_model::set(
+            harness.state.as_ref(),
+            CEILING_SESSION,
+            &SessionModelSetting {
+                agent: Some("agy".into()),
+                ..SessionModelSetting::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reply = harness
+            .agent
+            .handle_message(
+                CEILING_SESSION,
+                "Fix the footer",
+                None,
+                UserRole::Owner,
+                capped(ChannelContext::private("app")),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(approver.card_count(), 1, "{answer:?}");
+        if delivered {
+            assert_eq!(reply, "Sent to agy.", "{answer:?}");
+        } else {
+            assert!(!reply.contains("Sent to"), "{answer:?}: {reply}");
+            assert!(reply.contains("did not get your message"), "{reply}");
+        }
+    }
+}

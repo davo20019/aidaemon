@@ -103,10 +103,10 @@ impl TurnHooks {
 pub fn with_device_ceiling(
     mut chain: Vec<(HookSlot, Arc<dyn sdk::Hook>)>,
     cap: crate::device_cap::DeviceCap,
+    tools: crate::approvals::ApprovalTools,
 ) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
-    let hook: Arc<dyn sdk::Hook> = Arc::new(
-        crate::approvals::device_ceiling::DeviceCeilingHook::new(cap),
-    );
+    let hook: Arc<dyn sdk::Hook> =
+        Arc::new(crate::approvals::device_ceiling::DeviceCeilingHook::new(cap).with_tools(tools));
     let at = chain
         .iter()
         .position(|(slot, _)| *slot == HookSlot::Approval)
@@ -178,10 +178,14 @@ mod device_ceiling_slot_tests {
             (HookSlot::Approval, nop()),
             (HookSlot::Dispatch, nop()),
         ];
-        let slots: Vec<HookSlot> = with_device_ceiling(chain, crate::device_cap::DeviceCap::new())
-            .into_iter()
-            .map(|(slot, _)| slot)
-            .collect();
+        let slots: Vec<HookSlot> = with_device_ceiling(
+            chain,
+            crate::device_cap::DeviceCap::new(),
+            Default::default(),
+        )
+        .into_iter()
+        .map(|(slot, _)| slot)
+        .collect();
         assert_eq!(
             slots,
             [

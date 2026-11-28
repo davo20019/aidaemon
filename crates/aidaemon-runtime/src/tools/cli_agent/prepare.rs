@@ -68,6 +68,18 @@ impl CliAgentTool {
             .then(|| self.permissions().model_of(tool_name))
             .flatten();
         let mode = mode.or((!enforce_native_access).then_some(PermissionMode::Checked));
+        // A run its device capped (an e-ink reader) holds the agent to a
+        // checked mode, so its every request comes back to the run's
+        // safeguards (`ceiling`).
+        let device_capped = detached_judge
+            .as_ref()
+            .is_some_and(|judge| judge.device_cap().is_capped());
+        let mode_cap = self.ceiling_mode_cap(
+            device_capped,
+            &*coding_agent,
+            workspace_mode == CliWorkspaceMode::ReadOnly,
+            mode_cap,
+        );
         let mode = capped_mode(&*coding_agent, mode, mode_cap);
         let Some(mode) = mode else {
             let level = self.permissions().level();

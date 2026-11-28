@@ -103,6 +103,17 @@ pub trait OutcomeTool: ToolSemantics {
     fn validate_call(&self, _arguments: &Value) -> Result<(), String> {
         Ok(())
     }
+    /// Whether this exact call stays at most Medium in a run a device
+    /// capped at Medium started or steered (an e-ink reader), though its
+    /// declared effects alone could not show it: the tool itself holds what
+    /// the call starts to that ceiling (a coding agent launched in a checked
+    /// mode, each of its own requests coming back to the run's safeguards as
+    /// a nested call), or the call only reads or stops the tool's own work.
+    /// The tool must enforce what it claims here when the call runs. The
+    /// default is `false`: the call is judged from its effects.
+    fn holds_to_medium_ceiling(&self, _arguments: &str) -> bool {
+        false
+    }
     /// The permission mode the owner's cards for this tool are sent with
     /// (it picks the buttons offered). `None`: the default, Cautious.
     fn approval_card_mode(&self) -> Option<PermissionMode> {
