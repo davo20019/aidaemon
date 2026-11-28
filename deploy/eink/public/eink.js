@@ -468,6 +468,8 @@
     $('convo-title').textContent = (s && s.title) || (s && s.id ? 'Conversation' : 'New chat');
     $('convo-note').textContent = '';
     show('convo');
+    inlineSig = null;
+    renderInlineApprovals();
     current.toEnd = true;
     await loadHistory();
     var busyNow = ((overview && overview.running_tasks) || []).some(function (t) {
@@ -536,8 +538,13 @@
       if (current.view !== 'convo' || !current.session || current.session.id !== id) { stopWatching(); return; }
       try {
         var glance = (await (await ensureLink()).command({ type: 'get_glance' })).glance || {};
+        overview.pending_approvals = glance.pending_approvals || [];
+        overview.running_tasks = glance.running_tasks || [];
+        renderApprovals(overview);
+        renderInlineApprovals();
         var busy = (glance.running_tasks || []).some(function (t) { return t.session_id === id; });
-        if (busy) { sawWork = true; quietChecks = 0; return; }
+        var waiting = (glance.pending_approvals || []).some(function (a) { return a.session_id === id; });
+        if (busy || waiting) { sawWork = true; quietChecks = 0; return; }
         // Just sent: give the daemon a few checks to start before giving up.
         if (!sawWork && ++quietChecks < 4) return;
         // The turn is done; a coding agent may still be running in the
@@ -551,6 +558,37 @@
         stopWatching();
       }
     }, WATCH_MS);
+  }
+
+  // A waiting approval for the open conversation shows on top of the
+  // message box, so it is never missed while reading the conversation.
+  var inlineSig = '';
+  function renderInlineApprovals() {
+    var box = $('convo-approvals');
+    var id = current.session && current.session.id;
+    var mine = (overview.pending_approvals || []).filter(function (a) { return a.session_id === id; });
+    var sig = mine.map(function (a) { return a.id; }).join(',');
+    if (sig === inlineSig && box.childNodes.length === (mine.length ? mine.length : 0)) return;
+    inlineSig = sig;
+    clear(box);
+    mine.forEach(function (a) {
+      var card = el('div', 'inline-approval');
+      card.appendChild(el('div', 'msg-from', 'Needs your OK · ' + a.risk + ' risk'));
+      var text = el('div', 'msg-text');
+      richText(text, preview(a.detail || a.summary).text);
+      card.appendChild(text);
+      var actions = el('div', 'actions');
+      var review = el('button', 'btn btn-strong btn-small', 'Review \u25b8');
+      review.type = 'button';
+      review.addEventListener('click', function () { current.approvalFrom = 'convo'; openApproval(a); });
+      var deny = el('button', 'btn btn-small', 'Deny');
+      deny.type = 'button';
+      deny.addEventListener('click', function () { current.approval = a; current.approvalFrom = 'convo'; resolve('deny'); });
+      actions.appendChild(review);
+      actions.appendChild(deny);
+      card.appendChild(actions);
+      box.appendChild(card);
+    });
   }
 
   function stopWatching() {
@@ -1099,7 +1137,7 @@
       b.type = 'button';
       b.appendChild(el('span', 'title', a.summary));
       b.appendChild(el('span', 'meta', 'Risk: ' + a.risk));
-      b.addEventListener('click', function () { openApproval(a); });
+      b.addEventListener('click', function () { current.approvalFrom = null; openApproval(a); });
       li.appendChild(b);
       ul.appendChild(li);
     });
@@ -1108,6 +1146,10 @@
 
   function openApproval(a) {
     current.approval = a;
+    var back = document.querySelector('#view-approval [data-back]');
+    var fromConvo = current.approvalFrom === 'convo';
+    back.setAttribute('data-back', fromConvo ? 'convo' : 'approvals');
+    back.textContent = fromConvo ? '\u2190 Conversation' : '\u2190 Approvals';
     $('ap-title').textContent = a.summary;
     var t = $('ap-details');
     clear(t);
@@ -1132,6 +1174,15 @@
       note((decision === 'deny' ? 'Denied: ' : 'Approved once: ') + a.summary);
     } catch (e) {
       note(e.message);
+    }
+    var back = current.approvalFrom || 'approvals';
+    current.approvalFrom = null;
+    if (back === 'convo') {
+      overview.pending_approvals = (overview.pending_approvals || []).filter(function (x) { return x.id !== a.id; });
+      show('convo');
+      renderInlineApprovals();
+      renderApprovals(overview);
+      return;
     }
     show('approvals');
     loadSnapshot().catch(function (e) { note(e.message); });
