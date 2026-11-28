@@ -561,7 +561,21 @@
     }
   }
 
+  // The agent the composer addresses (send_message's in_run), until
+  // cancelled or another conversation opens.
+  function replyTo(r) {
+    current.replyThread = r ? (r.thread || r.id) : null;
+    $('reply-to').className = r ? 'reply-to' : 'reply-to hidden';
+    setText($('reply-to-label'), r ? 'Replying to ' + (r.agent || 'the agent') : '');
+    if (r) {
+      $('convo-note').textContent = '';
+      if (writing.mode !== 'write') $('convo-text').focus();
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+  }
+
   async function openChat(s, from, started) {
+    replyTo(null);
     stopWatching();
     if (writing.form !== 'convo') setMode('type', 'convo');
     current.session = s;
@@ -821,6 +835,14 @@
         steps.type = 'button';
         steps.addEventListener('click', function () { openRun(r); });
         card.appendChild(steps);
+        // Reply goes to this agent's own session (RunSummary.thread, or the
+        // run itself when it started the thread), as in the app.
+        if (r.session_id) {
+          var reply = el('button', 'btn btn-small', 'Reply');
+          reply.type = 'button';
+          reply.addEventListener('click', function () { replyTo(r); });
+          card.appendChild(reply);
+        }
         box.appendChild(card);
         return;
       }
@@ -1061,6 +1083,8 @@
       var command = { type: 'send_message', text: text };
       if (attachments.length) command.attachments = attachments;
       if (session && session.id) command.session_id = session.id;
+      var thread = current.replyThread;
+      if (thread && session && session.id) command.in_run = thread;
       var result = await l.command(command);
       if (current.view !== 'convo' || current.session !== session) return;
       // Strokes are kept until the daemon took the message.
@@ -1071,7 +1095,7 @@
         $('convo-title').textContent = current.session.title;
         remember('convo', true);
       }
-      $('convo-note').textContent = 'Sent. The reply appears here when it is ready.';
+      $('convo-note').textContent = command.in_run ? 'Sent to ' + $('reply-to-label').textContent.replace(/^Replying to /, '') + '. Its answer appears here.' : 'Sent. The reply appears here when it is ready.';
       current.toEnd = true;
       watchConversation(current.session.id, false);
       await loadHistory();
@@ -1631,6 +1655,7 @@
       refreshAll();
     });
     $('btn-send').addEventListener('click', send);
+    $('btn-reply-cancel').addEventListener('click', function () { replyTo(null); });
     $('mode-type').addEventListener('click', function () { setMode('type', 'convo'); });
     $('mode-write').addEventListener('click', function () { setMode('write', 'convo'); });
     $('nc-mode-type').addEventListener('click', function () { setMode('type', 'newcode'); });

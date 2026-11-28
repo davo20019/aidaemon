@@ -13,7 +13,7 @@
 </head>
 <body>
   <header class="top">
-    <div class="brand">aidaemon <span id="link-state" class="linktag">Starting</span></div>
+    <div class="brand">aidaemon <button type="button" id="link-state" class="linktag" disabled>Starting</button></div>
     <nav class="tabs" role="tablist" id="tabs">
       <button type="button" class="tab" data-view="chat" role="tab" aria-selected="false">Chat <span id="chat-working" class="count"></span></button>
       <button type="button" class="tab" data-view="code" role="tab" aria-selected="false">Code <span id="code-running" class="count"></span></button>
@@ -59,11 +59,11 @@
         <button type="button" class="btn" data-refresh>Refresh</button>
       </div>
       <h2 id="convo-title"></h2>
-      <div id="convo-runs"></div>
       <div id="convo-messages"></div>
       <div class="composer">
         <div id="convo-approvals"></div>
-        <div class="modes">
+        <p id="convo-readonly" class="muted hidden">View-only device. Raise access in the app to send messages.</p>
+        <div class="modes" id="convo-modes">
           <button type="button" class="btn mode active" id="mode-type">Type</button>
           <button type="button" class="btn mode" id="mode-write">Write</button>
           <button type="button" class="btn btn-strong send" id="btn-send">Send</button>
@@ -75,6 +75,7 @@
           <div class="actions">
             <button type="button" class="btn" id="btn-next-line">Next line</button>
             <button type="button" class="btn" id="btn-clear-line">Clear line</button>
+            <button type="button" class="btn" id="btn-undo-line" disabled>Undo line</button>
             <button type="button" class="btn" id="btn-clear-all">Clear all</button>
           </div>
         </div>
@@ -121,11 +122,12 @@
     <!-- ONE RUN -->
     <section id="view-run" class="view">
       <div class="bar">
-        <button type="button" class="btn" data-back="code">&larr; Code</button>
+        <button type="button" class="btn" id="btn-run-back">&larr; Conversation</button>
         <button type="button" class="btn" data-refresh>Refresh</button>
       </div>
       <h2 id="run-title"></h2>
       <p id="run-meta" class="muted"></p>
+      <p id="run-status" class="note"></p>
       <h3>Steps</h3>
       <ul class="list" id="run-steps"></ul>
       <div id="run-extra"></div>
@@ -165,6 +167,7 @@
       <div class="bar"><button type="button" class="btn" data-back="approvals">&larr; Approvals</button></div>
       <h2 id="ap-title"></h2>
       <table class="kv" id="ap-details"></table>
+      <ul class="warnings" id="ap-warnings"></ul>
       <h3>Exact request</h3>
       <pre id="ap-exact" class="exact"></pre>
       <div class="actions" id="ap-actions">
@@ -178,6 +181,7 @@
     <section id="view-confirm" class="view">
       <h2>Confirm approval</h2>
       <p id="cf-text" class="big"></p>
+      <ul class="warnings" id="cf-warnings"></ul>
       <pre id="cf-exact" class="exact"></pre>
       <p class="muted">Approves this one request, once.</p>
       <div class="actions">
