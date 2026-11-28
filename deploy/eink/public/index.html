@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>aidaemon e-ink</title>
+  <link rel="stylesheet" href="./eink.css">
+  <script src="./config.js"></script>
+  <script src="./bridge-proto.js"></script>
+  <script src="./eink.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">aidaemon <span id="link-state" class="mocktag">starting</span></div>
+    <nav class="tabs" role="tablist" id="tabs">
+      <button type="button" class="tab" data-view="chat" role="tab">Chat <span id="chat-working" class="count"></span></button>
+      <button type="button" class="tab" data-view="code" role="tab">Code <span id="code-running" class="count"></span></button>
+      <button type="button" class="tab" data-view="approvals" role="tab">Approvals <span id="approval-count" class="count"></span></button>
+    </nav>
+  </header>
+
+  <main id="main">
+    <!-- PAIR -->
+    <section id="view-pair" class="view">
+      <h2>Pair this Kindle</h2>
+      <p class="muted">Use this browser only for aidaemon. It is old and no longer updated, so a harmful website opened in it could act as this Kindle.</p>
+      <div class="actions"><button type="button" class="btn btn-strong" id="btn-pair">Pair</button></div>
+      <div id="pair-code-box" class="confirmbox">
+        <p>Type this code into aidaemon on your computer:</p>
+        <p id="pair-code" class="paircode"></p>
+        <p class="muted" id="pair-status">Waiting for your daemon&hellip;</p>
+      </div>
+      <p id="pair-note" class="note"></p>
+    </section>
+
+    <!-- CHAT LIST -->
+    <section id="view-chat" class="view">
+      <div class="bar">
+        <span class="updated muted"></span>
+        <span>
+          <button type="button" class="btn" data-refresh>Refresh</button>
+          <button type="button" class="btn btn-strong" id="btn-new-chat">New chat</button>
+        </span>
+      </div>
+      <ul class="list" id="chat-list"></ul>
+    </section>
+
+    <!-- CONVERSATION -->
+    <section id="view-convo" class="view">
+      <div class="bar">
+        <button type="button" class="btn" data-back="chat">&larr; Chats</button>
+        <button type="button" class="btn" data-refresh>Refresh</button>
+      </div>
+      <h2 id="convo-title"></h2>
+      <div id="convo-messages"></div>
+      <div class="composer">
+        <textarea id="convo-text" rows="3" placeholder="Type here"></textarea>
+        <div class="actions"><button type="button" class="btn btn-strong" id="btn-send">Send</button></div>
+        <p id="convo-note" class="note"></p>
+      </div>
+    </section>
+
+    <!-- CODE LIST -->
+    <section id="view-code" class="view">
+      <div class="bar">
+        <span class="updated muted"></span>
+        <span>
+          <button type="button" class="btn" data-refresh>Refresh</button>
+          <button type="button" class="btn btn-strong" id="btn-new-code">New session</button>
+        </span>
+      </div>
+      <h2>Running</h2>
+      <ul class="list" id="running-list"></ul>
+      <h2>Finished</h2>
+      <ul class="list" id="done-list"></ul>
+    </section>
+
+    <!-- NEW CODE SESSION -->
+    <section id="view-newcode" class="view">
+      <div class="bar"><button type="button" class="btn" data-back="code">&larr; Code</button></div>
+      <h2>New coding session</h2>
+      <label class="field-label" for="project">Project</label>
+      <select id="project"></select>
+      <label class="field-label" for="agent">Agent</label>
+      <select id="agent"></select>
+      <label class="field-label" for="newcode-text">What should it do?</label>
+      <textarea id="newcode-text" rows="4"></textarea>
+      <div class="actions"><button type="button" class="btn btn-strong" id="btn-start-code">Start session</button></div>
+      <p id="newcode-note" class="note"></p>
+    </section>
+
+    <!-- ONE RUN -->
+    <section id="view-run" class="view">
+      <div class="bar">
+        <button type="button" class="btn" data-back="code">&larr; Code</button>
+        <button type="button" class="btn" data-refresh>Refresh</button>
+      </div>
+      <h2 id="run-title"></h2>
+      <p id="run-meta" class="muted"></p>
+      <h3>Steps</h3>
+      <ul class="list" id="run-steps"></ul>
+      <div id="run-result"></div>
+      <div class="actions" id="run-actions"></div>
+      <h3>Steer it</h3>
+      <textarea id="steer-text" rows="2" placeholder="e.g. also add a test"></textarea>
+      <div class="actions"><button type="button" class="btn" id="btn-steer">Send to the agent</button></div>
+      <p id="run-note" class="note"></p>
+    </section>
+
+    <!-- STEP DETAIL -->
+    <section id="view-detail" class="view">
+      <div class="bar"><button type="button" class="btn" data-back="run">&larr; Run</button></div>
+      <h2 id="detail-title"></h2>
+      <pre id="detail-body" class="exact"></pre>
+    </section>
+
+    <!-- APPROVALS -->
+    <section id="view-approvals" class="view">
+      <div class="bar">
+        <span class="muted">Nothing runs until you decide.</span>
+        <button type="button" class="btn" data-refresh>Refresh</button>
+      </div>
+      <ul class="list" id="approval-list"></ul>
+    </section>
+
+    <!-- APPROVAL DETAIL -->
+    <section id="view-approval" class="view">
+      <div class="bar"><button type="button" class="btn" data-back="approvals">&larr; Approvals</button></div>
+      <h2 id="ap-title"></h2>
+      <table class="kv" id="ap-details"></table>
+      <h3>Exact request</h3>
+      <pre id="ap-exact" class="exact"></pre>
+      <div class="actions" id="ap-actions">
+        <button type="button" class="btn btn-strong" id="btn-approve">Approve once&hellip;</button>
+        <button type="button" class="btn" id="btn-deny">Deny</button>
+      </div>
+      <p id="ap-note" class="note"></p>
+    </section>
+
+    <!-- APPROVAL CONFIRM -->
+    <section id="view-confirm" class="view">
+      <h2>Confirm approval</h2>
+      <p id="cf-text" class="big"></p>
+      <pre id="cf-exact" class="exact"></pre>
+      <p class="muted">Approves this one request, once.</p>
+      <div class="actions">
+        <button type="button" class="btn btn-strong" id="btn-confirm">Yes, approve once</button>
+        <button type="button" class="btn" data-back="approval">Go back</button>
+      </div>
+    </section>
+
+    <p id="global-note" class="note"></p>
+  </main>
+</body>
+</html>

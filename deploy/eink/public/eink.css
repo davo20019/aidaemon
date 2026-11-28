@@ -1,0 +1,106 @@
+/* E-ink: pure black on white, thick borders, large targets, no animation. */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+body { font-family: Georgia, "Bookerly", serif; font-size: 20px; line-height: 1.4; }
+
+.top { border-bottom: 3px solid #000; padding: 12px 16px 0; }
+.brand { font-weight: bold; font-size: 22px; margin-bottom: 10px; }
+.mocktag { font-weight: normal; font-size: 15px; border: 1px solid #000; padding: 1px 6px; margin-left: 8px; }
+.tabs { display: flex; }
+.tab {
+  flex: 1; font: inherit; font-size: 20px; background: #fff; color: #000;
+  border: 2px solid #000; border-bottom: none; margin-right: -2px; padding: 14px 6px; min-height: 60px;
+}
+.tab.active { background: #000; color: #fff; font-weight: bold; }
+.count { display: inline-block; border: 2px solid currentColor; border-radius: 14px; padding: 0 8px; font-size: 16px; }
+
+main { padding: 12px 16px 40px; }
+.view { display: none; }
+.view.active { display: block; }
+
+h2 { font-size: 22px; margin: 22px 0 8px; border-bottom: 2px solid #000; padding-bottom: 4px; }
+h3 { font-size: 19px; margin: 18px 0 6px; }
+.muted { color: #333; font-size: 17px; }
+.big { font-size: 22px; }
+.bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+
+.list { list-style: none; margin: 0; padding: 0; }
+.item {
+  display: block; width: 100%; text-align: left; font: inherit; background: #fff; color: #000;
+  border: 2px solid #000; padding: 12px 14px; margin: 0 0 10px; min-height: 64px;
+}
+.item .title { font-weight: bold; display: block; }
+.item .meta { font-size: 16px; display: block; margin-top: 2px; }
+.empty { font-size: 17px; padding: 8px 0; }
+
+.btn {
+  font: inherit; font-size: 19px; background: #fff; color: #000; border: 2px solid #000;
+  padding: 12px 18px; min-height: 56px; margin: 0 10px 10px 0;
+}
+.btn-strong { background: #000; color: #fff; font-weight: bold; }
+.actions { margin-top: 14px; }
+
+.steps { padding-left: 26px; font-size: 18px; }
+.steps li { margin-bottom: 6px; }
+
+.kv { width: 100%; border-collapse: collapse; font-size: 18px; }
+.kv th, .kv td { border: 1px solid #000; padding: 8px; text-align: left; vertical-align: top; }
+.kv th { width: 34%; }
+.exact {
+  border: 2px solid #000; padding: 10px; white-space: pre-wrap; word-break: break-word;
+  font-family: "Courier New", monospace; font-size: 17px; margin: 0;
+}
+
+.field-label { display: block; font-weight: bold; margin: 16px 0 6px; }
+select, textarea, input[type="text"] {
+  width: 100%; font: inherit; font-size: 20px; border: 2px solid #000; background: #fff; color: #000; padding: 10px;
+}
+select { min-height: 56px; }
+.modes { margin-top: 18px; }
+.mode.active { background: #000; color: #fff; }
+
+.strip {
+  display: block; width: 100%; height: 120px; border: 2px solid #000; background: #fff;
+  touch-action: none; -webkit-user-select: none; user-select: none;
+}
+.lines img { display: block; width: 100%; height: auto; border: 1px solid #000; border-bottom: none; }
+.note { font-size: 18px; font-weight: bold; min-height: 1em; }
+
+.msg { border: 2px solid #000; padding: 10px 12px; margin: 0 0 10px; }
+.msg-you { margin-left: 12%; border-style: dashed; }
+.msg-from { font-weight: bold; font-size: 16px; margin-bottom: 2px; }
+.msg-text { white-space: pre-wrap; }
+.composer { margin-top: 12px; border-top: 2px solid #000; padding-top: 6px; }
+.composer textarea { margin-top: 4px; }
+
+.agent { border: 2px solid #000; padding: 10px 14px; margin: 0 0 10px; }
+.agent .title { font-weight: bold; display: block; }
+.agent .meta { font-size: 16px; display: block; margin: 2px 0 6px; }
+.btn-small { font-size: 16px; min-height: 44px; padding: 6px 12px; margin: 0; }
+
+.agent-open { border: none; padding: 0; margin: 0 0 4px; min-height: 0; }
+.nowbox { border: 3px solid #000; padding: 10px 14px; margin: 8px 0; }
+.nowbox .title { font-weight: bold; margin-right: 10px; }
+.step { min-height: 52px; padding: 10px 14px; }
+.step .title { font-weight: normal; }
+.step-running { border-width: 3px; }
+.step-running .title, .step-failed .title, .step-handoff .title { font-weight: bold; }
+.step-failed { border-style: dashed; }
+.fold .title { font-weight: normal; }
+
+.confirmbox { display: none; border: 3px solid #000; padding: 12px 14px; margin-top: 14px; }
+
+.paircode {
+  font-family: "Courier New", monospace;
+  font-size: 30px;
+  font-weight: bold;
+  letter-spacing: 2px;
+  word-break: break-all;
+  border: 3px solid #000;
+  padding: 12px;
+  text-align: center;
+}
+.composer { margin-top: 12px; border-top: 2px solid #000; padding-top: 6px; }
+
+.count:empty { display: none; }
+.step { min-height: 52px; padding: 10px 14px; }
