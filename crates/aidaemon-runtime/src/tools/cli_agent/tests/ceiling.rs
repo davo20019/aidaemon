@@ -375,3 +375,222 @@ async fn a_capped_note_never_enters_a_full_access_run() {
         tool.running.lock().await.clear();
     }
 }
+
+/// The run's terminal as the kernel sees it: `ls` a read whose effects it
+/// declares in full, anything else a push off the machine.
+struct SdkTerminal;
+
+#[async_trait::async_trait]
+impl aidaemon_core::Tool for SdkTerminal {
+    fn spec(&self) -> aidaemon_core::ToolSpec {
+        aidaemon_core::ToolSpec {
+            name: "terminal".into(),
+            description: "terminal".into(),
+            parameters: json!({}),
+        }
+    }
+    fn annotations_for(&self, arguments: &Value) -> aidaemon_core::ToolAnnotations {
+        if arguments["command"] == "ls" {
+            aidaemon_core::ToolAnnotations::READ_ONLY
+        } else {
+            aidaemon_core::ToolAnnotations {
+                egress: true,
+                ..aidaemon_core::ToolAnnotations::WRITE
+            }
+        }
+    }
+    fn effects(&self, arguments: &Value) -> aidaemon_core::CallEffects {
+        if arguments["command"] == "ls" {
+            aidaemon_core::CallEffects::none()
+        } else {
+            aidaemon_core::CallEffects {
+                keys: vec![aidaemon_core::EffectKey::egress(
+                    "https",
+                    "git.example.invalid",
+                    None,
+                )],
+                complete: true,
+                understood: true,
+            }
+        }
+    }
+    async fn call(
+        &self,
+        _arguments: Value,
+        _ctx: &aidaemon_core::ToolContext,
+    ) -> Result<aidaemon_core::ToolOutput, aidaemon_core::ToolError> {
+        Ok(aidaemon_core::ToolOutput::text("ok"))
+    }
+}
+
+/// The terminal's own ladder, as the approval rules consult it: every
+/// command asks the owner at Medium (as the live card did).
+struct MediumLadder;
+
+#[async_trait::async_trait]
+impl crate::tools::traits::ToolSemantics for MediumLadder {
+    async fn owner_approval_request(
+        &self,
+        _call: &aidaemon_tools::semantics::ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> aidaemon_tools::semantics::OwnerApprovalNeed {
+        aidaemon_tools::semantics::OwnerApprovalNeed::Ask(
+            aidaemon_core::OwnerApprovalRequest::plain(
+                "Run a command",
+                "terminal run",
+                aidaemon_core::ApprovalRisk::Medium,
+                Vec::new(),
+            ),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for MediumLadder {
+    fn name(&self) -> &str {
+        "terminal"
+    }
+    fn description(&self) -> &str {
+        "terminal"
+    }
+    fn schema(&self) -> Value {
+        json!({"name": "terminal", "description": "terminal", "parameters": {"type": "object"}})
+    }
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        anyhow::bail!("not run in this test")
+    }
+}
+
+/// The cards an agent's asks raise, judged as the run judges them (the
+/// approval rules with the terminal's Medium ladder, then the device
+/// ceiling), for an agent held from full access or not.
+async fn cards_for(
+    capped: bool,
+    held_from_full_access: bool,
+    command: &str,
+) -> Vec<(aidaemon_tools::command_risk::RiskLevel, bool)> {
+    use aidaemon_coding_agents::{ActionJudge as _, AgentAction};
+    let approvals = Arc::new(crate::approvals::OwnerApprovals::default());
+    let (tx, mut rx) = mpsc::channel::<aidaemon_channels::hub::ApprovalRequest>(8);
+    approvals.set_broker(crate::approvals::ApprovalBroker::new(tx));
+    let cards = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = cards.clone();
+    tokio::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            let once = matches!(
+                request.kind,
+                aidaemon_tools::semantics::ApprovalKind::CommandOnce
+            );
+            seen.lock().unwrap().push((request.risk_level, once));
+            let _ = request
+                .response_tx
+                .send(aidaemon_tools::semantics::ApprovalResponse::AllowOnce);
+        }
+    });
+    let ladder: Arc<dyn Tool> = Arc::new(MediumLadder);
+    let rules = crate::approvals::AppApprovalRules {
+        tools: crate::approvals::ApprovalTools::new([ladder]),
+        ..Default::default()
+    };
+    if capped {
+        rules.device_cap.raise();
+    }
+    let cap = rules.device_cap.clone();
+    let rules = Arc::new(rules);
+    let policy = aidaemon_policies::ApprovalPolicy::new(aidaemon_policies::ApprovalMode::Never)
+        .with_rules(rules.clone());
+    let hooks: Vec<Arc<dyn aidaemon_core::Hook>> = vec![
+        Arc::new(policy),
+        Arc::new(crate::approvals::device_ceiling::DeviceCeilingHook::new(
+            cap,
+        )),
+    ];
+    let mut tools: HashMap<String, Arc<dyn aidaemon_core::Tool>> = HashMap::new();
+    tools.insert("terminal".into(), Arc::new(SdkTerminal));
+    let detached = Arc::new(crate::approvals::DetachedNestedJudge::new(
+        tools,
+        hooks,
+        approvals,
+        rules,
+        aidaemon_core::SharedDeclines::default(),
+        aidaemon_core::RunId::new(),
+        "app:synthetic-ceiling".into(),
+        "app:synthetic-ceiling".into(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        false,
+    ));
+    let judge = crate::tools::agent_mode::DaemonJudge::for_run_with_detached(
+        None,
+        Some(detached),
+        crate::tools::agent_mode::Asker {
+            run: "cli-agent-held".into(),
+            agent: "Antigravity".into(),
+        },
+    )
+    .held_from_full_access(held_from_full_access);
+    let verdict = judge
+        .judge(AgentAction::RunCommand {
+            command: command.into(),
+            working_dir: Some("/w/synthetic".into()),
+        })
+        .await;
+    assert!(verdict.is_allowed(), "{command}: {verdict:?}");
+    cards.lock().unwrap().clone()
+}
+
+/// An agent the owner gave full access, held checked by the ceiling: a read
+/// runs with no card (the full-access answer), a push asks once on a High
+/// card only the phone can answer. An agent the owner set to ask for every
+/// command keeps its cards; uncapped, nothing changes.
+#[tokio::test]
+async fn a_held_full_access_agent_is_asked_only_above_the_ceiling() {
+    use aidaemon_tools::command_risk::RiskLevel;
+    assert!(cards_for(true, true, "ls").await.is_empty());
+    let push = cards_for(true, true, "git push origin main").await;
+    assert_eq!(push.len(), 1, "{push:?}");
+    assert!(push[0].0 >= RiskLevel::High && push[0].1, "{push:?}");
+    // The owner's own every-command choice: the ladder's card as today.
+    let every = cards_for(true, false, "ls").await;
+    assert_eq!(every, vec![(RiskLevel::Medium, false)]);
+    // Uncapped: the ladder's card, and no ceiling card.
+    let open = cards_for(false, false, "git push origin main").await;
+    assert_eq!(open, vec![(RiskLevel::Medium, false)]);
+}
+
+/// The launch records that the ceiling, not the owner, held the agent from
+/// full access; an owner's lower choice is not marked.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_launch_records_an_agent_held_from_full_access() {
+    let (tool, _db, _bin) = full_access_claude().await;
+    let folder = tempfile::tempdir().unwrap();
+    let folder = folder.path().canonicalize().unwrap().display().to_string();
+    assert!(
+        !prepare_claude(&tool, &folder, turn_judge(false))
+            .await
+            .held_from_full_access
+    );
+    assert!(
+        prepare_claude(&tool, &folder, turn_judge(true))
+            .await
+            .held_from_full_access
+    );
+    let config: toml::Table = toml::from_str(
+        "[authority]\nowner_default = \"full_access\"\n\
+         [cli_agents.permissions]\nclaude = \"every_command\"\n",
+    )
+    .unwrap();
+    let (every, _db2, _bin2) = full_access_claude().await;
+    every.permissions.get().unwrap().reload(&config);
+    let held = prepare_claude(&every, &folder, turn_judge(true)).await;
+    assert_eq!(
+        held.mode,
+        aidaemon_coding_agents::PermissionMode::EveryCommand
+    );
+    assert!(!held.held_from_full_access);
+}

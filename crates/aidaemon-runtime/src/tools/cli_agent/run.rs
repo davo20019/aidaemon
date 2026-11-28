@@ -101,6 +101,10 @@ pub(super) struct PreparedRun {
     pub(super) model: Option<String>,
     pub(super) can_host: bool,
     pub(super) mode: aidaemon_coding_agents::PermissionMode,
+    /// The owner gave the agent full access and the run's device ceiling
+    /// held it to `mode`: its asks at or below the ceiling get the owner's
+    /// full-access answer (`ceiling`).
+    pub(super) held_from_full_access: bool,
     pub(super) coding_agent: Arc<dyn aidaemon_coding_agents::CodingAgent>,
     pub(super) nested: Option<aidaemon_core::NestedCalls>,
     pub(super) detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
@@ -1649,7 +1653,8 @@ impl RunHandles {
                                 .with_controls(
                                     shared.process.cancel_token(),
                                     shared.in_flight_approvals.clone(),
-                                ),
+                                )
+                                .held_from_full_access(prep.held_from_full_access),
                             )
                         } else {
                             Arc::new(aidaemon_coding_agents::AllowAll)

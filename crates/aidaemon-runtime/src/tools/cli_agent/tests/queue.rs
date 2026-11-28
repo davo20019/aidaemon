@@ -713,6 +713,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         model: None,
         can_host: false,
         mode: aidaemon_coding_agents::PermissionMode::FullAccess,
+        held_from_full_access: false,
         coding_agent,
         nested: None,
         detached_judge: None,

@@ -348,6 +348,10 @@ pub struct DaemonJudge {
     /// Number of approval checks currently awaiting an answer (so the run's
     /// idle watchdog pauses while the owner is deciding).
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// The owner gave its agent full access and the run's device ceiling
+    /// held it to a checked mode: its asks at or below the ceiling get that
+    /// full-access answer ([`crate::approvals::agent_asks::begin_held`]).
+    held_from_full_access: bool,
 }
 
 struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -373,6 +377,7 @@ impl DaemonJudge {
             asker: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             in_flight: Arc::default(),
+            held_from_full_access: false,
         }
     }
 
@@ -384,6 +389,7 @@ impl DaemonJudge {
             asker: Some(asker),
             cancel: tokio_util::sync::CancellationToken::new(),
             in_flight: Arc::default(),
+            held_from_full_access: false,
         }
     }
 
@@ -404,7 +410,14 @@ impl DaemonJudge {
             asker: Some(asker),
             cancel,
             in_flight: Arc::default(),
+            held_from_full_access: false,
         }
+    }
+
+    /// Its agent was held from full access by the run's device ceiling.
+    pub fn held_from_full_access(mut self, held: bool) -> Self {
+        self.held_from_full_access = held;
+        self
     }
 
     /// Attach a per-run cancellation token and in-flight approval counter.
@@ -531,6 +544,9 @@ impl ActionJudge for DaemonJudge {
         };
         let id = call.id.clone();
         crate::approvals::agent_asks::begin(&id, asker.clone());
+        if self.held_from_full_access {
+            crate::approvals::agent_asks::begin_held(&id);
+        }
         let verdict = self.authorize(call).await;
         crate::approvals::agent_asks::end(&id);
         verdict

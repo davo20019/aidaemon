@@ -556,6 +556,17 @@ impl ApprovalRules for AppApprovalRules {
             self.device_cap
                 .rate(ctx.run_id, &device_ceiling::call_key(call), request.risk);
         }
+        // An agent the owner gave full access, held to a checked mode by the
+        // run's device ceiling: its asks get that full-access answer here,
+        // with no card of the rules' own. What is above the ceiling (by the
+        // call's typed facts and the rating just kept) the ceiling's hook
+        // asks on the phone, once; a refusal stands.
+        if matches!(decision, RuleDecision::Ask(_) | RuleDecision::Defer)
+            && self.device_cap.is_capped()
+            && agent_asks::held_from_full_access(&call.id)
+        {
+            return RuleDecision::Allow;
+        }
         decision
     }
 }

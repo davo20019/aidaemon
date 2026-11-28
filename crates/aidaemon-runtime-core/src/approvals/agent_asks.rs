@@ -32,6 +32,10 @@ pub fn end(call_id: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(call_id);
+    HELD_FULL_ACCESS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(call_id);
 }
 
 /// The run whose agent's ask is daemon call `call_id`, while it is judged.
@@ -41,4 +45,29 @@ pub fn asker_of(call_id: &str) -> Option<Asker> {
         .unwrap_or_else(|p| p.into_inner())
         .get(call_id)
         .cloned()
+}
+
+/// The asks judged now of agents the owner gave full access that a run's
+/// device ceiling held to a checked mode, by daemon call id. Such an ask at
+/// or below the ceiling gets the owner's full-access answer (no card); one
+/// above it still asks on the phone (`approvals::device_ceiling`).
+static HELD_FULL_ACCESS: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(Default::default);
+
+/// Daemon call `call_id` is an ask of an agent held from full access, while
+/// it is judged (cleared by [`end`]).
+pub fn begin_held(call_id: &str) {
+    HELD_FULL_ACCESS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(call_id.to_string());
+}
+
+/// Whether daemon call `call_id` is an ask of an agent the owner gave full
+/// access and the device ceiling held to a checked mode.
+pub fn held_from_full_access(call_id: &str) -> bool {
+    HELD_FULL_ACCESS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(call_id)
 }

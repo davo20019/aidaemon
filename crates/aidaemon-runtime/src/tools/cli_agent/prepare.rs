@@ -74,6 +74,8 @@ impl CliAgentTool {
         let device_capped = detached_judge
             .as_ref()
             .is_some_and(|judge| judge.device_cap().is_capped());
+        // The mode the owner's choice gives it here, before the ceiling.
+        let owner_mode = capped_mode(&*coding_agent, mode, mode_cap);
         let mode_cap = self.ceiling_mode_cap(
             device_capped,
             &*coding_agent,
@@ -81,6 +83,10 @@ impl CliAgentTool {
             mode_cap,
         );
         let mode = capped_mode(&*coding_agent, mode, mode_cap);
+        // Held from full access by the ceiling, not by the owner: its asks at
+        // or below the ceiling keep the full-access answer (`ceiling`).
+        let held_from_full_access = owner_mode == Some(PermissionMode::FullAccess)
+            && mode.is_some_and(|mode| mode < PermissionMode::FullAccess);
         let Some(mode) = mode else {
             let level = self.permissions().level();
             let program = coding_agent.name();
@@ -450,6 +456,7 @@ impl CliAgentTool {
             model,
             can_host,
             mode,
+            held_from_full_access,
             coding_agent,
             nested,
             detached_judge,
