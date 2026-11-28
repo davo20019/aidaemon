@@ -130,7 +130,13 @@ impl Connector {
     }
 
     async fn session(self: Arc<Self>) -> anyhow::Result<()> {
-        let (socket, _) = tokio_tungstenite::connect_async(self.url.as_str()).await?;
+        let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            self.url.as_str(),
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(tls_config()?)),
+        )
+        .await?;
         let (mut sink, mut stream) = socket.split();
 
         // Login: sign the bridge's nonce with the login key (and nothing else).
@@ -487,6 +493,19 @@ impl BridgePairer for Connector {
             }
         }
     }
+}
+
+/// TLS for the bridge socket: rustls on aws-lc-rs, checked by the OS trust
+/// store. The provider is named because the daemon links both rustls
+/// backends, and rustls panics when it has to choose.
+fn tls_config() -> anyhow::Result<Arc<rustls::ClientConfig>> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_platform_verifier()?
+        .with_no_client_auth();
+    Ok(Arc::new(config))
 }
 
 fn close_json(conn: u32) -> String {

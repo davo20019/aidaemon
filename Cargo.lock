@@ -233,6 +233,8 @@ dependencies = [
  "http-body-util",
  "p256",
  "rand 0.10.3",
+ "rustls",
+ "rustls-platform-verifier",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",

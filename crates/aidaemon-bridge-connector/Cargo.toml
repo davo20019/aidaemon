@@ -23,6 +23,8 @@ http = "1"
 http-body-util = "0.1"
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time", "fs"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
