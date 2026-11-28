@@ -109,3 +109,6 @@ select { min-height: 56px; }
 .lines canvas { display: block; width: 100%; height: auto; border: 1px solid #000; border-bottom: none; }
 
 .hidden { display: none !important; }
+
+#pair-qr { display: block; margin: 12px auto; image-rendering: pixelated; }
+.paircheck { font-family: "Courier New", monospace; font-size: 28px; letter-spacing: 3px; }

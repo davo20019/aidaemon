@@ -17,13 +17,15 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 bridge="${AIDAEMON_EINK_BRIDGE:-wss://bridge.aidaemon.ai}"
+pair_url="${AIDAEMON_EINK_PAIR_URL:-https://app.aidaemon.ai/pair-eink}"
 rm -rf "$here/dist"
 mkdir -p "$here/dist/assets"
 
-python3 - "$here/public" "$root/crates/aidaemon-bridge-proto/js/bridge-proto.js" "$here/dist" "$bridge" <<'PY'
+python3 - "$here/public" "$root/crates/aidaemon-bridge-proto/js/bridge-proto.js" "$here/dist" "$bridge" "$pair_url" <<'PY'
 import hashlib, pathlib, re, sys
 public, proto, dist = (pathlib.Path(a) for a in sys.argv[1:4])
 bridge = sys.argv[4]
+pair_url = sys.argv[5]
 
 def strip_js(text):
     out, in_block = [], False
@@ -46,11 +48,12 @@ def strip_css(text):
     text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
     return '\n'.join(l.strip() for l in text.splitlines() if l.strip()) + '\n'
 
-config = "window.AIDAEMON_EINK_CONFIG = { bridge: '%s' };\n" % bridge
+config = "window.AIDAEMON_EINK_CONFIG = { bridge: '%s', pair_url: '%s' };\n" % (bridge, pair_url)
 assets = {
     'config.js': config,
     'bridge-proto.js': strip_js(proto.read_text()),
     'eink.js': strip_js((public / 'eink.js').read_text()),
+    'qr.js': strip_js((public / 'qr.js').read_text()),
     'eink.css': strip_css((public / 'eink.css').read_text()),
 }
 html = (public / 'index.html').read_text()

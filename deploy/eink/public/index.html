@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="./eink.css">
   <script src="./config.js"></script>
   <script src="./bridge-proto.js"></script>
+  <script src="./qr.js"></script>
   <script src="./eink.js" defer></script>
 </head>
 <body>
@@ -27,8 +28,11 @@
       <p class="muted">Use this browser only for aidaemon. It is old and no longer updated, so a harmful website opened in it could act as this Kindle.</p>
       <div class="actions"><button type="button" class="btn btn-strong" id="btn-pair">Pair</button></div>
       <div id="pair-code-box" class="confirmbox">
-        <p>Type this code into aidaemon on your computer:</p>
+        <p>Scan this with your phone, or type the code below into aidaemon on your computer.</p>
+        <canvas id="pair-qr"></canvas>
         <p id="pair-code" class="paircode"></p>
+        <p>Check code: <b id="pair-check" class="paircheck"></b></p>
+        <p class="muted">The app asks for the check code after a scan. Only type it into your own app, never into a message.</p>
         <p class="muted" id="pair-status">Waiting for your daemon&hellip;</p>
       </div>
       <p id="pair-note" class="note"></p>

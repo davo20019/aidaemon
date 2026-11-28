@@ -17,6 +17,9 @@
   var B = window.AidaemonBridgeProto;
   var CONFIG = window.AIDAEMON_EINK_CONFIG || {};
   var BRIDGE = String(CONFIG.bridge || '').replace(/\/+$/, '');
+  // Where the owner's app opens a scanned pairing code (self-hosters: their
+  // own web app's /pair-eink).
+  var PAIR_URL = String(CONFIG.pair_url || 'https://app.aidaemon.ai/pair-eink');
   var enc = new TextEncoder();
   var dec = new TextDecoder();
 
@@ -288,6 +291,9 @@
       var deviceId = await B.deviceId(await B.exportPoint(key.publicKey));
       var code = nameplate + secret + base32First5(deviceId);
       $('pair-code').textContent = code.match(/.{1,5}/g).join('-');
+      $('pair-check').textContent = await checkCode(nameplate, secret);
+      var link = PAIR_URL + '#n=' + nameplate + '&s=' + secret + '&k=' + B.toHex(deviceId);
+      if (window.AidaemonQr) window.AidaemonQr.drawToCanvas($('pair-qr'), link, 5);
       $('pair-code-box').style.display = 'block';
       var sock = socketTo(BRIDGE + '/v1/wait?nameplate=' + nameplate);
       await sock.opened;
@@ -317,6 +323,15 @@
     } finally {
       $('btn-pair').disabled = false;
     }
+  }
+
+  // The check code the owner's app asks for after a scan: the first 4
+  // Crockford characters of SHA-256("aidaemon-eink-check-v1" ‖ nameplate ‖
+  // secret) (aidaemon-client-core computes the same).
+  async function checkCode(nameplate, secret) {
+    var digest = new Uint8Array(await crypto.subtle.digest('SHA-256',
+      enc.encode('aidaemon-eink-check-v1' + nameplate + secret)));
+    return base32First5(digest).slice(0, 4);
   }
 
   // The first 5 bytes of the device id as 8 Crockford Base32 characters.
