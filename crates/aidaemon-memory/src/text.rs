@@ -46,7 +46,7 @@ pub(crate) fn canonicalize_fact_key(key: &str) -> String {
 }
 
 /// The one name for a personal fact several keys mean (`dob` and
-/// `Date of Birth` are both `birth_date`), after [`canonicalize_fact_key`].
+/// `Date of Birth` are both `birth_date`), after the key is canonicalized.
 pub fn canonical_personal_key(key: &str) -> String {
     match canonicalize_fact_key(key).as_str() {
         "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),

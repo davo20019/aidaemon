@@ -725,7 +725,10 @@ async fn rows(pool: &SqlitePool, sql: &str) -> Rows {
         .collect()
 }
 
-/// The rows consolidation owns, without their timestamps of writing.
+/// The rows consolidation owns, without their timestamps of writing. REAL
+/// columns print with 15 significant digits (`%!.15g`, what SQLite's own
+/// text conversion used before 3.54 widened it to 17), so the golden does
+/// not move with the bundled SQLite.
 async fn snapshot(pool: &SqlitePool, results: Rows) -> Snapshot {
     let mut snapshot = Snapshot::new();
     snapshot.insert("results".to_string(), results);
@@ -733,7 +736,7 @@ async fn snapshot(pool: &SqlitePool, results: Rows) -> Snapshot {
         (
             "procedures",
             "SELECT name, trigger_pattern, steps, CAST(success_count AS TEXT),
-                    CAST(failure_count AS TEXT), CAST(avg_duration_secs AS TEXT),
+                    CAST(failure_count AS TEXT), IIF(avg_duration_secs IS NULL, NULL, printf('%!.15g', avg_duration_secs)),
                     CAST(last_used_at IS NOT NULL AS TEXT),
                     CAST(trigger_embedding IS NOT NULL AS TEXT)
              FROM procedures ORDER BY name",
@@ -750,14 +753,14 @@ async fn snapshot(pool: &SqlitePool, results: Rows) -> Snapshot {
             "expertise",
             "SELECT domain, CAST(tasks_attempted AS TEXT), CAST(tasks_succeeded AS TEXT),
                     CAST(tasks_failed AS TEXT), current_level,
-                    CAST(confidence_score AS TEXT), common_errors,
+                    IIF(confidence_score IS NULL, NULL, printf('%!.15g', confidence_score)), common_errors,
                     CAST(last_task_at IS NOT NULL AS TEXT)
              FROM expertise ORDER BY domain",
         ),
         (
             "behavior_patterns",
             "SELECT pattern_type, description, trigger_context, action,
-                    CAST(confidence AS TEXT), CAST(occurrence_count AS TEXT)
+                    IIF(confidence IS NULL, NULL, printf('%!.15g', confidence)), CAST(occurrence_count AS TEXT)
              FROM behavior_patterns ORDER BY pattern_type, trigger_context, action",
         ),
         (
