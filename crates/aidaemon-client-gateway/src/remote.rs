@@ -140,7 +140,7 @@ where
     guarded::<P>(gateway.clone(), crate::exposed_router(gateway))
 }
 
-/// The bridge's routes ([`crate::server::bridge_routes`]: sign-in, commands
+/// The bridge's routes (`server::bridge_routes`: sign-in, commands
 /// and message files only) behind the same peer guard, for the bridge
 /// connector, which puts the device key its handshake proved on each
 /// request as `P`. Build it once per connector: the guard's token bindings

@@ -196,7 +196,7 @@ async fn drop_endpoint(key: Key, relays: &Relays) {
 
 /// Start over with `url`'s daemon: close the endpoint that reaches it (so a
 /// dial waiting on a dead relay link fails now instead of at
-/// [`DIAL_TIMEOUT`]) and forget its connection; the next call dials afresh.
+/// `DIAL_TIMEOUT`) and forget its connection; the next call dials afresh.
 /// For when the link dropped, or the page or device woke while it was
 /// still dialing.
 pub async fn reset(url: &str, dialer: &Dialer) -> Result<(), SignInError> {

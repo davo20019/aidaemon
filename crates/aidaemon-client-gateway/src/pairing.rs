@@ -87,7 +87,7 @@ pub struct Principal {
     pub scopes: Vec<Scope>,
     pub ceiling: Option<Risk>,
     /// A device paired over the bridge (an e-ink reader): limited to
-    /// [`crate::eink`]'s commands and approvals. From the device's record,
+    /// the e-ink module's commands and approvals. From the device's record,
     /// never from what a request says.
     pub eink: bool,
     /// Revoking the device cancels this.
