@@ -406,15 +406,13 @@
   var sessions = [];
   // Project ids whose project has a folder (read once per connection).
   var folderProjects = null;
-  var lastRuns = [];
 
   // The app's rule (aidaemon-client-core's Client::is_coding): a
   // conversation works on code when it is set to a coding agent, is in a
   // project with a folder, or a coding agent ran in it.
-  function isCoding(s, runs) {
+  function isCoding(s) {
     if (s.agent) return true;
-    if (s.project_id && folderProjects && folderProjects[s.project_id]) return true;
-    return (runs || []).some(function (r) { return r.session_id === s.id && r.agent; });
+    return !!(s.project_id && folderProjects && folderProjects[s.project_id]);
   }
 
   function sortedSessions(list) {
@@ -423,8 +421,10 @@
     });
   }
 
-  function renderChats(list, runs) {
-    sessions = sortedSessions(list).filter(function (s) { return !isCoding(s, runs); }).slice(0, 30);
+  function renderChats() {
+    var all = ofKind('chat');
+    sessions = all.slice(0, shown.chat);
+    moreButton('chat', all.length);
     var ul = $('chat-list');
     clear(ul);
     sessions.forEach(function (s) {
@@ -461,37 +461,21 @@
 
   async function openChat(s, from) {
     current.session = s;
-    current.showAll = false;
+    current.historyLimit = 8;
     current.from = from || 'chat';
     $('convo-title').textContent = (s && s.title) || (s && s.id ? 'Conversation' : 'New chat');
     $('convo-note').textContent = '';
-    renderConvoRuns();
     show('convo');
     current.toEnd = true;
     await loadHistory();
   }
 
-  // A coding conversation's agents' runs, newest first, above its messages.
-  function renderConvoRuns() {
-    var box = $('convo-runs');
-    clear(box);
-    var s = current.session;
-    if (!s || !s.id) return;
-    var runs = lastRuns.filter(function (r) { return r.session_id === s.id; })
-      .sort(function (a, b) { return (b.started_at_ms || 0) - (a.started_at_ms || 0); });
-    if (!runs.length) return;
-    box.appendChild(el('h3', null, 'Agents\u2019 runs'));
-    var ul = el('ul', 'list');
-    runs.slice(0, 8).forEach(function (r) { ul.appendChild(runRow(r)); });
-    box.appendChild(ul);
-    box.appendChild(el('h3', null, 'Messages'));
-  }
+
 
   // How much of a message shows in the conversation; the rest is a tap
   // away in the reader, where it pages a screen at a time.
   var PREVIEW_LINES = 6;
   var PREVIEW_CHARS = 420;
-  var SHOWN_ITEMS = 8;
 
   function preview(text) {
     var lines = String(text || '').split('\n').filter(function (l, i, all) {
@@ -537,7 +521,7 @@
     var box = $('convo-messages');
     if (!current.session || !current.session.id) { clear(box); return; }
     var l = await ensureLink();
-    var result = await l.command({ type: 'get_history', session_id: current.session.id, limit: 20 });
+    var result = await l.command({ type: 'get_history', session_id: current.session.id, limit: current.historyLimit || 8 });
     if (mine !== loads.history) return;
     clear(box);
     blobUrls.forEach(function (u) { URL.revokeObjectURL(u); });
@@ -546,17 +530,22 @@
     // A coding agent's answer lives on its run, not in a message: put each
     // ended run in time order among the messages, its answer a tap away.
     var items = (result.messages || []).map(function (m) { return { at: m.at_ms || 0, message: m }; });
+    // Only the runs within the messages shown (the history lists them all).
+    var oldest = items.length ? items[0].at : 0;
     (result.runs || []).forEach(function (r) {
-      items.push({ at: r.ended_at_ms || r.started_at_ms || 0, run: r });
+      var at = r.ended_at_ms || r.started_at_ms || 0;
+      if (!result.more || at >= oldest) items.push({ at: at, run: r });
     });
     items.sort(function (a, b) { return a.at - b.at; });
-    var hidden = current.showAll ? 0 : Math.max(0, items.length - SHOWN_ITEMS);
-    if (hidden) {
-      var earlier = el('button', 'btn', 'Show ' + hidden + ' earlier');
+    // Older messages are fetched only when asked for.
+    if (result.more) {
+      var earlier = el('button', 'btn', 'Show earlier');
       earlier.type = 'button';
-      earlier.addEventListener('click', function () { current.showAll = true; loadHistory(); });
+      earlier.addEventListener('click', function () {
+        current.historyLimit = (current.historyLimit || 8) + 10;
+        loadHistory();
+      });
       box.appendChild(earlier);
-      items = items.slice(hidden);
     }
     items.forEach(function (item) {
       if (item.run) {
@@ -767,47 +756,92 @@
   // ------------------------------------------------------------------- code
   var PHASE_WORD = { running: 'running', succeeded: 'done', failed: 'failed', stopped: 'stopped' };
 
-  // One request for chats, approvals and runs together.
+  // What the lists show, loaded a page at a time: the daemon's full
+  // snapshot lists every conversation (hundreds, ~70 KB) on each refresh,
+  // too much for the Kindle's link. A page of conversations is ~2.5 KB.
+  var PAGE = 10;
+  var overview = { sessions: [], cursor: null, done: false, running_tasks: [], pending_approvals: [] };
+  var shown = { chat: PAGE, code: PAGE };
+
   async function loadSnapshot() {
     var l = await ensureLink();
     var mine = ++loads.code;
-    var result = await l.command({ type: 'get_snapshot' });
-    if (mine !== loads.code) return;
-    var state = result.state || {};
     if (!folderProjects) {
       var projects = (await l.command({ type: 'list_projects' })).projects || [];
       folderProjects = {};
       projects.forEach(function (p) { if (p.path) folderProjects[p.id] = true; });
     }
-    var keep = {
+    var glance = (await l.command({ type: 'get_glance' })).glance || {};
+    var page = await l.command({ type: 'list_sessions', limit: PAGE * 2 });
+    if (mine !== loads.code) return;
+    overview = {
       folder_projects: folderProjects,
-      sessions: state.sessions || [], pending_approvals: state.pending_approvals || [],
-      running_tasks: state.running_tasks || [], runs: state.runs || []
+      sessions: page.sessions || [], cursor: page.next_cursor || null, done: !page.next_cursor,
+      running_tasks: glance.running_tasks || [], pending_approvals: glance.pending_approvals || []
     };
-    renderSnapshot(keep);
-    cacheSave(keep);
+    shown = { chat: PAGE, code: PAGE };
+    // Fill the open tab's first screen if the first page was mostly the other kind.
+    await fillTo(current.view === 'code' ? 'code' : 'chat', PAGE, 3);
+    renderSnapshot(overview);
+    cacheSave(overview);
     updated(Date.now());
+  }
+
+  function ofKind(kind) {
+    return sortedSessions(overview.sessions).filter(function (s) {
+      return kind === 'code' ? isCoding(s) : !isCoding(s);
+    });
+  }
+
+  // Fetch further pages until `kind` has `want` conversations, or the end.
+  async function fillTo(kind, want, maxPages) {
+    var l = await ensureLink();
+    for (var i = 0; i < maxPages && !overview.done && ofKind(kind).length < want; i++) {
+      var page = await l.command({ type: 'list_sessions', limit: PAGE * 2, cursor: overview.cursor });
+      overview.sessions = overview.sessions.concat(page.sessions || []);
+      overview.cursor = page.next_cursor || null;
+      overview.done = !page.next_cursor;
+    }
+  }
+
+  async function loadMore(kind) {
+    var button = $('btn-more-' + kind);
+    button.disabled = true;
+    try {
+      shown[kind] += PAGE;
+      await fillTo(kind, shown[kind], 5);
+      renderSnapshot(overview);
+    } catch (e) {
+      note('Could not load more: ' + e.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function moreButton(kind, total) {
+    var more = total > shown[kind] || !overview.done;
+    $('btn-more-' + kind).className = more ? 'btn' : 'btn hidden';
   }
 
   function renderSnapshot(state) {
     if (state.folder_projects) folderProjects = state.folder_projects;
-    renderChats(state.sessions, state.runs);
+    if (state !== overview) overview = state;
+    renderChats();
     renderApprovals(state);
-    renderCode(state.sessions, state.runs);
+    renderCode();
   }
 
   // Code: the coding conversations, those with an agent at work first.
-  function renderCode(list, runs) {
-    runs = runs || [];
-    lastRuns = runs;
-    var coding = sortedSessions(list).filter(function (s) { return isCoding(s, runs); });
+  function renderCode() {
+    var coding = ofKind('code');
     var working = {};
-    runs.forEach(function (r) { if (r.phase === 'running') working[r.session_id] = r; });
+    (overview.running_tasks || []).forEach(function (t) { working[t.session_id] = t; });
     var busy = coding.filter(function (s) { return working[s.id]; });
-    var rest = coding.filter(function (s) { return !working[s.id]; }).slice(0, 20);
+    var rest = coding.filter(function (s) { return !working[s.id]; });
     $('code-running').textContent = busy.length ? String(busy.length) : '';
     fillSessions($('running-list'), busy, working);
-    fillSessions($('done-list'), rest, working);
+    fillSessions($('done-list'), rest.slice(0, shown.code), working);
+    moreButton('code', rest.length);
   }
 
   function fillSessions(ul, list, working) {
@@ -817,9 +851,9 @@
       var b = el('button', 'item');
       b.type = 'button';
       b.appendChild(el('span', 'title', s.title || 'Untitled'));
-      var run = working[s.id];
-      b.appendChild(el('span', 'meta', (s.agent || (run && run.agent) || 'aidaemon') + ' · ' + timeOf(s.last_activity_ms)));
-      if (run && run.step) b.appendChild(el('span', 'meta', 'Now: ' + run.step));
+      var task = working[s.id];
+      b.appendChild(el('span', 'meta', (s.agent || 'aidaemon') + ' · ' + timeOf(s.last_activity_ms)));
+      if (task && task.description) b.appendChild(el('span', 'meta', 'Working: ' + task.description));
       b.addEventListener('click', function () { openChat(s, 'code'); });
       li.appendChild(b);
       ul.appendChild(li);
@@ -1102,6 +1136,8 @@
     });
     setMode('type');
     $('btn-new-code').addEventListener('click', openNewCode);
+    $('btn-more-chat').addEventListener('click', function () { loadMore('chat'); });
+    $('btn-more-code').addEventListener('click', function () { loadMore('code'); });
     $('btn-start-code').addEventListener('click', startCode);
     $('btn-steer').addEventListener('click', steer);
     $('btn-approve').addEventListener('click', function () {
