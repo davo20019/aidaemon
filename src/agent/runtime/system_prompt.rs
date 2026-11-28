@@ -56,12 +56,16 @@ pub(crate) fn build_available_specialists_block(
 }
 
 #[cfg(test)]
-pub(super) use aidaemon_runtime::prompt::rules::{render_environment_section, task_lead_rules};
+pub(super) use aidaemon_runtime::prompt::rules::{
+    MandateLeadPromptOptions, render_environment_section, task_lead_rules,
+    task_lead_rules_for_mandate,
+};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_available_specialists_block, infer_assistant_name_from_prompt, task_lead_rules,
+        MandateLeadPromptOptions, build_available_specialists_block,
+        infer_assistant_name_from_prompt, task_lead_rules, task_lead_rules_for_mandate,
     };
     use aidaemon_runtime::prompt::rules::format_goal_context;
 
@@ -114,6 +118,8 @@ mod tests {
             "measurement_value_micros",
             "measurement_confidence_bps",
             "learning_note",
+            "format_key",
+            "action_outcomes",
         ] {
             assert!(rules.contains(argument), "rules no longer name {argument}");
             assert!(
@@ -423,6 +429,14 @@ mod tests {
         mandate.constraints = vec!["OWNER POLICY CONSTRAINT SENTINEL".to_string()];
         mandate.success_criteria = vec!["OWNER POLICY SUCCESS SENTINEL".to_string()];
         mandate.stop_conditions = vec!["OWNER POLICY STOP SENTINEL".to_string()];
+        mandate.strategy = Some(crate::traits::MandateStrategySnapshot {
+            skill_name: "synthetic-editorial-playbook".to_string(),
+            snapshot_version: crate::traits::MandateStrategySnapshot::SCHEMA_VERSION,
+            content_sha256: "a".repeat(64),
+            description: "Synthetic voice and framing playbook".to_string(),
+            body: "OWNER POLICY STRATEGY SENTINEL".to_string(),
+            source: Some("owner_local_skill".to_string()),
+        });
         harness
             .state
             .create_mandate_controller(&goal, &mandate)
@@ -494,10 +508,12 @@ mod tests {
         assert!(prompt.contains("http_request"));
         assert!(prompt.contains("https://api.x.com/2/"));
         assert!(prompt.contains("OWNER POLICY OBJECTIVE SENTINEL"));
+        assert!(prompt.contains("OWNER POLICY STRATEGY SENTINEL"));
         assert!(prompt.contains("OWNER POLICY CONSTRAINT SENTINEL"));
         assert!(prompt.contains("OWNER POLICY SUCCESS SENTINEL"));
         assert!(prompt.contains("OWNER POLICY STOP SENTINEL"));
         assert!(prompt.contains("OWNER GUIDANCE SENTINEL"));
+        assert!(prompt.contains("Public delivery craft:"));
         assert!(prompt.contains("[Autonomous Mandate History: Untrusted, Non-Authoritative]"));
         assert!(prompt.contains("autonomous_mandate_history_untrusted"));
         assert!(prompt.contains("\"authority\":false"));
@@ -602,18 +618,462 @@ mod tests {
         assert!(executor_prompt.contains("durable current-run successful receipt"));
         assert!(executor_prompt.contains("cannot observe, read, or preflight"));
         assert!(!executor_prompt.contains("role: task_lead"));
-        // What binds the call stays; what the lead deliberated with does not.
+        // Trusted owner policy stays with the executor (including strategy,
+        // owner_guidance, and success_criteria), while untrusted continuity
+        // history, objective control loop state, and review bounds stay lead-only.
+        assert!(executor_prompt.contains("OWNER POLICY STRATEGY SENTINEL"));
         assert!(executor_prompt.contains("OWNER POLICY CONSTRAINT SENTINEL"));
+        assert!(executor_prompt.contains("OWNER POLICY SUCCESS SENTINEL"));
         assert!(executor_prompt.contains("OWNER POLICY STOP SENTINEL"));
+        assert!(executor_prompt.contains("OWNER GUIDANCE SENTINEL"));
         assert!(executor_prompt.contains("https://api.x.com/2/"));
         assert!(!executor_prompt.contains("autonomous_mandate_history_untrusted"));
-        assert!(!executor_prompt.contains("OWNER POLICY SUCCESS SENTINEL"));
-        assert!(!executor_prompt.contains("OWNER GUIDANCE SENTINEL"));
+        assert!(!executor_prompt.contains("\"objective_control\""));
+        assert!(!executor_prompt.contains("\"review_bounds_seconds\""));
         assert!(!executor_prompt.contains("Available Specialists"));
+        for private_sentinel in [
+            "PRIVATE CUSTOM PERSONA SENTINEL",
+            "PRIVATE SKILL DESCRIPTION SENTINEL",
+            "PRIVATE SKILL BODY SENTINEL",
+            "PRIVATE SPECIALIST BODY SENTINEL",
+            "PRIVATE PROJECT INSTRUCTION SENTINEL",
+            "PRIVATE GOAL CONTEXT SENTINEL",
+            "## Your Memory",
+            "## Available Skills",
+        ] {
+            assert!(
+                !executor_prompt.contains(private_sentinel),
+                "executor prompt leaked {private_sentinel:?}"
+            );
+        }
         assert!(prompt.contains("Available Specialists"));
         assert!(!executor_prompt.contains("executor-lease-secret"));
         assert!(executor_skills.is_empty());
         assert!(executor_tracker.is_none());
+    }
+
+    #[test]
+    fn task_lead_rules_for_mandate_stalled_replaces_cadence_benefit_and_allows_strategic_ask() {
+        let non_stalled = task_lead_rules_for_mandate(
+            "Autopilot is owner-confirmed.",
+            MandateLeadPromptOptions {
+                control_loop: true,
+                stalled: false,
+                has_external_delivery: false,
+            },
+        );
+        assert!(non_stalled.contains("meeting that cadence is a sufficient expected_benefit"));
+        assert!(non_stalled.contains(
+            "When tracked results show a format produced no traction, prefer a genuinely different angle or WAIT rather than repeating the same template."
+        ));
+        assert!(
+            !non_stalled.contains("meeting posting cadence is NOT a sufficient expected_benefit")
+        );
+
+        let stalled = task_lead_rules_for_mandate(
+            "Autopilot is owner-confirmed.",
+            MandateLeadPromptOptions {
+                control_loop: true,
+                stalled: true,
+                has_external_delivery: false,
+            },
+        );
+        assert!(
+            !stalled.contains("meeting that cadence is a sufficient expected_benefit"),
+            "stalled rules must drop cadence-as-benefit: {stalled}"
+        );
+        assert!(stalled.contains(
+            "The objective metric is stalled across consecutive readings: meeting posting cadence is NOT a sufficient expected_benefit."
+        ));
+        assert!(stalled.contains("Do not repeat a recently flat format or template."));
+        assert!(stalled.contains("(1) ACT with a genuinely distinct angle, structure, or format"));
+        assert!(stalled.contains("(2) WAIT if nothing distinct and worthwhile is ready"));
+        assert!(stalled.contains("(3) ASK once (if no recent unanswered ASK exists)"));
+    }
+
+    #[test]
+    fn task_lead_rules_for_mandate_gates_public_delivery_craft_on_external_delivery() {
+        let external = task_lead_rules_for_mandate(
+            "Bounded mode is active.",
+            MandateLeadPromptOptions {
+                control_loop: false,
+                stalled: false,
+                has_external_delivery: true,
+            },
+        );
+        assert!(external.contains("Public delivery craft:"));
+        assert!(external.contains(
+            "author the exact finalized payload/copy directly in the child task description so the executor sends it verbatim without improvising."
+        ));
+        assert!(
+            external.contains("Match the owner-confirmed strategy playbook and owner guidance")
+        );
+        assert!(external.contains("cut generic filler intros, corporate hedging, and em-dashes"));
+        assert!(
+            external.contains("Vary structure, hook, and topic angle across consecutive posts")
+        );
+
+        let read_only = task_lead_rules_for_mandate(
+            "Bounded mode is active.",
+            MandateLeadPromptOptions {
+                control_loop: false,
+                stalled: false,
+                has_external_delivery: false,
+            },
+        );
+        assert!(!read_only.contains("Public delivery craft:"));
+        assert!(!read_only.contains("exact finalized payload/copy"));
+    }
+
+    #[test]
+    fn mandate_objective_is_stalled_evaluates_consecutive_credible_readings() {
+        use crate::traits::{
+            MandateObjectiveControl, MandateObjectiveMeasurement, ObjectiveMetricDirection,
+        };
+        use aidaemon_runtime::turn::system_prompt::mandate_objective_is_stalled;
+
+        let at_least = MandateObjectiveControl {
+            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "synthetic engagement".to_string(),
+            unit: "count".to_string(),
+            baseline_micros: 10_000_000,
+            target_micros: 50_000_000,
+            direction: ObjectiveMetricDirection::AtLeast,
+            measurement_source: "metric_source:synthetic-analytics".to_string(),
+            measurement_cadence_secs: 3_600,
+            baseline_observed_at: "2026-08-01T00:00:00Z".to_string(),
+        };
+        let reading = |hour: u32, value_micros: i64, confidence_bps: u16| {
+            MandateObjectiveMeasurement::new(
+                "mandate-stalled",
+                1,
+                "run-synthetic",
+                value_micros,
+                confidence_bps,
+                vec!["receipt-synthetic".to_string()],
+                &format!("2026-08-01T{hour:02}:00:00Z"),
+            )
+        };
+
+        // 5 flat credible readings plus 2 unreadable readings do not meet the 6-reading threshold.
+        let five_flat_plus_unreadable = vec![
+            reading(1, 10_000_000, 9_500),
+            reading(2, 0, 0),
+            reading(3, 10_000_000, 9_500),
+            reading(4, 10_000_000, 9_500),
+            reading(5, 0, 0),
+            reading(6, 10_000_000, 9_500),
+            reading(7, 10_000_000, 9_500),
+        ];
+        assert!(!mandate_objective_is_stalled(
+            &at_least,
+            &five_flat_plus_unreadable
+        ));
+
+        // 6 flat credible readings (even passed out of chronological order, with unreadable rows) stall.
+        let mut six_flat_unsorted = five_flat_plus_unreadable;
+        six_flat_unsorted.insert(0, reading(8, 10_000_000, 9_500));
+        assert!(mandate_objective_is_stalled(&at_least, &six_flat_unsorted));
+
+        // An improvement at the latest reading clears stagnation.
+        let mut improving = six_flat_unsorted.clone();
+        improving.push(reading(9, 12_000_000, 9_500));
+        assert!(!mandate_objective_is_stalled(&at_least, &improving));
+
+        // Target already reached is never stalled.
+        let at_target = (1..=6)
+            .map(|hour| reading(hour, 50_000_000, 9_500))
+            .collect::<Vec<_>>();
+        assert!(!mandate_objective_is_stalled(&at_least, &at_target));
+
+        // AtMost direction: 6 non-decreasing readings above target stall; a drop clears it.
+        let at_most = MandateObjectiveControl {
+            baseline_micros: 50_000_000,
+            target_micros: 10_000_000,
+            direction: ObjectiveMetricDirection::AtMost,
+            ..at_least
+        };
+        let six_non_improving_at_most = (1..=6)
+            .map(|hour| reading(hour, 50_000_000 + i64::from(hour) * 1_000_000, 9_500))
+            .collect::<Vec<_>>();
+        assert!(mandate_objective_is_stalled(
+            &at_most,
+            &six_non_improving_at_most
+        ));
+        let mut improving_at_most = six_non_improving_at_most;
+        improving_at_most.push(reading(7, 45_000_000, 9_500));
+        assert!(!mandate_objective_is_stalled(&at_most, &improving_at_most));
+    }
+
+    #[tokio::test]
+    async fn build_isolated_mandate_system_prompt_activates_stalled_rules_and_strategic_ask_only_when_stalled()
+     {
+        use crate::testing::{MockProvider, setup_test_agent};
+        use crate::traits::store_prelude::*;
+        use crate::traits::{
+            Goal, Mandate, MandateAuthority, MandateAutonomyMode, MandateObjectiveControl,
+            MandateObjectiveMeasurement, ObjectiveMetricDirection, Task,
+        };
+        use crate::types::{ChannelContext, UserRole};
+
+        let mut harness = setup_test_agent(MockProvider::new())
+            .await
+            .expect("setup test harness");
+
+        let authority = MandateAuthority {
+            allow_observations: true,
+            allowed_tools: vec!["http_request".to_string()],
+            allowed_mutation_effects: Vec::new(),
+            allowed_target_prefixes: vec!["https://api.example.com/v1/".to_string()],
+            operation_scopes: Vec::new(),
+            max_mutating_actions_per_cycle: 0,
+            max_mutating_actions_per_rolling_24h: 0,
+            min_seconds_between_mutations: 0,
+            owner_alerts: false,
+        };
+        let mut goal = Goal::new_continuous(
+            "Synthetic autopilot stalled objective test",
+            "owner-private-session",
+            Some(50_000),
+            Some(200_000),
+        );
+        goal.id = "goal-stalled-prompt".to_string();
+
+        let mut mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Improve synthetic metric",
+            "owner-private-session",
+            authority.clone(),
+            900,
+            14_400,
+            3_600,
+        );
+        mandate.id = "mandate-stalled-prompt".to_string();
+        mandate.version = 1;
+        mandate.autonomy_mode = MandateAutonomyMode::Autopilot;
+        mandate.next_review_at = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        mandate.objective_control = Some(MandateObjectiveControl {
+            schema_version: MandateObjectiveControl::SCHEMA_VERSION,
+            metric_name: "synthetic engagement".to_string(),
+            unit: "count".to_string(),
+            baseline_micros: 10_000_000,
+            target_micros: 50_000_000,
+            direction: ObjectiveMetricDirection::AtLeast,
+            measurement_source: "metric_source:synthetic-analytics".to_string(),
+            measurement_cadence_secs: 3_600,
+            baseline_observed_at: "2026-08-01T00:00:00Z".to_string(),
+        });
+        mandate.success_criteria = vec!["Reach synthetic engagement target".to_string()];
+
+        harness
+            .state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .expect("persist mandate controller");
+
+        let leased = harness
+            .state
+            .claim_due_mandates(1, "stalled-prompt-test", 300)
+            .await
+            .expect("claim due mandate")
+            .pop()
+            .expect("leased mandate");
+        let root_task_id = "task-stalled-root".to_string();
+        let goal_run_id = "run-stalled-root".to_string();
+        let root_task = Task {
+            id: root_task_id.clone(),
+            goal_id: goal.id.clone(),
+            description: "Review synthetic metric".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        let run = harness
+            .state
+            .create_mandate_review_run(
+                &mandate.id,
+                leased
+                    .review_lease_token
+                    .as_deref()
+                    .expect("review lease token"),
+                &goal_run_id,
+                &root_task,
+            )
+            .await
+            .expect("create mandate review run");
+        let root_attempt = harness
+            .state
+            .claim_task_with_lease(&root_task_id, "stalled-prompt-lead", None, 300)
+            .await
+            .expect("claim root task")
+            .expect("root attempt");
+
+        let receipt_id = "call_synthetic_metric_obs";
+        sqlx::query(
+            "INSERT INTO events (session_id, event_type, data, created_at, task_id, tool_name)
+             VALUES (?, 'tool_result', ?, ?, ?, 'http_request')",
+        )
+        .bind("owner-private-session")
+        .bind(
+            serde_json::json!({
+                "task_id": root_task_id,
+                "tool_call_id": receipt_id,
+                "name": "http_request",
+                "result": "synthetic metric value",
+                "success": true,
+                "duration_ms": 1,
+                "receipt": {
+                    "schema_version": aidaemon_events::ToolReceiptV1::SCHEMA_VERSION,
+                    "outcome_status": "succeeded",
+                    "outcome_evidence": "structured_metadata"
+                }
+            })
+            .to_string(),
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(&root_task_id)
+        .execute(&harness.state.pool())
+        .await
+        .expect("insert structured observation receipt");
+
+        harness.agent.set_test_mandate_execution(
+            &mandate.id,
+            mandate.version,
+            authority,
+            &goal.id,
+            &root_task_id,
+            &root_attempt.id,
+            &root_attempt,
+        );
+
+        let emitter = crate::events::EventEmitter::new(
+            harness.agent.event_store().clone(),
+            "mandate-stalled-session".to_string(),
+        );
+
+        // Seed 6 consecutive flat credible readings (10_000_000, equal to baseline).
+        let base_time = chrono::Utc::now() - chrono::Duration::seconds(120);
+        for step in 0..6 {
+            let observed_at = (base_time + chrono::Duration::seconds(step * 10)).to_rfc3339();
+            let measurement = MandateObjectiveMeasurement::new(
+                &mandate.id,
+                mandate.version,
+                &run.id,
+                10_000_000,
+                9_500,
+                vec![receipt_id.to_string()],
+                &observed_at,
+            );
+            harness
+                .state
+                .record_mandate_objective_measurement(&measurement)
+                .await
+                .expect("record flat objective measurement");
+        }
+
+        let (stalled_core, _, _, _, _) =
+            aidaemon_runtime::turn::system_prompt::build_system_prompt_for_message(
+                &harness.agent,
+                &emitter,
+                "stalled-prompt-task",
+                "mandate-stalled-session",
+                "Review current synthetic engagement",
+                UserRole::Owner,
+                &ChannelContext::internal(),
+                1,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("build stalled mandate lead prompt");
+
+        assert!(
+            !stalled_core.contains("meeting that cadence is a sufficient expected_benefit"),
+            "stalled autopilot lead must not treat cadence as sufficient benefit"
+        );
+        assert!(
+            stalled_core.contains("meeting posting cadence is NOT a sufficient expected_benefit"),
+            "stalled autopilot lead must carry stagnation warning"
+        );
+        assert!(
+            stalled_core.contains("you may make one strategic ASK"),
+            "stalled autopilot autonomy rules must permit one strategic ASK"
+        );
+        assert!(
+            stalled_core.contains("ASK once (if no recent unanswered ASK exists)"),
+            "stalled autopilot protocol rules must describe one strategic ASK"
+        );
+        assert!(
+            !stalled_core.contains("Public delivery craft:"),
+            "read-only monitor without external_delivery must omit public delivery craft rules"
+        );
+
+        // Now record one credible improving reading and confirm stagnation rules clear.
+        let improved_at = (base_time + chrono::Duration::seconds(90)).to_rfc3339();
+        let improved_measurement = MandateObjectiveMeasurement::new(
+            &mandate.id,
+            mandate.version,
+            &run.id,
+            15_000_000,
+            9_500,
+            vec![receipt_id.to_string()],
+            &improved_at,
+        );
+        harness
+            .state
+            .record_mandate_objective_measurement(&improved_measurement)
+            .await
+            .expect("record improving objective measurement");
+
+        let (improving_core, _, _, _, _) =
+            aidaemon_runtime::turn::system_prompt::build_system_prompt_for_message(
+                &harness.agent,
+                &emitter,
+                "improving-prompt-task",
+                "mandate-improving-session",
+                "Review current synthetic engagement",
+                UserRole::Owner,
+                &ChannelContext::internal(),
+                1,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("build improving mandate lead prompt");
+
+        assert!(
+            improving_core.contains("meeting that cadence is a sufficient expected_benefit"),
+            "improving autopilot lead should restore normal cadence rule"
+        );
+        assert!(
+            !improving_core
+                .contains("meeting posting cadence is NOT a sufficient expected_benefit"),
+            "improving autopilot lead must clear stagnation warning"
+        );
+        assert!(
+            !improving_core.contains("you may make one strategic ASK"),
+            "improving autopilot lead must not carry stalled strategic ASK allowance"
+        );
     }
 
     // ---- Pillar A Task 5: context tail builder ----

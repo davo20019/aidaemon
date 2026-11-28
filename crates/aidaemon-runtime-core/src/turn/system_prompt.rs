@@ -15,8 +15,9 @@ use tracing::{info, warn};
 use crate::host::TurnHost;
 use crate::prompt::core as core_prompt;
 use crate::prompt::rules::{
-    infer_assistant_name_from_prompt, render_conversation_agents, render_environment_section,
-    render_run_thread_section, render_workspace_section, task_lead_rules,
+    MandateLeadPromptOptions, infer_assistant_name_from_prompt, render_conversation_agents,
+    render_environment_section, render_run_thread_section, render_workspace_section,
+    task_lead_rules_for_mandate,
 };
 use crate::turn::resume::ResumeCheckpoint;
 
@@ -417,6 +418,31 @@ pub async fn build_system_prompt_for_message(
     ))
 }
 
+/// Returns true when the most recent credible objective measurements have
+/// failed to improve for at least `STALLED_MEASUREMENTS_THRESHOLD` consecutive
+/// readings without reaching the target.
+pub fn mandate_objective_is_stalled(
+    control: &aidaemon_work::mandates::MandateObjectiveControl,
+    measurements: &[aidaemon_work::mandates::MandateObjectiveMeasurement],
+) -> bool {
+    let mut ordered: Vec<&aidaemon_work::mandates::MandateObjectiveMeasurement> =
+        measurements.iter().collect();
+    ordered.sort_by(|left, right| {
+        let left_ts = chrono::DateTime::parse_from_rfc3339(&left.observed_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let right_ts = chrono::DateTime::parse_from_rfc3339(&right.observed_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        left_ts
+            .cmp(&right_ts)
+            .then_with(|| left.observed_at.cmp(&right.observed_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    aidaemon_work::mandates::history::objective_flat_streak(control, &ordered)
+        >= aidaemon_work::mandates::history::STALLED_MEASUREMENTS_THRESHOLD
+}
+
 pub async fn build_isolated_mandate_system_prompt(
     host: &dyn TurnHost,
     emitter: &aidaemon_events::EventEmitter,
@@ -466,10 +492,32 @@ pub async fn build_isolated_mandate_system_prompt(
     let owner_guidance =
         aidaemon_work::mandates::policy::bounded_owner_guidance(controller_goal.context.as_deref());
     let prompt_now = chrono::Utc::now();
-    // An executor performs the one mutation the lead already decided on,
-    // so it gets only what binds that call. The tactics, continuity and
-    // review cadence the lead deliberated with are not its to reread.
+    // An executor performs the one mutation the lead already decided on.
+    // It keeps the owner-confirmed policy (including strategy, owner_guidance,
+    // and success_criteria) so it stays aligned with trusted owner rules, while
+    // omitting untrusted continuity history, objective control loop state, and
+    // review cadence bounds that only the task lead deliberates with.
     let is_executor = fence.worker_task_id != fence.root_task_id;
+    let stalled = if !is_executor {
+        if let Some(control) = mandate.objective_control.as_ref() {
+            let measurements = host
+                .mandates()
+                .list_mandate_objective_measurements(&mandate.id, 12)
+                .await?;
+            anyhow::ensure!(
+                measurements
+                    .iter()
+                    .all(|measurement| measurement.mandate_id == mandate.id),
+                "mandate measurement query crossed its authority boundary"
+            );
+            mandate_objective_is_stalled(control, &measurements)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let has_external_delivery = mandate.authority.allows_effect("external_delivery");
     let history_section = if is_executor {
         String::new()
     } else {
@@ -489,21 +537,21 @@ pub async fn build_isolated_mandate_system_prompt(
         "mandate_version": mandate.version,
         "autonomy_mode": mandate.autonomy_mode,
         "objective": mandate.objective,
+        "strategy": mandate.strategy,
         "authority": mandate.authority,
         "constraints": mandate.constraints,
+        "success_criteria": mandate.success_criteria,
         "stop_conditions": mandate.stop_conditions,
+        "owner_guidance": owner_guidance,
         "expires_at": mandate.expires_at,
     });
     if !is_executor {
-        immutable_policy["strategy"] = json!(mandate.strategy);
         immutable_policy["objective_control"] = json!(mandate.objective_control);
-        immutable_policy["success_criteria"] = json!(mandate.success_criteria);
         immutable_policy["review_bounds_seconds"] = json!({
             "minimum": mandate.min_review_secs,
             "default": mandate.default_review_secs,
             "maximum": mandate.max_review_secs,
         });
-        immutable_policy["owner_guidance"] = json!(owner_guidance);
     }
     let immutable_policy_json = serde_json::to_string(&immutable_policy)?;
     let mandate_id_json = serde_json::to_string(&fence.mandate_id)?;
@@ -512,7 +560,11 @@ pub async fn build_isolated_mandate_system_prompt(
     let root_task_id_json = serde_json::to_string(&fence.root_task_id)?;
     let worker_task_id_json = serde_json::to_string(&fence.worker_task_id)?;
     let autonomy_rules = if mandate.autonomy_mode.is_autopilot() {
-        "Autopilot is owner-confirmed for this exact policy version. Make routine judgments independently inside the immutable authority envelope. Retry safe internal failures, resume from durable state after interruption, and prefer WAIT over asking about ordinary tactics or transient failures. ASK only for a concrete authority expansion, an externally ambiguous mutation that cannot be reconciled safely, or genuinely owner-only judgment. Never treat Autopilot as authority for a new tool, operation, effect, account, target, query parameter, destructive action, spending, or private-data scope."
+        if stalled {
+            "Autopilot is owner-confirmed for this exact policy version. Make routine judgments independently inside the immutable authority envelope. Retry safe internal failures, resume from durable state after interruption, and prefer WAIT over asking about ordinary tactics or transient failures. Because the measured objective is stalled across consecutive readings, you may make one strategic ASK proposing concrete owner-confirmed changes (such as a strategy/playbook update, wider authorized scopes, or pausing), provided no recent unanswered ASK already exists. Otherwise ASK only for a concrete authority expansion, an externally ambiguous mutation that cannot be reconciled safely, or genuinely owner-only judgment. Never repeat an unanswered ASK, and never treat Autopilot as authority for a new tool, operation, effect, account, target, query parameter, destructive action, spending, or private-data scope without separate owner confirmation."
+        } else {
+            "Autopilot is owner-confirmed for this exact policy version. Make routine judgments independently inside the immutable authority envelope. Retry safe internal failures, resume from durable state after interruption, and prefer WAIT over asking about ordinary tactics or transient failures. ASK only for a concrete authority expansion, an externally ambiguous mutation that cannot be reconciled safely, or genuinely owner-only judgment. Never treat Autopilot as authority for a new tool, operation, effect, account, target, query parameter, destructive action, spending, or private-data scope."
+        }
     } else {
         "Bounded mode is active. Exercise normal mandate judgment inside the immutable authority envelope and use ASK when owner judgment is genuinely required."
     };
@@ -520,7 +572,7 @@ pub async fn build_isolated_mandate_system_prompt(
     // it was claimed for, and the committed intention it serves, travel
     // with its fence. Without this it only sees the lead's free-form
     // spawn message and cannot know what to publish.
-    let assigned_work = if fence.worker_task_id == fence.root_task_id {
+    let assigned_work = if !is_executor {
         String::new()
     } else {
         let task = host
@@ -549,10 +601,15 @@ pub async fn build_isolated_mandate_system_prompt(
             }))?
         )
     };
-    let role_rules = if fence.worker_task_id == fence.root_task_id {
-        task_lead_rules(
+    let role_rules = if !is_executor {
+        task_lead_rules_for_mandate(
             autonomy_rules,
-            mandate.autonomy_mode.is_autopilot() && mandate.objective_control.is_some(),
+            MandateLeadPromptOptions {
+                control_loop: mandate.autonomy_mode.is_autopilot()
+                    && mandate.objective_control.is_some(),
+                stalled,
+                has_external_delivery,
+            },
         )
     } else {
         format!(

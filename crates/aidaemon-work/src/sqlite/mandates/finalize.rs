@@ -2,6 +2,87 @@
 
 use super::*;
 
+/// Links to what this run's succeeded mutations created, in action order,
+/// built only from each receipt's canonical id and the typed target.
+async fn run_published_links(
+    connection: &mut sqlx::SqliteConnection,
+    mandate_id: &str,
+    goal_run_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT targets_json, external_resource_id FROM mandate_mutation_attempts
+             WHERE mandate_id = ? AND goal_run_id = ? AND status = 'succeeded'
+               AND external_resource_id IS NOT NULL
+             ORDER BY reserved_action_attempt ASC",
+    )
+    .bind(mandate_id)
+    .bind(goal_run_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut links = Vec::new();
+    for (targets_json, resource_id) in rows {
+        let targets: Vec<crate::traits::MandateMutationTarget> =
+            serde_json::from_str(&targets_json).unwrap_or_default();
+        if let Some(link) = crate::traits::canonical_published_link(&targets, &resource_id)
+            && !links.contains(&link)
+        {
+            links.push(link);
+        }
+    }
+    Ok(links)
+}
+
+/// The measured objective's latest credible reading, when the mandate has
+/// a control and at least one credible measurement.
+async fn objective_notice_summary(
+    connection: &mut sqlx::SqliteConnection,
+    mandate_id: &str,
+) -> anyhow::Result<Option<crate::traits::MandateObjectiveNoticeSummary>> {
+    let control_json = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT objective_control_json FROM mandates WHERE id = ?",
+    )
+    .bind(mandate_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .flatten();
+    let Some(control) = control_json.and_then(|value| {
+        serde_json::from_str::<crate::traits::MandateObjectiveControl>(&value).ok()
+    }) else {
+        return Ok(None);
+    };
+    let rows = sqlx::query(
+        "SELECT id, mandate_id, mandate_version, goal_run_id, value_micros,
+                confidence_bps, evidence_receipt_ids_json, observed_at, created_at
+             FROM mandate_objective_measurements
+             WHERE mandate_id = ?
+             ORDER BY julianday(observed_at) DESC, id DESC LIMIT 12",
+    )
+    .bind(mandate_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut measurements = rows
+        .iter()
+        .map(objective_measurement_from_row)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    measurements.reverse();
+    let ordered = measurements.iter().collect::<Vec<_>>();
+    let Some(current) = ordered
+        .iter()
+        .rev()
+        .find(|measurement| measurement.confidence_bps > 0)
+    else {
+        return Ok(None);
+    };
+    let summary = crate::traits::MandateObjectiveNoticeSummary {
+        metric_name: control.metric_name.clone(),
+        unit: control.unit.clone(),
+        current_micros: current.value_micros,
+        target_micros: control.target_micros,
+        flat_streak: crate::mandates::history::objective_flat_streak(&control, &ordered),
+    };
+    Ok(summary.validate().is_ok().then_some(summary))
+}
+
 pub(super) async fn finalize_mandate_run_from_proof<S: WorkDatabase>(
     store: &S,
     request: &MandateRunFinalizationRequest,
@@ -673,7 +754,11 @@ pub(super) async fn finalize_mandate_run_from_proof<S: WorkDatabase>(
                 crate::traits::MandateRunNotificationKind::ActSatisfied,
                 counts.clone(),
                 &request.finalized_at,
-            );
+            )
+            .with_published_links(
+                run_published_links(&mut tx, &request.mandate_id, &request.goal_run_id).await?,
+            )
+            .with_objective_summary(objective_notice_summary(&mut tx, &request.mandate_id).await?);
             super::notifications::enqueue_mandate_run_notification_on_connection(&mut tx, &notice)
                 .await?;
             sqlx::query("UPDATE goals SET dispatch_failures = 0, updated_at = ? WHERE id = ?")

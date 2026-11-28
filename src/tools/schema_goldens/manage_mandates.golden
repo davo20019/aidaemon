@@ -17,6 +17,7 @@
             "pause",
             "resume",
             "answer_question",
+            "steer",
             "resolve_reconciliation",
             "cancel",
             "list_intentions"
@@ -60,6 +61,7 @@
           "type": "string"
         },
         "guidance": {
+          "description": "Bounded owner guidance for steer, answer_question, resume, or resolve_reconciliation; never adds authority. Steer supports active or paused confirmed mandates without an open question.",
           "maxLength": 1024,
           "type": "string"
         },
@@ -232,6 +234,7 @@
           "type": "array"
         },
         "strategy_skill": {
+          "description": "Owner-approved skill name for a domain, voice, or tactics playbook (not just an API reference); snapshotted immutably on confirmation.",
           "maxLength": 256,
           "type": "string"
         },

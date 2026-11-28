@@ -15,13 +15,13 @@ manage_auth 1980 495
 manage_automations 2217 555
 manage_config 1079 270
 manage_goal_tasks 1928 482
-manage_mandates 4215 1054
+manage_mandates 4575 1144
 manage_mcp 971 243
 manage_memories 1359 340
 manage_node_monitors 3130 783
 manage_people 3966 992
 manage_skills 820 205
-mandate_review 3694 924
+mandate_review 4697 1175
 node_restart 766 192
 policy_metrics 459 115
 read_channel_history 944 236
@@ -47,5 +47,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 81841 20461 (48 tools)
+TOTAL 83204 20801 (48 tools)
 PER_CALL 35505 8877 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 29 deferred)

@@ -13,7 +13,7 @@ pub(super) const DECISION_COLUMNS: &str = "id, mandate_id, goal_run_id, mandate_
      reconsider_at, action_attempts, created_at, updated_at";
 
 pub(super) const INTENTION_COLUMNS: &str = "id, mandate_id, decision_cycle_id, goal_run_id, description, rationale, \
-     value_criterion, expected_benefit, risk, invalidation_criteria, status, created_at, updated_at, completed_at";
+     value_criterion, expected_benefit, risk, invalidation_criteria, format_key, status, created_at, updated_at, completed_at";
 
 pub(super) const LEARNING_NOTE_COLUMNS: &str = "id, mandate_id, mandate_version, learned_in_decision_cycle_id, summary, \
      evidence_receipt_ids_json, created_at";
@@ -22,7 +22,10 @@ pub(super) const MUTATION_ATTEMPT_COLUMNS: &str = "id, mandate_id, mandate_versi
      root_task_id, root_task_attempt_id, task_id, task_attempt_id, reserved_action_attempt, \
      action_digest, tool_call_id, tool_name, mutation_effects_json, targets_json, \
      account_identifiers_json, status, outcome_evidence, http_status, exit_code, \
-     reserved_at, completed_at";
+     external_resource_id, reserved_at, completed_at";
+
+pub(super) const ACTION_OUTCOME_COLUMNS: &str = "id, mandate_id, mandate_version, decision_cycle_id, external_resource_id, \
+     format_key, engagements_micros, impressions, evidence_receipt_ids_json, observed_at, created_at";
 
 pub(super) fn qualified_columns(alias: &str, columns: &str) -> String {
     columns
@@ -151,10 +154,31 @@ pub(super) fn intention_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Resul
         expected_benefit: row.get("expected_benefit"),
         risk: row.get("risk"),
         invalidation_criteria: row.get("invalidation_criteria"),
+        format_key: row.get("format_key"),
         status,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         completed_at: row.get("completed_at"),
+    })
+}
+
+pub(super) fn action_outcome_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<MandateActionOutcome> {
+    Ok(MandateActionOutcome {
+        id: row.get("id"),
+        mandate_id: row.get("mandate_id"),
+        mandate_version: row.get("mandate_version"),
+        decision_cycle_id: row.get("decision_cycle_id"),
+        external_resource_id: row.get("external_resource_id"),
+        format_key: row.get("format_key"),
+        engagements_micros: row.get("engagements_micros"),
+        impressions: row.get("impressions"),
+        evidence_receipt_ids: serde_json::from_str(
+            &row.get::<String, _>("evidence_receipt_ids_json"),
+        )?,
+        observed_at: row.get("observed_at"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -217,6 +241,7 @@ pub(super) fn mutation_attempt_from_row(
         outcome_evidence,
         http_status,
         exit_code: row.get("exit_code"),
+        external_resource_id: row.get("external_resource_id"),
         reserved_at: row.get("reserved_at"),
         completed_at: row.get("completed_at"),
     })

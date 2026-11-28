@@ -68,7 +68,6 @@ manage_mandates.action
 manage_mandates.allow_observations
 manage_mandates.autonomy_mode
 manage_mandates.clear_strategy
-manage_mandates.guidance
 manage_mandates.include_terminal
 manage_mandates.limit
 manage_mandates.mandate_id
@@ -88,7 +87,6 @@ manage_mandates.operation_scopes[].tool
 manage_mandates.reconciliation_resolution
 manage_mandates.review_effort
 manage_mandates.section
-manage_mandates.strategy_skill
 manage_mcp.action
 manage_people.action
 manage_people.communication_style

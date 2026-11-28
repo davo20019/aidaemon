@@ -4,16 +4,16 @@
 
 use super::*;
 use crate::traits::{
-    GoalRun, Intention, IntentionStatus, Mandate, MandateActivityLevel, MandateAuthority,
-    MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOrigin, MandateDecisionOutcome,
-    MandateDispatchGate, MandateFinalizationRejectReason, MandateFinalizationStaleReason,
-    MandateLearningNote, MandateMutationAttempt, MandateMutationAttemptStatus,
-    MandateMutationDispatchClaim, MandateMutationEvidence, MandateMutationQuotaBlockReason,
-    MandateMutationQuotaState, MandateMutationReservation, MandateObjectiveMeasurement,
-    MandateOperatingUpdates, MandateReconciliationReason, MandateReconciliationResolution,
-    MandateRunFinalizationRequest, MandateRunFinalizationResult, MandateRunProofCounts,
-    MandateStatus, MandateStore, MandateSuspension, MandateSuspensionKind, MandateTerminationKind,
-    MandateWakeSignal, Task,
+    GoalRun, Intention, IntentionStatus, Mandate, MandateActionOutcome, MandateActivityLevel,
+    MandateAuthority, MandateAutonomyMode, MandateDecisionCycle, MandateDecisionOrigin,
+    MandateDecisionOutcome, MandateDispatchGate, MandateFinalizationRejectReason,
+    MandateFinalizationStaleReason, MandateLearningNote, MandateMutationAttempt,
+    MandateMutationAttemptStatus, MandateMutationDispatchClaim, MandateMutationEvidence,
+    MandateMutationQuotaBlockReason, MandateMutationQuotaState, MandateMutationReservation,
+    MandateObjectiveMeasurement, MandateOperatingUpdates, MandateReconciliationReason,
+    MandateReconciliationResolution, MandateRunFinalizationRequest, MandateRunFinalizationResult,
+    MandateRunProofCounts, MandateStatus, MandateStore, MandateSuspension, MandateSuspensionKind,
+    MandateTerminationKind, MandateWakeSignal, Task,
 };
 use sha2::{Digest, Sha256};
 
@@ -192,6 +192,14 @@ impl<S: WorkDatabase> MandateStore for S {
         limit: i64,
     ) -> anyhow::Result<Vec<MandateLearningNote>> {
         measurements::list_mandate_learning_notes(self, mandate_id, limit).await
+    }
+
+    async fn list_mandate_action_outcomes(
+        &self,
+        mandate_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<MandateActionOutcome>> {
+        decisions::list_mandate_action_outcomes(self, mandate_id, limit).await
     }
 
     async fn create_mandate_review_run(

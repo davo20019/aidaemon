@@ -372,6 +372,10 @@ pub struct ToolReceiptV1 {
     pub transport_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    /// Canonical id of the resource a strictly successful write created,
+    /// copied from the adapter's metadata (never from result text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_resource_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationInfo>,
     /// Completeness, range, source, and stable digest of the result body.
@@ -447,6 +451,7 @@ impl ToolReceiptV1 {
             completion_notifications_enabled: metadata.completion_notifications_enabled,
             transport_error: metadata.transport_error.clone(),
             http_status: metadata.http_status,
+            created_resource_id: metadata.created_resource_id.clone(),
             truncation: metadata.truncation.clone(),
             result_provenance: metadata.result_provenance.clone().unwrap_or_default(),
             authorization_preflight: metadata.authorization_preflight.clone(),
@@ -487,6 +492,7 @@ impl ToolReceiptV1 {
             completion_notifications_enabled: self.completion_notifications_enabled,
             transport_error: self.transport_error.clone(),
             http_status: self.http_status,
+            created_resource_id: self.created_resource_id.clone(),
             truncation: self.truncation.clone(),
             result_provenance: Some({
                 let mut provenance = self.result_provenance.clone();
@@ -2381,6 +2387,7 @@ mod tests {
             outcome_status: Some(ToolOutcomeStatus::Succeeded),
             exit_code: Some(0),
             http_status: Some(201),
+            created_resource_id: Some("synthetic-created-1".to_string()),
             access_enforcement: crate::traits::ToolAccessEnforcement::KernelEnforced,
             access_denial: Some(crate::traits::ToolAccessDenial {
                 reason_code: "filesystem_access_denied".to_string(),
@@ -2422,6 +2429,14 @@ mod tests {
         assert_eq!(roundtrip, receipt);
         assert_eq!(roundtrip.schema_version, ToolReceiptV1::SCHEMA_VERSION);
         assert_eq!(roundtrip.schema_version, 7);
+        assert_eq!(
+            roundtrip.created_resource_id.as_deref(),
+            Some("synthetic-created-1")
+        );
+        assert_eq!(
+            roundtrip.to_metadata().created_resource_id.as_deref(),
+            Some("synthetic-created-1")
+        );
         assert!(
             roundtrip
                 .context_header()

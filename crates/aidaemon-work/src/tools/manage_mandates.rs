@@ -1322,10 +1322,11 @@ impl ManageMandatesTool {
                     control.next_measurement_at(latest_measurement_observed_at)
                 });
                 let objective_progress = mandate.objective_control.as_ref().map(|control| {
-                    let current = recent_objective_measurements
-                        .iter()
-                        .max_by(|left, right| left.observed_at.cmp(&right.observed_at))
-                        .map(|measurement| measurement.value_micros);
+                    let mut ordered = recent_objective_measurements.iter().collect::<Vec<_>>();
+                    ordered.sort_by(|left, right| left.observed_at.cmp(&right.observed_at));
+                    let current = ordered.last().map(|measurement| measurement.value_micros);
+                    let flat_streak =
+                        crate::mandates::history::objective_flat_streak(control, &ordered);
                     json!({
                         "metric_name": control.metric_name,
                         "unit": control.unit,
@@ -1335,6 +1336,8 @@ impl ManageMandatesTool {
                         "direction": control.direction,
                         "target_reached": current.map(|value| control.target_reached(value)),
                         "measurement_count": recent_objective_measurements.len(),
+                        "flat_measurements_streak": flat_streak,
+                        "stalled": flat_streak >= crate::mandates::history::STALLED_MEASUREMENTS_THRESHOLD,
                     })
                 });
                 json!({
@@ -1373,6 +1376,10 @@ impl ManageMandatesTool {
                         "maximum_seconds": mandate.max_review_secs,
                     },
                     "resource_policy": controller_budget_snapshot(&controller, &mandate.review_effort),
+                    "owner_guidance": controller.context.as_deref()
+                        .and_then(|context| serde_json::from_str::<Value>(context).ok())
+                        .and_then(|context| context.get("owner_guidance").cloned())
+                        .unwrap_or_else(|| json!([])),
                     "authority_summary": {
                         "observations_allowed": mandate.authority.allow_observations,
                         "operation_scope_count": mandate.authority.operation_scopes.len(),
@@ -1384,6 +1391,8 @@ impl ManageMandatesTool {
                         "owner_alerts": mandate.authority.owner_alerts,
                     },
                     "owner_input_contract": {
+                        "steer_records_guidance_only": true,
+                        "steer_changes_authority": false,
                         "answer_question_records_guidance_only": true,
                         "answer_question_changes_authority": false,
                         "authority_changes_require_confirmed_update": true,
@@ -1454,6 +1463,10 @@ impl ManageMandatesTool {
                             .await?,
                     );
                 }
+                let action_outcomes = self
+                    .state
+                    .list_mandate_action_outcomes(&mandate.id, 64)
+                    .await?;
                 json!({
                     "schema_version": 2,
                     "section": "history",
@@ -1465,11 +1478,61 @@ impl ManageMandatesTool {
                     "recent_intentions": intentions,
                     "recent_learning_notes": learning,
                     "recent_mutation_receipts": mutation_receipts,
+                    "recent_action_outcomes": action_outcomes,
                 })
             }
             _ => anyhow::bail!("section must be summary, policy, or history"),
         };
         Ok(serde_json::to_string(&output)?)
+    }
+
+    async fn steer(&self, args: &ManageMandatesArgs) -> anyhow::Result<String> {
+        if !Self::is_private_owner_control(args) {
+            return Ok(
+                "Mandates can only be changed by the owner in a verified private channel."
+                    .to_string(),
+            );
+        }
+        let owner = Self::owner_session(args)?;
+        let mandate = self.resolve_selected_mandate(args, owner).await?;
+        anyhow::ensure!(
+            mandate.status != MandateStatus::AwaitingInput,
+            "this mandate is awaiting input; use answer_question or resolve_reconciliation"
+        );
+        anyhow::ensure!(
+            matches!(
+                mandate.status,
+                MandateStatus::Active | MandateStatus::Paused
+            ),
+            "steer requires an active or paused mandate; terminal mandates cannot be changed"
+        );
+        anyhow::ensure!(
+            mandate.confirmed_at.is_some(),
+            "steer requires an owner-confirmed mandate"
+        );
+        let guidance = args
+            .guidance
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("non-empty guidance is required for steer"))?;
+        validate_bounded_text(guidance, "guidance", MAX_GUIDANCE_ENTRY_TEXT)?;
+        let controller = self
+            .state
+            .get_goal(&mandate.goal_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mandate controller goal is missing"))?;
+        let context = append_owner_guidance(controller.context.as_deref(), guidance)?;
+        anyhow::ensure!(
+            self.state.record_active_mandate_owner_guidance(
+                &mandate.id, mandate.version, owner, &context,
+            ).await?,
+            "mandate changed before the guidance could be recorded"
+        );
+        Ok(format!(
+            "Mandate {} recorded bounded owner guidance for its next review. Immutable authority is unchanged: no tool, operation, effect, account, URL, or query scope was added. Use the separately owner-confirmed update workflow for any authority change.",
+            mandate.id
+        ))
     }
 
     async fn transition(&self, args: &ManageMandatesArgs, action: &str) -> anyhow::Result<String> {
@@ -1547,7 +1610,7 @@ impl ManageMandatesTool {
                 .any(|decision| decision.outcome == MandateDecisionOutcome::Ask);
             anyhow::ensure!(
                 asked,
-                "this mandate has no open question; use update to change its policy"
+                "this mandate has no open question; use steer to record tactical or voice guidance, or update to change its policy"
             );
             anyhow::ensure!(
                 self.state
@@ -2116,6 +2179,7 @@ const MANAGE_MANDATE_ACTIONS: &[&str] = &[
     "pause",
     "resume",
     "answer_question",
+    "steer",
     "resolve_reconciliation",
     "cancel",
     "list_intentions",
@@ -2197,10 +2261,10 @@ impl Tool for ManageMandatesTool {
                     "max_mutating_actions_per_cycle": integer_range(0, 24), "max_mutating_actions_per_rolling_24h": integer_range(0, 24), "min_seconds_between_mutations": integer_min(0),
                     "owner_alerts": described(json!({"type":"boolean"}), OWNER_ALERTS_DESCRIPTION),
                     "constraints": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), CONSTRAINT_FIELD_DESCRIPTION), "success_criteria": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), SUCCESS_FIELD_DESCRIPTION), "stop_conditions": described(bounded_text_array(MAX_POLICY_ENTRIES, MAX_POLICY_ENTRY_TEXT), STOP_FIELD_DESCRIPTION),
-                    "strategy_skill": bounded_text(256), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": described(integer_min(1), DEFAULT_REVIEW_FIELD_DESCRIPTION),
+                    "strategy_skill": described(bounded_text(256), "Owner-approved skill name for a domain, voice, or tactics playbook (not just an API reference); snapshotted immutably on confirmation."), "clear_strategy": { "type": "boolean" }, "min_review_minutes": integer_min(1), "max_review_minutes": integer_min(1), "default_review_minutes": described(integer_min(1), DEFAULT_REVIEW_FIELD_DESCRIPTION),
                     "duration_minutes": described(integer_min(1), DURATION_FIELD_DESCRIPTION), "expires_at": described(json!({"type":"string"}), FIXED_DEADLINE_DESCRIPTION), "priority": described(text_enum(PRIORITIES), PRIORITY_FIELD_DESCRIPTION), "review_effort": text_enum(REVIEW_EFFORTS),
                     "include_terminal": { "type": "boolean" }, "section": text_enum(GET_SECTIONS), "limit": integer_range(1, 10),
-                    "guidance": bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
+                    "guidance": described(bounded_text(MAX_GUIDANCE_ENTRY_TEXT), "Bounded owner guidance for steer, answer_question, resume, or resolve_reconciliation; never adds authority. Steer supports active or paused confirmed mandates without an open question."), "reconciliation_resolution": text_enum(RECONCILIATION_RESOLUTIONS)
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -2267,6 +2331,7 @@ impl ManageMandatesTool {
             "list" => self.list(&args).await,
             "get" => self.get(&args).await,
             "update" => self.update(&args).await,
+            "steer" => self.steer(&args).await,
             "pause" | "resume" | "answer_question" | "resolve_reconciliation" | "cancel" => {
                 self.transition(&args, &args.action).await
             }
@@ -2328,7 +2393,7 @@ impl crate::traits::ToolSemantics for ManageMandatesTool {
     fn owner_control_plane_call(&self, arguments: &str) -> bool {
         // Read-only actions, plus create and update, which commit only after
         // the owner confirms through the agent kernel. Transitions (pause,
-        // resume, cancel, answer_question, resolve_reconciliation) take
+        // resume, cancel, steer, answer_question, resolve_reconciliation) take
         // effect without a confirmation and are not admitted here.
         serde_json::from_str::<Value>(arguments)
             .ok()

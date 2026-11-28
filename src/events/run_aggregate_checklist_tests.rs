@@ -290,6 +290,7 @@ fn result(
                 completion_notifications_enabled: false,
                 transport_error: None,
                 http_status: None,
+                created_resource_id: None,
                 truncation: None,
                 result_provenance: ToolResultProvenance {
                     result_id: Some(format!("result:{id}")),

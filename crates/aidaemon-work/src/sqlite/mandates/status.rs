@@ -170,16 +170,18 @@ pub(super) async fn record_active_mandate_owner_guidance<S: WorkDatabase>(
         "UPDATE goals SET context = ?, updated_at = ?
              WHERE id = (
                  SELECT goal_id FROM mandates
-                 WHERE id = ? AND version = ? AND status = 'active'
+                 WHERE id = ? AND version = ? AND status IN ('active', 'paused')
                    AND confirmed_at IS NOT NULL AND created_by_session = ?
              )
-               AND domain = 'orchestration' AND goal_type = 'continuous'",
+               AND domain = 'orchestration' AND goal_type = 'continuous'
+               AND status = (SELECT status FROM mandates WHERE id = ?)",
     )
     .bind(controller_context)
     .bind(&now)
     .bind(mandate_id)
     .bind(expected_version)
     .bind(owner_session)
+    .bind(mandate_id)
     .execute(store.work_pool())
     .await?;
     Ok(updated.rows_affected() == 1)

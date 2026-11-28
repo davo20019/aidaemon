@@ -1378,6 +1378,7 @@ pub async fn migrate_work_tables(
             expected_benefit TEXT,
             risk TEXT,
             invalidation_criteria TEXT,
+            format_key TEXT,
             status TEXT NOT NULL DEFAULT 'committed',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1392,6 +1393,13 @@ pub async fn migrate_work_tables(
     aidaemon_tools::sqlite_schema::add_column_if_missing(
         pool,
         "ALTER TABLE intentions ADD COLUMN value_criterion TEXT",
+    )
+    .await?;
+    // The canonical format an ACT declared (`[a-z0-9_-]{1,64}`), so outcomes
+    // can be grouped by format. Older rows stay NULL ("untagged").
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE intentions ADD COLUMN format_key TEXT",
     )
     .await?;
 
@@ -1518,6 +1526,7 @@ pub async fn migrate_work_tables(
                 CHECK (outcome_evidence IS NULL OR outcome_evidence IN ('tool_reported', 'structured_metadata')),
             http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
             exit_code INTEGER,
+            external_resource_id TEXT,
             reserved_at TEXT NOT NULL,
             dispatch_claimed_at TEXT,
             completed_at TEXT,
@@ -1612,6 +1621,42 @@ pub async fn migrate_work_tables(
             .await?;
         tx.commit().await?;
     }
+    // The canonical id of the resource a strictly successful mutation
+    // created, projected from its receipt by the event store. Added after
+    // the rebuild above so an upgraded ledger gets it too.
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandate_mutation_attempts ADD COLUMN external_resource_id TEXT",
+    )
+    .await?;
+
+    // Runtime-validated per-action outcomes: a later review reads a
+    // published resource's public counts and records them against the
+    // succeeded mutation that created it. Only ids and counts, never text.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mandate_action_outcomes (
+            id TEXT PRIMARY KEY,
+            mandate_id TEXT NOT NULL REFERENCES mandates(id) ON DELETE CASCADE,
+            mandate_version INTEGER NOT NULL CHECK (mandate_version > 0),
+            decision_cycle_id TEXT NOT NULL REFERENCES mandate_decision_cycles(id) ON DELETE CASCADE,
+            external_resource_id TEXT NOT NULL,
+            format_key TEXT,
+            engagements_micros INTEGER NOT NULL CHECK (engagements_micros >= 0),
+            impressions INTEGER CHECK (impressions IS NULL OR impressions >= 0),
+            evidence_receipt_ids_json TEXT NOT NULL CHECK (json_valid(evidence_receipt_ids_json)),
+            observed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(mandate_id, external_resource_id, decision_cycle_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_mandate_action_outcomes_recent
+         ON mandate_action_outcomes(mandate_id, observed_at DESC)",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_mandates_due

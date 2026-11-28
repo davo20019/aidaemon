@@ -1665,12 +1665,63 @@ impl HttpRequestTool {
         }
     }
 
+    #[cfg(test)]
     async fn run_http(
         &self,
         arguments: &str,
         mandate_preapproved: bool,
         mandate_execution: bool,
         kernel_approved: Option<&crate::semantics::ApprovalScope>,
+    ) -> anyhow::Result<(String, Option<u16>, Option<TruncationInfo>)> {
+        let mut created_resource_id = None;
+        self.run_http_capturing(
+            arguments,
+            mandate_preapproved,
+            mandate_execution,
+            kernel_approved,
+            &mut created_resource_id,
+        )
+        .await
+    }
+
+    /// Canonical id of the resource a write created, read from the raw
+    /// response body (machine-format JSON, before any truncation or display
+    /// formatting): `/data/id`, then `/id`, as a string or an unsigned
+    /// integer. Only `[A-Za-z0-9_-]{1,64}` is accepted, so whitespace,
+    /// quotes, URLs and prose never pass through.
+    pub fn extract_canonical_created_resource_id(body: &[u8]) -> Option<String> {
+        let json: Value = serde_json::from_slice(body).ok()?;
+        ["/data/id", "/id"].iter().find_map(|pointer| {
+            let candidate = match json.pointer(pointer)? {
+                Value::String(id) => id.clone(),
+                Value::Number(number) => number.as_u64()?.to_string(),
+                _ => return None,
+            };
+            Self::is_canonical_resource_id(&candidate).then_some(candidate)
+        })
+    }
+
+    fn is_canonical_resource_id(candidate: &str) -> bool {
+        !candidate.is_empty()
+            && candidate.len() <= 64
+            && candidate
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+
+    /// A write's strictly successful status: 2xx except 202, whose effect
+    /// is only accepted, not done.
+    fn is_strict_write_success(status: u16) -> bool {
+        (200..300).contains(&status) && status != 202
+    }
+
+    async fn run_http_capturing(
+        &self,
+        arguments: &str,
+        mandate_preapproved: bool,
+        mandate_execution: bool,
+        kernel_approved: Option<&crate::semantics::ApprovalScope>,
+        created_resource_id: &mut Option<String>,
     ) -> anyhow::Result<(String, Option<u16>, Option<TruncationInfo>)> {
         let mut args: Value = serde_json::from_str(arguments)?;
 
@@ -2111,6 +2162,12 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
         // Build result with response details
         let status_code = status.as_u16();
         let captured_status = Some(status_code);
+        if !truncated
+            && Self::is_strict_write_success(status_code)
+            && Self::is_write_request(arguments)
+        {
+            *created_resource_id = Self::extract_canonical_created_resource_id(&collected_body);
+        }
         let mut result = format!(
             "HTTP {} {}\n",
             status_code,
@@ -2394,12 +2451,14 @@ impl Tool for HttpRequestTool {
                 finish: None,
             });
         }
+        let mut created_resource_id = None;
         let (output, http_status, truncation) = self
-            .run_http(
+            .run_http_capturing(
                 arguments,
                 exec_ctx.mandate_preapproved,
                 exec_ctx.mandate_execution,
                 exec_ctx.kernel_approved.as_ref(),
+                &mut created_resource_id,
             )
             .await?;
         Ok(ToolCallOutcome {
@@ -2413,6 +2472,7 @@ impl Tool for HttpRequestTool {
                     )
                 }),
                 http_status,
+                created_resource_id,
                 truncation,
                 authorization_preflight,
                 ..Default::default()
@@ -3661,6 +3721,114 @@ mod tests {
         assert!(HttpRequestTool::is_write_request(r#"{"method":"DELETE"}"#));
         assert!(!HttpRequestTool::is_write_request(r#"{"method":"GET"}"#));
         assert!(!HttpRequestTool::is_write_request(r#"{"url":"x"}"#));
+    }
+
+    #[test]
+    fn a_created_resource_id_is_read_only_from_canonical_json_ids() {
+        let id =
+            |body: &str| HttpRequestTool::extract_canonical_created_resource_id(body.as_bytes());
+        assert_eq!(
+            id(r#"{"data":{"id":"1234567890","text":"hello"}}"#).as_deref(),
+            Some("1234567890")
+        );
+        assert_eq!(id(r#"{"id":"note_ab-12"}"#).as_deref(), Some("note_ab-12"));
+        assert_eq!(id(r#"{"id":4242}"#).as_deref(), Some("4242"));
+        assert_eq!(
+            id(r#"{"data":{"id":"from-data"},"id":"top"}"#).as_deref(),
+            Some("from-data"),
+            "/data/id wins over /id"
+        );
+        assert_eq!(
+            id(r#"{"data":{"id":"has space"},"id":"fallback"}"#).as_deref(),
+            Some("fallback"),
+            "an invalid /data/id falls back to a valid /id"
+        );
+        for rejected in [
+            r#"{"id":""}"#,
+            r#"{"id":"two words"}"#,
+            r#"{"id":"https://example.com/x/1"}"#,
+            r#"{"id":"quote\"d"}"#,
+            r#"{"id":-7}"#,
+            r#"{"id":1.5}"#,
+            r#"{"id":true}"#,
+            r#"{"id":{"nested":"1"}}"#,
+            r#"{"data":[{"id":"1"}]}"#,
+            r#"{"id":"ünïcode"}"#,
+            "not json",
+            r#"{"other":"1"}"#,
+        ] {
+            assert_eq!(id(rejected), None, "{rejected}");
+        }
+        let long = "a".repeat(65);
+        assert_eq!(id(&format!(r#"{{"id":"{long}"}}"#)), None);
+        let max = "b".repeat(64);
+        assert_eq!(id(&format!(r#"{{"id":"{max}"}}"#)), Some(max));
+    }
+
+    /// Answers every request with one status line and JSON body.
+    async fn spawn_body_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let url = format!("http://{}/notes", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, server)
+    }
+
+    async fn created_id_for(method: &str, status_line: &'static str) -> Option<String> {
+        let (url, server) =
+            spawn_body_server(status_line, r#"{"data":{"id":"synthetic-post-1"}}"#).await;
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())));
+        let outcome = tool
+            .call_with_execution_context(
+                &json!({"method": method, "url": url, "body": "{}"}).to_string(),
+                None,
+                ToolCallContext {
+                    mandate_preapproved: true,
+                    mandate_execution: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an HTTP status is returned as a result");
+        server.abort();
+        let _ = server.await;
+        outcome.metadata.created_resource_id
+    }
+
+    #[tokio::test]
+    async fn only_a_strictly_successful_write_records_the_created_id() {
+        assert_eq!(
+            created_id_for("POST", "201 Created").await.as_deref(),
+            Some("synthetic-post-1")
+        );
+        assert_eq!(
+            created_id_for("POST", "200 OK").await.as_deref(),
+            Some("synthetic-post-1")
+        );
+        assert_eq!(created_id_for("POST", "202 Accepted").await, None);
+        assert_eq!(created_id_for("POST", "400 Bad Request").await, None);
+        assert_eq!(
+            created_id_for("GET", "200 OK").await,
+            None,
+            "a read creates nothing"
+        );
     }
 
     /// Answers each request with the next status line, repeating the last.

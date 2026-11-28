@@ -17,10 +17,10 @@ use crate::mandates::validate::{
     validate_bounded_strings, validate_bounded_text,
 };
 use crate::traits::{
-    Intention, MandateActivityLevel, MandateDecisionCycle, MandateDecisionOutcome,
-    MandateLearningNote, MandateObjectiveMeasurement, MandateOperatingUpdates, MandateToolStore,
-    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolOutcomeStatus, ToolRole,
+    Intention, MandateActionOutcome, MandateActivityLevel, MandateDecisionCycle,
+    MandateDecisionOutcome, MandateLearningNote, MandateObjectiveMeasurement,
+    MandateOperatingUpdates, MandateToolStore, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolOutcomeStatus, ToolRole,
 };
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::OutcomeTool as Tool;
@@ -65,6 +65,8 @@ const EXPECTED_BENEFIT_DESCRIPTION: &str = "ACT: benefit of acting now instead o
 const RISK_DESCRIPTION: &str = "ACT: expected cost or downside, or why none is material.";
 const INVALIDATION_DESCRIPTION: &str =
     "ACT: evidence making the intervention unsafe or not worthwhile.";
+const FORMAT_KEY_DESCRIPTION: &str = "ACT, optional: a short stable label for the format this action tries (lowercase a-z, 0-9, _ or -, up to 64), reused across reviews so outcomes group by format.";
+const ACTION_OUTCOMES_DESCRIPTION: &str = "Optional: public counts this run read for resources earlier actions created (see unmeasured_resource_ids in history); each must name a resource a succeeded action of this mandate created.";
 
 /// The review run's commit point: one ACT/WAIT/ASK/STOP decision per run,
 /// and, for a measured objective, the metric read before it.
@@ -320,6 +322,13 @@ impl MandateReviewTool {
                 )?
                 .to_string(),
             );
+            if let Some(format_key) = args.format_key.as_deref() {
+                anyhow::ensure!(
+                    crate::traits::is_canonical_format_key(format_key),
+                    "format_key must be 1 to 64 characters of lowercase a-z, 0-9, _ or -"
+                );
+                intention.format_key = Some(format_key.to_string());
+            }
             intention
                 .validate_value_contract()
                 .map_err(anyhow::Error::msg)?;
@@ -381,7 +390,11 @@ impl MandateReviewTool {
                 evidence,
             )
         });
-        let operating_updates = MandateOperatingUpdates { learning_note };
+        let action_outcomes = Self::action_outcomes(args, &decision)?;
+        let operating_updates = MandateOperatingUpdates {
+            learning_note,
+            action_outcomes,
+        };
         self.state
             .record_mandate_decision_with_updates(
                 &decision,
@@ -416,6 +429,64 @@ impl MandateReviewTool {
                 "STOP recorded. The mandate has been completed; create no tasks.".to_string()
             }
         })
+    }
+
+    /// The observed counts the call reports, as outcomes of this decision.
+    /// Each cites the decision's own evidence; the store checks that every
+    /// resource is one this mandate created with a succeeded action.
+    fn action_outcomes(
+        args: &MandateReviewArgs,
+        decision: &MandateDecisionCycle,
+    ) -> anyhow::Result<Vec<MandateActionOutcome>> {
+        let reported = args.action_outcomes.as_deref().unwrap_or_default();
+        anyhow::ensure!(
+            reported.len() <= crate::traits::MAX_MANDATE_ACTION_OUTCOMES,
+            "action_outcomes takes at most {} entries",
+            crate::traits::MAX_MANDATE_ACTION_OUTCOMES
+        );
+        if reported.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            !decision.evidence_receipt_ids.is_empty(),
+            "action_outcomes need this run's receipts that read the counts"
+        );
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let evidence = decision
+            .evidence_receipt_ids
+            .iter()
+            .take(MAX_EVIDENCE_RECEIPTS)
+            .cloned()
+            .collect::<Vec<_>>();
+        reported
+            .iter()
+            .map(|entry| {
+                let resource_id = match &entry.external_resource_id {
+                    Value::String(id) => id.trim().to_string(),
+                    Value::Number(number) => number
+                        .as_u64()
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                anyhow::ensure!(
+                    crate::traits::is_canonical_resource_id(&resource_id),
+                    "action_outcomes external_resource_id must be the id an earlier action created (A-Z, a-z, 0-9, _ or -, up to 64)"
+                );
+                let outcome = MandateActionOutcome::new(
+                    &decision.mandate_id,
+                    decision.mandate_version,
+                    &decision.id,
+                    &resource_id,
+                    entry.engagements_micros,
+                    entry.impressions,
+                    evidence.clone(),
+                    &observed_at,
+                );
+                outcome.validate().map_err(anyhow::Error::msg)?;
+                Ok(outcome)
+            })
+            .collect()
     }
 
     /// The summary of the committed decision of the review this call is
@@ -474,6 +545,8 @@ struct MandateReviewArgs {
     invalidation_criteria: Option<String>,
     learning_note: Option<String>,
     learning_evidence_receipt_ids: Option<Vec<String>>,
+    format_key: Option<String>,
+    action_outcomes: Option<Vec<ActionOutcomeArg>>,
     /// The dispatcher's facts about this call ([`Self::bind_facts`]),
     /// never arguments.
     #[serde(skip)]
@@ -516,6 +589,7 @@ impl MandateReviewArgs {
             &mut self.risk,
             &mut self.invalidation_criteria,
             &mut self.learning_note,
+            &mut self.format_key,
         ] {
             *value = value
                 .take()
@@ -523,6 +597,17 @@ impl MandateReviewArgs {
                 .filter(|raw| !raw.is_empty());
         }
     }
+}
+
+/// One reported outcome: the created resource's id (a string, or an
+/// unsigned integer) and the counts read for it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionOutcomeArg {
+    external_resource_id: Value,
+    engagements_micros: i64,
+    #[serde(default)]
+    impressions: Option<i64>,
 }
 
 /// The review runs in the mandate's internal task-lead session.
@@ -588,7 +673,28 @@ impl Tool for MandateReviewTool {
                     "risk": bounded_text(MAX_INTENTION_METADATA_TEXT, RISK_DESCRIPTION),
                     "invalidation_criteria": bounded_text(MAX_INTENTION_METADATA_TEXT, INVALIDATION_DESCRIPTION),
                     "learning_note": bounded_text(MAX_LEARNING_NOTE_TEXT, "Optional advisory lesson for later reviews; never changes authority."),
-                    "learning_evidence_receipt_ids": described_array(MAX_EVIDENCE_RECEIPTS, LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION)
+                    "learning_evidence_receipt_ids": described_array(MAX_EVIDENCE_RECEIPTS, LEARNING_EVIDENCE_RECEIPT_IDS_DESCRIPTION),
+                    "format_key": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "pattern": "^[a-z0-9_-]{1,64}$",
+                        "description": FORMAT_KEY_DESCRIPTION
+                    },
+                    "action_outcomes": {
+                        "type": "array",
+                        "maxItems": crate::traits::MAX_MANDATE_ACTION_OUTCOMES,
+                        "description": ACTION_OUTCOMES_DESCRIPTION,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "external_resource_id": { "type": "string", "maxLength": 64, "description": "The created resource's id, as listed in history (e.g. a post id)." },
+                                "engagements_micros": { "type": "integer", "minimum": 0, "description": "Its engagements in millionths (3 engagements = 3000000)." },
+                                "impressions": { "type": "integer", "minimum": 0, "description": "Its impressions, when the read returned them." }
+                            },
+                            "required": ["external_resource_id", "engagements_micros"],
+                            "additionalProperties": false
+                        }
+                    }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -676,5 +782,112 @@ impl crate::traits::ToolSemantics for MandateReviewTool {
 
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities::APPROVED_HIGH_IMPACT_LOCAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decision() -> MandateDecisionCycle {
+        let mut decision = MandateDecisionCycle::new(
+            "mandate-synthetic",
+            "run-synthetic",
+            MandateDecisionOutcome::Wait,
+            "Read the earlier post's counts",
+            2,
+        );
+        decision.evidence_receipt_ids = vec!["call_read_metrics".to_string()];
+        decision
+    }
+
+    fn args(outcomes: Value) -> MandateReviewArgs {
+        serde_json::from_value(json!({
+            "action": "record_decision",
+            "action_outcomes": outcomes,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reported_outcomes_become_typed_outcomes_of_this_decision() {
+        let decision = decision();
+        let outcomes = MandateReviewTool::action_outcomes(
+            &args(json!([
+                {"external_resource_id": "1000000000000000001", "engagements_micros": 3_000_000, "impressions": 120},
+                {"external_resource_id": 42, "engagements_micros": 0}
+            ])),
+            &decision,
+        )
+        .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].external_resource_id, "1000000000000000001");
+        assert_eq!(outcomes[0].impressions, Some(120));
+        assert_eq!(outcomes[1].external_resource_id, "42");
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.decision_cycle_id == decision.id
+                && outcome.mandate_version == 2
+                && outcome.format_key.is_none()
+                && outcome.evidence_receipt_ids == decision.evidence_receipt_ids
+        }));
+
+        for bad in [
+            json!([{"external_resource_id": "https://x.com/i/status/1", "engagements_micros": 1}]),
+            json!([{"external_resource_id": "1", "engagements_micros": -1}]),
+            json!([{"external_resource_id": true, "engagements_micros": 1}]),
+        ] {
+            assert!(
+                MandateReviewTool::action_outcomes(&args(bad.clone()), &decision).is_err(),
+                "{bad}"
+            );
+        }
+        let too_many = (0..=crate::traits::MAX_MANDATE_ACTION_OUTCOMES)
+            .map(
+                |index| json!({"external_resource_id": index.to_string(), "engagements_micros": 0}),
+            )
+            .collect::<Vec<_>>();
+        assert!(MandateReviewTool::action_outcomes(&args(json!(too_many)), &decision).is_err());
+        let mut uncited = decision.clone();
+        uncited.evidence_receipt_ids.clear();
+        assert!(
+            MandateReviewTool::action_outcomes(
+                &args(json!([{"external_resource_id": "1", "engagements_micros": 1}])),
+                &uncited
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<MandateReviewArgs>(json!({
+                "action": "record_decision",
+                "action_outcomes": [{"external_resource_id": "1", "engagements_micros": 1, "text": "prose"}]
+            }))
+            .is_err(),
+            "an outcome carries no other fields"
+        );
+    }
+
+    /// Every property, nested ones included, says what it is for.
+    #[tokio::test]
+    async fn every_schema_property_is_described() {
+        fn check(properties: &serde_json::Map<String, Value>) {
+            for (name, property) in properties {
+                assert!(
+                    property["description"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty()),
+                    "{name} has no description"
+                );
+                if let Some(nested) = property["items"]["properties"].as_object() {
+                    check(nested);
+                }
+            }
+        }
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::sqlite::open_for_tests(database.path().to_str().unwrap()).await;
+        let schema = MandateReviewTool::new(Arc::new(store)).schema();
+        let properties = schema["parameters"]["properties"].as_object().unwrap();
+        assert!(properties.contains_key("format_key"));
+        assert!(properties.contains_key("action_outcomes"));
+        check(properties);
     }
 }

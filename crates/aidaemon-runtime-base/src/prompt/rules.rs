@@ -775,23 +775,57 @@ fn userland_note(os: &str) -> &'static str {
     }
 }
 
+/// Prompt shaping options for the mandate task lead's protocol block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MandateLeadPromptOptions {
+    pub control_loop: bool,
+    pub stalled: bool,
+    pub has_external_delivery: bool,
+}
+
 /// The mandate task lead's protocol rules. The measured objective
 /// (record_measurement, STOP on target) is included only for an autopilot
 /// mandate with an objective control; elsewhere it is advisory and
 /// its rules are noise. Evidence receipts are attached by the runtime.
 pub fn task_lead_rules(autonomy_rules: &str, control_loop: bool) -> String {
+    task_lead_rules_for_mandate(
+        autonomy_rules,
+        MandateLeadPromptOptions {
+            control_loop,
+            stalled: false,
+            has_external_delivery: false,
+        },
+    )
+}
+
+/// The mandate task lead's protocol rules with stagnation and typed-effect
+/// shaping derived from the immutable mandate policy and measured history.
+pub fn task_lead_rules_for_mandate(
+    autonomy_rules: &str,
+    options: MandateLeadPromptOptions,
+) -> String {
+    let cadence_guidance = if options.stalled {
+        "The objective metric is stalled across consecutive readings: meeting posting cadence is NOT a sufficient expected_benefit. Do not repeat a recently flat format or template. Either (1) ACT with a genuinely distinct angle, structure, or format backed by current evidence, (2) WAIT if nothing distinct and worthwhile is ready, or (3) ASK once (if no recent unanswered ASK exists) proposing concrete owner-confirmed changes — such as updating the voice/strategy playbook, widening authorized read/interaction scopes, or pausing. Before ACT, compare the smallest useful intervention with WAIT; do not act to demonstrate activity, maximize volume, or follow a stale tactic."
+    } else {
+        "The owner's requested activity and cadence are owner-authored value, not proof that any particular action is good: when a mutation slot is free, the planned action fits every constraint, and current evidence does not argue against it, meeting that cadence is a sufficient expected_benefit. When tracked results show a format produced no traction, prefer a genuinely different angle or WAIT rather than repeating the same template. Before ACT, compare the smallest useful intervention with WAIT; do not act to demonstrate activity, maximize volume, or follow a stale tactic."
+    };
     let mut rules = format!(
         "role: task_lead\nAutonomy: {autonomy_rules}\n\
 Protocol: OBSERVE -> decide exactly one of ACT, WAIT, ASK, or STOP -> SCHEDULE, once per review; never an open-ended loop. Gather only authorized observations, select one typed activity_level, then record the decision with mandate_review record_decision. evidence_receipt_ids are optional: omit them and the runtime cites this run's successful observations.\n\
 Every authenticated http_request must carry the exact owner-pinned auth_profile and a top-level account_id matching its configured user_id; never guess or infer an account identity. URL queries must match an exact scoped query or use only parameter names in that operation scope's allowed_query_params.\n\
-The owner's requested activity and cadence are owner-authored value, not proof that any particular action is good: when a mutation slot is free, the planned action fits every constraint, and current evidence does not argue against it, meeting that cadence is a sufficient expected_benefit. Before ACT, compare the smallest useful intervention with WAIT; do not act to demonstrate activity, maximize volume, or follow a stale tactic.\n\
-ACT requires a positive mutation budget, a successful observation in this run, one exact owner-authored value_criterion, a concrete expected_benefit, an explicit risk, invalidation_criteria, one committed intention, and only the minimum run-bound child tasks for it. Create and exact-claim those tasks through manage_goal_tasks; never mutate yourself or use generic auto-dispatch. If no intervention materially advances a confirmed success criterion, record WAIT.\n\
+{cadence_guidance}\n\
+ACT requires a positive mutation budget, a successful observation in this run, one exact owner-authored value_criterion, a concrete expected_benefit, an explicit risk, invalidation_criteria, one committed intention, and only the minimum run-bound child tasks for it. Tag ACTs with a canonical format_key (e.g. contrarian-question) when testing formats, and pass action_outcomes for prior external_resource_id metrics you observed. Create and exact-claim those tasks through manage_goal_tasks; never mutate yourself or use generic auto-dispatch. If no intervention materially advances a confirmed success criterion, record WAIT.\n\
 WAIT, ASK, and STOP create no action tasks and no mutation attempts. When the policy's authority_summary has owner_alerts, a WAIT may carry owner_alert: one sentence telling the owner a finding they asked to hear about (the watched target is down, the awaited thing happened); without that grant never promise or attempt to tell the owner anything except through ASK. ASK poses one bounded question; if the latest decision is an unanswered ASK, do not repeat it and continue within current authority. Never ASK for permission to retry an internal fence or protocol failure. If operation_not_allowed shows that one specific minimal policy expansion is necessary, ASK once for that exact change and say it needs a separately confirmed policy update; never suggest that answer_question or ordinary guidance can grant it. Otherwise record WAIT with no children, naming the rejected operation. STOP creates no work, names a typed termination_kind, and matches the exact owner-authored criterion or condition when one applies.\n\
 quiet uses the default cadence, active accelerates it, urgent uses the owner-confirmed minimum; reconsider_minutes is clamped to the confirmed bounds. A learning_note is advisory, cites this run's receipt ids, and never alters authority."
     );
-    if control_loop {
+    if options.control_loop {
         rules.push_str(
             "\nMeasured objective: during OBSERVE read the metric from objective_control.measurement_source, then call mandate_review record_measurement with measurement_value_micros (millionths of one unit: 25 engagements = 25000000) and measurement_confidence_bps, before the decision. Compare it with baseline_micros and target_micros in the given direction; the history block lists prior objective_measurements and next_measurement_due. If the metric cannot be read, record measurement_value_micros 0 with measurement_confidence_bps 0 and never guess: an unreadable metric is an outage and no reason to ASK or STOP. STOP with success_criteria_satisfied only when the latest measurement reaches the target.",
+        );
+    }
+    if options.has_external_delivery {
+        rules.push_str(
+            "\nPublic delivery craft: author the exact finalized payload/copy directly in the child task description so the executor sends it verbatim without improvising. Match the owner-confirmed strategy playbook and owner guidance (register, audience, voice). Lead with a concrete observation, sharp question, or specific insight — cut generic filler intros, corporate hedging, and em-dashes. Vary structure, hook, and topic angle across consecutive posts: never repeat the same opening template or formula used in recent posts.",
         );
     }
     rules
@@ -855,5 +889,38 @@ mod environment_tests {
         assert!(section.contains("continue_run"));
         assert!(section.contains("Earlier: Created slug.py."));
         assert!(section.contains("Last result: Added the slug test. Checks: pytest -q passed."));
+    }
+
+    #[test]
+    fn task_lead_rules_for_mandate_shapes_stagnation_and_external_delivery() {
+        let normal = task_lead_rules_for_mandate(
+            "Autopilot is owner-confirmed.",
+            MandateLeadPromptOptions {
+                control_loop: true,
+                stalled: false,
+                has_external_delivery: false,
+            },
+        );
+        assert!(normal.contains("meeting that cadence is a sufficient expected_benefit"));
+        assert!(normal.contains("prefer a genuinely different angle or WAIT"));
+        assert!(normal.contains("Measured objective:"));
+        assert!(!normal.contains("Public delivery craft:"));
+
+        let stalled = task_lead_rules_for_mandate(
+            "Autopilot is owner-confirmed.",
+            MandateLeadPromptOptions {
+                control_loop: true,
+                stalled: true,
+                has_external_delivery: true,
+            },
+        );
+        assert!(!stalled.contains("meeting that cadence is a sufficient expected_benefit"));
+        assert!(stalled.contains("meeting posting cadence is NOT a sufficient expected_benefit"));
+        assert!(stalled.contains("Do not repeat a recently flat format or template"));
+        assert!(stalled.contains("ASK once (if no recent unanswered ASK exists)"));
+        assert!(stalled.contains("Public delivery craft:"));
+        assert!(
+            stalled.contains("exact finalized payload/copy directly in the child task description")
+        );
     }
 }

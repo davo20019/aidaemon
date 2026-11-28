@@ -64,6 +64,9 @@ pub(super) async fn record_mandate_decision_with_updates<S: WorkDatabase>(
             "learning evidence must be a subset of current decision evidence"
         );
     }
+    if let Some(updates) = operating_updates {
+        validate_action_outcomes(decision, &updates.action_outcomes)?;
+    }
     anyhow::ensure!(
         decision.action_attempts == 0,
         "a new decision cannot pre-spend actions"
@@ -379,8 +382,8 @@ pub(super) async fn record_mandate_decision_with_updates<S: WorkDatabase>(
             "INSERT INTO intentions (
                     id, mandate_id, decision_cycle_id, goal_run_id, description,
                     rationale, value_criterion, expected_benefit, risk, invalidation_criteria,
-                    status, created_at, updated_at, completed_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    format_key, status, created_at, updated_at, completed_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&intention.id)
         .bind(&intention.mandate_id)
@@ -392,6 +395,7 @@ pub(super) async fn record_mandate_decision_with_updates<S: WorkDatabase>(
         .bind(&intention.expected_benefit)
         .bind(&intention.risk)
         .bind(&intention.invalidation_criteria)
+        .bind(&intention.format_key)
         .bind(intention.status.as_str())
         .bind(&intention.created_at)
         .bind(&intention.updated_at)
@@ -420,6 +424,53 @@ pub(super) async fn record_mandate_decision_with_updates<S: WorkDatabase>(
         .await?;
     }
 
+    if let Some(updates) = operating_updates {
+        for outcome in &updates.action_outcomes {
+            // The resource must be one this mandate created with a strictly
+            // successful mutation; its format comes from that mutation's
+            // intention, never from the caller.
+            let created = sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT i.format_key
+                     FROM mandate_mutation_attempts a
+                     JOIN intentions i ON i.id = a.intention_id
+                     WHERE a.mandate_id = ? AND a.external_resource_id = ?
+                       AND a.status = 'succeeded'
+                     ORDER BY julianday(a.reserved_at) DESC, a.id DESC LIMIT 1",
+            )
+            .bind(&decision.mandate_id)
+            .bind(&outcome.external_resource_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((format_key,)) = created else {
+                anyhow::bail!(
+                    "action_outcomes external_resource_id `{}` is not a resource this mandate created with a succeeded action",
+                    outcome.external_resource_id
+                );
+            };
+            let format_key = format_key.filter(|key| crate::traits::is_canonical_format_key(key));
+            sqlx::query(
+                "INSERT INTO mandate_action_outcomes (
+                        id, mandate_id, mandate_version, decision_cycle_id,
+                        external_resource_id, format_key, engagements_micros, impressions,
+                        evidence_receipt_ids_json, observed_at, created_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&outcome.id)
+            .bind(&outcome.mandate_id)
+            .bind(outcome.mandate_version)
+            .bind(&outcome.decision_cycle_id)
+            .bind(&outcome.external_resource_id)
+            .bind(&format_key)
+            .bind(outcome.engagements_micros)
+            .bind(outcome.impressions)
+            .bind(serde_json::to_string(&outcome.evidence_receipt_ids)?)
+            .bind(&outcome.observed_at)
+            .bind(&outcome.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
     // The durable decision remains provisional until the root task itself
     // is durably successful and the proof finalizer closes the run. This
     // keeps every post-decision crash inside active orphan reconciliation.
@@ -443,6 +494,60 @@ pub(super) async fn record_mandate_decision_with_updates<S: WorkDatabase>(
     );
     tx.commit().await?;
     Ok(())
+}
+
+/// Checks the outcomes a decision records before any write: each is valid,
+/// belongs to this decision, cites only the decision's own evidence, and
+/// names a distinct resource.
+fn validate_action_outcomes(
+    decision: &MandateDecisionCycle,
+    outcomes: &[MandateActionOutcome],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        outcomes.len() <= crate::traits::MAX_MANDATE_ACTION_OUTCOMES,
+        "a decision records at most {} action outcomes",
+        crate::traits::MAX_MANDATE_ACTION_OUTCOMES
+    );
+    let mut seen = std::collections::HashSet::new();
+    for outcome in outcomes {
+        outcome.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            outcome.mandate_id == decision.mandate_id
+                && outcome.mandate_version == decision.mandate_version
+                && outcome.decision_cycle_id == decision.id,
+            "action outcome does not belong to this decision"
+        );
+        anyhow::ensure!(
+            outcome
+                .evidence_receipt_ids
+                .iter()
+                .all(|id| decision.evidence_receipt_ids.contains(id)),
+            "action outcome evidence must be a subset of current decision evidence"
+        );
+        anyhow::ensure!(
+            seen.insert(outcome.external_resource_id.as_str()),
+            "action outcome `{}` is recorded twice",
+            outcome.external_resource_id
+        );
+    }
+    Ok(())
+}
+
+pub(super) async fn list_mandate_action_outcomes<S: WorkDatabase>(
+    store: &S,
+    mandate_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<MandateActionOutcome>> {
+    let query = format!(
+        "SELECT {ACTION_OUTCOME_COLUMNS} FROM mandate_action_outcomes
+             WHERE mandate_id = ? ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
+        .bind(mandate_id)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(store.work_pool())
+        .await?;
+    rows.iter().map(action_outcome_from_row).collect()
 }
 
 pub(super) async fn get_mandate_decision_for_run<S: WorkDatabase>(

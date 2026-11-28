@@ -1675,6 +1675,11 @@ pub struct ToolCallMetadata {
     /// Populated at the tool boundary — not scraped from result text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    /// Canonical id of the resource a successful write created, read by the
+    /// adapter from the response's machine format (JSON `/data/id` or `/id`)
+    /// and validated as `[A-Za-z0-9_-]{1,64}`. Never model or prose text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_resource_id: Option<String>,
     /// Output truncation performed at the tool boundary. Rendered into the
     /// model-visible text by the loop after ledger/classifier consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]

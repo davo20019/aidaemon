@@ -282,7 +282,9 @@ pub trait MandateStore: Send + Sync {
         task_attempt_id: Option<&str>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            operating_updates.is_none_or(|updates| updates.learning_note.is_none()),
+            operating_updates.is_none_or(
+                |updates| updates.learning_note.is_none() && updates.action_outcomes.is_empty()
+            ),
             "adaptive mandate operating updates are not supported by this store"
         );
         self.record_mandate_decision(decision, intention, task_attempt_id)
@@ -338,6 +340,15 @@ pub trait MandateStore: Send + Sync {
         _mandate_id: &str,
         _limit: i64,
     ) -> anyhow::Result<Vec<crate::traits::MandateLearningNote>> {
+        Ok(Vec::new())
+    }
+
+    /// The most recent per-action outcomes of a mandate, newest first.
+    async fn list_mandate_action_outcomes(
+        &self,
+        _mandate_id: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<crate::traits::MandateActionOutcome>> {
         Ok(Vec::new())
     }
 

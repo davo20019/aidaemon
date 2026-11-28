@@ -2519,3 +2519,245 @@ async fn an_hourly_down_check_drafts_and_creates_with_the_five_line_card() {
     assert_eq!(mandates.len(), 1);
     assert_eq!(mandates[0].name.as_deref(), Some("qa-ux-card"));
 }
+
+async fn steering_fixture() -> (Arc<SqliteWorkStore>, ManageMandatesTool, Mandate) {
+    let state = test_store().await;
+    let mut goal = Goal::new_continuous("Synthetic voice controller", "owner-session", None, None);
+    goal.context = Some(json!({"preserved": "controller context"}).to_string());
+    let mut mandate = Mandate::new(
+        &goal.id,
+        None,
+        "Improve synthetic account copy",
+        "owner-session",
+        MandateAuthority::default(),
+        60,
+        3_600,
+        300,
+    );
+    mandate.name = Some("Synthetic voice".into());
+    state
+        .create_mandate_controller(&goal, &mandate)
+        .await
+        .unwrap();
+    let tool = ManageMandatesTool::new(state.clone());
+    (state, tool, mandate)
+}
+
+#[tokio::test]
+async fn steer_active_and_paused_appends_bounded_guidance_without_changing_policy() {
+    let (state, tool, mandate) = steering_fixture().await;
+    assert!(
+        state
+            .list_mandate_decisions(&mandate.id, 50)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for status in ["active", "paused"] {
+        if status == "paused" {
+            tool.call_with(
+                &json!({"action": "pause", "mandate_id": mandate.id}).to_string(),
+                owner_facts(),
+            )
+            .await
+            .unwrap();
+        }
+        let before = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        for index in 0..12 {
+            let args = json!({"action": "steer", "name": "Synthetic voice", "guidance": format!("Prefer concrete examples {status} {index}")});
+            assert!(matches!(
+                tool.owner_approval(&args, &owner_facts()).await,
+                OwnerApprovalNeed::NotNeeded
+            ));
+            assert!(!tool.owner_control_plane_call(&args.to_string()));
+            assert_eq!(
+                tool.call_effects(&args.to_string()),
+                aidaemon_core::CallEffects::unknown()
+            );
+            assert_eq!(
+                tool.call_semantics(&args.to_string()),
+                ToolCallSemantics::mutation_with(ToolMutationEffects::CONFIGURATION)
+            );
+            let result = tool
+                .call_with(&args.to_string(), owner_facts())
+                .await
+                .unwrap();
+            assert!(
+                result.contains("bounded owner guidance for its next review"),
+                "{result}"
+            );
+            assert!(result.contains("Immutable authority is unchanged"));
+            assert!(result.contains("owner-confirmed update"));
+        }
+        let after = state.get_mandate(&mandate.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let controller = state.get_goal(&mandate.goal_id).await.unwrap().unwrap();
+        assert_eq!(controller.status, status);
+        let context: Value = serde_json::from_str(controller.context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["preserved"], "controller context");
+        let entries = context["owner_guidance"].as_array().unwrap();
+        assert_eq!(entries.len(), 10);
+        assert_eq!(
+            entries.last().unwrap()["guidance"],
+            format!("Prefer concrete examples {status} 11")
+        );
+        let summary = tool
+            .call_with(
+                &json!({"action": "get", "mandate_id": mandate.id}).to_string(),
+                owner_facts(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&summary).unwrap()["owner_guidance"],
+            context["owner_guidance"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn steer_rejects_invalid_guidance_and_unverified_owner_facts() {
+    let (state, tool, mandate) = steering_fixture().await;
+    let before = state
+        .get_goal(&mandate.goal_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .context;
+    for guidance in [
+        None,
+        Some("".to_string()),
+        Some("   ".to_string()),
+        Some("x".repeat(1025)),
+    ] {
+        let mut args = json!({"action": "steer", "mandate_id": mandate.id});
+        if let Some(guidance) = guidance {
+            args["guidance"] = json!(guidance);
+        }
+        let error = tool
+            .call_with(&args.to_string(), owner_facts())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("guidance"), "{error}");
+    }
+    for (role, visibility) in [
+        (Some(UserRole::Guest), Some(ChannelVisibility::Private)),
+        (Some(UserRole::Owner), Some(ChannelVisibility::Public)),
+        (None, None),
+    ] {
+        let result = tool.call_with(&json!({"action": "steer", "mandate_id": mandate.id, "guidance": "Use concrete examples"}).to_string(), ToolCallContext {user_role: role, channel_visibility: visibility, ..owner_facts()}).await.unwrap();
+        assert!(result.contains("verified private channel"), "{result}");
+    }
+    let error = tool.call_with(&json!({"action": "answer_question", "mandate_id": mandate.id, "guidance": "Use concrete examples"}).to_string(), owner_facts()).await.unwrap_err();
+    assert!(error.to_string().contains("use steer"), "{error}");
+    assert_eq!(
+        state
+            .get_goal(&mandate.goal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .context,
+        before
+    );
+}
+
+#[tokio::test]
+async fn steer_rejects_terminal_awaiting_input_and_unconfirmed_mandates() {
+    let (state, tool, mandate) = steering_fixture().await;
+    for (status, confirmed, expected) in [
+        ("cancelled", true, "terminal"),
+        ("completed", true, "terminal"),
+        (
+            "awaiting_input",
+            true,
+            "answer_question or resolve_reconciliation",
+        ),
+        ("active", false, "owner-confirmed"),
+        ("paused", false, "owner-confirmed"),
+    ] {
+        sqlx::query("UPDATE mandates SET status = ?, confirmed_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(if confirmed {
+                mandate.confirmed_at.as_deref()
+            } else {
+                None
+            })
+            .bind(&mandate.id)
+            .execute(&state.pool())
+            .await
+            .unwrap();
+        let error = tool.call_with(&json!({"action": "steer", "mandate_id": mandate.id, "guidance": "Use concrete examples"}).to_string(), owner_facts()).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{status}: {error}");
+    }
+    let context = state
+        .get_goal(&mandate.goal_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .context
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&context).unwrap(),
+        json!({"preserved": "controller context"})
+    );
+}
+
+#[tokio::test]
+async fn steering_store_preserves_owner_version_confirmation_and_controller_fences() {
+    let (state, _, mandate) = steering_fixture().await;
+    let context = json!({"owner_guidance": [{"guidance": "Use concrete examples"}]}).to_string();
+    for (version, owner) in [
+        (mandate.version + 1, "owner-session"),
+        (mandate.version, "other-owner-session"),
+    ] {
+        assert!(
+            !state
+                .record_active_mandate_owner_guidance(&mandate.id, version, owner, &context)
+                .await
+                .unwrap()
+        );
+    }
+    for status in ["paused", "completed", "cancelled"] {
+        sqlx::query("UPDATE goals SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(&mandate.goal_id)
+            .execute(&state.pool())
+            .await
+            .unwrap();
+        assert!(
+            !state
+                .record_active_mandate_owner_guidance(
+                    &mandate.id,
+                    mandate.version,
+                    "owner-session",
+                    &context
+                )
+                .await
+                .unwrap()
+        );
+    }
+    sqlx::query("UPDATE goals SET status = 'active' WHERE id = ?")
+        .bind(&mandate.goal_id)
+        .execute(&state.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mandates SET confirmed_at = NULL WHERE id = ?")
+        .bind(&mandate.id)
+        .execute(&state.pool())
+        .await
+        .unwrap();
+    assert!(
+        !state
+            .record_active_mandate_owner_guidance(
+                &mandate.id,
+                mandate.version,
+                "owner-session",
+                &context
+            )
+            .await
+            .unwrap()
+    );
+}

@@ -15,6 +15,36 @@
           ],
           "type": "string"
         },
+        "action_outcomes": {
+          "description": "Optional: public counts this run read for resources earlier actions created (see unmeasured_resource_ids in history); each must name a resource a succeeded action of this mandate created.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "engagements_micros": {
+                "description": "Its engagements in millionths (3 engagements = 3000000).",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "external_resource_id": {
+                "description": "The created resource's id, as listed in history (e.g. a post id).",
+                "maxLength": 64,
+                "type": "string"
+              },
+              "impressions": {
+                "description": "Its impressions, when the read returned them.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "external_resource_id",
+              "engagements_micros"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
         "activity_level": {
           "description": "Next-review cadence: quiet = default, active = sooner, urgent = the confirmed minimum.",
           "enum": [
@@ -36,6 +66,12 @@
         "expected_benefit": {
           "description": "ACT: benefit of acting now instead of waiting.",
           "maxLength": 4096,
+          "type": "string"
+        },
+        "format_key": {
+          "description": "ACT, optional: a short stable label for the format this action tries (lowercase a-z, 0-9, _ or -, up to 64), reused across reviews so outcomes group by format.",
+          "maxLength": 64,
+          "pattern": "^[a-z0-9_-]{1,64}$",
           "type": "string"
         },
         "intention": {

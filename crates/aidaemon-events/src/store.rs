@@ -398,7 +398,19 @@ struct AtomicMandateReceiptProjection {
     outcome_evidence: Option<&'static str>,
     http_status: Option<i64>,
     exit_code: Option<i32>,
+    /// Set only for a strictly successful mutation whose receipt carries a
+    /// canonical `[A-Za-z0-9_-]{1,64}` id.
+    created_resource_id: Option<String>,
     completed_at: String,
+}
+
+/// The resource id format every store accepts: `[A-Za-z0-9_-]{1,64}`.
+fn is_canonical_created_resource_id(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn mandate_projection_from_tool_result(
@@ -474,6 +486,10 @@ fn mandate_projection_from_tool_result(
         outcome_evidence: evidence,
         http_status: receipt.http_status.map(i64::from),
         exit_code: receipt.exit_code,
+        created_resource_id: receipt
+            .created_resource_id
+            .clone()
+            .filter(|id| strict_success && is_canonical_created_resource_id(id)),
         completed_at: completed_at.to_string(),
     }))
 }
@@ -1206,7 +1222,7 @@ impl EventStore {
             let updated = sqlx::query(
                 "UPDATE mandate_mutation_attempts
                  SET status = ?, outcome_evidence = ?, http_status = ?, exit_code = ?,
-                     completed_at = ?
+                     external_resource_id = ?, completed_at = ?
                  WHERE mandate_id = ? AND mandate_version = ?
                    AND decision_cycle_id = ? AND reserved_action_attempt = ?
                    AND action_digest = ? AND tool_call_id = ?
@@ -1216,6 +1232,7 @@ impl EventStore {
             .bind(projection.outcome_evidence)
             .bind(projection.http_status)
             .bind(projection.exit_code)
+            .bind(projection.created_resource_id.as_deref())
             .bind(&projection.completed_at)
             .bind(&projection.mandate_id)
             .bind(projection.mandate_version)
@@ -4149,6 +4166,36 @@ mod tests {
         assert_eq!(status(Some(503), false), "ambiguous");
         assert_eq!(status(None, true), "ambiguous");
         assert_eq!(status(Some(400), true), "ambiguous");
+    }
+
+    /// Only a strictly successful mutation projects its created id, and only
+    /// when the id is canonical.
+    #[test]
+    fn a_created_id_projects_only_from_a_strict_success() {
+        let projected = |http_status: u16, id: &str| {
+            let mut result = mandate_post_result(Some(http_status), false);
+            let receipt = result.receipt.as_mut().unwrap();
+            receipt.outcome_status = crate::traits::ToolOutcomeStatus::Succeeded;
+            receipt.created_resource_id = Some(id.to_string());
+            mandate_projection_from_tool_result(&result, "2026-11-10T00:00:00Z")
+                .unwrap()
+                .unwrap()
+                .created_resource_id
+        };
+        assert_eq!(
+            projected(201, "synthetic-post-9").as_deref(),
+            Some("synthetic-post-9")
+        );
+        assert_eq!(projected(202, "synthetic-post-9"), None);
+        assert_eq!(projected(201, "not canonical"), None);
+        assert_eq!(projected(201, &"x".repeat(65)), None);
+        let refused = mandate_projection_from_tool_result(
+            &mandate_post_result(Some(400), false),
+            "2026-11-10T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused.created_resource_id, None);
     }
 
     async fn setup_store() -> (EventStore, tempfile::NamedTempFile) {

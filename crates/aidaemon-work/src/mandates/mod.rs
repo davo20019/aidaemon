@@ -34,6 +34,70 @@ fn text_within(value: &str, max: usize) -> bool {
     value.chars().count() <= max && value.len() <= max
 }
 
+/// Most action outcomes one decision may record.
+pub const MAX_MANDATE_ACTION_OUTCOMES: usize = 16;
+/// Most published links one owner notice names.
+pub const MAX_NOTICE_PUBLISHED_LINKS: usize = 8;
+
+/// A machine id of a resource a mutation created: `[A-Za-z0-9_-]{1,64}`.
+pub fn is_canonical_resource_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// A format key an ACT declares: `[a-z0-9_-]{1,64}`.
+pub fn is_canonical_format_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+/// The X post-creation endpoints, matched exactly against a mutation's
+/// canonical target URL (a machine format, never prose).
+const X_POST_CREATE_URLS: [&str; 2] = [
+    "https://api.x.com/2/tweets",
+    "https://api.twitter.com/2/tweets",
+];
+
+/// The owner-facing link for a resource a succeeded mutation created, built
+/// only from typed parts: a post created through the X posts endpoint with a
+/// numeric id becomes its canonical status URL; any other canonical id is
+/// shown as `id:<id>`. Anything else yields `None`.
+pub fn canonical_published_link(
+    targets: &[MandateMutationTarget],
+    external_resource_id: &str,
+) -> Option<String> {
+    let numeric = (1..=32).contains(&external_resource_id.len())
+        && external_resource_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit());
+    let x_post = targets.iter().any(|target| {
+        target.kind == "url" && X_POST_CREATE_URLS.contains(&target.identifier.as_str())
+    });
+    if x_post && numeric {
+        Some(format!("https://x.com/i/status/{external_resource_id}"))
+    } else if is_canonical_resource_id(external_resource_id) {
+        Some(format!("id:{external_resource_id}"))
+    } else {
+        None
+    }
+}
+
+/// Whether a link is one [`canonical_published_link`] can produce.
+fn is_canonical_published_link(link: &str) -> bool {
+    if let Some(id) = link.strip_prefix("https://x.com/i/status/") {
+        (1..=32).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
+    } else {
+        link.strip_prefix("id:")
+            .is_some_and(is_canonical_resource_id)
+    }
+}
+
 fn canonical_text_within(value: &str, max: usize) -> bool {
     !value.is_empty() && value.trim() == value && text_within(value, max)
 }
@@ -1643,6 +1707,101 @@ impl MandateDecisionCycle {
 #[derive(Debug, Clone, Default)]
 pub struct MandateOperatingUpdates {
     pub learning_note: Option<MandateLearningNote>,
+    /// Observed counts for resources earlier succeeded mutations created.
+    /// The store accepts each only for a succeeded mutation of this mandate.
+    pub action_outcomes: Vec<MandateActionOutcome>,
+}
+
+/// One observation of how a published resource did, recorded by a later
+/// review from a receipt that read it. Only ids and counts: the format key
+/// is copied by the store from the intention whose mutation created the
+/// resource, never from the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateActionOutcome {
+    pub id: String,
+    pub mandate_id: String,
+    pub mandate_version: i64,
+    pub decision_cycle_id: String,
+    pub external_resource_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_key: Option<String>,
+    pub engagements_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impressions: Option<i64>,
+    pub evidence_receipt_ids: Vec<String>,
+    pub observed_at: String,
+    pub created_at: String,
+}
+
+impl MandateActionOutcome {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mandate_id: &str,
+        mandate_version: i64,
+        decision_cycle_id: &str,
+        external_resource_id: &str,
+        engagements_micros: i64,
+        impressions: Option<i64>,
+        evidence_receipt_ids: Vec<String>,
+        observed_at: &str,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            mandate_id: mandate_id.to_string(),
+            mandate_version,
+            decision_cycle_id: decision_cycle_id.to_string(),
+            external_resource_id: external_resource_id.to_string(),
+            format_key: None,
+            engagements_micros,
+            impressions,
+            evidence_receipt_ids,
+            observed_at: observed_at.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !canonical_text_within(&self.id, 256)
+            || !canonical_text_within(&self.mandate_id, 256)
+            || self.mandate_version <= 0
+            || !canonical_text_within(&self.decision_cycle_id, 256)
+        {
+            return Err("action outcome identifiers are invalid".to_string());
+        }
+        if !is_canonical_resource_id(&self.external_resource_id) {
+            return Err(
+                "action outcome external_resource_id must be 1 to 64 characters of A-Z, a-z, 0-9, _ or -"
+                    .to_string(),
+            );
+        }
+        if self
+            .format_key
+            .as_deref()
+            .is_some_and(|key| !is_canonical_format_key(key))
+        {
+            return Err("action outcome format_key is not canonical".to_string());
+        }
+        if self.engagements_micros < 0 || self.impressions.is_some_and(|value| value < 0) {
+            return Err("action outcome counts must not be negative".to_string());
+        }
+        if self.evidence_receipt_ids.is_empty()
+            || self.evidence_receipt_ids.len() > MAX_MANDATE_EVIDENCE_REFS
+            || self
+                .evidence_receipt_ids
+                .iter()
+                .any(|value| !canonical_text_within(value, 256))
+        {
+            return Err("action outcome must cite 1 to 16 evidence receipts".to_string());
+        }
+        for (name, value) in [
+            ("observed_at", self.observed_at.as_str()),
+            ("created_at", self.created_at.as_str()),
+        ] {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map_err(|_| format!("action outcome {name} must be RFC3339"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Content-free external signal that may accelerate a matching Autopilot
@@ -1865,6 +2024,10 @@ pub struct Intention {
     pub expected_benefit: Option<String>,
     pub risk: Option<String>,
     pub invalidation_criteria: Option<String>,
+    /// The canonical format this ACT tries (`[a-z0-9_-]{1,64}`), so later
+    /// outcomes can be grouped by format. `None` is "untagged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_key: Option<String>,
     pub status: IntentionStatus,
     pub created_at: String,
     pub updated_at: String,
@@ -1891,6 +2054,7 @@ impl Intention {
             expected_benefit: None,
             risk: None,
             invalidation_criteria: None,
+            format_key: None,
             status: IntentionStatus::Committed,
             created_at: now.clone(),
             updated_at: now,
@@ -1899,6 +2063,15 @@ impl Intention {
     }
 
     pub fn validate_content_bounds(&self) -> Result<(), String> {
+        if self
+            .format_key
+            .as_deref()
+            .is_some_and(|key| !is_canonical_format_key(key))
+        {
+            return Err(
+                "intention format_key must be 1 to 64 characters of a-z, 0-9, _ or -".to_string(),
+            );
+        }
         if !canonical_text_within(&self.description, MAX_INTENTION_DESCRIPTION_TEXT) {
             return Err(
                 "intention description must be canonical non-empty text of at most 1 KiB in both characters and bytes"
@@ -2109,6 +2282,10 @@ pub struct MandateMutationAttempt {
     pub outcome_evidence: Option<MandateMutationEvidence>,
     pub http_status: Option<u16>,
     pub exit_code: Option<i32>,
+    /// Canonical id of the resource this mutation created, projected from
+    /// its strictly successful receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_resource_id: Option<String>,
     pub reserved_at: String,
     pub completed_at: Option<String>,
 }
@@ -2462,6 +2639,68 @@ pub struct MandateRunNotification {
     /// before the objective.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Links to what this run published, built by
+    /// [`canonical_published_link`] from the receipts' canonical ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_links: Vec<String>,
+    /// The measured objective's latest credible reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_summary: Option<MandateObjectiveNoticeSummary>,
+}
+
+/// The measured objective as an owner notice states it: owner-confirmed
+/// metric name and unit, and numbers. No model prose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MandateObjectiveNoticeSummary {
+    pub metric_name: String,
+    pub unit: String,
+    pub current_micros: i64,
+    pub target_micros: i64,
+    /// Consecutive latest credible readings that neither reached the target
+    /// nor improved.
+    pub flat_streak: usize,
+}
+
+impl MandateObjectiveNoticeSummary {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, max) in [(&self.metric_name, 128), (&self.unit, 64)] {
+            if !canonical_text_within(value, max)
+                || value.chars().any(char::is_control)
+                || value.contains('"')
+            {
+                return Err("invalid mandate notification objective summary".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn readout(&self) -> String {
+        let mut text = format!(
+            "{}: {}/{} {}",
+            self.metric_name,
+            format_micros(self.current_micros),
+            format_micros(self.target_micros),
+            self.unit
+        );
+        if self.flat_streak >= 3 {
+            text.push_str(&format!(", flat for {} readings", self.flat_streak));
+        }
+        text
+    }
+}
+
+/// Micro-units as a compact decimal: `1000000` is `1`, `1500000` is `1.5`.
+fn format_micros(value: i64) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = value.unsigned_abs();
+    let whole = magnitude / 1_000_000;
+    let fraction = magnitude % 1_000_000;
+    if fraction == 0 {
+        format!("{sign}{whole}")
+    } else {
+        let digits = format!("{fraction:06}");
+        format!("{sign}{whole}.{}", digits.trim_end_matches('0'))
+    }
 }
 
 /// How owner-facing notices name a mandate: its owner-confirmed objective,
@@ -2551,7 +2790,27 @@ impl MandateRunNotification {
             owner_alert: None,
             objective: None,
             name: None,
+            published_links: Vec::new(),
+            objective_summary: None,
         }
+    }
+
+    /// Keeps only canonical links, at most [`MAX_NOTICE_PUBLISHED_LINKS`].
+    pub fn with_published_links(mut self, links: Vec<String>) -> Self {
+        self.published_links = links
+            .into_iter()
+            .filter(|link| is_canonical_published_link(link))
+            .take(MAX_NOTICE_PUBLISHED_LINKS)
+            .collect();
+        self
+    }
+
+    pub fn with_objective_summary(
+        mut self,
+        summary: Option<MandateObjectiveNoticeSummary>,
+    ) -> Self {
+        self.objective_summary = summary;
+        self
     }
 
     pub fn with_objective(mut self, objective: Option<&str>) -> Self {
@@ -2593,6 +2852,17 @@ impl MandateRunNotification {
         if self.mandate_version <= 0 {
             return Err("invalid mandate notification version".to_string());
         }
+        if self.published_links.len() > MAX_NOTICE_PUBLISHED_LINKS
+            || self
+                .published_links
+                .iter()
+                .any(|link| !is_canonical_published_link(link))
+        {
+            return Err("invalid mandate notification published link".to_string());
+        }
+        if let Some(summary) = &self.objective_summary {
+            summary.validate()?;
+        }
         chrono::DateTime::parse_from_rfc3339(&self.created_at)
             .map_err(|_| "invalid mandate notification timestamp".to_string())?;
         Ok(())
@@ -2616,14 +2886,23 @@ impl MandateRunNotification {
         );
         match self.kind {
             MandateRunNotificationKind::ActSatisfied => {
-                let done = match self.counts.succeeded_mutations {
+                let mut done = match self.counts.succeeded_mutations {
                     0 => "finished a review and completed its planned work".to_string(),
                     count => format!(
                         "completed {}",
                         plural(count, "verified action", "verified actions")
                     ),
                 };
-                format!("{label} {done}. It keeps running on its own.")
+                if !self.published_links.is_empty() {
+                    done.push_str(&format!(" ({})", self.published_links.join(", ")));
+                }
+                done.push('.');
+                if let Some(summary) = &self.objective_summary {
+                    done.push(' ');
+                    done.push_str(&summary.readout());
+                    done.push('.');
+                }
+                format!("{label} {done} It keeps running on its own.")
             }
             MandateRunNotificationKind::Ask => match self.owner_question.as_deref() {
                 Some(question) => format!(
@@ -2778,6 +3057,177 @@ mod tests {
             "2026-08-11T12:00:00Z",
         )
         .with_objective(Some("Every hour, check the synthetic status page"))
+    }
+
+    fn act_notice() -> MandateRunNotification {
+        MandateRunNotification::new(
+            "mandate-synthetic",
+            2,
+            "goal-synthetic",
+            "run-synthetic",
+            "owner-synthetic",
+            MandateRunNotificationKind::ActSatisfied,
+            MandateRunProofCounts {
+                succeeded_mutations: 1,
+                ..Default::default()
+            },
+            "2026-08-11T12:00:00Z",
+        )
+        .with_name(Some("Synthetic posts"))
+    }
+
+    #[test]
+    fn an_act_notice_without_links_or_summary_is_unchanged() {
+        assert_eq!(
+            act_notice().message(),
+            "Your automation \"Synthetic posts\" completed 1 verified action. It keeps running on its own."
+        );
+        assert_eq!(
+            act_notice().with_published_links(Vec::new()).message(),
+            act_notice().message()
+        );
+    }
+
+    #[test]
+    fn an_act_notice_names_its_links_and_metric_readout() {
+        let linked = act_notice().with_published_links(vec![
+            "https://x.com/i/status/1000000000000000001".to_string(),
+            "id:note_7".to_string(),
+            "https://example.com/evil".to_string(),
+            "id:two words".to_string(),
+        ]);
+        assert_eq!(
+            linked.published_links,
+            vec![
+                "https://x.com/i/status/1000000000000000001".to_string(),
+                "id:note_7".to_string()
+            ],
+            "non-canonical links are dropped"
+        );
+        assert!(linked.validate().is_ok());
+        assert_eq!(
+            linked.message(),
+            "Your automation \"Synthetic posts\" completed 1 verified action \
+             (https://x.com/i/status/1000000000000000001, id:note_7). It keeps running on its own."
+        );
+        let summary = MandateObjectiveNoticeSummary {
+            metric_name: "weekly_engagements".to_string(),
+            unit: "engagements".to_string(),
+            current_micros: 1_500_000,
+            target_micros: 100_000_000,
+            flat_streak: 4,
+        };
+        let measured = act_notice().with_objective_summary(Some(summary.clone()));
+        assert_eq!(
+            measured.message(),
+            "Your automation \"Synthetic posts\" completed 1 verified action. weekly_engagements: \
+             1.5/100 engagements, flat for 4 readings. It keeps running on its own."
+        );
+        let short_streak =
+            act_notice().with_objective_summary(Some(MandateObjectiveNoticeSummary {
+                flat_streak: 2,
+                current_micros: -2_000_000,
+                ..summary.clone()
+            }));
+        assert!(
+            short_streak
+                .message()
+                .ends_with("weekly_engagements: -2/100 engagements. It keeps running on its own."),
+            "{}",
+            short_streak.message()
+        );
+        let mut forged = act_notice();
+        forged.published_links = vec!["javascript:alert(1)".to_string()];
+        assert!(forged.validate().is_err());
+        let mut prose = act_notice();
+        prose.objective_summary = Some(MandateObjectiveNoticeSummary {
+            metric_name: "say \"hi\"".to_string(),
+            ..summary
+        });
+        assert!(prose.validate().is_err());
+    }
+
+    #[test]
+    fn published_links_come_only_from_typed_targets_and_canonical_ids() {
+        let target = |url: &str| MandateMutationTarget {
+            kind: "url".to_string(),
+            identifier: url.to_string(),
+        };
+        let x = [target("https://api.x.com/2/tweets")];
+        assert_eq!(
+            canonical_published_link(&x, "1234567890").as_deref(),
+            Some("https://x.com/i/status/1234567890")
+        );
+        assert_eq!(
+            canonical_published_link(&[target("https://api.twitter.com/2/tweets")], "42")
+                .as_deref(),
+            Some("https://x.com/i/status/42")
+        );
+        assert_eq!(
+            canonical_published_link(&x, "abc_1").as_deref(),
+            Some("id:abc_1"),
+            "a non-numeric id is never dressed as a status URL"
+        );
+        assert_eq!(
+            canonical_published_link(&[target("https://api.example.com/notes")], "99").as_deref(),
+            Some("id:99")
+        );
+        assert_eq!(canonical_published_link(&x, "1 2"), None);
+        assert_eq!(canonical_published_link(&x, ""), None);
+        assert_eq!(
+            canonical_published_link(&x, &"1".repeat(33)).as_deref(),
+            Some(&*format!("id:{}", "1".repeat(33)))
+        );
+        assert_eq!(canonical_published_link(&x, &"1".repeat(65)), None);
+    }
+
+    #[test]
+    fn format_keys_and_action_outcomes_are_canonical() {
+        assert!(is_canonical_format_key("holiday-tip_2"));
+        assert!(!is_canonical_format_key("Holiday"));
+        assert!(!is_canonical_format_key(""));
+        assert!(!is_canonical_format_key(&"a".repeat(65)));
+        let mut intention = Intention::new("m", "d", "r", "describe", "because");
+        intention.format_key = Some("Not Canonical".to_string());
+        assert!(intention.validate_content_bounds().is_err());
+        intention.format_key = Some("question_hook".to_string());
+        assert!(intention.validate_content_bounds().is_ok());
+
+        let outcome = MandateActionOutcome::new(
+            "mandate-synthetic",
+            1,
+            "cycle-synthetic",
+            "1234567890",
+            3_000_000,
+            Some(120),
+            vec!["receipt-synthetic".to_string()],
+            "2026-08-11T12:00:00Z",
+        );
+        assert!(outcome.validate().is_ok());
+        for broken in [
+            MandateActionOutcome {
+                external_resource_id: "https://x.com/1".to_string(),
+                ..outcome.clone()
+            },
+            MandateActionOutcome {
+                engagements_micros: -1,
+                ..outcome.clone()
+            },
+            MandateActionOutcome {
+                impressions: Some(-1),
+                ..outcome.clone()
+            },
+            MandateActionOutcome {
+                evidence_receipt_ids: Vec::new(),
+                ..outcome.clone()
+            },
+            MandateActionOutcome {
+                observed_at: "yesterday".to_string(),
+                ..outcome.clone()
+            },
+        ] {
+            assert!(broken.validate().is_err(), "{broken:?}");
+        }
     }
 
     #[test]
