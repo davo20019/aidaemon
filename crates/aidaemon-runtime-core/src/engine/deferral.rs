@@ -96,6 +96,10 @@ pub struct DeferredChannel {
     workspace_id: Option<String>,
     sender_name: Option<String>,
     sender_id: Option<String>,
+    /// The sending device's ceiling: a re-run is capped as the run it
+    /// replaces was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
 }
 
 impl DeferredChannel {
@@ -108,6 +112,7 @@ impl DeferredChannel {
             workspace_id: context.workspace_id.clone(),
             sender_name: context.sender_name.clone(),
             sender_id: context.sender_id.clone(),
+            sender_ceiling: context.sender_ceiling,
         }
     }
 
@@ -120,6 +125,7 @@ impl DeferredChannel {
         context.workspace_id = self.workspace_id.clone();
         context.sender_name = self.sender_name.clone();
         context.sender_id = self.sender_id.clone();
+        context.sender_ceiling = self.sender_ceiling;
         context
     }
 }

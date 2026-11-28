@@ -1108,6 +1108,7 @@ impl ClientGateway {
                         ErrorCode::Invalid,
                         "An agent's name is at most 40 characters",
                     ));
+                    crate::eink::sender_ceiling(&caller.principal),
                 }
                 self.host
                     .rename_agent(&session_id, &thread, name.as_deref())
@@ -1780,6 +1781,7 @@ impl ClientGateway {
     }
 
     async fn devices_for(&self, caller: &Caller) -> Result<CommandResult, ProtocolError> {
+                    crate::eink::sender_ceiling(&caller.principal),
         Ok(CommandResult::Devices {
             devices: self.pairing.devices().await?,
             can_change: caller.principal.device_id.is_none(),
@@ -2243,7 +2245,12 @@ impl ClientGateway {
             text,
             attachments: Vec::new(),
             user_role: UserRole::Owner,
-            channel_ctx,
+            // The ceiling of the device that sent it, for the run it starts
+            // or steers in that chat.
+            channel_ctx: aidaemon_channels::context::ChannelContext {
+                sender_ceiling,
+                ..channel_ctx
+            },
             dedup_key: Some(request_id.to_string()),
             ingress_timing: None,
         };
@@ -2276,6 +2283,7 @@ impl ClientGateway {
         project
             .path
             .filter(|p| !p.trim().is_empty())
+        sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
             .map(std::path::PathBuf::from)
             .ok_or_else(|| ProtocolError::new(ErrorCode::Invalid, "This project has no folder"))
     }
@@ -2361,7 +2369,7 @@ impl ClientGateway {
                     ));
                 }
                 return self
-                    .reply_in_chat(request_id, session_id, text, placement)
+                    .reply_in_chat(request_id, session_id, text, placement, sender_ceiling)
                     .await;
             }
         };
@@ -2418,6 +2426,7 @@ impl ClientGateway {
                         } else {
                             aidaemon_channels::presentation::word_preview(&text, 60)
                         }),
+        sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
                         last_activity_ms: Some(bus::now_ms()),
                         writable: true,
                         project_id,
@@ -2522,6 +2531,7 @@ impl ClientGateway {
             .history(&session_id, 2_000)
             .await
             .map_err(internal)?;
+        channel_ctx.sender_ceiling = sender_ceiling;
         if let Some(before) = before {
             match messages.iter().position(|m| m.id == before) {
                 Some(at) => messages.truncate(at),

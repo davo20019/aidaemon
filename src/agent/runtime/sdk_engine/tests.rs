@@ -756,6 +756,7 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
                 trusted: false,
                 in_run: None,
                 fresh_agent_session: false,
+                sender_ceiling: None,
                 agents: Vec::new(),
             },
             None,

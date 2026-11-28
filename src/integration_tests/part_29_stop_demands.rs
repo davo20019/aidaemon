@@ -20,6 +20,7 @@ fn owner_channel() -> ChannelContext {
         trusted: false,
         in_run: None,
         fresh_agent_session: false,
+        sender_ceiling: None,
         agents: Vec::new(),
     }
 }

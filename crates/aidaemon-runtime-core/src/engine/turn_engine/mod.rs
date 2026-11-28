@@ -781,6 +781,11 @@ impl TurnEngine<'_> {
             .as_ref()
             .and_then(|parent| parent.spawn_family.clone())
             .unwrap_or_else(|| crate::authority::SpawnFamily::new(self.turn_limits().spawn_family));
+        // A message from a device capped at Medium caps its run, and the
+        // request's whole tree with it, for the rest of their lives.
+        if channel_ctx.sender_ceiling.is_some() {
+            spawn_family.device_cap().raise();
+        }
         let owned_folders = spawn_family.owned_folders().clone();
         let mut detached_tools: std::collections::HashMap<String, Arc<dyn sdk::Tool>> =
             std::collections::HashMap::new();
@@ -1018,6 +1023,7 @@ impl TurnEngine<'_> {
             terminal: terminal_approvals,
             tools: crate::approvals::ApprovalTools::new(self.tools().iter().cloned()),
             run_declines: run_declines.clone(),
+            device_cap: spawn_family.device_cap().clone(),
         };
         let rules = Arc::new(rules);
         let approvals = self.owner_approvals().clone();
@@ -1140,7 +1146,8 @@ impl TurnEngine<'_> {
                 calls: calls_tx.clone(),
             },
         };
-        let chain = hooks.chain();
+        let chain =
+            turn_hooks::with_device_ceiling(hooks.chain(), spawn_family.device_cap().clone());
         let detached_hooks: Vec<Arc<dyn sdk::Hook>> = chain
             .iter()
             .filter(|(slot, _)| {
@@ -1153,6 +1160,7 @@ impl TurnEngine<'_> {
                         | HookSlot::Egress
                         | HookSlot::Untrusted
                         | HookSlot::Approval
+                        | HookSlot::DeviceCeiling
                 )
             })
             .map(|(_, hook)| hook.clone())

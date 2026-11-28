@@ -62,9 +62,9 @@ pub mod turn;
 // The lower half of the runtime, below the turn and the engine.
 pub use aidaemon_runtime_base::{
     authority, background_run, budget_policy, call_args, chat_bridge, consolidation,
-    context_budget, coordination, decisions, eval, helper_run, history, host, known_resources, llm,
-    markers, media, memory, memory_port, message_content, mid_run, opt_out, owed_reports,
-    owner_level, permissions, policy, prompt, render, run_state, session_model, settings, spawn,
-    spawn_tool, state, steering, stores, terminal_grants, text_cut, tool_manifest, turn_project,
-    turn_runtime, untrusted, untrusted_writes,
+    context_budget, coordination, decisions, device_cap, eval, helper_run, history, host,
+    known_resources, llm, markers, media, memory, memory_port, message_content, mid_run, opt_out,
+    owed_reports, owner_level, permissions, policy, prompt, render, run_state, session_model,
+    settings, spawn, spawn_tool, state, steering, stores, terminal_grants, text_cut, tool_manifest,
+    turn_project, turn_runtime, untrusted, untrusted_writes,
 };

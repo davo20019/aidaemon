@@ -22,6 +22,7 @@ pub mod consolidation;
 pub mod context_budget;
 pub mod coordination;
 pub mod decisions;
+pub mod device_cap;
 pub mod eval;
 pub mod helper_run;
 pub mod history;

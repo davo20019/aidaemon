@@ -589,6 +589,8 @@ pub struct SeenCard {
     pub permission_mode: crate::tools::command_risk::PermissionMode,
     /// The card's typed facts, when the request gave them.
     pub card: Option<aidaemon_core::ApprovalCard>,
+    /// The kind of card: it picks which answers are offered.
+    pub kind: crate::types::ApprovalKind,
 }
 
 /// Answers owner-approval cards from a script, in order: `Some(answer)`
@@ -616,6 +618,7 @@ impl ScriptedApprover {
                     warnings: request.warnings.clone(),
                     permission_mode: request.permission_mode,
                     card: request.card.as_deref().cloned(),
+                    kind: request.kind,
                 });
                 match script.next().flatten() {
                     Some(answer) => {

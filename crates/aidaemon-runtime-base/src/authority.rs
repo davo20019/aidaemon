@@ -248,6 +248,8 @@ struct SpawnFamilyState {
     /// The files this request's own work produced (its captures and the
     /// files its calls created), for every run of the tree.
     produced_files: aidaemon_tools::semantics::ProducedFiles,
+    /// The request's device ceiling, shared by every run of the tree.
+    device_cap: crate::device_cap::DeviceCap,
 }
 
 /// One request's tree of plain sub-agents: its running count, how many it
@@ -335,7 +337,15 @@ impl SpawnFamily {
             ),
             owned_folders: Default::default(),
             produced_files: Default::default(),
+            device_cap: Default::default(),
         }))
+    }
+
+    /// The request's device ceiling ([`crate::device_cap`]), shared by
+    /// every run of the tree: a capped root caps its sub-agents, and a
+    /// steer that caps the root caps the children already running.
+    pub fn device_cap(&self) -> &crate::device_cap::DeviceCap {
+        &self.0.device_cap
     }
 
     /// The folders the runtime made fresh for this request's work, shared

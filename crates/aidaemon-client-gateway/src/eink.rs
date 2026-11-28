@@ -22,6 +22,18 @@ pub(crate) const MAX_PNG_SIDE: u32 = 4096;
 /// Most pixels in that PNG (checked before anything decodes it).
 pub(crate) const MAX_PNG_PIXELS: u64 = 8_000_000;
 
+/// The ceiling a message from `principal` puts on the run it starts or
+/// steers: an e-ink device's messages cap it at Medium, so a call above
+/// that waits for the owner on the phone or the computer. From the
+/// device's record, never from the message.
+pub(crate) fn sender_ceiling(
+    principal: &crate::pairing::Principal,
+) -> Option<aidaemon_channels::context::SenderCeiling> {
+    principal
+        .eink
+        .then_some(aidaemon_channels::context::SenderCeiling::Medium)
+}
+
 fn refused(message: &str) -> ProtocolError {
     ProtocolError::new(ErrorCode::Forbidden, message)
 }
@@ -137,6 +149,28 @@ mod tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// Only an e-ink device's messages carry the Medium ceiling, from its
+    /// record; the owner's own token and an app device carry none.
+    #[test]
+    fn only_an_eink_device_caps_the_run_its_message_starts() {
+        let owner = crate::pairing::Principal::owner();
+        assert_eq!(sender_ceiling(&owner), None);
+        let app = crate::pairing::Principal {
+            device_id: Some("dv-synthetic-phone".into()),
+            ..crate::pairing::Principal::owner()
+        };
+        assert_eq!(sender_ceiling(&app), None);
+        let reader = crate::pairing::Principal {
+            device_id: Some("dv-synthetic-reader".into()),
+            eink: true,
+            ..crate::pairing::Principal::owner()
+        };
+        assert_eq!(
+            sender_ceiling(&reader),
+            Some(aidaemon_channels::context::SenderCeiling::Medium)
+        );
     }
 
     fn upload(data: String) -> Command {

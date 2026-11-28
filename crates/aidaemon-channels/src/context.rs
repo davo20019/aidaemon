@@ -122,6 +122,38 @@ pub struct ChannelContext {
     /// owner sees them (a client that shows them names them); empty where
     /// none are known.
     pub agents: Vec<ConversationAgent>,
+    /// The most the device that sent this message may let the run do
+    /// unasked, set by the client gateway from the device's paired record
+    /// (an e-ink reader on a public bridge), never from what the message or
+    /// its page says. A run this message starts or steers keeps the ceiling
+    /// for the rest of its life. `None`: the owner's own app or chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_ceiling: Option<SenderCeiling>,
+}
+
+/// The ceiling a sending device puts on the run its message starts or
+/// enters: above it, a call needs the owner's answer on a trusted device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SenderCeiling {
+    /// Medium: a call that sends data off the machine, destroys or cannot
+    /// be undone, or that its tool rates High or above is asked on a card
+    /// only the phone or the computer can answer, once.
+    Medium,
+}
+
+impl ChannelContext {
+    /// The same sender and conversation as `other`, whatever ceiling each
+    /// message's device put on the run: a steer from a capped device may
+    /// enter a run the owner's app started (the run is capped from then
+    /// on), and the owner's own steer may enter a capped run (it stays
+    /// capped).
+    pub fn same_sender_as(&self, other: &ChannelContext) -> bool {
+        let mut other = other.clone();
+        other.sender_ceiling = self.sender_ceiling;
+        *self == other
+    }
 }
 
 /// One coding agent session of a conversation: one of its participants.
@@ -186,6 +218,7 @@ impl ChannelContext {
             in_run: None,
             fresh_agent_session: false,
             agents: Vec::new(),
+            sender_ceiling: None,
         }
     }
 
@@ -206,6 +239,7 @@ impl ChannelContext {
             in_run: None,
             fresh_agent_session: false,
             agents: Vec::new(),
+            sender_ceiling: None,
         }
     }
 
@@ -226,6 +260,7 @@ impl ChannelContext {
             in_run: None,
             fresh_agent_session: false,
             agents: Vec::new(),
+            sender_ceiling: None,
         }
     }
 
@@ -296,6 +331,7 @@ mod workspace_grant_tests {
             in_run: None,
             fresh_agent_session: false,
             agents: Vec::new(),
+            sender_ceiling: None,
         }
     }
 

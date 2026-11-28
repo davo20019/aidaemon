@@ -697,7 +697,9 @@ impl TaskRegistry {
         let mut kept = VecDeque::with_capacity(queue.len());
         let mut stopped = false;
         for next in queue.drain(..) {
-            let same = next.user_role == user_role && &next.channel_ctx == channel_ctx;
+            // A sending device's ceiling does not make it another sender:
+            // the running turn takes the ceiling on with the message.
+            let same = next.user_role == user_role && next.channel_ctx.same_sender_as(channel_ctx);
             if !stopped && same && next.steerable && next.attachments.is_empty() {
                 taken.push(next);
             } else {
@@ -1705,6 +1707,52 @@ mod queue_edit_tests {
             .map(|(_, text, _, _)| text)
             .collect();
         assert_eq!(left, ["after this"]);
+    }
+
+    /// A device's ceiling does not make its message another sender's: a
+    /// running turn takes it (and takes the ceiling on), while a message
+    /// from another conversation still waits for its own turn.
+    #[tokio::test]
+    async fn a_capped_devices_steer_is_the_same_sender() {
+        let registry = TaskRegistry::new(10);
+        let session = "app:synthetic-capped-steer";
+        let ctx = ChannelContext::private("app");
+        let mut capped = ctx.clone();
+        capped.sender_ceiling = Some(crate::context::SenderCeiling::Medium);
+        let mut elsewhere = ctx.clone();
+        elsewhere.channel_id = Some("app:synthetic-other".to_string());
+        for (text, from) in [
+            ("from the reader", capped.clone()),
+            ("from the phone", ctx.clone()),
+            ("from elsewhere", elsewhere),
+        ] {
+            let message = QueuedMessage::new(text, UserRole::Owner, from, Vec::new());
+            registry.queue_message(session, message, None).await;
+        }
+        let taken = registry
+            .take_steering_messages(session, UserRole::Owner, &ctx)
+            .await;
+        assert_eq!(
+            taken.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["from the reader", "from the phone"]
+        );
+        assert_eq!(
+            taken[0].channel_ctx.sender_ceiling,
+            Some(crate::context::SenderCeiling::Medium),
+            "the ceiling travels with the message"
+        );
+        assert_eq!(registry.queue_len(session).await, 1);
+        // A capped turn takes the owner's own steer too.
+        let phone = QueuedMessage::new("one more", UserRole::Owner, ctx.clone(), Vec::new());
+        let session = "app:synthetic-capped-turn";
+        registry.queue_message(session, phone, None).await;
+        assert_eq!(
+            registry
+                .take_steering_messages(session, UserRole::Owner, &capped)
+                .await
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

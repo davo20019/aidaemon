@@ -724,6 +724,15 @@ impl TurnEngine<'_> {
         } else {
             STEERING_MARKER.to_string()
         };
+        // A message from a device capped at Medium caps the run it enters,
+        // before the model reads it: every call from now on is judged
+        // capped (`approvals::device_ceiling`), the tree's children too.
+        if taken
+            .iter()
+            .any(|queued| queued.channel_ctx.sender_ceiling.is_some())
+        {
+            scope.spawn_family.device_cap().raise();
+        }
         let mut messages = Vec::with_capacity(taken.len());
         for queued in taken {
             let mut message =

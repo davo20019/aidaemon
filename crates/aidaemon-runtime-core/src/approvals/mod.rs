@@ -36,6 +36,7 @@ use crate::untrusted::UntrustedVerifier;
 
 pub mod agent_asks;
 pub mod broker;
+pub mod device_ceiling;
 
 pub use broker::ApprovalBroker;
 
@@ -108,6 +109,10 @@ pub struct AppApprovalRules {
     /// (`HookContext::declined`, which every judged call refreshes): a
     /// child spawned from this turn starts with them.
     pub run_declines: RunDeclines,
+    /// The request's device ceiling ([`crate::device_cap`]): in a capped
+    /// run a card above Medium offers only Allow once and records no lasting
+    /// grant, and the rating a tool gives a call is kept for the cap's hook.
+    pub device_cap: crate::device_cap::DeviceCap,
 }
 
 /// The turn's tools as the approval rules consult them, by name.
@@ -539,6 +544,24 @@ impl AppApprovalRules {
 #[async_trait]
 impl ApprovalRules for AppApprovalRules {
     async fn judge(
+        &self,
+        ctx: &sdk::HookContext<'_>,
+        call: &sdk::ToolCall,
+        info: &sdk::ToolInfo,
+    ) -> RuleDecision {
+        let decision = self.judge_call(ctx, call, info).await;
+        // The tool's own rating of the call, kept whether or not a grant
+        // then covers the ask: a capped run asks about it above Medium.
+        if let RuleDecision::Ask(request) = &decision {
+            self.device_cap
+                .rate(ctx.run_id, &device_ceiling::call_key(call), request.risk);
+        }
+        decision
+    }
+}
+
+impl AppApprovalRules {
+    async fn judge_call(
         &self,
         ctx: &sdk::HookContext<'_>,
         call: &sdk::ToolCall,
@@ -1025,6 +1048,14 @@ impl OwnerApprovalResolver<'_> {
         kind: ApprovalKind,
     ) -> sdk::Resolution {
         let tool = interruption.call.name.as_str();
+        // A run capped by its device: a card above Medium is answered on the
+        // phone or the computer, once, and leaves no lasting grant.
+        let capped = device_ceiling::card_is_capped(&self.rules.device_cap, request);
+        let kind = if capped {
+            device_ceiling::once_only(kind)
+        } else {
+            kind
+        };
         self.record("owner_approval_requested", tool, request, None)
             .await;
         // Several sub-agents can ask at once: the card says which one asks.
@@ -1055,6 +1086,16 @@ impl OwnerApprovalResolver<'_> {
             .await
         {
             Answer::Granted(response) => {
+                let response = if capped {
+                    // The capped device could not have answered it: the
+                    // cap's own hook takes this answer for this call.
+                    self.rules
+                        .device_cap
+                        .allow_call(run, &device_ceiling::call_key(&interruption.call));
+                    ApprovalResponse::AllowOnce
+                } else {
+                    response
+                };
                 if self.rules.keeps_own_grants(tool) {
                     // The tool's grants live in its own stores (for the
                     // terminal: session and persisted prefixes, capability
@@ -1244,8 +1285,24 @@ impl DetachedNestedJudge {
                     ..
                 } => {
                     let kind = self.rules.card_kind(&call.name, &request);
+                    // A run capped by its device: once only, no lasting
+                    // grant, as the turn's own resolver does.
+                    let capped = device_ceiling::card_is_capped(&self.rules.device_cap, &request);
+                    let kind = if capped {
+                        device_ceiling::once_only(kind)
+                    } else {
+                        kind
+                    };
                     match self.ask_owner(&call, &request, kind, cancel).await {
                         Answer::Granted(response) => {
+                            let response = if capped {
+                                self.rules
+                                    .device_cap
+                                    .allow_call(self.run_id, &device_ceiling::call_key(&call));
+                                ApprovalResponse::AllowOnce
+                            } else {
+                                response
+                            };
                             if self.rules.keeps_own_grants(&call.name) {
                                 self.rules
                                     .record_owner_answer(self.run_id, &call, Some(response))

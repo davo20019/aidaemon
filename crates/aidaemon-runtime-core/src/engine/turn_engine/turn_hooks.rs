@@ -28,6 +28,9 @@ pub enum HookSlot {
     Egress,
     Untrusted,
     Approval,
+    /// A run capped by its device (`approvals::device_ceiling`), inserted
+    /// right after `Approval` by `with_device_ceiling`.
+    DeviceCeiling,
     Dispatch,
     Coordination,
 }
@@ -90,6 +93,28 @@ impl TurnHooks {
     }
 }
 
+/// The turn's hook chain with the device ceiling
+/// (`approvals::device_ceiling::DeviceCeilingHook`) right after owner
+/// approval: after every hook that may still refuse or rewrite the call (so
+/// the owner is asked only about a call that would otherwise run) and before
+/// the dispatcher's gate. The kernel runs a call only when every hook allows
+/// it, so no allow in `ApprovalPolicy` (a mode, an allow rule, a grant)
+/// stands in for this hook's answer.
+pub fn with_device_ceiling(
+    mut chain: Vec<(HookSlot, Arc<dyn sdk::Hook>)>,
+    cap: crate::device_cap::DeviceCap,
+) -> Vec<(HookSlot, Arc<dyn sdk::Hook>)> {
+    let hook: Arc<dyn sdk::Hook> = Arc::new(
+        crate::approvals::device_ceiling::DeviceCeilingHook::new(cap),
+    );
+    let at = chain
+        .iter()
+        .position(|(slot, _)| *slot == HookSlot::Approval)
+        .map_or(chain.len(), |approval| approval + 1);
+    chain.insert(at, (HookSlot::DeviceCeiling, hook));
+    chain
+}
+
 /// A computer_use GUI loop pins a vision-capable model for its task; every
 /// later call of the task uses it. Early in the chain, so hooks that size the
 /// request by its model see the one that will answer.
@@ -136,4 +161,36 @@ pub fn turn_tool(
         calls,
         trust_roots,
     )
+}
+
+#[cfg(test)]
+mod device_ceiling_slot_tests {
+    use super::*;
+
+    #[test]
+    fn the_device_ceiling_sits_right_after_owner_approval() {
+        struct Nop;
+        impl sdk::Hook for Nop {}
+        let nop = || -> Arc<dyn sdk::Hook> { Arc::new(Nop) };
+        let chain = vec![
+            (HookSlot::Authority, nop()),
+            (HookSlot::Untrusted, nop()),
+            (HookSlot::Approval, nop()),
+            (HookSlot::Dispatch, nop()),
+        ];
+        let slots: Vec<HookSlot> = with_device_ceiling(chain, crate::device_cap::DeviceCap::new())
+            .into_iter()
+            .map(|(slot, _)| slot)
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                HookSlot::Authority,
+                HookSlot::Untrusted,
+                HookSlot::Approval,
+                HookSlot::DeviceCeiling,
+                HookSlot::Dispatch
+            ]
+        );
+    }
 }
