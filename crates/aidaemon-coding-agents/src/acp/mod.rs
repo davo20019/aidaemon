@@ -16,11 +16,13 @@
 //! can continue it, and a run asked to continue one with an agent that
 //! can't ends before its task is sent.
 //!
-//! [`AcpAgent::antigravity`] and [`AcpAgent::gemini`] are the ones known;
+//! [`AcpAgent::antigravity`], [`AcpAgent::gemini`] and [`AcpAgent::opencode`]
+//! are the ones known;
 //! [`AcpAgent::custom`] is any other the owner names.
 
 pub mod events;
 pub mod host;
+mod opencode;
 
 use crate::{
     CodingAgent, Discovery, Launch, LaunchArguments, PermissionMode, Plan, PromptPlacement,
@@ -58,6 +60,9 @@ pub struct AcpAgent {
     /// Whether the embedding agent may hand it work on its own sign-in
     /// (its maker's terms); a key AIdaemon hands it is always allowed.
     own_delegation: crate::Delegation,
+    /// Its own sign-in holds one per model provider (OpenCode): work handed
+    /// to it runs without those on a subscription plan.
+    per_provider_sign_ins: bool,
 }
 
 /// Google's Antigravity FAQ and Terms (section 6): wrapping `agy` in a
@@ -70,6 +75,16 @@ const AGY_OWN_SIGN_IN: crate::SignInNote = crate::SignInNote {
            AIdaemon never does in the background, and agents in a Code session you watch do so \
            at your account's risk. A Gemini API key avoids that.",
     link: "https://antigravity.google/docs/faq",
+};
+
+/// OpenCode signs in to each model provider on its own. A subscription
+/// plan's OAuth sign-in (a Claude plan's terms bar other tools from using
+/// it) is turned off when another agent hands it work.
+const OPENCODE_OWN_SIGN_INS: crate::SignInNote = crate::SignInNote {
+    text: "When another agent hands it work, AIdaemon turns off the providers it is signed in \
+           to with a subscription plan (their terms may not allow it), so that work runs only \
+           on its API-key providers. Your own prompts to it use them all.",
+    link: "https://opencode.ai/docs/providers/",
 };
 
 impl AcpAgent {
@@ -88,6 +103,7 @@ impl AcpAgent {
             gemini_key_folder: None,
             default_sign_in: crate::SignInMethod::Own,
             own_delegation: crate::Delegation::Allowed,
+            per_provider_sign_ins: false,
         }
     }
 
@@ -137,6 +153,28 @@ impl AcpAgent {
             mark: Some("gemini"),
             supports_gemini_key: true,
             ..Self::custom("Gemini CLI", "gemini", &["--acp"])
+        }
+    }
+    /// OpenCode (`opencode acp`): any model provider it is logged in to.
+    /// Work another agent hands it runs only on its API-key providers
+    /// (`opencode::delegated`).
+    pub fn opencode() -> Self {
+        Self {
+            discovery: Some(Discovery {
+                name: "opencode",
+                command: "opencode",
+                args: &["acp"],
+                description: "OpenCode — an open-source coding agent for any model provider",
+            }),
+            arguments: Some(LaunchArguments {
+                flags: &["--pure", "--print-logs"],
+                valued: &["--log-level"],
+                subcommands: &["acp"],
+            }),
+            account: "Its own OpenCode sign-ins, one per model provider (API keys or plans).",
+            own_delegation: crate::Delegation::Warned(OPENCODE_OWN_SIGN_INS),
+            per_provider_sign_ins: true,
+            ..Self::custom("OpenCode", "opencode", &["acp"])
         }
     }
 }
@@ -216,6 +254,15 @@ impl CodingAgent for AcpAgent {
         match sign_in {
             crate::SignInMethod::Own => self.own_delegation,
             crate::SignInMethod::GeminiApiKey => crate::Delegation::Allowed,
+        }
+    }
+
+    /// Its own sign-in without the providers on a plan when it holds one
+    /// per provider (OpenCode); otherwise as [`Self::signed_in`].
+    fn signed_in_delegated(&self, sign_in: &crate::SignIn) -> Result<crate::SignedIn, String> {
+        match sign_in {
+            crate::SignIn::Own if self.per_provider_sign_ins => opencode::delegated(),
+            other => self.signed_in(other),
         }
     }
 
@@ -472,6 +519,41 @@ mod tests {
         }
         let other = AcpAgent::custom("Synthetic Agent", "synthetic-agent", &["--acp"]);
         assert_eq!(other.delegation(SignInMethod::Own), Delegation::Allowed);
+    }
+
+    /// OpenCode takes handed work on its own sign-ins with a word: that work
+    /// runs without its plan sign-ins (`opencode::delegated`), the owner's
+    /// own runs with all of them.
+    #[test]
+    fn opencode_is_handed_work_without_its_plan_sign_ins() {
+        use crate::{CodingAgent as _, Delegation, SignInMethod};
+        let agent = AcpAgent::opencode();
+        assert!(agent.launches("opencode"));
+        assert!(matches!(
+            agent.delegation(SignInMethod::Own),
+            Delegation::Warned(_)
+        ));
+        assert!(agent.delegation(SignInMethod::Own).permits(false));
+        assert!(agent.sign_in_note().is_some());
+        assert!(agent.sign_ins().is_empty());
+        assert_eq!(
+            agent.signed_in(&crate::SignIn::Own).unwrap(),
+            crate::SignedIn::default()
+        );
+        let mut launch = Launch {
+            args: Vec::new(),
+            start: 0,
+        };
+        agent
+            .prepare(&request(PermissionMode::EveryCommand, true), &mut launch)
+            .unwrap();
+        assert_eq!(launch.args, ["acp"]);
+        // Other agents hand nothing different to delegated work.
+        let gemini = AcpAgent::gemini();
+        assert_eq!(
+            gemini.signed_in_delegated(&crate::SignIn::Own).unwrap(),
+            crate::SignedIn::default()
+        );
     }
 
     #[test]

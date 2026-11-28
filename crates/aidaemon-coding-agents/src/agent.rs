@@ -127,6 +127,14 @@ pub trait CodingAgent: Send + Sync {
         None
     }
 
+    /// What `sign_in` adds to its launch when another agent hands it the
+    /// work (not the owner's own prompts, passed through). The same as
+    /// [`Self::signed_in`] unless the agent holds several sign-ins and some
+    /// have terms that bar a hand-off: those it leaves out here.
+    fn signed_in_delegated(&self, sign_in: &crate::SignIn) -> Result<crate::SignedIn, String> {
+        self.signed_in(sign_in)
+    }
+
     /// How to ask whether it can do work now (signed in, served by its
     /// provider), without a task. `None`: it cannot be asked.
     fn readiness_probe(&self) -> Option<crate::Probe> {

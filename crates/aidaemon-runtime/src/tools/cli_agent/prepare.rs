@@ -146,7 +146,14 @@ impl CliAgentTool {
                 note.link
             )));
         }
-        let signed = match sign_in.and_then(|sign_in| coding_agent.signed_in(&sign_in)) {
+        // Work handed to it may leave out sign-ins whose terms bar that.
+        let signed = match sign_in.and_then(|sign_in| {
+            if direct_agent {
+                coding_agent.signed_in(&sign_in)
+            } else {
+                coding_agent.signed_in_delegated(&sign_in)
+            }
+        }) {
             Ok(signed) => signed,
             Err(reason) => {
                 mark_refused_before_launch(PrelaunchRefusal::Policy);

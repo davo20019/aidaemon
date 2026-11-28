@@ -18,8 +18,9 @@ impl CodingAgents {
     }
 
     /// The agents this crate ships: Claude Code and Codex (hosted by their
-    /// own protocols), Antigravity CLI and Gemini CLI (hosted over the Agent
-    /// Client Protocol), GitHub Copilot CLI and Aider (full access only).
+    /// own protocols), Antigravity CLI, Gemini CLI and OpenCode (hosted over
+    /// the Agent Client Protocol), GitHub Copilot CLI and Aider (full access
+    /// only).
     /// Whether each can do work now is its readiness check's to say.
     pub fn builtin() -> Self {
         Self::empty()
@@ -27,6 +28,7 @@ impl CodingAgents {
             .with(Codex)
             .with(AcpAgent::antigravity())
             .with(AcpAgent::gemini())
+            .with(AcpAgent::opencode())
             .with(PlainAgent::copilot())
             .with(PlainAgent::aider())
     }
@@ -152,7 +154,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["claude", "codex", "agy", "gemini", "copilot", "aider"]
+            [
+                "claude", "codex", "agy", "gemini", "opencode", "copilot", "aider"
+            ]
         );
     }
 }
