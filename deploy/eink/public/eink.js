@@ -140,6 +140,44 @@
       tabs[j].className = tabs[j].getAttribute('data-view') === tabFor(view) ? 'tab active' : 'tab';
     }
     window.scrollTo(0, 0);
+    remember(view);
+  }
+
+  // ---------------------------------------------------------------- address
+  // Each screen has its own address after '#' (it never leaves the Kindle),
+  // so a reload comes back to the same tab or conversation and the
+  // browser's back button steps back: #chat, #code, #approvals,
+  // #chat/<conversation>, #code/<conversation>.
+  function routeOf(view) {
+    if (view === 'convo' && current.session && current.session.id) {
+      return '#' + (current.from || 'chat') + '/' + encodeURIComponent(current.session.id);
+    }
+    if (view === 'chat' || view === 'code' || view === 'approvals') return '#' + view;
+    return null;
+  }
+
+  function remember(view) {
+    var route = routeOf(view);
+    if (!route || route === window.location.hash || !window.history || !history.pushState) return;
+    // Opening a conversation is a step back can undo; switching tabs is not.
+    if (view === 'convo') { history.pushState(null, '', route); current.pushed = true; }
+    else history.replaceState(null, '', route);
+  }
+
+  // Go where the address says (on load, and when the back button changes it).
+  function followRoute() {
+    var m = /^#(chat|code|approvals)(?:\/(.+))?$/.exec(window.location.hash || '');
+    if (!m) { show('chat'); return false; }
+    if (m[2] && m[1] !== 'approvals') {
+      var id = decodeURIComponent(m[2]);
+      var known = null;
+      var last = cacheLoad();
+      ((last && last.snapshot && last.snapshot.sessions) || []).forEach(function (s) { if (s.id === id) known = s; });
+      openChat(known || { id: id, title: '' }, m[1]);
+      return true;
+    }
+    show(m[1]);
+    return false;
   }
 
   // ------------------------------------------------------------- the channel
@@ -425,7 +463,7 @@
     current.session = s;
     current.showAll = false;
     current.from = from || 'chat';
-    $('convo-title').textContent = (s && s.title) || 'New chat';
+    $('convo-title').textContent = (s && s.title) || (s && s.id ? 'Conversation' : 'New chat');
     $('convo-note').textContent = '';
     renderConvoRuns();
     show('convo');
@@ -1043,7 +1081,12 @@
     for (var k = 0; k < refreshes.length; k++) refreshes[k].addEventListener('click', refreshAll);
     $('btn-pair').addEventListener('click', pair);
     $('btn-new-chat').addEventListener('click', function () { openChat(null, 'chat'); });
-    $('btn-convo-back').addEventListener('click', function () { show(current.from || 'chat'); refreshAll(); });
+    $('btn-convo-back').addEventListener('click', function () {
+      // Undo the step that opened it, so the back button and this agree.
+      if (current.pushed) { current.pushed = false; history.back(); return; }
+      show(current.from || 'chat');
+      refreshAll();
+    });
     $('btn-send').addEventListener('click', send);
     $('mode-type').addEventListener('click', function () { setMode('type'); });
     $('mode-write').addEventListener('click', function () { setMode('write'); });
@@ -1073,14 +1116,19 @@
     // Paint the last visit's screen at once, then refresh it.
     var last = cacheLoad();
     if (last && last.snapshot) {
-      show('chat');
       renderSnapshot(last.snapshot);
       updated(last.at);
     }
+    window.addEventListener('popstate', function () { followRoute(); refreshAll(); });
+    // An address typed or changed by hand.
+    window.addEventListener('hashchange', function () {
+      var view = current.view;
+      if (routeOf(view) !== window.location.hash) { followRoute(); refreshAll(); }
+    });
     dbGet('pinned').then(function (pinned) {
       if (!pinned) { show('pair'); setLink('not paired'); return; }
-      if (!last) show('chat');
-      refreshAll();
+      // A conversation loads itself; a list refreshes.
+      if (!followRoute()) refreshAll();
     }).catch(function () { show('pair'); });
   }
 
