@@ -113,7 +113,7 @@ mod store;
 pub mod stores;
 mod system;
 pub mod task_learning;
-mod text;
+pub mod text;
 mod tools;
 pub mod trajectory;
 mod types;

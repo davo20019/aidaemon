@@ -617,6 +617,7 @@ pub trait ToolDispatch: TurnHost {
             channel_visibility: Some(ctx.channel_visibility),
             channel_id: ctx.channel_id.map(str::to_string),
             task_id: ctx.task_id.map(str::to_string),
+            user_message: ctx.user_text.map(str::to_string),
             tool_call_id: ctx.tool_call_id.map(str::to_string),
             lone_root_call: ctx.lone_root_call,
             turn_id: self

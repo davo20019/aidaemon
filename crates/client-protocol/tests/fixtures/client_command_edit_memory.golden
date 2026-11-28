@@ -1,0 +1,9 @@
+{
+  "command": {
+    "memory_id": "41",
+    "type": "edit_memory",
+    "value": "Alice Rivera takes her coffee black with oat milk"
+  },
+  "request_id": "5d0c2b1e-0010a",
+  "type": "command"
+}

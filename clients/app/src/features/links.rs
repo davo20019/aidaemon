@@ -1,4 +1,6 @@
-//! Links into the app. A channel's handoff card links to the live view as
+//! Links into the app. An e-ink reader's QR link (`…/pair-eink#n=…`) offers
+//! to pair it (`aidaemon_client_core::eink`), read once and taken out of the
+//! address at once. A channel's handoff card links to the live view as
 //! `…/client/v1/next/#surface=<id>`: opened in a browser, the app waits until
 //! it is connected, opens that view with control (as the card's own "Open the
 //! live view" does), and only then takes the part out of its address, so a
@@ -30,7 +32,22 @@ pub fn surface_links(store: Store) {
             {
                 wanted.set(Some((id, at.to_owned())));
             }
+            // An e-ink reader's QR link: its part leaves the address at
+            // once, so a reload or a later visit never offers it again.
+            if let Some(at) = url.as_deref()
+                && let Some(link) = aidaemon_client_core::eink::parse_pair_link(at)
+            {
+                let _ = set_app_url(without_eink_link(at));
+                store.open_eink_link(link);
+            }
             url = Some(next_app_url_change().await.url);
+        }
+    });
+    // Online (the page connects after it reads its address), Settings →
+    // Connections offers the e-ink link; it takes it within a minute.
+    effect(move || {
+        if store.eink_link_waiting() && store.is_online() {
+            untracked(|| store.open_settings_tab(crate::store::SettingsTab::Connections));
         }
     });
     effect(move || {
@@ -82,6 +99,17 @@ fn without_surface(url: &str) -> String {
         base.to_owned()
     } else {
         format!("{base}#{}", rest.join("&"))
+    }
+}
+
+/// The address an e-ink reader's QR link opened, without the link: the
+/// app's own page (`…/pair-eink#n=…` to `…/`).
+fn without_eink_link(url: &str) -> String {
+    let base = url.split_once('#').map_or(url, |(base, _)| base);
+    let base = base.trim_end_matches('/');
+    match base.strip_suffix(aidaemon_client_core::eink::LINK_PATH) {
+        Some(site) => format!("{site}/"),
+        None => format!("{base}/"),
     }
 }
 
@@ -153,6 +181,18 @@ pub fn open_document_link(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_eink_link_leaves_the_address_once_read() {
+        assert_eq!(
+            without_eink_link("https://app.aidaemon.ai/pair-eink#n=K7F2&s=9QXM4HTAPZ6CR&k=00"),
+            "https://app.aidaemon.ai/"
+        );
+        assert_eq!(
+            without_eink_link("https://daemon.example.test/client/v1/next/pair-eink/#n=K7F2"),
+            "https://daemon.example.test/client/v1/next/"
+        );
+    }
 
     #[test]
     fn only_web_and_mail_links_leave_the_app() {

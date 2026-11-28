@@ -132,6 +132,66 @@ pub fn span(secs: u64) -> String {
     }
 }
 
+/// Unused this many days, a paired device reads as stale.
+pub const STALE_DAYS: u64 = 14;
+
+/// When a paired device was paired and last used, in the viewer's local
+/// time: "Paired Nov 12 · Last used 3 hours ago", "… · Last used today,
+/// 1:01 AM", "… · Never used". `true` when it has not been used for
+/// [`STALE_DAYS`] ("Not used for 15 days").
+pub fn device_use(created_ms: u64, last_seen_ms: Option<u64>, now_ms: u64) -> (String, bool) {
+    let paired = format!("Paired {}", short_date(created_ms, now_ms));
+    let Some(seen) = last_seen_ms else {
+        return (format!("{paired} · Never used"), false);
+    };
+    let secs = now_ms.saturating_sub(seen) / 1000;
+    let days = secs / 86_400;
+    if days >= STALE_DAYS {
+        return (format!("{paired} · Not used for {days} days"), true);
+    }
+    let last = match secs {
+        0..120 => "just now".to_string(),
+        120..3_600 => format!("{} minutes ago", secs / 60),
+        3_600..7_200 => "an hour ago".to_string(),
+        7_200..21_600 => format!("{} hours ago", secs / 3_600),
+        _ if day(seen) == day(now_ms) => format!("today, {}", clock(seen)),
+        _ if day(now_ms) - day(seen) == 1 => format!("yesterday, {}", clock(seen)),
+        _ => short_date(seen, now_ms),
+    };
+    (format!("{paired} · Last used {last}"), false)
+}
+
+#[cfg(test)]
+mod device_use_tests {
+    use super::*;
+
+    #[test]
+    fn a_devices_use_reads_in_plain_words_and_stale_ones_stand_out() {
+        let now = 1_763_000_000_000;
+        let paired = short_date(now - 20 * 86_400_000, now);
+        assert_eq!(
+            device_use(now - 20 * 86_400_000, None, now),
+            (format!("Paired {paired} · Never used"), false)
+        );
+        assert_eq!(
+            device_use(now - 20 * 86_400_000, Some(now - 3 * 3_600_000), now).0,
+            format!("Paired {paired} · Last used 3 hours ago")
+        );
+        assert!(
+            device_use(now, Some(now - 30_000), now)
+                .0
+                .ends_with("Last used just now")
+        );
+        assert_eq!(
+            device_use(now - 20 * 86_400_000, Some(now - 15 * 86_400_000), now),
+            (format!("Paired {paired} · Not used for 15 days"), true)
+        );
+        let (words, stale) = device_use(now - 20 * 86_400_000, Some(now - 5 * 86_400_000), now);
+        assert!(!stale);
+        assert!(words.ends_with(&short_date(now - 5 * 86_400_000, now)));
+    }
+}
+
 #[cfg(test)]
 mod stamp_tests {
     use super::*;

@@ -199,6 +199,43 @@ pub trait FactStore: Send + Sync {
         Ok(false)
     }
 
+    /// Edit an active fact's value in place as an explicit owner update.
+    /// Supports both positive flat fact ids and negative canonical ids where
+    /// editable (owner facts and aliases). Returns the updated fact if found.
+    async fn update_fact_value(&self, _fact_id: i64, _value: &str) -> anyhow::Result<Option<Fact>> {
+        Ok(None)
+    }
+
+    /// Reversibly archive an active fact so it leaves passive recall without
+    /// permanent deletion. Returns true if an active fact was archived.
+    async fn archive_fact(&self, _fact_id: i64) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Restore a previously archived fact back to active memory.
+    async fn restore_fact(&self, _fact_id: i64) -> anyhow::Result<Option<Fact>> {
+        Ok(None)
+    }
+
+    /// Archived facts available for restore, newest first.
+    async fn get_archived_facts(&self, _limit: usize) -> anyhow::Result<Vec<Fact>> {
+        Ok(Vec::new())
+    }
+
+    /// Automatically archive active facts whose typed `expires_at` has passed.
+    async fn archive_expired_facts(
+        &self,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Map of active fact id -> another active fact id that looks like a
+    /// conceptual duplicate/overlap (for UI review hints).
+    async fn detect_fact_overlaps(&self) -> anyhow::Result<std::collections::HashMap<i64, i64>> {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Get all active facts with provenance info for memory management display.
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
         self.get_facts(None).await
@@ -497,16 +534,21 @@ pub trait MemoryDecay: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-/// One maintenance pass: merge restated facts, then let unrecalled memory
-/// fade, so decay sees one row per piece of knowledge.
+/// One maintenance pass: archive expired facts, merge restated facts, then
+/// let unrecalled memory fade, so decay sees one active row per piece of
+/// knowledge.
 pub async fn decay_memory<S>(store: &S, policy: &DecayPolicy) -> anyhow::Result<()>
 where
     S: FactStore + MemoryDecay + ?Sized,
 {
+    let now = chrono::Utc::now();
+    if let Err(error) = store.archive_expired_facts(now).await {
+        tracing::warn!(%error, "Failed to archive expired facts");
+    }
     if let Err(error) = store.fold_restated_facts().await {
         tracing::warn!(%error, "Failed to fold restated facts");
     }
-    store.decay(policy, chrono::Utc::now()).await
+    store.decay(policy, now).await
 }
 
 /// Every store behind the daemon-shaped memory contract, as one handle.

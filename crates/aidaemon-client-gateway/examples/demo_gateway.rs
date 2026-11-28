@@ -771,8 +771,13 @@ impl ClientHost for Host {
             category: category.into(),
             key: key.into(),
             value: value.into(),
-            source: "conversation".into(),
+            source: "user_stated".into(),
             updated_ms: now_ms() - 86_400_000,
+            excerpt: None,
+            archived: false,
+            editable: true,
+            kind: None,
+            overlaps_with: None,
         })
         .collect())
     }

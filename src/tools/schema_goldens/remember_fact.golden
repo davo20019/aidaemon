@@ -8,6 +8,7 @@
       "additionalProperties": false,
       "properties": {
         "category": {
+          "description": "Canonical categories: user (owner identity, name, addressing, location, birthday), preference (likes, style, communication), project (project details), technical (environment, tools).",
           "type": "string"
         },
         "delete": {

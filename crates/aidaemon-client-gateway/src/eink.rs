@@ -9,7 +9,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use aidaemon_client_protocol::{Command, ErrorCode, ProtocolError};
+use aidaemon_client_protocol::{Command, EinkAccess, ErrorCode, ProtocolError, Risk, Scope};
 use base64::Engine as _;
 
 /// The device kind recorded for a bridge device.
@@ -22,15 +22,54 @@ pub(crate) const MAX_PNG_SIDE: u32 = 4096;
 /// Most pixels in that PNG (checked before anything decodes it).
 pub(crate) const MAX_PNG_PIXELS: u64 = 8_000_000;
 
+/// A reader's access level, read from its record's scopes and ceiling (no
+/// column of its own): no Chat is View only, a High ceiling is Full, and
+/// anything else (a Medium ceiling, the level readers paired before levels
+/// had) is Limited.
+pub(crate) fn level_of(scopes: &[Scope], ceiling: Option<Risk>) -> EinkAccess {
+    if !scopes.contains(&Scope::Chat) {
+        EinkAccess::ViewOnly
+    } else if ceiling == Some(Risk::High) {
+        EinkAccess::Full
+    } else {
+        EinkAccess::Limited
+    }
+}
+
+/// [`level_of`] for a reader's principal.
+pub(crate) fn level(principal: &crate::pairing::Principal) -> EinkAccess {
+    level_of(&principal.scopes, principal.ceiling)
+}
+
+/// The scopes a level records. `None`: not a level to set.
+pub(crate) fn scopes_for(level: EinkAccess) -> Option<Vec<Scope>> {
+    match level {
+        EinkAccess::ViewOnly => Some(vec![Scope::Observe]),
+        EinkAccess::Limited | EinkAccess::Full => {
+            Some(vec![Scope::Observe, Scope::Chat, Scope::Approve])
+        }
+        EinkAccess::Unknown => None,
+    }
+}
+
+/// The risk ceiling a level records: what it may approve once, at most.
+/// Never above High, so a Critical card always waits for a trusted device.
+pub(crate) fn ceiling_for(level: EinkAccess) -> Risk {
+    match level {
+        EinkAccess::Full => Risk::High,
+        _ => Risk::Medium,
+    }
+}
+
 /// The ceiling a message from `principal` puts on the run it starts or
-/// steers: an e-ink device's messages cap it at Medium, so a call above
-/// that waits for the owner on the phone or the computer. From the
+/// steers: a Limited reader's messages cap it at Medium, so a call above
+/// that waits for the owner on the phone or the computer; a Full reader's
+/// runs follow the owner's settings like any app message. From the
 /// device's record, never from the message.
 pub(crate) fn sender_ceiling(
     principal: &crate::pairing::Principal,
 ) -> Option<aidaemon_channels::context::SenderCeiling> {
-    principal
-        .eink
+    (principal.eink && level(principal) == EinkAccess::Limited)
         .then_some(aidaemon_channels::context::SenderCeiling::Medium)
 }
 
@@ -38,8 +77,65 @@ fn refused(message: &str) -> ProtocolError {
     ProtocolError::new(ErrorCode::Forbidden, message)
 }
 
-/// Whether an e-ink device may send `command`, and with these arguments.
-pub(crate) fn check(command: &Command, home: Option<&Path>) -> Result<(), ProtocolError> {
+/// Whether `principal` may pair an e-ink reader: the owner's local token,
+/// or a device that may answer every approval (Approve with no risk
+/// ceiling). An e-ink reader never pairs another device, whatever its
+/// scopes say. The live scope is checked again by the dispatcher.
+pub(crate) fn may_pair(principal: &crate::pairing::Principal) -> Result<(), ProtocolError> {
+    if principal.eink {
+        return Err(refused("An e-ink device may not pair devices"));
+    }
+    if principal.is_owner() {
+        return Ok(());
+    }
+    if principal.may(aidaemon_client_protocol::Scope::Approve) && principal.ceiling.is_none() {
+        return Ok(());
+    }
+    Err(refused(
+        "Pair an e-ink device from a device that may answer every approval",
+    ))
+}
+
+/// Whether `principal` may unpair device `device_id`: whoever may pair
+/// ([`may_pair`]), but never the device asking (removing itself from a
+/// list by mistake would lock the owner out of that device).
+pub(crate) fn may_revoke(
+    principal: &crate::pairing::Principal,
+    device_id: &str,
+) -> Result<(), ProtocolError> {
+    may_pair(principal)?;
+    if principal.device_id.as_deref() == Some(device_id) {
+        return Err(refused(
+            "This device cannot remove itself: remove it from another device, or on the \
+             computer AIDaemon runs on",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an e-ink device at `level` may send `command`, and with these
+/// arguments.
+pub(crate) fn check(
+    command: &Command,
+    level: EinkAccess,
+    home: Option<&Path>,
+) -> Result<(), ProtocolError> {
+    let reads = matches!(
+        command,
+        Command::ListSessions { .. }
+            | Command::GetHistory { .. }
+            | Command::GetRun { .. }
+            | Command::GetGlance
+            | Command::GetSnapshot
+            | Command::GetChanges { .. }
+            | Command::ListProjects
+            | Command::ListModels
+    );
+    if level == EinkAccess::ViewOnly && !reads {
+        return Err(refused(
+            "This e-ink device may only look: raise its access in the app to do that",
+        ));
+    }
     match command {
         Command::ListSessions { .. }
         | Command::GetHistory { .. }
@@ -139,6 +235,10 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    fn check_full(command: &Command, home: Option<&Path>) -> Result<(), ProtocolError> {
+        check(command, EinkAccess::Full, home)
+    }
+
     use super::*;
 
     fn png(width: u32, height: u32) -> String {
@@ -173,6 +273,42 @@ mod tests {
         );
     }
 
+    fn device(scopes: &[aidaemon_client_protocol::Scope]) -> crate::pairing::Principal {
+        crate::pairing::Principal {
+            device_id: Some("dv-synthetic-phone".into()),
+            device_name: Some("Synthetic phone".into()),
+            scopes: scopes.to_vec(),
+            ..crate::pairing::Principal::owner()
+        }
+    }
+
+    /// The owner's token and a device that may answer every approval pair a
+    /// reader; a ceilinged device, an observer and a reader itself do not.
+    #[test]
+    fn who_may_pair_an_eink_reader() {
+        use aidaemon_client_protocol::{Risk, Scope};
+        assert!(may_pair(&crate::pairing::Principal::owner()).is_ok());
+        assert!(may_pair(&device(&[Scope::Observe, Scope::Chat, Scope::Approve])).is_ok());
+        let watch = crate::pairing::Principal {
+            ceiling: Some(Risk::Low),
+            ..device(&[Scope::Observe, Scope::Approve])
+        };
+        assert_eq!(may_pair(&watch).unwrap_err().code, ErrorCode::Forbidden);
+        assert!(may_pair(&device(&[Scope::Observe])).is_err());
+        assert!(may_pair(&device(&[Scope::Observe, Scope::Chat])).is_err());
+        let reader = crate::pairing::Principal {
+            eink: true,
+            ..device(&[Scope::Observe, Scope::Chat, Scope::Approve])
+        };
+        assert!(may_pair(&reader).is_err());
+        // Even a reader with no ceiling and every scope.
+        let odd_reader = crate::pairing::Principal {
+            eink: true,
+            ..crate::pairing::Principal::owner()
+        };
+        assert!(may_pair(&odd_reader).is_err());
+    }
+
     fn upload(data: String) -> Command {
         Command::UploadFile {
             name: "line.png".into(),
@@ -192,9 +328,32 @@ mod tests {
 
     #[test]
     fn only_the_listed_commands_pass() {
-        assert!(check(&Command::ListDevices, None).is_err());
+        assert!(check_full(&Command::ListDevices, None).is_err());
         assert!(
-            check(
+            check_full(
+                &Command::PairEinkDevice {
+                    code: "K7F29QXM4HTAPZ6CRVTPVXVT2".into()
+                },
+                None
+            )
+            .is_err(),
+            "an e-ink device never pairs another"
+        );
+        assert!(
+            check_full(
+                &Command::ChangeSettings {
+                    change: aidaemon_client_protocol::SettingsChange::Set {
+                        key: "client_gateway.eink.bridge_url".into(),
+                        value: Some("\"wss://bridge.example.test/v1/daemon\"".into()),
+                    }
+                },
+                None
+            )
+            .is_err(),
+            "an e-ink device never changes settings, e-ink access included"
+        );
+        assert!(
+            check_full(
                 &Command::DeleteSession {
                     session_id: "s".into()
                 },
@@ -202,14 +361,14 @@ mod tests {
             )
             .is_err()
         );
-        assert!(check(&Command::GetSystem, None).is_err());
+        assert!(check_full(&Command::GetSystem, None).is_err());
     }
 
     #[test]
     fn project_folders_stay_inside_home_and_unhidden() {
         let home = Path::new("/home/alice");
-        assert!(check(&create("~/projects/garden"), Some(home)).is_ok());
-        assert!(check(&create("/home/alice/projects/garden"), Some(home)).is_ok());
+        assert!(check_full(&create("~/projects/garden"), Some(home)).is_ok());
+        assert!(check_full(&create("/home/alice/projects/garden"), Some(home)).is_ok());
         for bad in [
             "~/.ssh",
             "~/projects/.git",
@@ -219,19 +378,133 @@ mod tests {
             "~",
             "/home/alicex/projects",
         ] {
-            assert!(check(&create(bad), Some(home)).is_err(), "{bad} passed");
+            assert!(
+                check_full(&create(bad), Some(home)).is_err(),
+                "{bad} passed"
+            );
         }
-        assert!(check(&create("~/projects/garden"), None).is_err());
+        assert!(check_full(&create("~/projects/garden"), None).is_err());
     }
 
     #[test]
     fn uploads_must_be_small_pngs() {
-        assert!(check(&upload(png(930, 240)), None).is_ok());
-        assert!(check(&upload(png(100_000, 100_000)), None).is_err());
-        assert!(check(&upload(png(4000, 4000)), None).is_err());
-        assert!(check(&upload(png(0, 10)), None).is_err());
+        assert!(check_full(&upload(png(930, 240)), None).is_ok());
+        assert!(check_full(&upload(png(100_000, 100_000)), None).is_err());
+        assert!(check_full(&upload(png(4000, 4000)), None).is_err());
+        assert!(check_full(&upload(png(0, 10)), None).is_err());
         let gif = base64::engine::general_purpose::STANDARD.encode(b"GIF89a................");
-        assert!(check(&upload(gif), None).is_err());
-        assert!(check(&upload("not base64!".into()), None).is_err());
+        assert!(check_full(&upload(gif), None).is_err());
+        assert!(check_full(&upload("not base64!".into()), None).is_err());
+    }
+
+    fn reader(level: EinkAccess) -> crate::pairing::Principal {
+        crate::pairing::Principal {
+            device_id: Some("dv-synthetic-reader".into()),
+            scopes: scopes_for(level).unwrap(),
+            ceiling: Some(ceiling_for(level)),
+            eink: true,
+            ..crate::pairing::Principal::owner()
+        }
+    }
+
+    /// Each level records scopes and a ceiling that read back as it; a
+    /// reader paired before levels (Observe, Chat, Approve, Medium) is
+    /// Limited; only Limited caps the runs it starts.
+    #[test]
+    fn levels_map_to_scopes_ceilings_and_run_caps() {
+        use aidaemon_channels::context::SenderCeiling;
+        for level in [EinkAccess::ViewOnly, EinkAccess::Limited, EinkAccess::Full] {
+            assert_eq!(
+                level_of(&scopes_for(level).unwrap(), Some(ceiling_for(level))),
+                level
+            );
+        }
+        assert_eq!(
+            scopes_for(EinkAccess::ViewOnly).unwrap(),
+            vec![Scope::Observe]
+        );
+        assert_eq!(ceiling_for(EinkAccess::Limited), Risk::Medium);
+        assert_eq!(ceiling_for(EinkAccess::Full), Risk::High);
+        assert!(scopes_for(EinkAccess::Unknown).is_none());
+        let old = [Scope::Observe, Scope::Chat, Scope::Approve];
+        assert_eq!(level_of(&old, Some(Risk::Medium)), EinkAccess::Limited);
+        assert_eq!(level_of(&old, None), EinkAccess::Limited);
+        assert_eq!(
+            sender_ceiling(&reader(EinkAccess::Limited)),
+            Some(SenderCeiling::Medium)
+        );
+        assert_eq!(sender_ceiling(&reader(EinkAccess::Full)), None);
+        assert_eq!(sender_ceiling(&reader(EinkAccess::ViewOnly)), None);
+    }
+
+    /// View only reads; every level refuses settings, pairing and changing
+    /// its own access.
+    #[test]
+    fn view_only_reads_and_no_level_manages_devices() {
+        let command =
+            |json: serde_json::Value| -> Command { serde_json::from_value(json).unwrap() };
+        let send = command(serde_json::json!({"type": "send_message", "text": "hi"}));
+        let resolve = command(serde_json::json!({
+            "type": "resolve_approval", "approval_id": "a-1", "decision": "approve_once"
+        }));
+        let stop = command(serde_json::json!({"type": "stop_turn", "session_id": "s"}));
+        for refused in [
+            &send,
+            &resolve,
+            &stop,
+            &create("~/projects/garden"),
+            &upload(png(10, 10)),
+        ] {
+            assert!(
+                check(
+                    refused,
+                    EinkAccess::ViewOnly,
+                    Some(Path::new("/home/alice"))
+                )
+                .is_err(),
+                "{refused:?}"
+            );
+        }
+        for read in [
+            Command::GetGlance,
+            Command::GetSnapshot,
+            Command::ListProjects,
+            Command::ListModels,
+        ] {
+            assert!(check(&read, EinkAccess::ViewOnly, None).is_ok(), "{read:?}");
+        }
+        assert!(check(&send, EinkAccess::Limited, None).is_ok());
+        assert!(check(&resolve, EinkAccess::Full, None).is_ok());
+        let set = Command::SetEinkAccess {
+            device_id: "dv-synthetic-reader".into(),
+            level: EinkAccess::Full,
+        };
+        for level in [EinkAccess::ViewOnly, EinkAccess::Limited, EinkAccess::Full] {
+            assert!(check(&set, level, None).is_err());
+            assert!(may_pair(&reader(level)).is_err());
+        }
+    }
+
+    #[test]
+    fn who_may_remove_a_device() {
+        use aidaemon_client_protocol::Risk;
+        let owner = crate::pairing::Principal::owner();
+        assert!(may_revoke(&owner, "dv-synthetic-phone").is_ok());
+        let phone = device(&[Scope::Observe, Scope::Chat, Scope::Approve]);
+        assert!(may_revoke(&phone, "dv-synthetic-other").is_ok());
+        assert!(
+            may_revoke(&phone, "dv-synthetic-phone").is_err(),
+            "not itself"
+        );
+        let watch = crate::pairing::Principal {
+            ceiling: Some(Risk::Low),
+            ..device(&[Scope::Observe, Scope::Approve])
+        };
+        assert!(may_revoke(&watch, "dv-synthetic-other").is_err());
+        assert!(may_revoke(&reader(EinkAccess::Full), "dv-synthetic-other").is_err());
+        let remove = Command::RevokeDevice {
+            device_id: "dv-synthetic-other".into(),
+        };
+        assert!(check(&remove, EinkAccess::Full, None).is_err());
     }
 }

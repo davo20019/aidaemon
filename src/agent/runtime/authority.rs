@@ -132,6 +132,7 @@ mod tests {
             owner_approval_by_kernel: false,
             session_id: "guest-session",
             task_id: None,
+            user_text: None,
             status_tx: None,
             channel_visibility: crate::types::ChannelVisibility::PrivateGroup,
             channel_id: Some("telegram:synthetic-group"),

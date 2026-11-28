@@ -86,7 +86,9 @@ const DAEMON_MEMORY_TABLE_ROWS: &str = "| Store user info | remember_fact | — 
 
 const DAEMON_CORRECTION_RULE: &str =
     "- **Learn from corrections.** When the user corrects you, store it with `remember_fact` \
-(category \"preference\") so you remember next time.
+using the matching category (`user` for their name, how to address them, or personal info; \
+`preference` for general style/likes; `project` or `technical` for project/environment rules) \
+and include their verbatim words in `evidence` so you remember next time.
 ";
 
 const DAEMON_PEOPLE_TABLE_ROW: &str = "\n| Remember other people, family, relationships | manage_people (remember) | — |\n| Track contacts, birthdays | manage_people | — |";

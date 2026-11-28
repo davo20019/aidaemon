@@ -77,12 +77,15 @@ pub struct Connector {
     daemon_id: [u8; 32],
     link: Mutex<Option<mpsc::Sender<Out>>>,
     joins: Mutex<HashMap<String, PendingJoin>>,
+    /// The task that keeps the bridge connection; [`Self::stop`] ends it.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Connector {
     /// Start dialing `url` (`wss://<bridge>/v1/daemon`) and register with
     /// the gateway: devices may then sign in to `bridge:<daemon id>`, and
-    /// the owner may pair one. Runs until the process ends.
+    /// the owner may pair one. Runs until [`Self::stop`] or the process
+    /// ends.
     pub fn start(gateway: Arc<ClientGateway>, url: String, keys: BridgeKeys) -> Arc<Self> {
         let route_id = ids::route_id(&keys.login_pub());
         let daemon_id = ids::daemon_id(&keys.identity_pub());
@@ -96,13 +99,42 @@ impl Connector {
             daemon_id,
             link: Mutex::new(None),
             joins: Mutex::new(HashMap::new()),
+            task: Mutex::new(None),
         });
         let pairing = gateway.pairing();
         pairing.set_bridge_id(Some(hex::encode(daemon_id)));
         pairing.set_bridge_pairer(Some(connector.clone()));
         let running = connector.clone();
-        tokio::spawn(async move { running.run().await });
+        let task = tokio::spawn(async move { running.run().await });
+        *connector.task.lock().unwrap_or_else(|p| p.into_inner()) = Some(task);
         connector
+    }
+
+    /// E-ink access turned off: end the bridge connection (and with it
+    /// every device's connection through it, and a pairing under way), and
+    /// take the bridge's sign-in and pairing away from the gateway. Paired
+    /// devices stay listed; they connect again once a connector starts.
+    pub fn stop(&self) {
+        if let Some(task) = self.task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            // Dropping the session drops each device connection's queue,
+            // so their tasks end and the writer closes the socket.
+            task.abort();
+        }
+        *self.link.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.fail_joins("E-ink access was turned off");
+        let pairing = self.gateway.pairing();
+        pairing.set_bridge_id(None);
+        pairing.set_bridge_pairer(None);
+        info!("E-ink access off: the bridge connection is closed");
+    }
+
+    /// Whether the connection task still runs (not stopped).
+    pub fn is_running(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     /// The route id browsers connect to (`?route=`), as hex.
@@ -257,10 +289,21 @@ impl Connector {
             }
         };
         let peer = BridgePeer(channel.device_id);
+        // A revocation (from any device) closes this connection at once
+        // when it names this device.
+        let mut revoked = self.gateway.pairing().revocations_seen();
         loop {
-            let frame = match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
-                Ok(Some(frame)) => frame,
-                _ => break,
+            let frame = tokio::select! {
+                frame = tokio::time::timeout(IDLE_TIMEOUT, rx.recv()) => match frame {
+                    Ok(Some(frame)) => frame,
+                    _ => break,
+                },
+                changed = revoked.changed() => {
+                    if changed.is_err() || !self.still_paired(&channel.device_id).await {
+                        break;
+                    }
+                    continue;
+                }
             };
             let message = match channel.opener.open(&frame) {
                 Ok(Some(message)) => message,
@@ -284,6 +327,16 @@ impl Connector {
             }
         }
         let _ = out.send(Out::Text(close_json(conn))).await;
+    }
+
+    /// Whether the device with `device_id` is still paired (not revoked).
+    async fn still_paired(&self, device_id: &[u8; 32]) -> bool {
+        self.gateway
+            .pairing()
+            .active_bridge_keys()
+            .await
+            .iter()
+            .any(|key| ids::device_id(key) == *device_id)
     }
 
     async fn session_handshake(

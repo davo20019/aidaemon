@@ -1164,21 +1164,62 @@ impl ClientHost for DaemonClientHost {
     }
 
     async fn memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
-        let mut facts = self.system.memory.get_facts(None).await?;
-        facts.retain(|f| f.superseded_at.is_none());
+        let (items, _, _) = self.memories_snapshot().await?;
+        Ok(items)
+    }
+
+    async fn memories_snapshot(
+        &self,
+    ) -> anyhow::Result<(Vec<MemoryItem>, Option<u64>, Vec<MemoryItem>)> {
+        let memory = &self.system.memory;
+        let canonical = memory
+            .get_canonical_memory_facts()
+            .await
+            .unwrap_or_default();
+        let canonical_owner_keys: std::collections::HashSet<String> = canonical
+            .iter()
+            .filter(|f| f.category == "user")
+            .map(|f| aidaemon_memory::text::owner_projection_family(&f.key))
+            .collect();
+        let mut facts = canonical;
+        for f in memory.get_facts(None).await? {
+            if f.superseded_at.is_some() {
+                continue;
+            }
+            let cat_lower = f.category.trim().to_ascii_lowercase();
+            let shadowed_owner = (matches!(cat_lower.as_str(), "user" | "personal" | "profile")
+                || (cat_lower == "preference"
+                    && aidaemon_memory::text::is_owner_profile_key(&f.key)))
+                && canonical_owner_keys
+                    .contains(&aidaemon_memory::text::owner_projection_family(&f.key));
+            if !shadowed_owner {
+                facts.push(f);
+            }
+        }
         facts.sort_by_key(|f| std::cmp::Reverse(f.updated_at));
-        facts.truncate(500);
-        Ok(facts
+        let total = Some(facts.len() as u64);
+        let overlaps = memory.detect_fact_overlaps().await.unwrap_or_default();
+        facts.truncate(2000);
+        let active_ids: std::collections::HashSet<i64> = facts.iter().map(|f| f.id).collect();
+        let active_items: Vec<MemoryItem> = facts
             .into_iter()
-            .map(|f| MemoryItem {
-                id: f.id.to_string(),
-                category: f.category,
-                key: f.key,
-                value: f.value,
-                source: f.source,
-                updated_ms: u64::try_from(f.updated_at.timestamp_millis()).unwrap_or(0),
+            .map(|f| {
+                let overlap = overlaps
+                    .get(&f.id)
+                    .copied()
+                    .filter(|other| active_ids.contains(other))
+                    .map(|other| other.to_string());
+                fact_to_memory_item(f, false, overlap)
             })
-            .collect())
+            .collect();
+        let archived_items: Vec<MemoryItem> = memory
+            .get_archived_facts(200)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| fact_to_memory_item(f, true, None))
+            .collect();
+        Ok((active_items, total, archived_items))
     }
 
     async fn forget(&self, id: &str) -> anyhow::Result<bool> {
@@ -1186,11 +1227,54 @@ impl ClientHost for DaemonClientHost {
             return Ok(false);
         };
         let memory = &self.system.memory;
-        if !memory.get_facts(None).await?.iter().any(|f| f.id == id) {
+        let exists = if id < 0 {
+            memory
+                .get_canonical_memory_facts()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|f| f.id == id)
+        } else {
+            memory.get_facts(None).await?.iter().any(|f| f.id == id)
+                || memory
+                    .get_archived_facts(500)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|f| f.id == id)
+        };
+        if !exists {
             return Ok(false);
         }
         memory.delete_fact(id).await?;
         Ok(true)
+    }
+
+    async fn edit_memory(&self, id: &str, value: &str) -> anyhow::Result<Option<MemoryItem>> {
+        let Ok(id) = id.parse::<i64>() else {
+            return Ok(None);
+        };
+        let Some(updated) = self.system.memory.update_fact_value(id, value).await? else {
+            return Ok(None);
+        };
+        Ok(Some(fact_to_memory_item(updated, false, None)))
+    }
+
+    async fn archive_memory(&self, id: &str) -> anyhow::Result<bool> {
+        let Ok(id) = id.parse::<i64>() else {
+            return Ok(false);
+        };
+        self.system.memory.archive_fact(id).await
+    }
+
+    async fn restore_memory(&self, id: &str) -> anyhow::Result<Option<MemoryItem>> {
+        let Ok(id) = id.parse::<i64>() else {
+            return Ok(None);
+        };
+        let Some(restored) = self.system.memory.restore_fact(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(fact_to_memory_item(restored, false, None)))
     }
 
     fn owner_only_command(&self, command: &str) -> bool {
@@ -1225,6 +1309,40 @@ impl ClientHost for DaemonClientHost {
 /// The agent-driven view on the running gateway: `client_view` moves the
 /// app connection that sent the turn's message, and only that one.
 pub(crate) struct GatewayViews;
+
+fn fact_to_memory_item(
+    f: aidaemon_memory::records::Fact,
+    archived: bool,
+    overlaps_with: Option<String>,
+) -> MemoryItem {
+    let is_canonical = f.id < 0;
+    let editable = !archived && (f.id > 0 || (f.id <= -1_000_000_000 && f.id > -3_000_000_000));
+    let excerpt = f
+        .source_excerpt
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.chars().count() <= 160 {
+                s
+            } else {
+                let cut: String = s.chars().take(159).collect();
+                format!("{}…", cut.trim_end())
+            }
+        });
+    MemoryItem {
+        id: f.id.to_string(),
+        category: f.category,
+        key: f.key,
+        value: f.value,
+        source: f.source,
+        updated_ms: u64::try_from(f.updated_at.timestamp_millis()).unwrap_or(0),
+        excerpt,
+        archived,
+        editable,
+        kind: is_canonical.then(|| "canonical".to_string()),
+        overlaps_with,
+    }
+}
 
 impl aidaemon_client_gateway::client_view::ClientViews for GatewayViews {
     fn can_show(&self, session_id: &str) -> bool {

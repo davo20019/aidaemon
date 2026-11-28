@@ -140,6 +140,8 @@ const DELETE_SESSION_MINOR: u16 = 59;
 /// The protocol minor from which a sign-in step's answer goes only to the
 /// device that took it (no `settings_updated` to every client).
 const OWN_SIGN_IN_ANSWER_MINOR: u16 = 60;
+/// The protocol minor that adds inline memory editing, archiving, and restore.
+const MEMORY_LIFECYCLE_MINOR: u16 = 61;
 
 /// Something read from the daemon, as last asked.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -421,6 +423,15 @@ pub struct ComposerTargetView {
     pub shows_recipient: bool,
 }
 
+/// What the Memory page reads from the daemon: active items, the true active
+/// total before any wire cap, and archived items available for restore.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoriesState {
+    pub items: Vec<MemoryItem>,
+    pub total: Option<u64>,
+    pub archived: Vec<MemoryItem>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Client {
     pub state: State,
@@ -485,8 +496,13 @@ pub struct Client {
     /// Settings changes waiting for an approval, and whether another
     /// device must give it.
     pub settings_waiting: BTreeMap<String, bool>,
-    pub memories: Read<Vec<MemoryItem>>,
+    pub memories: Read<MemoriesState>,
     memories_request: Option<String>,
+    /// A memory changed while a read was in flight: read again once it answers.
+    memories_again: bool,
+    /// In-flight memory mutations (forget/edit/archive/restore), so errors
+    /// surface as a toast on any page instead of polluting `state.notice`.
+    memory_mutations: BTreeSet<String>,
     pub automations: Read<Vec<AutomationSummary>>,
     automations_request: Option<String>,
     /// The run the owner opened, and what its record says
@@ -589,6 +605,16 @@ pub struct Client {
     devices_request: Option<String>,
     /// Why the last device change was refused.
     pub devices_error: Option<String>,
+    /// This client's own paired device id, as the device list says
+    /// (protocol 1.63); `None` on the daemon's own computer.
+    pub this_device: Option<String>,
+    /// Pairing an e-ink reader (protocol 1.62; [`crate::eink`]).
+    pub eink_pairing: crate::eink::EinkPairing,
+    pub(crate) eink_pair_request: Option<String>,
+    /// An e-ink reader's level change (protocol 1.63) under way, and why
+    /// the last one was refused.
+    pub(crate) eink_access_request: Option<String>,
+    pub eink_access_note: Option<String>,
     /// The reads of a refresh the owner asked for (or the app's return),
     /// until each is answered: the refresh indicator spins meanwhile.
     refreshing: BTreeSet<String>,
@@ -665,6 +691,9 @@ impl Client {
                 // before every change since.
                 self.settings_request = None;
                 self.settings_again = false;
+                self.memories_request = None;
+                self.memories_again = false;
+                self.memory_mutations.clear();
                 // So are a project's files: shown as last read until asked
                 // again.
                 if self.files_dir_request.take().is_some() && !self.files_dir.is_ready() {
@@ -675,6 +704,9 @@ impl Client {
                 }
                 if self.settings.is_ready() || cx.settings_open {
                     self.refresh_settings();
+                }
+                if matches!(self.memories, Read::Loading) || self.memories.is_ready() {
+                    self.refresh_memories();
                 }
                 if let Some(id) = &cx.selected {
                     // Held lines may have missed what was said meanwhile:
@@ -690,6 +722,9 @@ impl Client {
                 // Changes in flight get no answer now.
                 self.settings_changes.clear();
                 self.sign_in_steps.clear();
+                self.memory_mutations.clear();
+                self.memories_request = None;
+                self.memories_again = false;
                 self.refreshing.clear();
                 let retry = u64::try_from(disconnect.retry_in.as_millis()).unwrap_or(0);
                 // Only a connection that worked drops quietly: one that
@@ -1302,10 +1337,22 @@ impl Client {
             }
             ServerFrame::Ack {
                 request_id,
-                result: CommandResult::Memories { memories },
+                result:
+                    CommandResult::Memories {
+                        memories,
+                        total,
+                        archived,
+                    },
             } if mine(&self.memories_request, request_id) => {
                 self.memories_request = None;
-                self.memories = Read::Ready(memories.clone());
+                self.memories = Read::Ready(MemoriesState {
+                    items: memories.clone(),
+                    total: *total,
+                    archived: archived.clone(),
+                });
+                if std::mem::take(&mut self.memories_again) {
+                    self.refresh_memories();
+                }
                 return true;
             }
             ServerFrame::Error {
@@ -1313,17 +1360,112 @@ impl Client {
                 error,
             } if mine(&self.memories_request, request_id) => {
                 self.memories_request = None;
+                self.memories_again = false;
                 self.memories = Read::Failed(error.message.clone());
                 return true;
             }
-            ServerFrame::Ack {
-                result: CommandResult::Forgotten { memory_id },
-                ..
-            } => {
-                if let Read::Ready(items) = &mut self.memories {
-                    items.retain(|item| item.id != *memory_id);
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.memory_mutations.remove(request_id) => {
+                out.push(Effect::Say(error.message.clone()));
+                if error.code == ErrorCode::NotFound && self.memories.is_ready() {
+                    self.refresh_memories();
                 }
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Forgotten { memory_id },
+            } => {
+                self.memory_mutations.remove(request_id);
+                if let Read::Ready(state) = &mut self.memories {
+                    let before = state.items.len();
+                    state.items.retain(|item| item.id != *memory_id);
+                    if state.items.len() < before
+                        && let Some(total) = &mut state.total
+                    {
+                        *total = total.saturating_sub(1);
+                    }
+                    state.archived.retain(|item| item.id != *memory_id);
+                    for item in &mut state.items {
+                        if item.overlaps_with.as_deref() == Some(memory_id.as_str()) {
+                            item.overlaps_with = None;
+                        }
+                    }
+                }
+                // Forgetting can cascade to inverse relationships or copies;
+                // refresh quietly so the list stays authoritative.
+                self.refresh_memories();
                 out.push(Effect::Say("Forgotten".into()));
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::MemoryUpdated { memory },
+            } => {
+                self.memory_mutations.remove(request_id);
+                if let Read::Ready(state) = &mut self.memories {
+                    if let Some(pos) = state.items.iter().position(|m| m.id == memory.id) {
+                        state.items.remove(pos);
+                        state.items.insert(0, memory.clone());
+                    }
+                    for other in &mut state.items {
+                        if other.overlaps_with.as_deref() == Some(memory.id.as_str()) {
+                            other.overlaps_with = None;
+                        }
+                    }
+                }
+                // Refresh quietly so recomputed overlap hints stay accurate.
+                self.refresh_memories();
+                out.push(Effect::Say("Memory updated".into()));
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::MemoryArchived { memory_id },
+            } => {
+                self.memory_mutations.remove(request_id);
+                if let Read::Ready(state) = &mut self.memories
+                    && let Some(pos) = state.items.iter().position(|m| m.id == *memory_id)
+                {
+                    let mut item = state.items.remove(pos);
+                    item.archived = true;
+                    item.editable = false;
+                    item.overlaps_with = None;
+                    state.archived.insert(0, item);
+                    if let Some(total) = &mut state.total {
+                        *total = total.saturating_sub(1);
+                    }
+                    for other in &mut state.items {
+                        if other.overlaps_with.as_deref() == Some(memory_id.as_str()) {
+                            other.overlaps_with = None;
+                        }
+                    }
+                }
+                if self.memories_request.is_some() {
+                    self.memories_again = true;
+                }
+                out.push(Effect::Say("Archived".into()));
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::MemoryRestored { memory },
+            } => {
+                self.memory_mutations.remove(request_id);
+                if let Read::Ready(state) = &mut self.memories {
+                    state.archived.retain(|m| m.id != memory.id);
+                    if !state.items.iter().any(|m| m.id == memory.id) {
+                        state.items.insert(0, memory.clone());
+                        if let Some(total) = &mut state.total {
+                            *total = total.saturating_add(1);
+                        }
+                    }
+                }
+                // Refresh quietly so overlap hints reflect the restored fact.
+                self.refresh_memories();
+                out.push(Effect::Say("Restored".into()));
                 return true;
             }
             ServerFrame::Ack {
@@ -1640,8 +1782,16 @@ impl Client {
         })
     }
 
+    /// Whether the connected daemon supports inline memory editing, archiving,
+    /// and restore (protocol 1.61).
+    pub fn can_manage_memories(&self) -> bool {
+        self.daemon_version
+            .is_some_and(|v| v.major == 1 && v.minor >= MEMORY_LIFECYCLE_MINOR)
+    }
+
     pub fn refresh_memories(&mut self) {
         if self.memories_request.is_some() {
+            self.memories_again = true;
             return;
         }
         if !self.memories.is_ready() {
@@ -1651,9 +1801,41 @@ impl Client {
     }
 
     pub fn forget_memory(&mut self, id: &str) {
-        self.send(Command::ForgetMemory {
+        let req = self.send(Command::ForgetMemory {
             memory_id: id.to_owned(),
         });
+        self.memory_mutations.insert(req);
+    }
+
+    pub fn edit_memory(&mut self, id: &str, value: &str) {
+        if !self.can_manage_memories() {
+            return;
+        }
+        let req = self.send(Command::EditMemory {
+            memory_id: id.to_owned(),
+            value: value.to_owned(),
+        });
+        self.memory_mutations.insert(req);
+    }
+
+    pub fn archive_memory(&mut self, id: &str) {
+        if !self.can_manage_memories() {
+            return;
+        }
+        let req = self.send(Command::ArchiveMemory {
+            memory_id: id.to_owned(),
+        });
+        self.memory_mutations.insert(req);
+    }
+
+    pub fn restore_memory(&mut self, id: &str) {
+        if !self.can_manage_memories() {
+            return;
+        }
+        let req = self.send(Command::RestoreMemory {
+            memory_id: id.to_owned(),
+        });
+        self.memory_mutations.insert(req);
     }
 
     pub fn refresh_settings(&mut self) {
@@ -3863,6 +4045,15 @@ impl Client {
         self.devices_request = Some(self.send(Command::ListDevices));
     }
 
+    /// Unpair `device_id` (protocol 1.63): it loses access at once. The
+    /// list as it is after answers.
+    pub fn revoke_device(&mut self, device_id: &str) {
+        self.devices_error = None;
+        self.devices_request = Some(self.send(Command::RevokeDevice {
+            device_id: device_id.to_owned(),
+        }));
+    }
+
     /// Let `device_id` watch and control screens, or not.
     pub fn set_device_control(&mut self, device_id: &str, on: bool) {
         let Some((devices, _)) = self.devices.ready() else {
@@ -3889,6 +4080,9 @@ impl Client {
 
     /// Answers to the live view's own commands.
     fn live_answer(&mut self, frame: &ServerFrame, out: &mut Vec<Effect>) -> bool {
+        if self.eink_answer(frame) {
+            return true;
+        }
         match frame {
             ServerFrame::Ack {
                 request_id,
@@ -3896,9 +4090,11 @@ impl Client {
                     CommandResult::Devices {
                         devices,
                         can_change,
+                        this_device,
                     },
             } if self.devices_request.as_deref() == Some(request_id) => {
                 self.devices_request = None;
+                self.this_device = this_device.clone();
                 self.devices = Read::Ready((devices.clone(), *can_change));
                 true
             }
@@ -4841,6 +5037,29 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_device_reads_the_list_after_and_names_this_one() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.revoke_device("d2");
+        let (request, command) = client.take_outgoing().pop().unwrap();
+        assert_eq!(
+            command,
+            Command::RevokeDevice {
+                device_id: "d2".into()
+            }
+        );
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"devices","devices":[{{"device_id":"d1","name":"Synthetic phone","kind":"mobile","scopes":["observe"],"created_at_ms":1}}],"can_change":false,"this_device":"d1"}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(matches!(&client.devices, Read::Ready((d, false)) if d.len() == 1));
+        assert_eq!(client.this_device.as_deref(), Some("d1"));
+    }
+
+    #[test]
     fn done_answers_the_take_over_card() {
         let mut client = Client::new();
         client.update(Update::Connected, &cx(None));
@@ -5235,7 +5454,7 @@ mod tests {
             )),
             &cx(None),
         );
-        assert_eq!(client.memories, Read::Ready(Vec::new()));
+        assert_eq!(client.memories, Read::Ready(MemoriesState::default()));
     }
 
     #[test]
@@ -6252,5 +6471,145 @@ mod tests {
             &cx(None),
         );
         assert!(client.sending("app:s1").is_empty());
+    }
+
+    #[test]
+    fn memories_lifecycle_edit_archive_restore_and_forget_updates_state_and_overlaps() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.update(
+            frame(
+                r#"{"type":"welcome","version":{"major":1,"minor":61},"owner":{},"latest_seq":0}"#,
+            ),
+            &cx(None),
+        );
+        client.take_outgoing();
+        assert!(client.can_manage_memories());
+
+        client.refresh_memories();
+        let req_id = client.take_outgoing()[0].0.clone();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{req_id}","result":{{"type":"memories","total":2,"memories":[{{"id":"-10","category":"user","key":"preferred_name","value":"Alice","source":"canonical:user_stated","updated_ms":200,"editable":true,"kind":"canonical"}},{{"id":"42","category":"preference","key":"address_as","value":"Call owner Alice","source":"inferred","updated_ms":100,"editable":true,"kind":"fact","overlaps_with":"-10"}}],"archived":[{{"id":"7","category":"project","key":"old_host","value":"staging.acme.example","source":"derived","updated_ms":50,"archived":true,"editable":false,"kind":"fact"}}]}}}}"#
+            )),
+            &cx(None),
+        );
+        let Read::Ready(state) = &client.memories else {
+            panic!("memories should be ready");
+        };
+        assert_eq!(state.total, Some(2));
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.archived.len(), 1);
+
+        // Edit active memory inline.
+        client.edit_memory("-10", "Alicia");
+        let (edit_req, edit_cmd) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            edit_cmd,
+            Command::EditMemory { ref memory_id, ref value } if memory_id == "-10" && value == "Alicia"
+        ));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{edit_req}","result":{{"type":"memory_updated","memory":{{"id":"-10","category":"user","key":"preferred_name","value":"Alicia","source":"canonical:user_stated","updated_ms":300,"editable":true,"kind":"canonical"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        // Clear the quiet follow-up refresh so later assertions stay deterministic.
+        let refresh_req = client.take_outgoing().pop().unwrap().0;
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{refresh_req}","result":{{"type":"memories","total":2,"memories":[{{"id":"-10","category":"user","key":"preferred_name","value":"Alicia","source":"canonical:user_stated","updated_ms":300,"editable":true,"kind":"canonical"}},{{"id":"42","category":"preference","key":"address_as","value":"Call owner Alice","source":"inferred","updated_ms":100,"editable":true,"kind":"fact"}}],"archived":[{{"id":"7","category":"project","key":"old_host","value":"staging.acme.example","source":"derived","updated_ms":50,"archived":true,"editable":false,"kind":"fact"}}]}}}}"#
+            )),
+            &cx(None),
+        );
+        let Read::Ready(state) = &client.memories else {
+            panic!();
+        };
+        assert_eq!(state.items[0].value, "Alicia");
+        assert_eq!(state.items[1].overlaps_with, None);
+
+        // Failed mutation surfaces Effect::Say instead of polluting state.notice.
+        client.edit_memory("-10", "Bad value");
+        let (bad_req, _) = client.take_outgoing().pop().unwrap();
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{bad_req}","error":{{"code":"invalid","message":"Invalid value","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Say(msg) if msg == "Invalid value")),
+            "{effects:?}"
+        );
+        assert!(client.state.notice.is_none());
+
+        // Archive flat memory 42 -> moves to archived and decrements total.
+        client.archive_memory("42");
+        let (arch_req, arch_cmd) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            arch_cmd,
+            Command::ArchiveMemory { ref memory_id } if memory_id == "42"
+        ));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{arch_req}","result":{{"type":"memory_archived","memory_id":"42"}}}}"#
+            )),
+            &cx(None),
+        );
+        let Read::Ready(state) = &client.memories else {
+            panic!();
+        };
+        assert_eq!(state.total, Some(1));
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.archived.len(), 2);
+        assert!(state.archived.iter().any(|m| m.id == "42" && m.archived));
+
+        // Restore memory 7 -> moves back to active and increments total.
+        client.restore_memory("7");
+        let (rest_req, rest_cmd) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            rest_cmd,
+            Command::RestoreMemory { ref memory_id } if memory_id == "7"
+        ));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{rest_req}","result":{{"type":"memory_restored","memory":{{"id":"7","category":"project","key":"old_host","value":"staging.acme.example","source":"derived","updated_ms":400,"archived":false,"editable":true,"kind":"fact"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        client.take_outgoing();
+        let Read::Ready(state) = &client.memories else {
+            panic!();
+        };
+        assert_eq!(state.total, Some(2));
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.archived.len(), 1);
+
+        // Forget archived memory 42 -> removes from archived without changing active total.
+        client.forget_memory("42");
+        let (forget_req, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{forget_req}","result":{{"type":"forgotten","memory_id":"42"}}}}"#
+            )),
+            &cx(None),
+        );
+        client.take_outgoing();
+        let Read::Ready(state) = &client.memories else {
+            panic!();
+        };
+        assert_eq!(state.total, Some(2));
+        assert!(state.archived.is_empty());
+
+        // Reconnect clears any wedged memories_request and refreshes.
+        client.update(Update::Connected, &cx(None));
+        let sent = client.take_outgoing();
+        assert!(
+            sent.iter()
+                .any(|(_, cmd)| matches!(cmd, Command::ListMemories)),
+            "expected reconnect to re-send ListMemories"
+        );
     }
 }

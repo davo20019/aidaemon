@@ -3463,6 +3463,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
             owner_approval_by_kernel: false,
             session_id: "telegram:synthetic-user-1",
             task_id: None,
+            user_text: None,
             status_tx: None,
             channel_visibility: crate::types::ChannelVisibility::Private,
             channel_id: None,

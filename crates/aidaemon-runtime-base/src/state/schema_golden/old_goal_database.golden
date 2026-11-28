@@ -144,7 +144,7 @@ CREATE TABLE facts (
             source TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        , superseded_at TEXT, recall_count INTEGER DEFAULT 0, last_recalled_at TEXT, channel_id TEXT, privacy TEXT DEFAULT 'global', embedding BLOB, first_seen_at TEXT, source_excerpt TEXT, superseded_reason TEXT, folded_into INTEGER)
+        , superseded_at TEXT, recall_count INTEGER DEFAULT 0, last_recalled_at TEXT, channel_id TEXT, privacy TEXT DEFAULT 'global', embedding BLOB, first_seen_at TEXT, source_excerpt TEXT, superseded_reason TEXT, folded_into INTEGER, archived_at TEXT, expires_at TEXT)
 
 table episodes on episodes
 CREATE TABLE episodes (
@@ -296,6 +296,27 @@ CREATE INDEX idx_episodes_session_end_event
 index idx_facts_active_unique on facts
 CREATE UNIQUE INDEX idx_facts_active_unique
          ON facts(category, key) WHERE superseded_at IS NULL
+
+index idx_facts_archived on facts
+CREATE INDEX idx_facts_archived ON facts(archived_at)
+
+table memory_fact_tombstones on memory_fact_tombstones
+CREATE TABLE memory_fact_tombstones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            retired_at TEXT NOT NULL
+        )
+
+index idx_memory_fact_tombstones_unique on memory_fact_tombstones
+CREATE UNIQUE INDEX idx_memory_fact_tombstones_unique
+         ON memory_fact_tombstones(category, canonical_key, normalized_value, reason)
+
+index idx_memory_fact_tombstones_key on memory_fact_tombstones
+CREATE INDEX idx_memory_fact_tombstones_key
+         ON memory_fact_tombstones(canonical_key)
 
 index idx_people_name_unique on people
 CREATE UNIQUE INDEX idx_people_name_unique ON people(LOWER(name))
@@ -1609,6 +1630,7 @@ rows expertise = 0
 rows error_solutions = 0
 rows people = 0
 rows person_facts = 0
+rows memory_fact_tombstones = 0
 rows memory_spans = 0
 rows memory_claims = 0
 rows memory_entities = 0

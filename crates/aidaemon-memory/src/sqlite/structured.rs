@@ -54,6 +54,10 @@ fn predicate(value: &str) -> String {
         "current_residence" | "home" | "location" => "residence".to_string(),
         "place_of_birth" => "birthplace".to_string(),
         "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
+        "address_as" | "call_me" | "preferred_address" | "salutation" => "addressing".to_string(),
+        "avoid_names" | "rejected_name" | "rejected_names" | "do_not_call" => {
+            "rejected_alias".to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -63,6 +67,9 @@ fn alias_type(value: &str) -> String {
         "favorite_name" | "preferred" | "preferred_first_name" => "preferred_name".to_string(),
         "online_nickname" | "online_username" => "online_handle".to_string(),
         "legal_name" | "full_name" => "legal_name_variant".to_string(),
+        "avoid_names" | "rejected_name" | "rejected_names" | "do_not_call" => {
+            "rejected_alias".to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -184,7 +191,7 @@ fn confidence(source: &str, direct: bool) -> f32 {
 fn low_authority(source: &str) -> bool {
     matches!(
         source,
-        "legacy" | "consolidation" | "inferred" | "progressive" | "task_learning"
+        "legacy" | "consolidation" | "inferred" | "progressive" | "task_learning" | "derived"
     )
 }
 
@@ -369,7 +376,15 @@ async fn owner_entity(
 
     let display = candidate.canonical_name.trim();
     let canonical = words(display);
-    if candidate.canonical_name_confirmed && !canonical.is_empty() && canonical != "owner" {
+    let source_can_confirm_owner = !matches!(
+        source,
+        "consolidation" | "inferred" | "progressive" | "task_learning" | "derived"
+    );
+    if candidate.canonical_name_confirmed
+        && source_can_confirm_owner
+        && !canonical.is_empty()
+        && canonical != "owner"
+    {
         let current: String =
             sqlx::query_scalar("SELECT canonical_name FROM memory_entities WHERE id = ?")
                 .bind(id)
@@ -576,37 +591,108 @@ async fn write_alias(
         return Ok(());
     }
     let now = Utc::now().to_rfc3339();
-    if let Some(id) = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM memory_aliases
-         WHERE entity_id = ? AND alias_type = ? AND normalized_value = ?",
-    )
-    .bind(entity_id)
-    .bind(&kind)
-    .bind(&normalized)
-    .fetch_optional(&mut **tx)
-    .await?
+    if let Some((id, existing_source, existing_status, existing_valid_to)) =
+        sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+            "SELECT id, source, status, valid_to FROM memory_aliases
+             WHERE entity_id = ? AND alias_type = ? AND normalized_value = ?",
+        )
+        .bind(entity_id)
+        .bind(&kind)
+        .bind(&normalized)
+        .fetch_optional(&mut **tx)
+        .await?
     {
+        let was_inactive = existing_status != "active" || existing_valid_to.is_some();
+        if was_inactive {
+            // A retracted/forgotten alias can only be reactivated by a fresh,
+            // direct high-authority owner statement, never by derived/automated
+            // repetition, and never inherits the old row's authority.
+            if !direct || low_authority(source) {
+                return Ok(());
+            }
+            sqlx::query(
+                "UPDATE memory_aliases SET status = 'active', value = ?,
+                 confidence = ?, source = ?, provenance = ?,
+                 last_confirmed_at = ?, confirmed_at = ?,
+                 valid_to = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(candidate.value.trim())
+            .bind(confidence)
+            .bind(source)
+            .bind(provenance)
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+            result.confirmed_aliases += 1;
+            return Ok(());
+        }
+        let upgrade_source = super::facts::fact_source_rank(source)
+            >= super::facts::fact_source_rank(&existing_source);
+        let kept_source = if upgrade_source {
+            source
+        } else {
+            existing_source.as_str()
+        };
         sqlx::query(
             "UPDATE memory_aliases SET status = 'active', value = ?,
-             confidence = MAX(confidence, ?), source = ?, provenance = COALESCE(?, provenance),
+             confidence = MAX(confidence, ?), source = ?,
+             provenance = CASE WHEN ? THEN COALESCE(?, provenance) ELSE COALESCE(provenance, ?) END,
              last_confirmed_at = CASE WHEN ? THEN ? ELSE last_confirmed_at END,
              confirmed_at = CASE WHEN ? THEN COALESCE(confirmed_at, ?) ELSE confirmed_at END,
-             valid_to = NULL, updated_at = ? WHERE id = ?",
+             valid_to = NULL,
+             updated_at = CASE WHEN ? THEN ? ELSE updated_at END WHERE id = ?",
         )
         .bind(candidate.value.trim())
         .bind(confidence)
-        .bind(source)
+        .bind(kept_source)
+        .bind(upgrade_source)
+        .bind(provenance)
         .bind(provenance)
         .bind(direct)
         .bind(&now)
         .bind(direct)
         .bind(&now)
+        .bind(upgrade_source || direct)
         .bind(&now)
         .bind(id)
         .execute(&mut **tx)
         .await?;
         result.confirmed_aliases += 1;
         return Ok(());
+    }
+    if !direct || low_authority(source) {
+        // Consult durable owner tombstones so low-authority/derived writes
+        // cannot resurrect a deleted/folded owner alias value for the same
+        // owner-profile key family (without affecting other people's aliases).
+        let is_owner: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM memory_entities WHERE id = ? AND is_owner = 1 LIMIT 1",
+        )
+        .bind(entity_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some();
+        if is_owner {
+            let value_norm = crate::text::normalize_fact_value(candidate.value.trim());
+            let target_family = crate::text::owner_projection_family(&kind);
+            let tombstone_keys: Vec<String> = sqlx::query_scalar(
+                "SELECT canonical_key FROM memory_fact_tombstones
+                 WHERE normalized_value = ?
+                   AND reason IN ('deleted', 'folded')
+                   AND LOWER(category) IN ('user', 'personal', 'profile', 'preference')",
+            )
+            .bind(&value_norm)
+            .fetch_all(&mut **tx)
+            .await?;
+            if tombstone_keys
+                .iter()
+                .any(|k| crate::text::owner_projection_family(k) == target_family)
+            {
+                return Ok(());
+            }
+        }
     }
     let id = sqlx::query(
         "INSERT INTO memory_aliases
@@ -696,8 +782,8 @@ async fn write_fact(
         .as_deref()
         .unwrap_or(candidate.value.trim());
     let now = Utc::now().to_rfc3339();
-    if let Some(id) = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM memory_entity_facts
+    if let Some((id, existing_source)) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, source FROM memory_entity_facts
          WHERE subject_entity_id = ? AND predicate = ? AND normalized_value = ?
            AND status = 'active' AND valid_to IS NULL LIMIT 1",
     )
@@ -707,21 +793,32 @@ async fn write_fact(
     .fetch_optional(&mut **tx)
     .await?
     {
+        let upgrade_source = super::facts::fact_source_rank(source)
+            >= super::facts::fact_source_rank(&existing_source);
+        let kept_source = if upgrade_source {
+            source
+        } else {
+            existing_source.as_str()
+        };
         sqlx::query(
             "UPDATE memory_entity_facts SET display_value = ?, source = ?,
-             confidence = MAX(confidence, ?), provenance = COALESCE(?, provenance),
+             confidence = MAX(confidence, ?),
+             provenance = CASE WHEN ? THEN COALESCE(?, provenance) ELSE COALESCE(provenance, ?) END,
              last_confirmed_at = CASE WHEN ? THEN ? ELSE last_confirmed_at END,
              confirmed_at = CASE WHEN ? THEN COALESCE(confirmed_at, ?) ELSE confirmed_at END,
-             updated_at = ? WHERE id = ?",
+             updated_at = CASE WHEN ? THEN ? ELSE updated_at END WHERE id = ?",
         )
         .bind(display)
-        .bind(source)
+        .bind(kept_source)
         .bind(confidence)
+        .bind(upgrade_source)
+        .bind(provenance)
         .bind(provenance)
         .bind(direct)
         .bind(&now)
         .bind(direct)
         .bind(&now)
+        .bind(upgrade_source || direct)
         .bind(&now)
         .bind(id)
         .execute(&mut **tx)
@@ -1280,6 +1377,211 @@ impl SqliteMemory {
         Ok(retracted > 0)
     }
 
+    /// Updates the value of an editable canonical projection (owner/people
+    /// entity facts and aliases; relationships return `None`). Returns the
+    /// refreshed projected `Fact` when updated.
+    pub async fn update_canonical_projection(
+        &self,
+        projected_id: i64,
+        new_value: &str,
+        source: &str,
+    ) -> anyhow::Result<Option<Fact>> {
+        let trimmed = new_value.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut result_projected_id = projected_id;
+        if projected_id <= -3_000_000_000 {
+            // Relationship edges are not edited as free text.
+            return Ok(None);
+        } else if projected_id <= -2_000_000_000 {
+            let id = -2_000_000_000 - projected_id;
+            let row = sqlx::query(
+                "SELECT entity_id, alias_type FROM memory_aliases
+                 WHERE id = ? AND status = 'active' AND valid_to IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let entity_id: i64 = row.get("entity_id");
+            let kind: String = row.get("alias_type");
+            let normalized = alias_value(trimmed, &kind);
+            if normalized.is_empty() {
+                return Ok(None);
+            }
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            // Resolve UNIQUE(entity_id, alias_type, normalized_value) collisions
+            // cleanly: remove an inactive duplicate before updating, or merge
+            // into an already-active identical alias.
+            if let Some((other_id, other_status)) = sqlx::query_as::<_, (i64, String)>(
+                "SELECT id, status FROM memory_aliases
+                 WHERE entity_id = ? AND alias_type = ? AND normalized_value = ? AND id != ?
+                 LIMIT 1",
+            )
+            .bind(entity_id)
+            .bind(&kind)
+            .bind(&normalized)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                if other_status == "active" {
+                    retract(&mut tx, "memory_aliases", "alias", &[id], source).await?;
+                    sqlx::query(
+                        "UPDATE memory_aliases
+                         SET value = ?, source = ?, confidence = 1.0,
+                             confirmed_at = COALESCE(confirmed_at, ?), last_confirmed_at = ?,
+                             updated_at = ?
+                         WHERE id = ?",
+                    )
+                    .bind(trimmed)
+                    .bind(source)
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(other_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    result_projected_id = -2_000_000_000 - other_id;
+                    tx.commit().await?;
+                    return Ok(self
+                        .canonical_personal_facts()
+                        .await?
+                        .into_iter()
+                        .find(|fact| fact.id == result_projected_id));
+                } else {
+                    sqlx::query("DELETE FROM memory_aliases WHERE id = ?")
+                        .bind(other_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            sqlx::query(
+                "UPDATE memory_aliases
+                 SET value = ?, normalized_value = ?, source = ?, confidence = 1.0,
+                     confirmed_at = COALESCE(confirmed_at, ?), last_confirmed_at = ?,
+                     updated_at = ?
+                 WHERE id = ? AND status = 'active' AND valid_to IS NULL",
+            )
+            .bind(trimmed)
+            .bind(&normalized)
+            .bind(source)
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            audit(
+                &mut tx,
+                "edit",
+                Some(entity_id),
+                "alias",
+                Some(id),
+                serde_json::json!({"value": trimmed, "normalized_value": normalized}),
+                source,
+                None,
+            )
+            .await?;
+            tx.commit().await?;
+        } else if projected_id <= -1_000_000_000 {
+            let id = -1_000_000_000 - projected_id;
+            let row = sqlx::query(
+                "SELECT subject_entity_id, predicate FROM memory_entity_facts
+                 WHERE id = ? AND status = 'active' AND valid_to IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let entity_id: i64 = row.get("subject_entity_id");
+            let pred: String = row.get("predicate");
+            let (normalized, value_type) = normalized_fact(&pred, trimmed)?;
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(other_id) = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM memory_entity_facts
+                 WHERE subject_entity_id = ? AND predicate = ? AND normalized_value = ?
+                   AND status = 'active' AND valid_to IS NULL AND id != ?
+                 LIMIT 1",
+            )
+            .bind(entity_id)
+            .bind(&pred)
+            .bind(&normalized)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                retract(&mut tx, "memory_entity_facts", "fact", &[id], source).await?;
+                sqlx::query(
+                    "UPDATE memory_entity_facts
+                     SET display_value = ?, source = ?, confidence = 1.0,
+                         confirmed_at = COALESCE(confirmed_at, ?), last_confirmed_at = ?,
+                         updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(trimmed)
+                .bind(source)
+                .bind(&now)
+                .bind(&now)
+                .bind(&now)
+                .bind(other_id)
+                .execute(&mut *tx)
+                .await?;
+                result_projected_id = -1_000_000_000 - other_id;
+                tx.commit().await?;
+                return Ok(self
+                    .canonical_personal_facts()
+                    .await?
+                    .into_iter()
+                    .find(|fact| fact.id == result_projected_id));
+            }
+            sqlx::query(
+                "UPDATE memory_entity_facts
+                 SET value_type = ?, value = ?, normalized_value = ?, display_value = ?,
+                     source = ?, confidence = 1.0,
+                     confirmed_at = COALESCE(confirmed_at, ?), last_confirmed_at = ?,
+                     updated_at = ?
+                 WHERE id = ? AND status = 'active' AND valid_to IS NULL",
+            )
+            .bind(value_type)
+            .bind(&normalized)
+            .bind(&normalized)
+            .bind(trimmed)
+            .bind(source)
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            audit(
+                &mut tx,
+                "edit",
+                Some(entity_id),
+                "fact",
+                Some(id),
+                serde_json::json!({"display_value": trimmed, "normalized_value": normalized}),
+                source,
+                None,
+            )
+            .await?;
+            tx.commit().await?;
+        } else {
+            return Ok(None);
+        }
+        Ok(self
+            .canonical_personal_facts()
+            .await?
+            .into_iter()
+            .find(|fact| fact.id == result_projected_id))
+    }
+
     /// Retracts the owner's canonical facts and aliases a profile key names
     /// (`residence`, `birthday`, `name`, ...): forgetting `[user] residence`
     /// must reach the store the owner block is rendered from, not only the
@@ -1415,6 +1717,7 @@ impl SqliteMemory {
             "SELECT f.id, f.key, f.value, f.source, f.channel_id, f.privacy, f.source_excerpt
              FROM facts f
              WHERE f.superseded_at IS NULL
+               AND f.archived_at IS NULL
                AND lower(f.category) IN ('user', 'personal', 'profile', 'family')
                AND lower(f.key) IN (
                  'dad_name', 'father_name', 'mom_name', 'mother_name',
@@ -1572,6 +1875,7 @@ impl SqliteMemory {
                     f.source_excerpt
              FROM facts f
              WHERE f.superseded_at IS NULL
+               AND f.archived_at IS NULL
                AND lower(f.category) IN ('user', 'personal', 'profile', 'family')
                AND (
                     lower(f.key) LIKE 'daughter_%_full_name'
@@ -1745,6 +2049,7 @@ impl SqliteMemory {
                     f.source_excerpt
              FROM facts f
              WHERE f.superseded_at IS NULL
+               AND f.archived_at IS NULL
                AND lower(f.category) IN ('user', 'personal', 'profile', 'family')
                AND (
                     lower(f.key) LIKE 'daughter_%_birthday'
@@ -1872,6 +2177,7 @@ impl SqliteMemory {
             "SELECT f.id, f.source, f.channel_id, f.privacy, f.source_excerpt
              FROM facts f
              WHERE f.superseded_at IS NULL
+               AND f.archived_at IS NULL
                AND lower(f.category) IN ('user', 'personal', 'profile', 'family')
                AND lower(f.key) IN (
                    'daughters_live_with_user', 'sons_live_with_user',
@@ -2062,6 +2368,7 @@ impl SqliteMemory {
         let compound_parents = sqlx::query(
             "SELECT id, key, value FROM facts
              WHERE superseded_at IS NULL
+               AND archived_at IS NULL
                AND lower(key) IN ('father_name', 'mother_name', 'parent_name', 'parents')
                AND (lower(value) LIKE '% and %' OR value LIKE '%&%')",
         )
@@ -2092,12 +2399,22 @@ impl SqliteMemory {
             "SELECT f.id, f.key, f.value, f.source, f.channel_id, f.privacy, f.source_excerpt
              FROM facts f
              WHERE f.superseded_at IS NULL
-               AND lower(f.category) IN ('user', 'personal', 'profile')
-               AND lower(f.key) IN (
-                 'name', 'full_name', 'preferred_name', 'nickname', 'username',
-                 'online_nickname', 'online_handle', 'handle', 'birthday',
-                 'birth_date', 'date_of_birth', 'residence', 'current_residence',
-                 'birthplace', 'place_of_birth'
+               AND f.archived_at IS NULL
+               AND (
+                 (lower(f.category) IN ('user', 'personal', 'profile')
+                  AND lower(f.key) IN (
+                    'name', 'full_name', 'preferred_name', 'nickname', 'username',
+                    'online_nickname', 'online_handle', 'handle', 'birthday',
+                    'birth_date', 'date_of_birth', 'residence', 'current_residence',
+                    'birthplace', 'place_of_birth', 'address_as', 'call_me',
+                    'preferred_address', 'addressing', 'avoid_names', 'rejected_alias'
+                  ))
+                 OR (lower(f.category) = 'preference'
+                  AND lower(f.key) IN (
+                    'name', 'full_name', 'preferred_name', 'nickname',
+                    'address_as', 'call_me', 'preferred_address', 'addressing',
+                    'avoid_names', 'rejected_alias'
+                  ))
                )
                AND NOT EXISTS (
                  SELECT 1 FROM memory_write_audit a
@@ -2218,6 +2535,7 @@ impl SqliteMemory {
             "SELECT f.value, f.source, f.channel_id, f.privacy, f.source_excerpt
              FROM facts f
              WHERE f.superseded_at IS NULL
+               AND f.archived_at IS NULL
                AND lower(f.category) IN ('user', 'personal', 'profile')
                AND lower(f.key) = 'full_name'
                AND lower(f.value) NOT LIKE '% and %' AND f.value NOT LIKE '%&%'

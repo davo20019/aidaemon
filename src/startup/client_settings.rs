@@ -201,6 +201,10 @@ fn kind_of_text(text: &str) -> SettingKind {
 /// When a change to `key` takes effect: providers and models reload in
 /// place; the rest is read at start.
 fn applies_of(key: &str) -> Applies {
+    // E-ink access starts and stops at once (`startup::eink::apply`).
+    if key.starts_with("client_gateway.eink") {
+        return Applies::Now;
+    }
     // AIdaemon's level and the coding agents' choices are live
     // (`aidaemon_runtime::permissions`): every write takes them again.
     if key == "authority.owner_default"
@@ -262,6 +266,52 @@ fn risk_of(risk: aidaemon_core::ApprovalRisk) -> Risk {
 /// the chat instructions ("Run /reload") the app shows its own way.
 fn first_paragraph(text: &str) -> String {
     text.split("\n\n").next().unwrap_or(text).trim().to_string()
+}
+
+/// The bridge `[client_gateway.eink]` names in `table`, if any.
+fn eink_bridge_of(table: &toml::Table) -> Option<String> {
+    table
+        .get("client_gateway")?
+        .get("eink")?
+        .get("bridge_url")?
+        .as_str()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a change to e-ink access widens who may reach the daemon:
+/// turning it on, or moving it to another bridge (asked on another
+/// device); turning it off is free. `Ok(None)`: not an e-ink setting.
+/// A bridge that is not `wss://` is refused.
+fn eink_widens(
+    key: &str,
+    value: Option<&str>,
+    current: &toml::Table,
+) -> Result<Option<bool>, String> {
+    let key = key.trim();
+    if key == "client_gateway.eink" {
+        // A whole table: asked unless it only removes it.
+        return Ok(Some(value.is_some()));
+    }
+    if key != crate::startup::eink::BRIDGE_URL_KEY {
+        return Ok(None);
+    }
+    let Some(text) = value else {
+        return Ok(Some(false));
+    };
+    let url = toml::from_str::<toml::Table>(&format!("v = {text}"))
+        .ok()
+        .and_then(|t| t.get("v").and_then(|v| v.as_str().map(str::to_string)))
+        .ok_or(
+            "The e-ink bridge is a quoted address, like \"wss://bridge.aidaemon.ai/v1/daemon\"",
+        )?;
+    let url = url.trim();
+    if url.is_empty() {
+        return Ok(Some(false));
+    }
+    crate::startup::eink::check_bridge_url(url)?;
+    Ok(Some(eink_bridge_of(current).as_deref() != Some(url)))
 }
 
 /// Whether a change under `[authority]` widens what the daemon may do.
@@ -634,6 +684,16 @@ impl SettingsHost {
         }
         if let SettingsChange::Set { key, value } = change {
             let current = self.current().map_err(|e| e.to_string())?;
+            // Turning e-ink access off goes the usual way below (an unset
+            // asks as `manage_config` says).
+            if eink_widens(key, value.as_deref(), &current)? == Some(true) {
+                return Ok(ask(
+                    "Turn on e-ink access: an e-ink reader you pair can then reach this \
+                     daemon through the bridge"
+                        .to_string(),
+                    true,
+                ));
+            }
             if let Some(widens) = widens_authority(key, value.as_deref(), &current) {
                 return Ok(if widens {
                     ask(
@@ -1084,6 +1144,20 @@ impl SettingsHost {
             && let Ok(config) = toml::from_str::<SurfacesOnly>(&text)
         {
             registry.set_config(config.surfaces.registry_config());
+        }
+        // E-ink access follows the saved file at once: on dials the bridge,
+        // off closes it.
+        if key.starts_with("client_gateway.eink") {
+            let bridge = self.current().ok().and_then(|table| eink_bridge_of(&table));
+            if let Err(why) = crate::startup::eink::apply(bridge.as_deref()) {
+                return Ok(SettingsDone {
+                    message: format!(
+                        "{} E-ink access did not start: {why}",
+                        first_paragraph(&text)
+                    ),
+                    applies: Some(Applies::Restart),
+                });
+            }
         }
         Ok(SettingsDone {
             message: first_paragraph(&text),
@@ -1730,6 +1804,90 @@ allowed_user_ids = [1]
             ["telegram_bots[0].allowed_user_ids", "telegram_bots[0].name"]
         );
         assert_eq!(plain_key("telegram_bots[0].name"), "telegram_bots.name");
+    }
+
+    #[test]
+    fn only_turning_eink_access_on_needs_another_device() {
+        let off = toml::Table::new();
+        let on: toml::Table =
+            "[client_gateway.eink]\nbridge_url = \"wss://bridge.aidaemon.ai/v1/daemon\"\n"
+                .parse()
+                .unwrap();
+        let key = crate::startup::eink::BRIDGE_URL_KEY;
+        let project = Some("\"wss://bridge.aidaemon.ai/v1/daemon\"");
+        assert_eq!(eink_widens(key, project, &off), Ok(Some(true)));
+        assert_eq!(eink_widens(key, project, &on), Ok(Some(false)));
+        assert_eq!(
+            eink_widens(key, Some("\"wss://bridge.example.test/v1/daemon\""), &on),
+            Ok(Some(true)),
+            "another bridge"
+        );
+        assert_eq!(eink_widens(key, None, &on), Ok(Some(false)));
+        assert_eq!(eink_widens(key, Some("\"\""), &on), Ok(Some(false)));
+        assert!(eink_widens(key, Some("\"ws://bridge.example.test\""), &off).is_err());
+        assert!(eink_widens(key, Some("3"), &off).is_err());
+        assert_eq!(
+            eink_widens("client_gateway.eink", Some("{}"), &off),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            eink_widens("client_gateway.port", Some("1"), &off),
+            Ok(None)
+        );
+        assert_eq!(applies_of(key), Applies::Now);
+    }
+
+    /// Turning e-ink access on asks on another device and saves the bridge;
+    /// turning it off is free and takes it out of the file.
+    #[tokio::test]
+    async fn eink_access_round_trips_through_settings() {
+        let (_dir, host) = host(CONFIG).await;
+        let key = crate::startup::eink::BRIDGE_URL_KEY.to_string();
+        let on = SettingsChange::Set {
+            key: key.clone(),
+            value: Some(format!("\"{}\"", crate::startup::eink::PROJECT_BRIDGE)),
+        };
+        assert!(matches!(
+            host.gate(&on).await.unwrap(),
+            SettingsGate::Ask {
+                other_device: true,
+                ..
+            }
+        ));
+        host.change(on, true).await.unwrap();
+        let saved = host.current().unwrap();
+        assert_eq!(
+            eink_bridge_of(&saved).as_deref(),
+            Some(crate::startup::eink::PROJECT_BRIDGE)
+        );
+        let shown = host.settings().await.unwrap();
+        assert!(
+            shown
+                .groups
+                .iter()
+                .flat_map(|g| &g.settings)
+                .any(|s| s.key == key),
+            "Settings lists it"
+        );
+        let off = SettingsChange::Set {
+            key: key.clone(),
+            value: None,
+        };
+        // Off never needs another device; it is asked as any unset is.
+        let approved = match host.gate(&off).await.unwrap() {
+            SettingsGate::Free => false,
+            SettingsGate::Ask { other_device, .. } => {
+                assert!(!other_device);
+                true
+            }
+        };
+        host.change(off, approved).await.unwrap();
+        assert_eq!(eink_bridge_of(&host.current().unwrap()), None);
+        let bad = SettingsChange::Set {
+            key,
+            value: Some("\"ws://bridge.example.test/v1/daemon\"".into()),
+        };
+        assert!(host.gate(&bad).await.is_err());
     }
 
     #[test]

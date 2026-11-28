@@ -339,6 +339,7 @@ fn ready(
         CONNECTIONS => {
             return page
                 .child(bots(store, &settings.bots))
+                .child(eink_access(store, &settings))
                 .child(devices(store))
                 .child(mcp_servers(store, &settings.mcp_servers));
         }
@@ -2045,11 +2046,15 @@ fn devices(store: Store) -> View {
     view()
         .gap_2()
         .child(section_label("Paired devices"))
+        // Outside the list: a devices read (after pairing one) rebuilds the
+        // list, and this keeps where its pairing stands.
+        .child(crate::features::pairing::pair_eink(store))
         .child(dynamic(move || {
             let read = store.devices();
             Some(untracked(move || match read {
                 aidaemon_client_core::Read::Ready((devices, can_change)) => {
                     let devices: Vec<_> = devices.into_iter().filter(|d| !d.revoked).collect();
+                    let this_device = store.this_device();
                     let mut list = view().gap_2();
                     if can_change && crate::link::owner_pairing::available() {
                         list = list.child(crate::features::pairing::pair_phone(store));
@@ -2069,7 +2074,9 @@ fn devices(store: Store) -> View {
                             .contains(&aidaemon_client_protocol::Scope::Control);
                         let id = device.device_id.clone();
                         let name = device.name.clone();
-                        let control: View = if can_change {
+                        let control: View = if let Some(level) = device.eink_access {
+                            eink_level(store, device.device_id.clone(), device.name.clone(), level)
+                        } else if can_change {
                             view().child(
                                 ui::toggle(
                                     "Can watch and control the agent's screens",
@@ -2090,12 +2097,52 @@ fn devices(store: Store) -> View {
                                 if on { Tone::Info } else { Tone::Neutral },
                             ))
                         };
-                        list = list.child(
-                            ui::inset()
-                                .gap_1()
-                                .child(text(device.name.clone()).font_weight(FontWeight::MEDIUM))
-                                .child(control),
+                        let this = this_device.as_deref() == Some(device.device_id.as_str());
+                        let mut title = view().flex_row().items_center().gap_2().child(
+                            text(device.name.clone())
+                                .font_weight(FontWeight::MEDIUM)
+                                .flex_1(),
                         );
+                        if this {
+                            title = title.child(ui::badge("This device", Tone::Info));
+                        } else {
+                            let id = device.device_id.clone();
+                            let asked = device.name.clone();
+                            title = title.child(
+                                ui::btn("Remove", Variant::Ghost, Size::Sm, move || {
+                                    let id = id.clone();
+                                    ui::confirm(
+                                        format!("Remove {asked}?"),
+                                        "It loses access at once and must pair again to come \
+                                         back.",
+                                        "Remove",
+                                        move || store.revoke_device(&id),
+                                    )
+                                })
+                                .accessibility_label(format!("Remove {}", device.name)),
+                            );
+                        }
+                        let mut row = ui::inset().gap_1().child(title);
+                        if let Some(kind) = device_kind_label(device.kind) {
+                            row = row.child(muted(kind));
+                        }
+                        let (used, stale) = ui::time::device_use(
+                            device.created_at_ms,
+                            device.last_seen_ms,
+                            crate::store::now_ms(),
+                        );
+                        row = row.child(if stale {
+                            view().flex_row().child(ui::badge(used, Tone::Warning))
+                        } else {
+                            view().child(muted(used))
+                        });
+                        if this {
+                            row = row.child(muted(
+                                "To remove this device, use another device or the computer \
+                                 AIDaemon runs on.",
+                            ));
+                        }
+                        list = list.child(row.child(control));
                     }
                     list.into_element()
                 }
@@ -2109,6 +2156,182 @@ fn devices(store: Store) -> View {
                 ui::banner(why, Tone::Danger).into_element()
             }))
         }))
+}
+
+/// The setting that names the e-ink bridge, and the project's bridge.
+const EINK_BRIDGE_KEY: &str = "client_gateway.eink.bridge_url";
+const PROJECT_BRIDGE: &str = "wss://bridge.aidaemon.ai/v1/daemon";
+
+/// E-ink access: off, through the project's bridge, or through the owner's
+/// own. Turning it on is asked on another device (it widens who reaches
+/// the daemon); the daemon starts or stops it at once.
+fn eink_access(store: Store, settings: &Settings) -> View {
+    // A TOML basic string, its quotes taken off (machine format).
+    let saved: Option<String> = settings
+        .groups
+        .iter()
+        .flat_map(|g| &g.settings)
+        .find(|s| s.key == EINK_BRIDGE_KEY)
+        .and_then(|s| s.value.as_deref())
+        .map(|v| v.trim().trim_matches('"').trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let mode = signal(match saved.as_deref() {
+        None => 0_usize,
+        Some(PROJECT_BRIDGE) => 1,
+        Some(_) => 2,
+    });
+    let custom = signal(
+        saved
+            .clone()
+            .filter(|url| url != PROJECT_BRIDGE)
+            .unwrap_or_default(),
+    );
+    let set = move |url: Option<String>| {
+        store.change_settings(SettingsChange::Set {
+            key: EINK_BRIDGE_KEY.into(),
+            value: url.map(|url| {
+                let escaped = url.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            }),
+        });
+    };
+    let choose = move |at: usize| {
+        mode.set(at);
+        match at {
+            0 => set(None),
+            1 => set(Some(PROJECT_BRIDGE.to_owned())),
+            // Their own bridge waits for its address and Save.
+            _ => {}
+        }
+    };
+    view()
+        .gap_2()
+        .child(section_label("E-ink access"))
+        .child(muted(
+            "Lets an e-ink reader like a Kindle reach this daemon through a bridge, end-to-end \
+             encrypted. Off unless you turn it on. Then pair it under Paired devices below.",
+        ))
+        .child(view().flex_row().child(ui::segmented(
+            "E-ink access",
+            &["Off", "AIDaemon's bridge", "My own bridge"],
+            move || mode.get(),
+            choose,
+        )))
+        .child(when(
+            move || mode.get() == 2,
+            move || {
+                view()
+                    .flex_row()
+                    .items_end()
+                    .gap_2()
+                    .child(
+                        view().flex_1().child(ui::labeled(
+                            "Bridge address",
+                            ui::field("wss://bridge.example.com/v1/daemon", custom)
+                                .auto_correct(false)
+                                .label("E-ink bridge address"),
+                        )),
+                    )
+                    .child(
+                        ui::btn("Save", Variant::Primary, Size::Sm, move || {
+                            set(Some(custom.get_untracked().trim().to_owned()))
+                        })
+                        .disabled(move || {
+                            // Machine format: the bridge's URL scheme (the
+                            // daemon checks it again).
+                            custom.with(|url| {
+                                let url = url.trim();
+                                !["wss://", "ws://127.0.0.1", "ws://localhost"]
+                                    .iter()
+                                    .any(|scheme| url.starts_with(scheme))
+                            })
+                        }),
+                    )
+            },
+        ))
+}
+
+/// What an e-ink level allows, in one line.
+fn eink_level_line(level: aidaemon_client_protocol::EinkAccess) -> &'static str {
+    use aidaemon_client_protocol::EinkAccess;
+    match level {
+        EinkAccess::ViewOnly => "Reads conversations, runs and changes. Sends nothing.",
+        EinkAccess::Limited => {
+            "Chats and answers medium-risk agent approvals once; runs it starts stay capped at \
+             medium risk."
+        }
+        _ => {
+            "Chats and answers agent approvals up to high risk once; its runs follow your \
+             settings. Never a shell, settings, pairing or lasting grants."
+        }
+    }
+}
+
+/// The warning under Full: the reader's browser is old.
+const EINK_FULL_WARNING: &str =
+    "Its browser is no longer updated; a harmful site opened in it could act with this access.";
+
+/// An e-ink reader's access level, as a choice with what each allows. A
+/// raise is confirmed here first; lowering applies at once.
+fn eink_level(
+    store: Store,
+    device_id: String,
+    name: String,
+    level: aidaemon_client_protocol::EinkAccess,
+) -> View {
+    use aidaemon_client_protocol::EinkAccess;
+    const LEVELS: [EinkAccess; 3] = [EinkAccess::ViewOnly, EinkAccess::Limited, EinkAccess::Full];
+    const NAMES: [&str; 3] = ["View only", "Limited", "Full"];
+    let at = LEVELS.iter().position(|l| *l == level).unwrap_or(1);
+    let mut column = view()
+        .gap_1()
+        .child(view().flex_row().child(ui::segmented(
+            "E-ink access level",
+            &NAMES,
+            move || at,
+            move |chosen: usize| {
+                let next = LEVELS[chosen];
+                if chosen < at {
+                    store.set_eink_access(&device_id, next);
+                } else if chosen > at {
+                    let mut detail = eink_level_line(next).to_owned();
+                    if next == EinkAccess::Full {
+                        detail.push_str("\n\n");
+                        detail.push_str(EINK_FULL_WARNING);
+                    }
+                    let id = device_id.clone();
+                    ui::confirm(
+                        format!("Give {name} {} access?", NAMES[chosen]),
+                        detail,
+                        "Confirm",
+                        move || store.set_eink_access(&id, next),
+                    );
+                }
+            },
+        )))
+        .child(muted(eink_level_line(level)));
+    if level == EinkAccess::Full {
+        column = column.child(ui::banner(EINK_FULL_WARNING, Tone::Warning));
+    }
+    column.child(dynamic(move || {
+        let note = store.eink_access_note()?;
+        Some(untracked(move || muted(note)))
+    }))
+}
+
+/// What kind of device a paired one is, where the name alone may not say.
+fn device_kind_label(kind: aidaemon_client_protocol::ClientKind) -> Option<&'static str> {
+    use aidaemon_client_protocol::ClientKind;
+    match kind {
+        ClientKind::Eink => Some("E-ink reader"),
+        ClientKind::Mobile => Some("Phone"),
+        ClientKind::Watch => Some("Watch"),
+        ClientKind::Desktop => Some("Computer"),
+        ClientKind::Web => Some("Browser"),
+        ClientKind::Tui => Some("Terminal"),
+        ClientKind::Script => Some("Script"),
+        _ => None,
+    }
 }
 
 fn mcp_servers(store: Store, servers: &[McpServerInfo]) -> View {

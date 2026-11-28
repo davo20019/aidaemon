@@ -153,9 +153,32 @@ pub trait ClientHost: Send + Sync {
     async fn memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
         Ok(Vec::new())
     }
+    /// Active memories, the true active total before any truncation, and
+    /// archived memories available for restore (protocol 1.61).
+    async fn memories_snapshot(
+        &self,
+    ) -> anyhow::Result<(Vec<MemoryItem>, Option<u64>, Vec<MemoryItem>)> {
+        let items = self.memories().await?;
+        let total = Some(items.len() as u64);
+        Ok((items, total, Vec::new()))
+    }
     /// Forget memory `id`; `false` when there is no such memory.
     async fn forget(&self, _id: &str) -> anyhow::Result<bool> {
         Ok(false)
+    }
+    /// Update memory `id`'s value in place (protocol 1.61). `Ok(None)` when
+    /// not found or not editable.
+    async fn edit_memory(&self, _id: &str, _value: &str) -> anyhow::Result<Option<MemoryItem>> {
+        Ok(None)
+    }
+    /// Reversibly archive memory `id` (protocol 1.61). `false` when not found
+    /// or not archivable.
+    async fn archive_memory(&self, _id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Restore archived memory `id` back to active recall (protocol 1.61).
+    async fn restore_memory(&self, _id: &str) -> anyhow::Result<Option<MemoryItem>> {
+        Ok(None)
     }
 
     /// The uncommitted changes in the git repositories session
@@ -514,6 +537,9 @@ fn needed_scope(command: &Command) -> Option<Scope> {
         | Command::ChangeAutomation { .. }
         | Command::EditAutomation { .. } => Some(Scope::Chat),
         Command::ForgetMemory { .. }
+        | Command::EditMemory { .. }
+        | Command::ArchiveMemory { .. }
+        | Command::RestoreMemory { .. }
         | Command::UploadFile { .. }
         | Command::ChangeSettings { .. }
         | Command::Setup { .. } => Some(Scope::Chat),
@@ -523,6 +549,10 @@ fn needed_scope(command: &Command) -> Option<Scope> {
         Command::ListSurfaces => Some(Scope::Control),
         Command::PointAt { .. } | Command::ShareScreen { .. } => Some(Scope::Control),
         Command::SetDeviceScopes { .. } => None,
+        // And more, checked below: no ceiling, not an e-ink reader.
+        Command::PairEinkDevice { .. }
+        | Command::SetEinkAccess { .. }
+        | Command::RevokeDevice { .. } => Some(Scope::Approve),
         Command::OpenSurface { .. }
         | Command::CloseSurface { .. }
         | Command::TakeControl { .. }
@@ -958,7 +988,11 @@ impl ClientGateway {
         // An e-ink device's limits come first, even before a remembered
         // reply: what it may do is judged from its record on every request.
         if caller.principal.eink
-            && let Err(error) = eink::check(&command, dirs::home_dir().as_deref())
+            && let Err(error) = eink::check(
+                &command,
+                eink::level(&caller.principal),
+                dirs::home_dir().as_deref(),
+            )
         {
             return ServerFrame::Error {
                 request_id: Some(request_id.to_string()),
@@ -1082,6 +1116,7 @@ impl ClientGateway {
                     (model, effort),
                     in_run,
                     fresh_agent_session,
+                    crate::eink::sender_ceiling(&caller.principal),
                 )
                 .await
             }
@@ -1108,7 +1143,6 @@ impl ClientGateway {
                         ErrorCode::Invalid,
                         "An agent's name is at most 40 characters",
                     ));
-                    crate::eink::sender_ceiling(&caller.principal),
                 }
                 self.host
                     .rename_agent(&session_id, &thread, name.as_deref())
@@ -1373,11 +1407,16 @@ impl ClientGateway {
                 commands: self.host.commands(),
             }),
             Command::ListMemories => {
-                let memories = self.host.memories().await.map_err(|e| {
-                    warn!(error = %e, "Listing memories failed");
-                    ProtocolError::new(ErrorCode::Internal, "Could not read memories")
-                })?;
-                Ok(CommandResult::Memories { memories })
+                let (memories, total, archived) =
+                    self.host.memories_snapshot().await.map_err(|e| {
+                        warn!(error = %e, "Listing memories failed");
+                        ProtocolError::new(ErrorCode::Internal, "Could not read memories")
+                    })?;
+                Ok(CommandResult::Memories {
+                    memories,
+                    total,
+                    archived,
+                })
             }
             Command::UploadFile {
                 name,
@@ -1396,6 +1435,61 @@ impl ClientGateway {
                     ))
                 }
             },
+            Command::EditMemory { memory_id, value } => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Invalid,
+                        "Memory value cannot be empty",
+                    ));
+                }
+                match self.host.edit_memory(&memory_id, trimmed).await {
+                    Ok(Some(memory)) => Ok(CommandResult::MemoryUpdated { memory }),
+                    Ok(None) => Err(ProtocolError::new(
+                        ErrorCode::NotFound,
+                        "No editable memory with that id",
+                    )),
+                    Err(e) => {
+                        warn!(error = %e, "Editing a memory failed");
+                        Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            "Could not update memory",
+                        ))
+                    }
+                }
+            }
+            Command::ArchiveMemory { memory_id } => {
+                match self.host.archive_memory(&memory_id).await {
+                    Ok(true) => Ok(CommandResult::MemoryArchived { memory_id }),
+                    Ok(false) => Err(ProtocolError::new(
+                        ErrorCode::NotFound,
+                        "No archivable memory with that id",
+                    )),
+                    Err(e) => {
+                        warn!(error = %e, "Archiving a memory failed");
+                        Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            "Could not archive memory",
+                        ))
+                    }
+                }
+            }
+            Command::RestoreMemory { memory_id } => {
+                match self.host.restore_memory(&memory_id).await {
+                    Ok(Some(memory)) => Ok(CommandResult::MemoryRestored { memory }),
+                    Ok(None) => Err(ProtocolError::new(
+                        ErrorCode::NotFound,
+                        "No archived memory with that id",
+                    )),
+                    Err(e) => {
+                        warn!(error = %e, "Restoring a memory failed");
+                        Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            "Could not restore memory",
+                        ))
+                    }
+                }
+            }
             Command::ListProjects => {
                 let projects = self.host.projects().await.map_err(|e| {
                     warn!(error = %e, "Listing projects failed");
@@ -1695,6 +1789,7 @@ impl ClientGateway {
                     (None, None),
                     None,
                     false,
+                    crate::eink::sender_ceiling(&caller.principal),
                 )
                 .await
             }
@@ -1716,6 +1811,23 @@ impl ClientGateway {
                     ));
                 }
                 if !self.pairing.set_scopes(&device_id, &scopes).await? {
+                    return Err(ProtocolError::new(ErrorCode::NotFound, "No such device"));
+                }
+                self.devices_for(caller).await
+            }
+            Command::PairEinkDevice { code } => {
+                eink::may_pair(&caller.principal)?;
+                let name = self.pairing.pair_bridge_device(&code).await?;
+                Ok(CommandResult::EinkPaired { name })
+            }
+            Command::SetEinkAccess { device_id, level } => {
+                eink::may_pair(&caller.principal)?;
+                self.set_eink_access(device_id, level).await
+            }
+            Command::RevokeDevice { device_id } => {
+                eink::may_revoke(&caller.principal, &device_id)?;
+                // Revoking only narrows access: no second device is asked.
+                if !self.pairing.revoke(&device_id).await? {
                     return Err(ProtocolError::new(ErrorCode::NotFound, "No such device"));
                 }
                 self.devices_for(caller).await
@@ -1780,11 +1892,42 @@ impl ClientGateway {
         }
     }
 
+    /// Set an e-ink reader's access level, at once: the caller already
+    /// passed [`eink::may_pair`] (the owner's computer, or a trusted device
+    /// that may answer every approval), and it changes another device, not
+    /// its own reach, so a raise needs no second device. The protocol's
+    /// `awaiting_approval` is never set.
+    async fn set_eink_access(
+        &self,
+        device_id: String,
+        level: aidaemon_client_protocol::EinkAccess,
+    ) -> Result<CommandResult, ProtocolError> {
+        use aidaemon_client_protocol::EinkAccess;
+        if level == EinkAccess::Unknown {
+            return Err(ProtocolError::new(
+                ErrorCode::Invalid,
+                "Unknown access level",
+            ));
+        }
+        if !self.pairing.set_eink_access(&device_id, level).await? {
+            return Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                "No such e-ink device",
+            ));
+        }
+        Ok(CommandResult::EinkAccessChanged {
+            device_id,
+            level,
+            awaiting_approval: None,
+            other_device: false,
+        })
+    }
+
     async fn devices_for(&self, caller: &Caller) -> Result<CommandResult, ProtocolError> {
-                    crate::eink::sender_ceiling(&caller.principal),
         Ok(CommandResult::Devices {
             devices: self.pairing.devices().await?,
             can_change: caller.principal.device_id.is_none(),
+            this_device: caller.principal.device_id.clone(),
         })
     }
 
@@ -2192,6 +2335,7 @@ impl ClientGateway {
         session_id: String,
         text: String,
         placement: Option<MidRunPlacement>,
+        sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
     ) -> Result<CommandResult, ProtocolError> {
         let known = self
             .contexts
@@ -2283,7 +2427,6 @@ impl ClientGateway {
         project
             .path
             .filter(|p| !p.trim().is_empty())
-        sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
             .map(std::path::PathBuf::from)
             .ok_or_else(|| ProtocolError::new(ErrorCode::Invalid, "This project has no folder"))
     }
@@ -2340,6 +2483,7 @@ impl ClientGateway {
         ),
         in_run: Option<String>,
         fresh_agent_session: bool,
+        sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
     ) -> Result<CommandResult, ProtocolError> {
         let files = self.message_files(&attachments)?;
         if text.trim().is_empty() && files.is_empty() {
@@ -2426,7 +2570,6 @@ impl ClientGateway {
                         } else {
                             aidaemon_channels::presentation::word_preview(&text, 60)
                         }),
-        sender_ceiling: Option<aidaemon_channels::context::SenderCeiling>,
                         last_activity_ms: Some(bus::now_ms()),
                         writable: true,
                         project_id,
@@ -2445,6 +2588,7 @@ impl ClientGateway {
             channel_ctx.agents = self.conversation_agents(&session_id).await;
         }
         channel_ctx.fresh_agent_session = fresh_agent_session;
+        channel_ctx.sender_ceiling = sender_ceiling;
         channel_ctx.in_run = match in_run.filter(|_| !new_session) {
             Some(run) => {
                 // Where its agent worked, from the run's record: the
@@ -2531,7 +2675,6 @@ impl ClientGateway {
             .history(&session_id, 2_000)
             .await
             .map_err(internal)?;
-        channel_ctx.sender_ceiling = sender_ceiling;
         if let Some(before) = before {
             match messages.iter().position(|m| m.id == before) {
                 Some(at) => messages.truncate(at),

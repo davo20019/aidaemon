@@ -24,6 +24,7 @@
 #[cfg(feature = "remote")]
 pub mod bridge;
 pub mod client;
+pub mod eink;
 pub mod keystore;
 #[cfg(feature = "native")]
 pub mod link;
@@ -48,7 +49,8 @@ mod tls;
 pub mod tools;
 
 pub use client::{
-    Client, ComposerTarget, ComposerTargetView, Connection, Context, Effect, Felt, Read,
+    Client, ComposerTarget, ComposerTargetView, Connection, Context, Effect, Felt, MemoriesState,
+    Read,
 };
 #[cfg(target_os = "ios")]
 pub use keystore::KeychainKeyStore;

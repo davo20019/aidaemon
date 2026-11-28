@@ -310,11 +310,13 @@ fn normalize_name_candidate(raw: &str) -> Option<String> {
 }
 
 /// The pinned identities, from typed facts only: the owner's name is the
-/// value of a canonical name key (`user.name`, `owner_name`, ...), the
-/// assistant's that of an assistant name key. A value is never parsed for a
-/// name: "I am the CTO" stored under any key names no one.
+/// value of a canonical name key (`user.preferred_name`, `user.name`,
+/// `owner_name`, ...), preferring `preferred_name` over legal `name` when
+/// both exist; the assistant's is that of an assistant name key. A value is
+/// never parsed for a name: "I am the CTO" stored under any key names no one.
 pub fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
     let mut summary = CriticalFactSummary::default();
+    let mut fallback_owner_name: Option<String> = None;
 
     for fact in facts {
         let key = fact.key.trim();
@@ -325,17 +327,23 @@ pub fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
         let lower_key = key.to_ascii_lowercase();
         let lower_cat = fact.category.trim().to_ascii_lowercase();
 
-        if summary.owner_name.is_none() {
+        let owner_name_category = matches!(
+            lower_cat.as_str(),
+            "user" | "personal" | "profile" | "identity"
+        );
+        if summary.owner_name.is_none()
+            && lower_key == "preferred_name"
+            && (owner_name_category || lower_cat == "preference")
+        {
+            summary.owner_name = normalize_name_candidate(value);
+        }
+        if fallback_owner_name.is_none() {
             let owner_name_key = matches!(
                 lower_key.as_str(),
                 "name" | "owner_name" | "user_name" | "full_name" | "my_name" | "owner"
             );
-            let owner_name_category = matches!(
-                lower_cat.as_str(),
-                "user" | "personal" | "profile" | "identity"
-            );
             if (owner_name_key && owner_name_category) || lower_key == "owner_name" {
-                summary.owner_name = normalize_name_candidate(value);
+                fallback_owner_name = normalize_name_candidate(value);
             }
         }
 
@@ -349,6 +357,10 @@ pub fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
                 summary.assistant_name = normalize_name_candidate(value);
             }
         }
+    }
+
+    if summary.owner_name.is_none() {
+        summary.owner_name = fallback_owner_name;
     }
 
     summary
@@ -426,6 +438,12 @@ mod tests {
             fact("user", "name", "Alice Rivera"),
         ]);
         assert_eq!(summary.owner_name.as_deref(), Some("Alice Rivera"));
+        // Preferred name wins over legal name regardless of list order.
+        let summary = extract_critical_fact_summary(&[
+            fact("user", "name", "Alice Marie Rivera"),
+            fact("user", "preferred_name", "Alice"),
+        ]);
+        assert_eq!(summary.owner_name.as_deref(), Some("Alice"));
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 60;
+pub const PROTOCOL_MINOR: u16 = 63;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -175,6 +175,10 @@ pub enum ClientKind {
     Watch,
     /// A script or other program.
     Script,
+    /// An e-ink reader paired over the bridge: a fixed small authority the
+    /// daemon sets (protocol 1.62). Only the daemon records this kind; a
+    /// client cannot pair as one.
+    Eink,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -343,6 +347,12 @@ pub enum Command {
     },
     /// Forget one remembered fact, by its `id` from `list_memories`.
     ForgetMemory { memory_id: String },
+    /// Update one remembered fact's value in place (protocol 1.61).
+    EditMemory { memory_id: String, value: String },
+    /// Reversibly archive one remembered fact so it leaves active recall (protocol 1.61).
+    ArchiveMemory { memory_id: String },
+    /// Restore an archived memory back to active recall (protocol 1.61).
+    RestoreMemory { memory_id: String },
     /// The daemon's settings: every value its config file holds (secrets
     /// only as set or not), the settings it knows that are unset, its bots
     /// and MCP servers, and what waits for a reload or restart
@@ -580,6 +590,28 @@ pub enum Command {
         device_id: String,
         scopes: Vec<Scope>,
     },
+    /// Pair the e-ink reader whose screen shows `code` (protocol 1.62): the
+    /// 25 Crockford Base32 characters it shows, spaces and dashes allowed.
+    /// The owner's local token, or a device that may answer every approval
+    /// (scope `approve`, no risk ceiling, not an e-ink reader). Answers with
+    /// `eink_paired` once the reader finishes its handshake through the
+    /// bridge (up to two minutes).
+    PairEinkDevice { code: String },
+    /// Set what e-ink reader `device_id` may do (protocol 1.63): the owner's
+    /// local token, or a device that may answer every approval, never an
+    /// e-ink reader. Applies at once, raising too: the device asking is
+    /// trusted and changes another device, not itself. Answers with
+    /// `eink_access_changed`.
+    SetEinkAccess {
+        device_id: String,
+        level: EinkAccess,
+    },
+    /// Unpair device `device_id` (protocol 1.63): it loses access at once
+    /// (its sockets and bridge connection close) and must pair again. The
+    /// owner's local token, or a device that may answer every approval,
+    /// never an e-ink reader, and never the device asking. Answers with
+    /// `devices`, as they are after.
+    RevokeDevice { device_id: String },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -953,10 +985,29 @@ pub enum CommandResult {
     /// `list_memories`.
     Memories {
         memories: Vec<MemoryItem>,
+        /// Total active memories in the store before any truncation (protocol 1.61).
+        /// Absent on older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+        /// Archived memories available for restore (protocol 1.61).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        archived: Vec<MemoryItem>,
     },
     /// `forget_memory`: the fact is no longer recalled.
     Forgotten {
         memory_id: String,
+    },
+    /// `edit_memory`: the updated memory item (protocol 1.61).
+    MemoryUpdated {
+        memory: MemoryItem,
+    },
+    /// `archive_memory`: the memory left active recall and can be restored (protocol 1.61).
+    MemoryArchived {
+        memory_id: String,
+    },
+    /// `restore_memory`: the memory returned to active recall (protocol 1.61).
+    MemoryRestored {
+        memory: MemoryItem,
     },
     /// `upload_file`: the file is kept; send it with `send_message`.
     Uploaded {
@@ -1056,7 +1107,49 @@ pub enum CommandResult {
         /// daemon's own computer).
         #[serde(default)]
         can_change: bool,
+        /// The device asking, when it is a paired one (protocol 1.63), so
+        /// a list can mark it; `None` for the daemon's own computer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        this_device: Option<String>,
     },
+    /// `pair_eink_device` (protocol 1.62): the reader is paired, under the
+    /// name it gave.
+    EinkPaired {
+        name: String,
+    },
+    /// `set_eink_access` (protocol 1.63): the reader's level now.
+    /// `awaiting_approval` and `other_device` are kept for compatibility
+    /// and never set: a change applies at once.
+    EinkAccessChanged {
+        device_id: String,
+        level: EinkAccess,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaiting_approval: Option<String>,
+        /// Only another device (or the owner at the computer) may approve it.
+        #[serde(default)]
+        other_device: bool,
+    },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// What an e-ink reader may do (protocol 1.63), chosen by the owner. Every
+/// level keeps the reader's fixed command list and never reaches a shell,
+/// settings, pairing, lasting grants or setup.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EinkAccess {
+    /// Read only: conversations, runs, changes, projects.
+    ViewOnly,
+    /// Chat and approve medium-risk agent calls once; runs it starts or
+    /// steers stay capped at medium risk.
+    Limited,
+    /// Chat and approve agent calls up to high risk once; its runs follow
+    /// the owner's settings like any app message. The default.
+    Full,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -1093,6 +1186,23 @@ pub struct MemoryItem {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     pub updated_ms: u64,
+    /// Short quote or context showing where this memory came from (protocol 1.61).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    /// True when archived (hidden from active recall, restorable) (protocol 1.61).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
+    /// True when the value can be edited in place via `edit_memory` (protocol 1.61).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub editable: bool,
+    /// Storage kind: absent for flat facts, `"canonical"` for structured personal
+    /// memory (protocol 1.61).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Id of another active memory this item appears to overlap or duplicate,
+    /// for UI review hints (protocol 1.61).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlaps_with: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4136,6 +4246,10 @@ pub struct DeviceInfo {
     pub scopes: Vec<Scope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_ceiling: Option<Risk>,
+    /// An e-ink reader's access level (protocol 1.63); `None` for any
+    /// other device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eink_access: Option<EinkAccess>,
     pub created_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,

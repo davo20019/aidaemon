@@ -1,0 +1,8 @@
+{
+  "command": {
+    "device_id": "dev-phone-2",
+    "type": "revoke_device"
+  },
+  "request_id": "5d0c2b1e-0042",
+  "type": "command"
+}

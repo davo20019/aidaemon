@@ -270,7 +270,7 @@ impl SqliteMemory {
     pub async fn project_fact_memory(&self, fact_id: i64) -> anyhow::Result<()> {
         let Some(row) = sqlx::query(
             "SELECT id, category, key, value, source, channel_id, privacy, embedding,
-                    created_at, updated_at, superseded_at, first_seen_at, source_excerpt
+                    created_at, updated_at, superseded_at, archived_at, first_seen_at, source_excerpt
              FROM facts WHERE id = ?",
         )
         .bind(fact_id)
@@ -281,7 +281,8 @@ impl SqliteMemory {
         };
 
         let superseded_at: Option<String> = row.get("superseded_at");
-        if let Some(valid_to) = superseded_at {
+        let archived_at: Option<String> = row.get("archived_at");
+        if let Some(valid_to) = superseded_at.or(archived_at) {
             sqlx::query(
                 "UPDATE memory_claims SET valid_to = COALESCE(valid_to, ?), updated_at = datetime('now')
                  WHERE source_fact_id = ?",
@@ -459,8 +460,8 @@ impl SqliteMemory {
             let ids: Vec<i64> = sqlx::query_scalar(
                 "SELECT f.id FROM facts f
                  LEFT JOIN memory_claims c ON c.source_fact_id = f.id
-                 WHERE (f.superseded_at IS NULL AND c.id IS NULL)
-                    OR (f.superseded_at IS NOT NULL
+                 WHERE (f.superseded_at IS NULL AND f.archived_at IS NULL AND c.id IS NULL)
+                    OR ((f.superseded_at IS NOT NULL OR f.archived_at IS NOT NULL)
                         AND c.id IS NOT NULL
                         AND c.valid_to IS NULL)
                  ORDER BY f.id LIMIT ?",

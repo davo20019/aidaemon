@@ -2768,3 +2768,316 @@ fn the_composer_keeps_send_inside_the_box_on_a_narrow_phone() -> Result<(), Stri
     }
     Ok(())
 }
+
+#[test]
+fn the_memory_page_shows_duplicates_edits_archives_and_restores() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let before_list = sent("list_memories");
+    feed([
+        Update::Connected,
+        frame(r#"{"type":"welcome","version":{"major":1,"minor":61},"owner":{},"latest_seq":0}"#),
+    ]);
+    // Open Memory from the settings navigation strip.
+    app.press("Settings: change how the daemon runs")?;
+    app.wait_for("Memory: what the daemon remembers")?;
+    app.press("Memory: what the daemon remembers")?;
+    let list_id = wait_sent_new("list_memories", before_list)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{list_id}","result":{{"type":"memories","total":2,"memories":[{{"id":"-10","category":"user","key":"preferred_name","value":"Alice","source":"canonical:user_stated","updated_ms":1700000000000,"editable":true,"kind":"canonical","excerpt":"Call me Alice"}},{{"id":"42","category":"preference","key":"address_as","value":"Call owner Alice, not Al","source":"inferred","updated_ms":1699999000000,"editable":true,"kind":"fact","overlaps_with":"-10"}}],"archived":[{{"id":"7","category":"project","key":"staging_host","value":"staging.acme.example","source":"derived","updated_ms":1699990000000,"archived":true,"editable":true,"kind":"fact"}}]}}}}"#
+    ))]);
+
+    app.wait_for("2 memories · 1 to review")?;
+    app.wait_for("Duplicate?")?;
+    app.wait_for("Similar to Preferred name: Alice")?;
+    app.wait_for("“Call me Alice”")?;
+
+    // Review tab isolates inferred / duplicate items.
+    app.press("Needs review")?;
+    app.wait_for("1 memory to review")?;
+    app.wait_for("Call owner Alice, not Al")?;
+    if app.shows("“Call me Alice”") {
+        return Err("clean user_stated memory appeared under Needs review".into());
+    }
+
+    // Back to All: inline edit Alice -> Alicia.
+    app.press("All")?;
+    app.wait_for("2 memories · 1 to review")?;
+    let before_edit = sent("edit_memory");
+    app.press("label:Edit: Alice")?;
+    app.wait_for("label:Memory value")?;
+    app.clear("label:Memory value")?;
+    app.type_text("label:Memory value", "Alicia")?;
+    app.press("Save")?;
+    let edit_id = wait_sent_new("edit_memory", before_edit)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{edit_id}","result":{{"type":"memory_updated","memory":{{"id":"-10","category":"user","key":"preferred_name","value":"Alicia","source":"canonical:user_stated","updated_ms":1700000001000,"editable":true,"kind":"canonical","excerpt":"Call me Alice"}}}}}}"#
+    ))]);
+    app.wait_for("Alicia")?;
+
+    // Archive the duplicate flat preference.
+    let before_archive = sent("archive_memory");
+    app.press("label:Archive: Call owner Alice, not Al")?;
+    let archive_id = wait_sent_new("archive_memory", before_archive)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{archive_id}","result":{{"type":"memory_archived","memory_id":"42"}}}}"#
+    ))]);
+    app.wait_for("1 memory")?;
+
+    // Archived tab shows both archived memories and lets the owner restore one.
+    app.press("Archived")?;
+    app.wait_for("2 archived memories")?;
+    app.wait_for("staging.acme.example")?;
+    let before_restore = sent("restore_memory");
+    app.press("label:Restore: staging.acme.example")?;
+    let restore_id = wait_sent_new("restore_memory", before_restore)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{restore_id}","result":{{"type":"memory_restored","memory":{{"id":"7","category":"project","key":"staging_host","value":"staging.acme.example","source":"derived","updated_ms":1700000002000,"archived":false,"editable":true,"kind":"fact"}}}}}}"#
+    ))]);
+    app.wait_for("1 archived memory")?;
+    app.press("All")?;
+    app.wait_for("staging.acme.example")?;
+    Ok(())
+}
+
+/// Open Settings → Connections and answer its devices read (none paired).
+fn open_paired_devices(app: &mut Headless) -> Result<(), String> {
+    let before = sent("get_settings");
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
+    ))]);
+    let before = sent("list_devices");
+    app.press("Connections")?;
+    let id = wait_sent_new("list_devices", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"devices","devices":[],"can_change":true}}}}"#
+    ))]);
+    Ok(())
+}
+
+/// The owner types the code the Kindle shows (any case, dashes): the app
+/// sends it as the daemon reads it and shows the name it paired under.
+#[test]
+fn pairing_an_eink_device_from_its_typed_code() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    open_paired_devices(&mut app)?;
+    app.wait_for("Pair an e-ink device")?;
+    app.press("Pair an e-ink device")?;
+    app.wait_for("label:E-ink pairing code")?;
+    app.type_text("label:E-ink pairing code", "k7f2 9qxm4htapz6cr-vtpvxvt2")?;
+    let before = sent("pair_eink_device");
+    app.press("Pair")?;
+    let id = wait_sent_new("pair_eink_device", before)?;
+    app.wait_for("text:/^Waiting for your e-ink device/")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"eink_paired","name":"Synthetic Kindle"}}}}"#
+    ))]);
+    app.wait_for("Paired: Synthetic Kindle")?;
+    Ok(())
+}
+
+/// The reader's QR link opens Settings with "Pair this e-ink device?",
+/// leaves the address at once, and pairs only after the reader's check
+/// code: a wrong one closes it with nothing sent.
+#[test]
+fn pairing_an_eink_device_from_its_qr_link_needs_its_check_code() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    no_local_daemon();
+    const KEY: &str = "deadbeef42000000000000000000000000000000000000000000000000000001";
+    let link = format!("https://app.example.test/pair-eink#n=K7F2&s=9QXM4HTAPZ6CR&k={KEY}");
+    let open = |link: &str| -> Result<Headless, String> {
+        let mut config = EngineConfig::new(Root::of::<Offline>());
+        config.viewport = Size::new(Points(1280.0), Points(820.0));
+        let mut app = Headless::start_at_page(config, link).map_err(|e| e.to_string())?;
+        let before = sent("get_settings");
+        feed([Update::Connected]);
+        let id = wait_sent_new("get_settings", before)?;
+        feed([frame(&format!(
+            r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
+        ))]);
+        app.wait_for("Pair this e-ink device?")?;
+        Ok(app)
+    };
+    let mut app = open(&link)?;
+    app.wait_for("Code K7F2-9QXM4HTAPZ6CR-VTPVXVT2")?;
+    if app.browser().url() != Some("https://app.example.test/") {
+        return Err(format!(
+            "the link stayed in the address: {:?}",
+            app.browser().url()
+        ));
+    }
+    let before = sent("pair_eink_device");
+    app.type_text("label:E-ink check code", "ZZZZ")?;
+    app.wait_for("text:/^That check code does not match/")?;
+    app.wait_for_gone("Pair this e-ink device?", std::time::Duration::from_secs(5))?;
+    if sent("pair_eink_device") != before {
+        return Err("a wrong check code paired".into());
+    }
+    drop(app);
+    // The link opened again (the owner scans again): the right check code
+    // pairs.
+    let mut app = open(&link)?;
+    app.type_text("label:E-ink check code", "ftjb")?;
+    app.press("Pair")?;
+    let id = wait_sent_new("pair_eink_device", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"eink_paired","name":"Synthetic Kindle"}}}}"#
+    ))]);
+    app.wait_for("Paired: Synthetic Kindle")?;
+    Ok(())
+}
+
+/// Settings → Connections turns e-ink access on through the project's
+/// bridge, or through the owner's own (wss:// only), with one setting.
+#[test]
+fn eink_access_is_a_setting_in_connections() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    open_paired_devices(&mut app)?;
+    app.wait_for("E-ink access")?;
+    app.wait_for("text:/^Lets an e-ink reader like a Kindle reach this daemon/")?;
+    let key = "client_gateway.eink.bridge_url";
+    let sent_for = |want: serde_json::Value| -> Result<(), String> {
+        for _ in 0..100 {
+            if nsh_app_aidaemon::settings_sent()
+                .iter()
+                .filter_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .any(|c| c["change"] == want)
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Err(format!("{want} was not sent"))
+    };
+    app.press("AIDaemon's bridge")?;
+    sent_for(
+        serde_json::json!({"kind": "set", "key": key, "value": "\"wss://bridge.aidaemon.ai/v1/daemon\""}),
+    )?;
+    app.press("My own bridge")?;
+    app.wait_for("label:E-ink bridge address")?;
+    app.type_text(
+        "label:E-ink bridge address",
+        "wss://bridge.example.test/v1/daemon",
+    )?;
+    app.press("Save")?;
+    sent_for(
+        serde_json::json!({"kind": "set", "key": key, "value": "\"wss://bridge.example.test/v1/daemon\""}),
+    )?;
+    app.press("Off")?;
+    sent_for(serde_json::json!({"kind": "set", "key": key}))?;
+    Ok(())
+}
+
+/// Each e-ink reader shows its level as a choice. A raise asks in place
+/// first (Cancel sends nothing, Confirm sends it); lowering sends at once.
+#[test]
+fn an_eink_readers_level_is_chosen_in_paired_devices() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    let before = sent("get_settings");
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
+    ))]);
+    let before = sent("list_devices");
+    app.press("Connections")?;
+    let id = wait_sent_new("list_devices", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"devices","devices":[{{"device_id":"dv-k","name":"Synthetic Kindle","kind":"eink","scopes":["observe","chat","approve"],"risk_ceiling":"medium","eink_access":"limited","created_at_ms":1}}],"can_change":true}}}}"#
+    ))]);
+    app.wait_for("E-ink reader")?;
+    app.wait_for("text:/^Chats and answers medium-risk agent approvals once/")?;
+    app.answer_dialogs_myself();
+    let before = sent("set_eink_access");
+    app.press("Full")?;
+    let asked = app
+        .pending_dialog()
+        .map(|d| (d.title.clone(), d.message.clone()));
+    let Some((Some(title), Some(message))) = asked else {
+        return Err(format!("no confirm dialog: {asked:?}"));
+    };
+    assert_eq!(title, "Give Synthetic Kindle Full access?");
+    assert!(
+        message.contains("Its browser is no longer updated"),
+        "{message}"
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Cancel".into()))?;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if sent("set_eink_access") != before {
+        return Err("Cancel raised it".into());
+    }
+    app.press("Full")?;
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Confirm".into()))?;
+    let raised = wait_sent_new("set_eink_access", before)?;
+    // Lowering: no dialog, sent at once.
+    app.press("View only")?;
+    if app.pending_dialog().is_some() {
+        return Err("lowering asked".into());
+    }
+    wait_sent_new("set_eink_access", Some(raised))?;
+    Ok(())
+}
+
+/// Each device says when it was paired and last used, a long-unused one
+/// stands out, this device is marked and cannot remove itself, and Remove
+/// asks first, then sends.
+#[test]
+fn paired_devices_show_their_use_and_another_can_be_removed() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    let before = sent("get_settings");
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
+    ))]);
+    let before = sent("list_devices");
+    app.press("Connections")?;
+    let id = wait_sent_new("list_devices", before)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as u64;
+    let day = 86_400_000;
+    let (paired, stale, recent) = (now - 40 * day, now - 20 * day, now - 3 * 3_600_000);
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"devices","devices":[{{"device_id":"dv-me","name":"Synthetic phone","kind":"mobile","scopes":["observe","chat","approve"],"created_at_ms":{paired},"last_seen_ms":{recent}}},{{"device_id":"dv-old","name":"Synthetic tablet","kind":"web","scopes":["observe","chat","approve"],"created_at_ms":{paired},"last_seen_ms":{stale}}}],"can_change":false,"this_device":"dv-me"}}}}"#
+    ))]);
+    app.wait_for("This device")?;
+    app.wait_for("text:/Last used 3 hours ago$/")?;
+    app.wait_for("text:/Not used for 20 days$/")?;
+    app.wait_for("text:/^To remove this device, use another device/")?;
+    if app.shows("label:Remove Synthetic phone") {
+        return Err("this device offers to remove itself".into());
+    }
+    app.answer_dialogs_myself();
+    let before = sent("revoke_device");
+    app.press("Remove Synthetic tablet")?;
+    let asked = app
+        .pending_dialog()
+        .map(|d| (d.title.clone(), d.message.clone()));
+    assert_eq!(
+        asked,
+        Some((
+            Some("Remove Synthetic tablet?".to_owned()),
+            Some("It loses access at once and must pair again to come back.".to_owned())
+        ))
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Remove".into()))?;
+    wait_sent_new("revoke_device", before)?;
+    Ok(())
+}

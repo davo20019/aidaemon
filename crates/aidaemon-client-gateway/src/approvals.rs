@@ -684,4 +684,63 @@ mod tests {
             .unwrap_err();
         assert_eq!(refused.code, ErrorCode::Forbidden);
     }
+
+    /// A Full reader (a High ceiling) may allow a High agent call once, but
+    /// never a Critical one, a lasting grant, or a card of another kind (a
+    /// settings or pairing card, which the gateway asks itself).
+    #[test]
+    fn a_full_eink_device_allows_a_high_agent_call_once_and_nothing_more() {
+        let book = approvals();
+        let high = Some(Risk::High);
+        let (id, mut answer) = agent_command(&book, Risk::High);
+        let refused = book
+            .resolve(
+                &id,
+                ApprovalDecision::ApproveAlways,
+                None,
+                Some("dv-k"),
+                high,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+        book.resolve(
+            &id,
+            ApprovalDecision::ApproveOnce,
+            None,
+            Some("dv-k"),
+            high,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            answer.try_recv(),
+            Ok((ApprovalResponse::AllowOnce, _))
+        ));
+        let (id, _answer) = agent_command(&book, Risk::Critical);
+        let refused = book
+            .resolve(
+                &id,
+                ApprovalDecision::ApproveOnce,
+                None,
+                Some("dv-k"),
+                high,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+        // A High settings or pairing card the gateway asks for: deny only.
+        let (id, _answer) = book.ask(own(None));
+        let refused = book
+            .resolve(
+                &id,
+                ApprovalDecision::ApproveOnce,
+                None,
+                Some("dv-k"),
+                high,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+    }
 }

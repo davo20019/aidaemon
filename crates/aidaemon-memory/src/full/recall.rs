@@ -20,6 +20,11 @@ use crate::render::{
 use crate::stores::MemoryStores;
 
 /// Identity/profile categories pinned as critical facts in owner DMs.
+///
+/// `preference` is intentionally excluded: preferences hold heterogeneous
+/// style, taste, and operational choices that should go through normal
+/// relevance filtering and Core Profile's bounded preference quota rather
+/// than bypassing recall filters or pulling folded duplicates into one bucket.
 pub const IDENTITY_CATEGORIES: &[&str] = &[
     "identity",
     "personal",
@@ -28,7 +33,6 @@ pub const IDENTITY_CATEGORIES: &[&str] = &[
     "assistant",
     "bot",
     "relationship",
-    "preference",
     "family",
 ];
 
@@ -572,10 +576,12 @@ impl FullRecall {
         // embeddings) in front of every turn's first model call.
         let lookups_started = std::time::Instant::now();
         let critical_facts = async {
-            // Critical facts (identity/profile): bounded identity categories
-            // only, owner DMs (delegated agents included).
+            // Critical facts (identity/profile): canonical structured personal
+            // memory first, then bounded legacy identity categories, owner DMs
+            // only (delegated agents included).
             if allowed && inject_personal {
-                let mut identity_facts = Vec::new();
+                let mut identity_facts =
+                    or_logged(store.get_canonical_memory_facts().await, "critical_facts");
                 for category in IDENTITY_CATEGORIES {
                     identity_facts.append(&mut or_logged(
                         store.get_facts(Some(category)).await,

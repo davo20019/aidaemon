@@ -17,10 +17,10 @@ use std::time::Duration;
 
 use aidaemon_channels::hub::ApprovalRequest;
 use aidaemon_client_protocol::{
-    ALL_SCOPES, AccessGrant, Challenge, ClientKind, DeviceInfo, Enrollment, EnrollmentState,
-    ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk, SOCKET_SIGN_IN_MAX_AGE_MS,
-    SOCKET_SIGN_IN_MAX_AHEAD_MS, Scope, SocketSignIn, challenge_message, challenge_message_v2,
-    is_loopback_url, sign_in_audience, socket_sign_in_message,
+    ALL_SCOPES, AccessGrant, Challenge, ClientKind, DeviceInfo, EinkAccess, Enrollment,
+    EnrollmentState, ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk,
+    SOCKET_SIGN_IN_MAX_AGE_MS, SOCKET_SIGN_IN_MAX_AHEAD_MS, Scope, SocketSignIn, challenge_message,
+    challenge_message_v2, is_loopback_url, sign_in_audience, socket_sign_in_message,
 };
 use aidaemon_store_sqlite::{DeviceRow, PairingRow, SqliteClientEventLog};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -221,6 +221,9 @@ pub struct Pairing {
     /// The bridge connector while e-ink access is on: it pairs a device
     /// from the code the owner read off its screen.
     bridge_pairer: Mutex<Option<Arc<dyn BridgePairer>>>,
+    /// Bumped on every revocation: the bridge connector closes a revoked
+    /// reader's connection at once ([`Self::revocations_seen`]).
+    revoked_epoch: tokio::sync::watch::Sender<u64>,
     /// Offers shown on the owner's own screen ([`Self::offer_shown_here`]):
     /// redeeming one pairs at once. Kept in memory only: after a restart
     /// such an offer asks like any other.
@@ -276,8 +279,12 @@ fn scopes_of(text: &str) -> Vec<Scope> {
 }
 
 /// What a device gets when it asks for nothing in particular: everything,
-/// but watching and controlling surfaces only on a phone or a computer.
+/// but watching and controlling surfaces only on a phone or a computer. An
+/// e-ink reader gets its fixed scopes (it pairs only over the bridge).
 pub(crate) fn default_scopes(kind: Option<ClientKind>) -> Vec<Scope> {
+    if kind == Some(ClientKind::Eink) {
+        return EINK_SCOPES.to_vec();
+    }
     let gets_control = kind.is_some_and(|kind| {
         matches!(
             kind,
@@ -301,6 +308,12 @@ fn kind_text(kind: ClientKind) -> String {
 fn kind_of(text: &str) -> ClientKind {
     serde_json::from_value(serde_json::Value::String(text.to_string()))
         .unwrap_or(ClientKind::Unknown)
+}
+
+fn risk_text(risk: Risk) -> Option<String> {
+    serde_json::to_value(risk)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
 }
 
 fn risk_of(text: &str) -> Option<Risk> {
@@ -402,6 +415,7 @@ impl Pairing {
             web_app: Mutex::default(),
             bridge_id: Mutex::default(),
             bridge_pairer: Mutex::default(),
+            revoked_epoch: tokio::sync::watch::Sender::new(0),
             shown_here: Mutex::default(),
             fingerprint,
             access: Mutex::default(),
@@ -509,6 +523,20 @@ impl Pairing {
     /// is off, and pairing one is refused).
     pub fn set_bridge_pairer(&self, pairer: Option<Arc<dyn BridgePairer>>) {
         *self.bridge_pairer.lock().unwrap_or_else(|p| p.into_inner()) = pairer;
+    }
+
+    /// Wakes on every revocation, so a bridge connection checks whether its
+    /// device is still paired.
+    pub fn revocations_seen(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revoked_epoch.subscribe()
+    }
+
+    /// Whether e-ink access is on: a bridge connector is registered.
+    pub fn eink_on(&self) -> bool {
+        self.bridge_pairer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     /// Pair the e-ink device whose screen shows `code`: the owner read it
@@ -653,6 +681,15 @@ impl Pairing {
         let name: String = request.device_name.trim().chars().take(60).collect();
         if name.is_empty() {
             return Err(ProtocolError::new(ErrorCode::Invalid, "Name the device"));
+        }
+        // Only the bridge connector records an e-ink reader
+        // (`add_bridge_device`): a device redeeming an offer may not claim
+        // that kind (or the bridge's fixed authority that comes with it).
+        if request.device_kind == ClientKind::Eink {
+            return Err(ProtocolError::new(
+                ErrorCode::Invalid,
+                "An e-ink reader pairs over the bridge, not with an offer",
+            ));
         }
         let scopes = if request.scopes.is_empty() {
             default_scopes(Some(request.device_kind))
@@ -1079,7 +1116,13 @@ impl Pairing {
     /// A new access token for `device`, with its scopes and ceiling.
     async fn grant(&self, device: &DeviceRow) -> AccessGrant {
         let scopes = scopes_of(&device.scopes);
-        let ceiling = device.risk_ceiling.as_deref().and_then(risk_of);
+        let eink = device.kind == crate::eink::EINK_KIND;
+        let mut ceiling = device.risk_ceiling.as_deref().and_then(risk_of);
+        // A reader always has a ceiling, and never above High: a Critical
+        // card waits for a trusted device whatever its record says.
+        if eink {
+            ceiling = Some(ceiling.unwrap_or(Risk::Medium).min(Risk::High));
+        }
         let revoked = self
             .revocations
             .lock()
@@ -1094,7 +1137,7 @@ impl Pairing {
             device_name: Some(device.name.clone()),
             scopes: scopes.clone(),
             ceiling,
-            eink: device.kind == crate::eink::EINK_KIND,
+            eink,
             revoked,
         };
         {
@@ -1131,9 +1174,11 @@ impl Pairing {
     }
 
     /// Pair a device over the bridge (an e-ink reader), after the owner
-    /// approved it in a trusted app. Its authority is fixed here, whatever
-    /// it asked for: Observe, Chat and Approve, a Medium ceiling, and the
-    /// kind that limits it to [`crate::eink`]'s commands.
+    /// approved it in a trusted app. Its authority is set here, whatever it
+    /// asked for: the Full level (Observe, Chat and Approve, a High
+    /// ceiling, the owner's choice of default), and the kind that limits it
+    /// to the e-ink commands. The owner lowers it with
+    /// [`Self::set_eink_access`].
     pub async fn add_bridge_device(
         &self,
         name: &str,
@@ -1151,9 +1196,7 @@ impl Pairing {
                 kind: crate::eink::EINK_KIND.to_string(),
                 public_key: URL_SAFE_NO_PAD.encode(public_key),
                 scopes: scopes_text(&EINK_SCOPES),
-                risk_ceiling: serde_json::to_value(Risk::Medium)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string)),
+                risk_ceiling: risk_text(crate::eink::ceiling_for(EinkAccess::Full)),
                 created_at_ms: now_ms(),
                 last_seen_ms: None,
                 revoked_at_ms: None,
@@ -1185,6 +1228,12 @@ impl Pairing {
             .map_err(internal)?
             .into_iter()
             .map(|device| DeviceInfo {
+                eink_access: (device.kind == crate::eink::EINK_KIND).then(|| {
+                    crate::eink::level_of(
+                        &scopes_of(&device.scopes),
+                        device.risk_ceiling.as_deref().and_then(risk_of),
+                    )
+                }),
                 scopes: scopes_of(&device.scopes),
                 kind: kind_of(&device.kind),
                 risk_ceiling: device.risk_ceiling.as_deref().and_then(risk_of),
@@ -1197,6 +1246,72 @@ impl Pairing {
             .collect())
     }
 
+    /// The access level of e-ink reader `device_id`: `None` when there is
+    /// no such reader (not paired, revoked, or not an e-ink reader).
+    pub async fn eink_access(&self, device_id: &str) -> Result<Option<EinkAccess>, ProtocolError> {
+        Ok(self
+            .log
+            .devices()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .find(|d| {
+                d.device_id == device_id
+                    && d.revoked_at_ms.is_none()
+                    && d.kind == crate::eink::EINK_KIND
+            })
+            .map(|d| {
+                crate::eink::level_of(
+                    &scopes_of(&d.scopes),
+                    d.risk_ceiling.as_deref().and_then(risk_of),
+                )
+            }))
+    }
+
+    /// Set e-ink reader `device_id`'s access level (the caller checked who
+    /// asks, and that a raise was approved). Its live access tokens change
+    /// with it, so the next request it makes is judged at the new level;
+    /// nothing is closed. `false`: no such reader.
+    pub async fn set_eink_access(
+        &self,
+        device_id: &str,
+        level: EinkAccess,
+    ) -> Result<bool, ProtocolError> {
+        let Some(scopes) = crate::eink::scopes_for(level) else {
+            return Err(ProtocolError::new(
+                ErrorCode::Invalid,
+                "Unknown access level",
+            ));
+        };
+        if self.eink_access(device_id).await?.is_none() {
+            return Ok(false);
+        }
+        let ceiling = crate::eink::ceiling_for(level);
+        let changed = self
+            .log
+            .set_device_access(
+                device_id,
+                &scopes_text(&scopes),
+                risk_text(ceiling).as_deref(),
+            )
+            .await
+            .map_err(internal)?;
+        if changed {
+            for access in self
+                .access
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values_mut()
+                .filter(|a| a.principal.device_id.as_deref() == Some(device_id))
+            {
+                access.principal.scopes = scopes.clone();
+                access.principal.ceiling = Some(ceiling);
+            }
+            info!(device_id, ?level, "Set an e-ink device's access");
+        }
+        Ok(changed)
+    }
+
     /// Change what a device may do. Its live access tokens change with it;
     /// taking a scope away does not wait for them to expire.
     pub async fn set_scopes(
@@ -1204,6 +1319,12 @@ impl Pairing {
         device_id: &str,
         scopes: &[Scope],
     ) -> Result<bool, ProtocolError> {
+        if self.eink_access(device_id).await?.is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "Change an e-ink device's access with its level",
+            ));
+        }
         let scopes: Vec<Scope> = scopes
             .iter()
             .copied()
@@ -1322,6 +1443,7 @@ impl Pairing {
         if let Err(error) = self.load_admission().await {
             warn!(error = %error.message, "Could not reload remote admission");
         }
+        self.revoked_epoch.send_modify(|epoch| *epoch += 1);
         Ok(revoked)
     }
 }
@@ -1343,6 +1465,118 @@ mod tests {
         assert_eq!(pairing.unbound_sign_in("dv-b", 8_000), Some(1));
         assert_eq!(pairing.unbound_sign_in("dv-a", 1_000 + hour), Some(4));
         assert_eq!(pairing.unbound_sign_in("dv-a", 2_000 + hour), None);
+    }
+
+    /// The kind text recorded for a bridge device is the protocol's
+    /// `ClientKind::Eink`, both ways, so it lists as what it is.
+    #[test]
+    fn the_eink_kind_is_the_protocols() {
+        assert_eq!(kind_text(ClientKind::Eink), crate::eink::EINK_KIND);
+        assert_eq!(kind_of(crate::eink::EINK_KIND), ClientKind::Eink);
+        assert_eq!(default_scopes(Some(ClientKind::Eink)), EINK_SCOPES.to_vec());
+    }
+
+    /// A device redeeming an offer cannot claim to be an e-ink reader, and
+    /// the refusal spends none of the offer's tries.
+    #[tokio::test]
+    async fn an_offer_never_pairs_an_eink_reader() {
+        use p256::elliptic_curve::Generate as _;
+        let pairing = std::sync::Arc::new(pairing().await);
+        let offer = pairing.offer(None).await.unwrap();
+        let key = p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
+        let request = |kind| RedeemRequest {
+            offer_id: offer.offer_id.clone(),
+            code: offer.code.clone(),
+            device_name: "Synthetic Kindle".into(),
+            device_kind: kind,
+            public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(false).as_bytes()),
+            scopes: Vec::new(),
+        };
+        let refused = pairing.redeem(request(ClientKind::Eink)).await.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Invalid);
+        let redeemed = pairing.redeem(request(ClientKind::Mobile)).await.unwrap();
+        assert_eq!(redeemed.device_kind, Some(ClientKind::Mobile));
+    }
+
+    /// A reader pairs at Full; changing its level changes its live token's
+    /// principal at once, and its kind's scopes cannot be changed directly.
+    #[tokio::test]
+    async fn a_reader_pairs_at_full_and_its_level_applies_live() {
+        let pairing = pairing().await;
+        let id = pairing
+            .add_bridge_device("Synthetic Kindle", &[4u8; 65])
+            .await
+            .unwrap();
+        assert_eq!(
+            pairing.eink_access(&id).await.unwrap(),
+            Some(EinkAccess::Full)
+        );
+        let row = pairing
+            .log
+            .devices()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.device_id == id)
+            .unwrap();
+        let grant = pairing.grant(&row).await;
+        let live = pairing.principal(&grant.access_token).unwrap();
+        assert!(live.eink);
+        assert_eq!(live.ceiling, Some(Risk::High));
+        assert!(
+            pairing
+                .set_eink_access(&id, EinkAccess::ViewOnly)
+                .await
+                .unwrap()
+        );
+        let live = pairing.principal(&grant.access_token).unwrap();
+        assert_eq!(live.scopes, vec![Scope::Observe]);
+        assert_eq!(crate::eink::level(&live), EinkAccess::ViewOnly);
+        assert!(
+            pairing
+                .set_eink_access(&id, EinkAccess::Limited)
+                .await
+                .unwrap()
+        );
+        let live = pairing.principal(&grant.access_token).unwrap();
+        assert_eq!(live.ceiling, Some(Risk::Medium));
+        let listed = pairing.devices().await.unwrap();
+        assert_eq!(listed[0].eink_access, Some(EinkAccess::Limited));
+        assert!(
+            pairing
+                .set_scopes(&id, &[Scope::Observe, Scope::Control])
+                .await
+                .is_err()
+        );
+        // Not a reader: no level to set.
+        pairing
+            .log
+            .add_device(&device("dv-phone", "mobile", 1))
+            .await
+            .unwrap();
+        assert!(
+            !pairing
+                .set_eink_access("dv-phone", EinkAccess::Full)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Revoking a reader wakes the bridge connector's watch, and its key
+    /// leaves the active ones, so its connection closes.
+    #[tokio::test]
+    async fn revoking_a_reader_wakes_its_bridge_connection() {
+        let pairing = pairing().await;
+        let id = pairing
+            .add_bridge_device("Synthetic Kindle", &[4u8; 65])
+            .await
+            .unwrap();
+        let mut seen = pairing.revocations_seen();
+        assert_eq!(pairing.active_bridge_keys().await.len(), 1);
+        assert!(pairing.revoke(&id).await.unwrap());
+        assert!(seen.has_changed().unwrap());
+        seen.mark_unchanged();
+        assert!(pairing.active_bridge_keys().await.is_empty());
     }
 
     async fn pairing() -> Pairing {

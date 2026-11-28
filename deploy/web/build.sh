@@ -35,6 +35,15 @@ assert page.count("</head>") == 1, "index.html has no single </head>"
 open(path, "w").write(page.replace("</head>", tag + "</head>"))
 PY
 cp "$here/_headers" "$here/dist/_headers"
+# An e-ink reader's QR code opens https://<site>/pair-eink#n=…: the same app
+# page there, its relative files resolved from the site root.
+mkdir -p "$here/dist/pair-eink"
+python3 - "$here/dist/index.html" "$here/dist/pair-eink/index.html" <<'PY'
+import sys
+page = open(sys.argv[1]).read()
+assert page.count("<head>") == 1, "index.html has no single <head>"
+open(sys.argv[2], "w").write(page.replace("<head>", '<head><base href="/">', 1))
+PY
 # nsh names every file but the page and the manifest by a digest of its
 # content (nsh.<digest>.wasm, browser.<digest>/, …), so browsers keep them
 # without asking again: otherwise each launch revalidates the 12 MB engine
@@ -43,7 +52,7 @@ cp "$here/_headers" "$here/dist/_headers"
 for entry in "$here/dist"/*; do
   name="$(basename "$entry")"
   case "$name" in
-    index.html | manifest.webmanifest | sw.js | _headers | remote) continue ;;
+    index.html | manifest.webmanifest | sw.js | _headers | remote | pair-eink) continue ;;
   esac
   if [ -d "$entry" ]; then rule="/$name/*"; else rule="/$name"; fi
   printf '%s\n  Cache-Control: public, max-age=31536000, immutable\n' "$rule" >>"$here/dist/_headers"

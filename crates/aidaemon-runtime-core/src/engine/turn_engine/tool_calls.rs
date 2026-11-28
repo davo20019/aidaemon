@@ -1548,6 +1548,7 @@ impl TurnEngine<'_> {
             owner_approval_by_kernel: true,
             session_id: scope.session_id,
             task_id: Some(scope.task_id),
+            user_text: Some(scope.user_text),
             status_tx: scope.status_tx.clone(),
             channel_visibility: scope.channel_ctx.visibility,
             channel_id: scope.channel_ctx.channel_id.as_deref(),

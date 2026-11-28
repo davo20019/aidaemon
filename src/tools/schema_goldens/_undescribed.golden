@@ -106,7 +106,6 @@ manage_skills.dry_run
 manage_skills.name
 manage_skills.query
 manage_skills.url
-remember_fact.category
 remember_fact.facts
 remember_fact.facts[].category
 remember_fact.facts[].evidence

@@ -259,6 +259,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListCommands => "list_commands",
         Command::ListMemories => "list_memories",
         Command::ForgetMemory { .. } => "forget_memory",
+        Command::EditMemory { .. } => "edit_memory",
+        Command::ArchiveMemory { .. } => "archive_memory",
+        Command::RestoreMemory { .. } => "restore_memory",
         Command::UploadFile { .. } => "upload_file",
         Command::GetSettings => "get_settings",
         Command::ChangeSettings { .. } => "change_settings",
@@ -297,6 +300,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::ShareScreen { .. } => "share_screen",
         Command::ListDevices => "list_devices",
         Command::SetDeviceScopes { .. } => "set_device_scopes",
+        Command::PairEinkDevice { .. } => "pair_eink_device",
+        Command::SetEinkAccess { .. } => "set_eink_access",
+        Command::RevokeDevice { .. } => "revoke_device",
         Command::Unknown => "unknown",
     }
 }
@@ -327,6 +333,9 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Commands { .. } => "commands",
         CommandResult::Memories { .. } => "memories",
         CommandResult::Forgotten { .. } => "forgotten",
+        CommandResult::MemoryUpdated { .. } => "memory_updated",
+        CommandResult::MemoryArchived { .. } => "memory_archived",
+        CommandResult::MemoryRestored { .. } => "memory_restored",
         CommandResult::Uploaded { .. } => "uploaded",
         CommandResult::Settings { .. } => "settings",
         CommandResult::SettingsChanged { .. } => "settings_changed",
@@ -347,6 +356,8 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::ShellOpened { .. } => "shell_opened",
         CommandResult::ScreenShared { .. } => "screen_shared",
         CommandResult::Devices { .. } => "devices",
+        CommandResult::EinkPaired { .. } => "eink_paired",
+        CommandResult::EinkAccessChanged { .. } => "eink_access_changed",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -461,6 +472,25 @@ fn client_samples() -> Vec<ClientFrame> {
         command(
             "5d0c2b1e-0010",
             Command::ForgetMemory {
+                memory_id: "41".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0010a",
+            Command::EditMemory {
+                memory_id: "41".into(),
+                value: "Alice Rivera takes her coffee black with oat milk".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0010b",
+            Command::ArchiveMemory {
+                memory_id: "41".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0010c",
+            Command::RestoreMemory {
                 memory_id: "41".into(),
             },
         ),
@@ -718,6 +748,25 @@ fn client_samples() -> Vec<ClientFrame> {
             Command::SetDeviceScopes {
                 device_id: "dev-phone-1".into(),
                 scopes: vec![Scope::Observe, Scope::Chat, Scope::Approve],
+            },
+        ),
+        command(
+            "5d0c2b1e-0040",
+            Command::PairEinkDevice {
+                code: "K7F2-9QXM4HTAPZ6CR-VTPVXVT2".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0041",
+            Command::SetEinkAccess {
+                device_id: "dv-synthetic-kindle".into(),
+                level: EinkAccess::Limited,
+            },
+        ),
+        command(
+            "5d0c2b1e-0042",
+            Command::RevokeDevice {
+                device_id: "dev-phone-2".into(),
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -1166,10 +1215,50 @@ fn server_samples() -> Vec<ServerFrame> {
                 value: "Alice Rivera takes her coffee black".into(),
                 source: "conversation".into(),
                 updated_ms: 1_767_225_000_000,
+                excerpt: None,
+                archived: false,
+                editable: false,
+                kind: None,
+                overlaps_with: None,
             }],
+            total: None,
+            archived: Vec::new(),
         }),
         ack(CommandResult::Forgotten {
             memory_id: "41".into(),
+        }),
+        ack(CommandResult::MemoryUpdated {
+            memory: MemoryItem {
+                id: "41".into(),
+                category: "preference".into(),
+                key: "coffee".into(),
+                value: "Alice Rivera takes her coffee black with oat milk".into(),
+                source: "user_stated".into(),
+                updated_ms: 1_767_225_100_000,
+                excerpt: None,
+                archived: false,
+                editable: true,
+                kind: None,
+                overlaps_with: None,
+            },
+        }),
+        ack(CommandResult::MemoryArchived {
+            memory_id: "41".into(),
+        }),
+        ack(CommandResult::MemoryRestored {
+            memory: MemoryItem {
+                id: "41".into(),
+                category: "preference".into(),
+                key: "coffee".into(),
+                value: "Alice Rivera takes her coffee black with oat milk".into(),
+                source: "user_stated".into(),
+                updated_ms: 1_767_225_200_000,
+                excerpt: None,
+                archived: false,
+                editable: true,
+                kind: None,
+                overlaps_with: None,
+            },
         }),
         ack(CommandResult::Uploaded {
             attachment: AttachmentRef {
@@ -1670,11 +1759,22 @@ fn server_samples() -> Vec<ServerFrame> {
                 kind: ClientKind::Mobile,
                 scopes: ALL_SCOPES.to_vec(),
                 risk_ceiling: None,
+                eink_access: None,
                 created_at_ms: 1_767_225_600_000,
                 last_seen_ms: Some(1_767_225_900_000),
                 revoked: false,
             }],
             can_change: true,
+            this_device: Some("dev-phone-1".into()),
+        }),
+        ack(CommandResult::EinkPaired {
+            name: "Synthetic Kindle".into(),
+        }),
+        ack(CommandResult::EinkAccessChanged {
+            device_id: "dv-synthetic-kindle".into(),
+            level: EinkAccess::Limited,
+            awaiting_approval: None,
+            other_device: false,
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {
@@ -1860,6 +1960,7 @@ fn http_samples() -> Vec<(&'static str, Value)> {
                 kind: ClientKind::Web,
                 scopes: ALL_SCOPES.to_vec(),
                 risk_ceiling: None,
+                eink_access: None,
                 created_at_ms: 1_767_225_600_000,
                 last_seen_ms: Some(1_767_225_700_000),
                 revoked: false,

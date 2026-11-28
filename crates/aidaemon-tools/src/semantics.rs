@@ -2308,6 +2308,9 @@ pub struct ToolCallContext {
     pub channel_id: Option<String>,
     /// The task the call runs under.
     pub task_id: Option<String>,
+    /// The owner/user message text of this turn (control-plane only; used for
+    /// synchronous provenance verification in `remember_fact`).
+    pub user_message: Option<String>,
     /// The model's id for this tool call.
     pub tool_call_id: Option<String>,
     /// The call is the only one in a root turn's model response, so a reply
@@ -2368,6 +2371,10 @@ impl std::fmt::Debug for ToolCallContext {
             .field("channel_visibility", &self.channel_visibility)
             .field("channel_id", &self.channel_id)
             .field("task_id", &self.task_id)
+            .field(
+                "user_message",
+                &self.user_message.as_ref().map(|_| "[USER MESSAGE]"),
+            )
             .field("tool_call_id", &self.tool_call_id)
             .field("lone_root_call", &self.lone_root_call)
             .field("turn_id", &self.turn_id)

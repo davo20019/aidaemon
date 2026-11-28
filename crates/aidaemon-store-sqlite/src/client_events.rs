@@ -210,6 +210,27 @@ impl SqliteClientEventLog {
         Ok(done.rows_affected() == 1)
     }
 
+    /// Replace a device's scopes and risk ceiling together (an e-ink
+    /// reader's access level); returns whether the device exists and is
+    /// not revoked.
+    pub async fn set_device_access(
+        &self,
+        device_id: &str,
+        scopes: &str,
+        risk_ceiling: Option<&str>,
+    ) -> Result<bool, Error> {
+        let done = sqlx::query(
+            "UPDATE client_devices SET scopes = ?2, risk_ceiling = ?3
+             WHERE device_id = ?1 AND revoked_at_ms IS NULL",
+        )
+        .bind(device_id)
+        .bind(scopes)
+        .bind(risk_ceiling)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }

@@ -337,6 +337,50 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "ALTER TABLE facts ADD COLUMN folded_into INTEGER",
     )
     .await?;
+    // Reversible archival (hides from active recall while staying restorable)
+    // and optional typed expiry timestamp (auto-archived on maintenance passes).
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN archived_at TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN expires_at TEXT",
+    )
+    .await?;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_archived ON facts(archived_at)")
+        .execute(pool)
+        .await;
+
+    // Durable tombstones for deleted/folded facts. Retention can physically
+    // purge old superseded rows from `facts` without erasing the resurrection
+    // barrier that prevents background extractors from bringing back knowledge
+    // the owner explicitly forgot or folded away.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_fact_tombstones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            retired_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_fact_tombstones_unique
+         ON memory_fact_tombstones(category, canonical_key, normalized_value, reason)",
+    )
+    .execute(pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_fact_tombstones_key
+         ON memory_fact_tombstones(canonical_key)",
+    )
+    .execute(pool)
+    .await;
 
     // Migration: deduplicate people entries and add unique index on LOWER(name).
     // Keeps the row with the lowest id for each name, merging interaction counts.

@@ -47,12 +47,58 @@ pub(crate) fn canonicalize_fact_key(key: &str) -> String {
 
 /// The one name for a personal fact several keys mean (`dob` and
 /// `Date of Birth` are both `birth_date`), after [`canonicalize_fact_key`].
-pub(crate) fn canonical_personal_key(key: &str) -> String {
+pub fn canonical_personal_key(key: &str) -> String {
     match canonicalize_fact_key(key).as_str() {
         "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
         "current_residence" | "home" | "location" => "residence".to_string(),
         "place_of_birth" => "birthplace".to_string(),
         "favorite_name" | "preferred_first_name" => "preferred_name".to_string(),
+        "address_as" | "call_me" | "preferred_address" | "salutation" => "addressing".to_string(),
+        "avoid_names" | "rejected_name" | "rejected_names" | "do_not_call" => {
+            "rejected_alias".to_string()
+        }
         other => other.to_string(),
     }
+}
+
+/// Canonical family for matching projected owner records (e.g. `legal_name_variant`
+/// and `online_handle`) against flat input keys (`name`/`full_name`, `username`/`handle`).
+pub fn owner_projection_family(key: &str) -> String {
+    match canonical_personal_key(key).as_str() {
+        "name" | "full_name" | "legal_name_variant" => "name".to_string(),
+        "username" | "online_nickname" | "online_handle" | "handle" => "online_handle".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Keys naming how the owner is named or addressed, regardless of whether a
+/// writer filed them under `user` or `preference`.
+pub fn is_owner_name_key(key: &str) -> bool {
+    matches!(
+        canonical_personal_key(key).as_str(),
+        "name"
+            | "full_name"
+            | "legal_name_variant"
+            | "first_name"
+            | "last_name"
+            | "preferred_name"
+            | "nickname"
+            | "addressing"
+            | "rejected_alias"
+    )
+}
+
+/// Keys belonging to the owner's structured canonical profile.
+pub fn is_owner_profile_key(key: &str) -> bool {
+    is_owner_name_key(key)
+        || matches!(
+            canonical_personal_key(key).as_str(),
+            "username"
+                | "online_nickname"
+                | "online_handle"
+                | "handle"
+                | "birth_date"
+                | "residence"
+                | "birthplace"
+        )
 }

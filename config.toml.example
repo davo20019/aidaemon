@@ -583,6 +583,14 @@ include_raw_tool_args = false
 # web_app = "https://app.aidaemon.ai"   # where a phone with no app pairs from
 #                # a QR code: the project's web app, or your own copy of the
 #                # web build (clients/app); "" for links that open the app only
+#
+# E-ink access: lets an e-ink reader like a Kindle reach this daemon through
+# a bridge, end-to-end encrypted (the bridge sees only ciphertext). Off unless
+# you turn it on (Settings → Connections → E-ink access, or here). A reader
+# gets a fixed small authority: chat, runs, coding sessions, medium-risk
+# approvals once; no shell, no settings. Pair one from the app.
+# [client_gateway.eink]
+# bridge_url = "wss://bridge.aidaemon.ai/v1/daemon"   # or your own aidaemon-bridge (wss:// only)
 
 # Tunnels the daemon runs itself, so the gateways are reachable from elsewhere
 # (see "Reaching the gateways" in the README). Each table needs its gateway on

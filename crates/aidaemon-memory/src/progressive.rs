@@ -512,7 +512,7 @@ impl ProgressiveExtractor {
         let existing_facts = store.get_facts(None).await.unwrap_or_default();
         let mut written: Vec<Value> = Vec::new();
         for fact in facts {
-            if fact.lifetime.is_transient() && fact.personal_memory.is_none() {
+            if fact.lifetime.is_transient() {
                 continue;
             }
             // The user's quoted words are the fact's provenance.
@@ -692,13 +692,12 @@ fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
     }
 }
 
-/// Identity-class `user` fact keys: the owner's own name.
-const USER_IDENTITY_KEYS: &[&str] = &["name", "full_name", "first_name", "last_name", "nickname"];
-
-/// Whether `category`/`key` names the owner's identity (canonical keys).
+/// Whether `category`/`key` names the owner's identity or how to address them
+/// (regardless of whether the extractor filed it under `user` or `preference`).
 fn is_owner_identity_key(category: &str, key: &str) -> bool {
-    category.trim().eq_ignore_ascii_case("user")
-        && USER_IDENTITY_KEYS.contains(&key.trim().to_ascii_lowercase().as_str())
+    let cat = category.trim().to_ascii_lowercase();
+    matches!(cat.as_str(), "user" | "preference" | "personal" | "profile")
+        && crate::text::is_owner_name_key(key)
 }
 
 /// True when a proposed owner identity fact (e.g. `user.name`) lacks the

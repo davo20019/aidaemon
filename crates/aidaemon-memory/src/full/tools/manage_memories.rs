@@ -265,7 +265,7 @@ impl ManageMemoriesTool {
                 let canonical_owner_keys: std::collections::HashSet<String> = facts
                     .iter()
                     .filter(|fact| fact.category == "user")
-                    .map(|fact| crate::text::canonical_personal_key(&fact.key))
+                    .map(|fact| crate::text::owner_projection_family(&fact.key))
                     .collect();
                 facts.extend(
                     self.store
@@ -273,9 +273,14 @@ impl ManageMemoriesTool {
                         .await?
                         .into_iter()
                         .filter(|fact| {
-                            fact.category != "user"
+                            let cat_lower = fact.category.trim().to_ascii_lowercase();
+                            let is_owner_cat =
+                                matches!(cat_lower.as_str(), "user" | "personal" | "profile")
+                                    || (cat_lower == "preference"
+                                        && crate::text::is_owner_profile_key(&fact.key));
+                            !is_owner_cat
                                 || !canonical_owner_keys
-                                    .contains(&crate::text::canonical_personal_key(&fact.key))
+                                    .contains(&crate::text::owner_projection_family(&fact.key))
                         }),
                 );
                 // The same visibility rule recall applies: what this turn's
@@ -429,6 +434,29 @@ impl ManageMemoriesTool {
                         continue;
                     }
                     if matches_key_cross_category(f) && seen_ids.insert(f.id) {
+                        to_delete.push((f.id, f.category.clone(), f.key.clone()));
+                    }
+                }
+
+                // Also check canonical personal memory (owner profile facts,
+                // aliases, relationships) so canonical-only records can be
+                // forgotten via `manage_memories(action="forget")`.
+                let canonical_facts = self.store.get_canonical_memory_facts().await?;
+                let req_personal_key = crate::text::canonical_personal_key(key);
+                let req_family = crate::text::owner_projection_family(key);
+                let cat_lower = category.trim().to_ascii_lowercase();
+                for f in &canonical_facts {
+                    let same_cat = f.category.eq_ignore_ascii_case(&cat_lower);
+                    let owner_alias_cat = f.category == "user"
+                        && (matches!(cat_lower.as_str(), "user" | "personal" | "profile")
+                            || (cat_lower == "preference"
+                                && crate::text::is_owner_profile_key(&req_personal_key)));
+                    let personal_match = (same_cat || owner_alias_cat)
+                        && (f.key == key
+                            || canon(&f.key) == key_canonical
+                            || crate::text::canonical_personal_key(&f.key) == req_personal_key
+                            || crate::text::owner_projection_family(&f.key) == req_family);
+                    if personal_match && seen_ids.insert(f.id) {
                         to_delete.push((f.id, f.category.clone(), f.key.clone()));
                     }
                 }
@@ -804,5 +832,70 @@ mod tests {
         let narrow = r#"{"action":"set_privacy","category":"preference","key":"report_format","privacy":"private"}"#;
         tool.run(narrow, &ToolCallContext::default()).await.unwrap();
         assert_eq!(privacy_of(&store).await, FactPrivacy::Private);
+    }
+
+    #[tokio::test]
+    async fn forget_retracts_canonical_only_owner_fact() {
+        use crate::records::{
+            PersonalAliasCandidate, PersonalEntityCandidate, PersonalMemoryWrite,
+        };
+        use crate::stores::FactStore as _;
+        let store = crate::full::tools::test_support::memory().await;
+        let update = PersonalMemoryWrite {
+            direct_user_statement: true,
+            entities: vec![PersonalEntityCandidate {
+                local_id: "owner".to_string(),
+                entity_type: "person".to_string(),
+                canonical_name: "Owner".to_string(),
+                is_reference: false,
+                canonical_name_confirmed: false,
+            }],
+            aliases: vec![PersonalAliasCandidate {
+                entity_local_id: "owner".to_string(),
+                value: "Alice".to_string(),
+                alias_type: "preferred_name".to_string(),
+            }],
+            ..Default::default()
+        };
+        store
+            .reconcile_personal_memory(
+                &update,
+                "user_stated",
+                Some("Call me Alice"),
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_canonical_memory_facts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|f| f.key == "preferred_name" && f.value == "Alice")
+        );
+        let tool = ManageMemoriesTool::new(store.clone());
+        let owner = ToolCallContext {
+            channel_visibility: Some(ChannelVisibility::Private),
+            user_role: Some(aidaemon_core::UserRole::Owner),
+            ..Default::default()
+        };
+        let out = tool
+            .run(
+                r#"{"action":"forget","category":"user","key":"preferred_name"}"#,
+                &owner,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Forgot"), "{out}");
+        assert!(
+            !store
+                .get_canonical_memory_facts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|f| f.key == "preferred_name" && f.value == "Alice")
+        );
     }
 }

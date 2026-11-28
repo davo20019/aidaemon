@@ -53,16 +53,17 @@ fn hybrid_fact_score(
     graph_match: bool,
     freshness: f32,
 ) -> f32 {
+    let confidence = match fact_source_rank(&fact.source) {
+        2 => 1.0,
+        1 => 0.85,
+        _ => 0.65,
+    };
     crate::HybridWeights::default().fuse(&crate::Signals {
         semantic,
         lexical,
         graph: if graph_match { 1.0 } else { 0.0 },
         freshness: (freshness / FACT_FRESHNESS_MAX_BOOST).clamp(0.0, 1.0),
-        confidence: if fact.source == "consolidation" {
-            0.7
-        } else {
-            1.0
-        },
+        confidence,
         provenance: if fact.source_excerpt.is_some() {
             1.0
         } else {
@@ -166,7 +167,8 @@ pub fn keys_name_same_attribute(a: &str, b: &str) -> bool {
 /// Sources that record the owner's own words. Background extractors can
 /// never overwrite these, only restate or add beside them.
 pub fn is_owner_authored_fact_source(source: &str) -> bool {
-    matches!(source, "agent" | "user_stated" | "owner" | "owner-stated")
+    let base = source.strip_prefix("canonical:").unwrap_or(source);
+    matches!(base, "agent" | "user_stated" | "owner" | "owner-stated")
 }
 
 /// Source of a per-turn fact the owner asserted, with a verbatim quote from
@@ -180,9 +182,10 @@ pub const OWNER_QUOTED_SOURCE: &str = "owner_quoted";
 /// replace a different value only at equal or higher rank, and a restatement
 /// never lowers a row's rank.
 pub fn fact_source_rank(source: &str) -> u8 {
-    if is_owner_authored_fact_source(source) {
+    let base = source.strip_prefix("canonical:").unwrap_or(source);
+    if is_owner_authored_fact_source(base) {
         2
-    } else if source == OWNER_QUOTED_SOURCE {
+    } else if base == OWNER_QUOTED_SOURCE {
         1
     } else {
         0
@@ -261,7 +264,7 @@ pub(crate) fn facts_make_the_same_claim(
     a == b || !keys_name_distinct_concepts(&a_tokens, &b_tokens)
 }
 
-pub(super) use crate::text::{canonical_personal_key, canonicalize_fact_key};
+pub(super) use crate::text::canonicalize_fact_key;
 
 fn prefer_canonical_facts(
     mut canonical: Vec<Fact>,
@@ -269,6 +272,16 @@ fn prefer_canonical_facts(
     query: &str,
     max: usize,
 ) -> Vec<Fact> {
+    // Collect shadowed owner families BEFORE query-filtering canonical facts so
+    // an old-value-only query cannot leak a stale flat row after a canonical edit.
+    let canonical_owner_keys: std::collections::HashSet<String> = canonical
+        .iter()
+        .filter(|fact| fact.category == "user")
+        .map(|fact| crate::text::owner_projection_family(&fact.key))
+        .collect();
+    let has_relationships = canonical
+        .iter()
+        .any(|fact| fact.category == "relationships");
     let query_lower = query.to_lowercase();
     let query_words = query_tokens(&query_lower);
     if !query.trim().is_empty() {
@@ -277,18 +290,12 @@ fn prefer_canonical_facts(
                 || fact.value.to_lowercase().contains(query_lower.trim())
         });
     }
-
-    let canonical_owner_keys: std::collections::HashSet<String> = canonical
-        .iter()
-        .filter(|fact| fact.category == "user")
-        .map(|fact| canonical_personal_key(&fact.key))
-        .collect();
-    let has_relationships = canonical
-        .iter()
-        .any(|fact| fact.category == "relationships");
     canonical.extend(legacy.into_iter().filter(|fact| {
-        !(fact.category == "user"
-            && canonical_owner_keys.contains(&canonical_personal_key(&fact.key))
+        let cat_lower = fact.category.trim().to_ascii_lowercase();
+        let shadowed_owner = (is_owner_profile_category(&cat_lower)
+            || (cat_lower == "preference" && crate::text::is_owner_profile_key(&fact.key)))
+            && canonical_owner_keys.contains(&crate::text::owner_projection_family(&fact.key));
+        !(shadowed_owner
             || has_relationships
                 && matches!(
                     canonicalize_fact_key(&fact.key).as_str(),
@@ -431,7 +438,7 @@ impl SqliteMemory {
     ) -> anyhow::Result<Option<(String, String)>> {
         let canonical = canonicalize_fact_key(key);
         let active: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM facts WHERE category = ? AND key IN (?, ?) AND superseded_at IS NULL",
+            "SELECT id FROM facts WHERE category = ? AND key IN (?, ?) AND superseded_at IS NULL AND archived_at IS NULL",
         )
         .bind(category)
         .bind(key)
@@ -484,7 +491,7 @@ impl SqliteMemory {
             "SELECT id, category, key, value, source, COALESCE(recall_count, 0) AS recall_count,
                     COALESCE(privacy, 'global') AS privacy, channel_id, embedding
              FROM facts
-             WHERE superseded_at IS NULL AND embedding IS NOT NULL
+             WHERE superseded_at IS NULL AND archived_at IS NULL AND embedding IS NOT NULL
              ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -548,22 +555,74 @@ impl SqliteMemory {
         }))
     }
 
+    /// Record a durable tombstone for a deleted or folded fact so retention
+    /// cleanup can purge old superseded payloads without allowing background
+    /// extractors to resurrect forgotten knowledge.
+    async fn record_tombstone(
+        &self,
+        category: &str,
+        key: &str,
+        value: &str,
+        reason: SupersededReason,
+        retired_at: &str,
+    ) -> anyhow::Result<()> {
+        let canonical_key = canonicalize_fact_key(key);
+        if canonical_key.is_empty() {
+            return Ok(());
+        }
+        let normalized_value = crate::text::normalize_fact_value(value);
+        sqlx::query(
+            "INSERT INTO memory_fact_tombstones
+                (category, canonical_key, normalized_value, reason, retired_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(category, canonical_key, normalized_value, reason)
+             DO UPDATE SET retired_at = MAX(retired_at, excluded.retired_at)",
+        )
+        .bind(category.trim().to_ascii_lowercase())
+        .bind(&canonical_key)
+        .bind(&normalized_value)
+        .bind(reason.as_str())
+        .bind(retired_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn retired_knowledge(
         &self,
         category: &str,
         keys: &[&str],
         value: &str,
     ) -> anyhow::Result<Vec<RetiredKnowledge>> {
-        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        let mut rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
             "SELECT f.category, f.key, f.value, f.superseded_at, f.superseded_reason
              FROM facts f
              WHERE f.superseded_at IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM facts a WHERE a.superseded_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM facts a WHERE a.superseded_at IS NULL AND a.archived_at IS NULL
                                 AND a.category = f.category AND a.key = f.key)
              ORDER BY f.superseded_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
+        let tombstones: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT t.category, t.canonical_key, t.normalized_value, t.retired_at, t.reason
+             FROM memory_fact_tombstones t
+             WHERE NOT EXISTS (SELECT 1 FROM facts a WHERE a.superseded_at IS NULL AND a.archived_at IS NULL
+                                AND LOWER(TRIM(a.category)) = LOWER(TRIM(t.category))
+                                AND LOWER(TRIM(a.key)) = LOWER(TRIM(t.canonical_key)))
+             ORDER BY t.retired_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        for (t_cat, t_key, t_val, t_at, t_reason) in tombstones {
+            let reason = if t_reason == "unknown" {
+                None
+            } else {
+                Some(t_reason)
+            };
+            rows.push((t_cat, t_key, t_val, t_at, reason));
+        }
         Ok(rows
             .into_iter()
             .filter(
@@ -604,16 +663,16 @@ impl SqliteMemory {
         let canonical = canonicalize_fact_key(key);
         let tokens: std::collections::HashSet<&str> =
             canonical.split('_').filter(|t| !t.is_empty()).collect();
-        let rows: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT id, key, source FROM facts
-             WHERE superseded_at IS NULL AND id <> ? AND LOWER(TRIM(value)) = LOWER(?)",
+        let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, category, key, source FROM facts
+             WHERE superseded_at IS NULL AND archived_at IS NULL AND id <> ? AND LOWER(TRIM(value)) = LOWER(?)",
         )
         .bind(changed_id)
         .bind(value)
         .fetch_all(&self.pool)
         .await?;
         let now = Utc::now().to_rfc3339();
-        for (id, other_key, other_source) in rows {
+        for (id, other_cat, other_key, other_source) in rows {
             // A quoted change never retires what the owner stated.
             if fact_source_rank(&other_source) > max_source_rank {
                 continue;
@@ -635,6 +694,11 @@ impl SqliteMemory {
             .bind(id)
             .execute(&self.pool)
             .await?;
+            if reason == SupersededReason::Deleted {
+                let _ = self
+                    .record_tombstone(&other_cat, &other_key, value, reason, &now)
+                    .await;
+            }
             if let Err(error) = self.project_fact_memory(id).await {
                 tracing::warn!(%error, fact_id = id, "Deferred superseded-copy projection");
             }
@@ -842,14 +906,17 @@ impl SqliteMemory {
         let projection_by_key: std::collections::HashMap<String, i64> = facts
             .iter()
             .filter(|fact| fact.category == "user")
-            .map(|fact| (canonical_personal_key(&fact.key), fact.id))
+            .map(|fact| (crate::text::owner_projection_family(&fact.key), fact.id))
             .collect();
         // The newest covered row stands in.
         let mut newest: std::collections::HashMap<i64, (i64, DateTime<Utc>)> =
             std::collections::HashMap::new();
         for fact in self.get_all_facts_with_provenance().await? {
-            let covering = (fact.category == "user")
-                .then(|| projection_by_key.get(&canonical_personal_key(&fact.key)))
+            let cat_lower = fact.category.trim().to_ascii_lowercase();
+            let is_owner_cat = is_owner_profile_category(&cat_lower)
+                || (cat_lower == "preference" && crate::text::is_owner_profile_key(&fact.key));
+            let covering = is_owner_cat
+                .then(|| projection_by_key.get(&crate::text::owner_projection_family(&fact.key)))
                 .flatten();
             match covering {
                 Some(projection) => {
@@ -1024,18 +1091,41 @@ impl FactStore for SqliteMemory {
         first_seen_at: Option<DateTime<Utc>>,
         source_excerpt: Option<&str>,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE facts
-             SET source = ?, first_seen_at = ?, source_excerpt = ?
-             WHERE category = ? AND key = ? AND superseded_at IS NULL",
+        let canonical = canonicalize_fact_key(key);
+        // Only classify rows still awaiting post-run provenance (`source = 'agent'`),
+        // or rows being upgraded to a strictly closer rank — never downgrade an
+        // already-stamped `user_stated` or `owner_quoted` fact to `derived`.
+        let new_rank = fact_source_rank(source);
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, source FROM facts
+             WHERE LOWER(TRIM(category)) = LOWER(TRIM(?))
+               AND (key = ? OR key = ?)
+               AND superseded_at IS NULL
+               AND archived_at IS NULL",
         )
-        .bind(source)
-        .bind(first_seen_at.map(|at| at.to_rfc3339()))
-        .bind(source_excerpt)
         .bind(category)
         .bind(key)
-        .execute(&self.pool)
+        .bind(&canonical)
+        .fetch_all(&self.pool)
         .await?;
+        for (id, existing_source) in rows {
+            if existing_source != "agent" && fact_source_rank(&existing_source) >= new_rank {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE facts
+                 SET source = ?,
+                     first_seen_at = COALESCE(?, first_seen_at),
+                     source_excerpt = COALESCE(?, source_excerpt)
+                 WHERE id = ?",
+            )
+            .bind(source)
+            .bind(first_seen_at.map(|at| at.to_rfc3339()))
+            .bind(source_excerpt)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -1121,8 +1211,20 @@ impl FactStore for SqliteMemory {
             .await?;
         }
         tx.commit().await?;
-        // A folded row leaves recall's projections too, as a copy does.
+        // Record durable tombstones for folded rows so retention cleanup cannot
+        // later reopen them to background resurrection.
         for (folded_id, _) in &folded {
+            if let Some(cand) = candidates.iter().find(|c| c.id == *folded_id) {
+                let _ = self
+                    .record_tombstone(
+                        &cand.category,
+                        &cand.key,
+                        &cand.value,
+                        SupersededReason::Folded,
+                        &now,
+                    )
+                    .await;
+            }
             if let Err(error) = self.project_fact_memory(*folded_id).await {
                 tracing::warn!(%error, fact_id = folded_id, "Deferred folded-fact projection");
             }
@@ -1148,7 +1250,7 @@ impl FactStore for SqliteMemory {
     async fn refresh_fact_memory(&self, category: &str, key: &str) -> anyhow::Result<()> {
         if let Some(id) = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM facts WHERE lower(category) = lower(?) AND lower(key) = lower(?)
-             AND superseded_at IS NULL ORDER BY updated_at DESC LIMIT 1",
+             AND superseded_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC LIMIT 1",
         )
         .bind(category)
         .bind(key)
@@ -1218,17 +1320,18 @@ impl FactStore for SqliteMemory {
         let now = Utc::now().to_rfc3339();
         let privacy_str = privacy.to_string();
 
-        let category_clean = category.trim();
+        let category_owned = category.trim().to_ascii_lowercase();
+        let category_clean = category_owned.as_str();
         let key_clean = key.trim();
         let canonical_key = canonicalize_fact_key(key_clean);
 
-        // Find existing current fact (not superseded).
+        // Find existing current fact (not superseded, not archived).
         // Prefer exact match; fall back to canonical match to avoid key drift
         // ("dog name" vs "dog_name") creating duplicates.
         let mut existing: Option<(i64, String, String)> = None;
 
         if let Some(row) = sqlx::query(
-            "SELECT id, key, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
+            "SELECT id, key, value FROM facts WHERE LOWER(TRIM(category)) = ? AND key = ? AND superseded_at IS NULL AND archived_at IS NULL",
         )
         .bind(category_clean)
         .bind(key_clean)
@@ -1239,7 +1342,7 @@ impl FactStore for SqliteMemory {
         } else {
             if canonical_key != key_clean
                 && let Some(row) = sqlx::query(
-                    "SELECT id, key, value FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
+                    "SELECT id, key, value FROM facts WHERE LOWER(TRIM(category)) = ? AND key = ? AND superseded_at IS NULL AND archived_at IS NULL",
                 )
                 .bind(category_clean)
                 .bind(&canonical_key)
@@ -1253,7 +1356,7 @@ impl FactStore for SqliteMemory {
                 // Canonical scan: match an existing key by canonical form.
                 // Limits churn when historical keys were not canonicalized.
                 let rows = sqlx::query(
-                    "SELECT id, key, value FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC",
+                    "SELECT id, key, value FROM facts WHERE LOWER(TRIM(category)) = ? AND superseded_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC",
                 )
                 .bind(category_clean)
                 .fetch_all(&self.pool)
@@ -1278,7 +1381,7 @@ impl FactStore for SqliteMemory {
         if existing.is_none() {
             let category_facts = sqlx::query(
                 "SELECT id, key, value FROM facts
-                 WHERE category = ? AND superseded_at IS NULL",
+                 WHERE LOWER(TRIM(category)) = ? AND superseded_at IS NULL AND archived_at IS NULL",
             )
             .bind(category_clean)
             .fetch_all(&self.pool)
@@ -1374,6 +1477,42 @@ impl FactStore for SqliteMemory {
             .map(|v| encode_embedding(&v));
 
         let automated_source = !is_owner_authored_fact_source(source);
+        // If an archived row already holds this (category, key):
+        // - An automated extractor never resurrects an archived fact.
+        // - An explicit owner write supersedes the archived row so the new
+        //   active value inserts cleanly under `idx_facts_active_unique`.
+        if existing.is_none() {
+            let archived_id: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM facts
+                 WHERE LOWER(TRIM(category)) = ? AND key IN (?, ?)
+                   AND superseded_at IS NULL AND archived_at IS NOT NULL
+                 LIMIT 1",
+            )
+            .bind(category_clean)
+            .bind(key_clean)
+            .bind(&key_for_write)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(archived_id) = archived_id {
+                if automated_source {
+                    tracing::debug!(
+                        category = category_clean,
+                        key = key_clean,
+                        source,
+                        "Automated fact write skipped: an archived fact exists for this key"
+                    );
+                    return Ok(());
+                }
+                sqlx::query(
+                    "UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced'
+                     WHERE id = ? AND superseded_at IS NULL",
+                )
+                .bind(&now)
+                .bind(archived_id)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
         // Background extraction reads conversations after the fact: evidence
         // older than a later, different value of the same knowledge (its key,
         // in any category) is what the owner corrected since, and must not
@@ -1423,7 +1562,7 @@ impl FactStore for SqliteMemory {
             {
                 let candidates = sqlx::query(
                     "SELECT id, category, key, value, source, embedding FROM facts
-                     WHERE superseded_at IS NULL AND embedding IS NOT NULL
+                     WHERE superseded_at IS NULL AND archived_at IS NULL AND embedding IS NOT NULL
                        AND COALESCE(privacy, 'global') = ? AND channel_id IS ?",
                 )
                 .bind(&privacy_str)
@@ -1477,7 +1616,10 @@ impl FactStore for SqliteMemory {
                         "Automated fact write folded into existing restatement"
                     );
                     // The owner quoting what an extractor inferred raises the
-                    // kept fact to the quote's rank, with the quote.
+                    // kept fact to the quote's rank, with the quote. A lower-
+                    // or equal-rank automated restatement does NOT bump
+                    // `updated_at` so background repetition cannot fake
+                    // freshness or push old facts to the top of the UI.
                     if fact_source_rank(source) > fact_source_rank(&matched_source) {
                         sqlx::query(
                             "UPDATE facts SET updated_at = ?, source = ?,
@@ -1489,12 +1631,6 @@ impl FactStore for SqliteMemory {
                         .bind(id)
                         .execute(&self.pool)
                         .await?;
-                    } else {
-                        sqlx::query("UPDATE facts SET updated_at = ? WHERE id = ?")
-                            .bind(&now)
-                            .bind(id)
-                            .execute(&self.pool)
-                            .await?;
                     }
                     return Ok(());
                 }
@@ -1650,14 +1786,14 @@ impl FactStore for SqliteMemory {
                         .await?;
                 let existing_rank = existing_source.as_deref().map_or(0, fact_source_rank);
                 if fact_source_rank(source) < existing_rank {
-                    sqlx::query(
-                        "UPDATE facts SET updated_at = ?, embedding = COALESCE(embedding, ?) WHERE id = ?",
-                    )
-                    .bind(&now)
-                    .bind(&embedding_blob)
-                    .bind(old_id)
-                    .execute(&self.pool)
-                    .await?;
+                    // Lower-rank automated restatement: backfill a missing
+                    // embedding, but do NOT bump `updated_at` so background
+                    // re-extraction does not artificially renew freshness.
+                    sqlx::query("UPDATE facts SET embedding = COALESCE(embedding, ?) WHERE id = ?")
+                        .bind(&embedding_blob)
+                        .bind(old_id)
+                        .execute(&self.pool)
+                        .await?;
                 } else if fact_source_rank(source) > existing_rank {
                     sqlx::query(
                         "UPDATE facts SET source = ?, updated_at = ?, embedding = COALESCE(embedding, ?), first_seen_at = COALESCE(first_seen_at, ?), source_excerpt = COALESCE(?, source_excerpt) WHERE id = ?",
@@ -1784,11 +1920,11 @@ impl FactStore for SqliteMemory {
         // different keys are never superseded here, whatever words or
         // embedding they share ("favorite_drink: green tea" must never
         // retire "allergy: green tea").
-        if source == "agent" {
+        if matches!(source, "agent" | "user_stated") {
             let canonical_written = canonicalize_fact_key(&key_for_write);
             let others = sqlx::query(
                 "SELECT id, key, value FROM facts
-                         WHERE category = ? AND superseded_at IS NULL
+                         WHERE LOWER(TRIM(category)) = ? AND superseded_at IS NULL AND archived_at IS NULL
                            AND key != ?",
             )
             .bind(category_clean)
@@ -1829,14 +1965,14 @@ impl FactStore for SqliteMemory {
     }
 
     async fn get_facts(&self, category: Option<&str>) -> anyhow::Result<Vec<Fact>> {
-        // Only return current (non-superseded) facts
+        // Only return current (non-superseded, non-archived) facts
         let rows = if let Some(cat) = category {
-            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE category = ? AND superseded_at IS NULL ORDER BY updated_at DESC")
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE LOWER(TRIM(category)) = LOWER(TRIM(?)) AND superseded_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC")
                 .bind(cat)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC")
+            sqlx::query("SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt FROM facts WHERE superseded_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC")
                 .fetch_all(&self.pool)
                 .await?
         };
@@ -1853,7 +1989,7 @@ impl FactStore for SqliteMemory {
         // it has none for read their own blob (`unindexed_fact_scores`).
         let rows = sqlx::query(
             "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
-             FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+             FROM facts WHERE superseded_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2033,7 +2169,7 @@ impl FactStore for SqliteMemory {
         // Public/PrivateGroup: global + same-channel facts (no private, no other-channel)
         let rows = sqlx::query(
             "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
-             FROM facts WHERE superseded_at IS NULL ORDER BY updated_at DESC",
+             FROM facts WHERE superseded_at IS NULL AND archived_at IS NULL ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2203,11 +2339,71 @@ impl FactStore for SqliteMemory {
     }
 
     async fn delete_fact(&self, fact_id: i64) -> anyhow::Result<()> {
-        // A canonical personal-memory record reaches the model under a
-        // synthetic negative id; forgetting it retracts that record.
+        // A canonical personal-memory record reaches the model and UI under a
+        // synthetic negative id; forgetting it retracts that record AND retires
+        // any shadowed flat owner-profile rows for the same canonical key so
+        // they cannot resurrect on the next snapshot or recall.
         if fact_id < 0 {
-            self.retract_canonical_projection(fact_id, "owner_forget")
+            let projected = self
+                .canonical_personal_facts()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|fact| fact.id == fact_id);
+            let retracted = self
+                .retract_canonical_projection(fact_id, "owner_forget")
                 .await?;
+            if retracted
+                && let Some(fact) = projected
+                && fact.category == "user"
+            {
+                let now = Utc::now().to_rfc3339();
+                let target_family = crate::text::owner_projection_family(&fact.key);
+                let _ = self
+                    .record_tombstone(
+                        "user",
+                        &target_family,
+                        &fact.value,
+                        SupersededReason::Deleted,
+                        &now,
+                    )
+                    .await;
+                let flat_rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+                    "SELECT id, LOWER(TRIM(category)), LOWER(TRIM(key)), value FROM facts
+                     WHERE superseded_at IS NULL
+                       AND LOWER(TRIM(category)) IN ('user', 'personal', 'profile', 'preference')",
+                )
+                .fetch_all(&self.pool)
+                .await?;
+                for (flat_id, flat_cat, flat_key, flat_val) in flat_rows {
+                    let is_shadowed_cat = is_owner_profile_category(&flat_cat)
+                        || (flat_cat == "preference"
+                            && crate::text::is_owner_profile_key(&flat_key));
+                    if is_shadowed_cat
+                        && crate::text::owner_projection_family(&flat_key) == target_family
+                    {
+                        sqlx::query(
+                            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted', archived_at = NULL WHERE id = ?",
+                        )
+                        .bind(&now)
+                        .bind(flat_id)
+                        .execute(&self.pool)
+                        .await?;
+                        if let Err(error) = self.project_fact_memory(flat_id).await {
+                            tracing::warn!(%error, fact_id = flat_id, "Deferred shadowed-fact deletion projection");
+                        }
+                        let _ = self
+                            .record_tombstone(
+                                &flat_cat,
+                                &flat_key,
+                                &flat_val,
+                                SupersededReason::Deleted,
+                                &now,
+                            )
+                            .await;
+                    }
+                }
+            }
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
@@ -2219,7 +2415,7 @@ impl FactStore for SqliteMemory {
         .fetch_optional(&self.pool)
         .await?;
         sqlx::query(
-            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted' WHERE id = ?",
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted', archived_at = NULL WHERE id = ?",
         )
         .bind(&now)
         .bind(fact_id)
@@ -2229,9 +2425,14 @@ impl FactStore for SqliteMemory {
             tracing::warn!(%error, fact_id, "Deferred deleted-fact projection");
         }
         if let Some((category, key, value)) = forgotten {
+            let _ = self
+                .record_tombstone(&category, &key, &value, SupersededReason::Deleted, &now)
+                .await;
             self.supersede_copies(fact_id, &key, &value, SupersededReason::Deleted, 2)
                 .await?;
-            if is_owner_profile_category(&category) {
+            if is_owner_profile_category(&category)
+                || (category == "preference" && crate::text::is_owner_profile_key(&key))
+            {
                 self.retract_owner_profile_key(&key, "owner_forget").await?;
             }
         }
@@ -2252,7 +2453,7 @@ impl FactStore for SqliteMemory {
         .await?;
         let ids: Vec<i64> = deleted.iter().map(|(id, _, _)| *id).collect();
         let result = sqlx::query(
-            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted' WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted', archived_at = NULL WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
         )
         .bind(&now)
         .bind(&cat_clean)
@@ -2268,20 +2469,206 @@ impl FactStore for SqliteMemory {
         // prompt renders as its own block: forgetting the legacy row alone
         // left the old value in front of the model.
         for (id, key, value) in &deleted {
+            let _ = self
+                .record_tombstone(&cat_clean, key, value, SupersededReason::Deleted, &now)
+                .await;
             self.supersede_copies(*id, key, value, SupersededReason::Deleted, 2)
                 .await?;
         }
-        let canonical = is_owner_profile_category(&cat_clean)
+        let canonical = (is_owner_profile_category(&cat_clean)
+            || (cat_clean == "preference" && crate::text::is_owner_profile_key(&key_clean)))
             && self
                 .retract_owner_profile_key(&key_clean, "owner_forget")
                 .await?;
         Ok(result.rows_affected() > 0 || canonical)
     }
 
+    async fn update_fact_value(&self, fact_id: i64, value: &str) -> anyhow::Result<Option<Fact>> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if fact_id < 0 {
+            return self
+                .update_canonical_projection(fact_id, trimmed, "user_stated")
+                .await;
+        }
+        let _upsert_guard = self.fact_upsert_lock.lock().await;
+        let row = sqlx::query(
+            "SELECT category, key FROM facts WHERE id = ? AND superseded_at IS NULL AND archived_at IS NULL",
+        )
+        .bind(fact_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let category: String = row.get("category");
+        let key: String = row.get("key");
+        let now = Utc::now().to_rfc3339();
+        let fact_text = build_fact_embedding_text(&category, &key, trimmed);
+        let embedding_blob = self
+            .embedding_service
+            .embed(fact_text)
+            .await
+            .ok()
+            .map(|v| encode_embedding(&v));
+        sqlx::query(
+            "UPDATE facts
+             SET value = ?, source = 'user_stated', updated_at = ?,
+                 embedding = COALESCE(?, embedding)
+             WHERE id = ? AND superseded_at IS NULL AND archived_at IS NULL",
+        )
+        .bind(trimmed)
+        .bind(&now)
+        .bind(&embedding_blob)
+        .bind(fact_id)
+        .execute(&self.pool)
+        .await?;
+        if let Err(error) = self.project_fact_memory(fact_id).await {
+            tracing::warn!(%error, fact_id, "Deferred edited-fact projection");
+        }
+        let updated = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
+             FROM facts WHERE id = ?",
+        )
+        .bind(fact_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(updated.as_ref().map(Self::row_to_fact))
+    }
+
+    async fn archive_fact(&self, fact_id: i64) -> anyhow::Result<bool> {
+        if fact_id < 0 {
+            return Ok(false);
+        }
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            "UPDATE facts SET archived_at = ?
+             WHERE id = ? AND superseded_at IS NULL AND archived_at IS NULL",
+        )
+        .bind(&now)
+        .bind(fact_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() > 0 {
+            // Invalidate the archived fact's claim projection, embedding, and graph edges.
+            if let Err(error) = self.project_fact_memory(fact_id).await {
+                tracing::warn!(%error, fact_id, "Deferred archived-fact projection");
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn restore_fact(&self, fact_id: i64) -> anyhow::Result<Option<Fact>> {
+        if fact_id < 0 {
+            return Ok(None);
+        }
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            "UPDATE facts SET archived_at = NULL, expires_at = NULL, updated_at = ?
+             WHERE id = ? AND superseded_at IS NULL AND archived_at IS NOT NULL",
+        )
+        .bind(&now)
+        .bind(fact_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+        if let Err(error) = self.project_fact_memory(fact_id).await {
+            tracing::warn!(%error, fact_id, "Deferred restored-fact projection");
+        }
+        let restored = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
+             FROM facts WHERE id = ?",
+        )
+        .bind(fact_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(restored.as_ref().map(Self::row_to_fact))
+    }
+
+    async fn get_archived_facts(&self, limit: usize) -> anyhow::Result<Vec<Fact>> {
+        let rows = sqlx::query(
+            "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
+             FROM facts
+             WHERE superseded_at IS NULL AND archived_at IS NOT NULL
+             ORDER BY archived_at DESC
+             LIMIT ?",
+        )
+        .bind(limit.min(500) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::row_to_fact).collect())
+    }
+
+    async fn archive_expired_facts(&self, now: DateTime<Utc>) -> anyhow::Result<u64> {
+        let now_str = now.to_rfc3339();
+        let expired: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM facts
+             WHERE superseded_at IS NULL AND archived_at IS NULL
+               AND expires_at IS NOT NULL AND expires_at <= ?",
+        )
+        .bind(&now_str)
+        .fetch_all(&self.pool)
+        .await?;
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0u64;
+        for id in expired {
+            if self.archive_fact(id).await? {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            tracing::info!(count, "Archived expired facts");
+        }
+        Ok(count)
+    }
+
+    async fn detect_fact_overlaps(&self) -> anyhow::Result<std::collections::HashMap<i64, i64>> {
+        let mut candidates = self.fold_candidates().await?;
+        // Include canonical owner facts so flat duplicates (e.g. preference/address_as)
+        // can be flagged against canonical user/preferred_name, and drop flat rows
+        // already shadowed by canonical owner facts so overlap pointers always
+        // reference visible items.
+        let canonical = self.canonical_personal_facts().await.unwrap_or_default();
+        let canonical_owner_keys: std::collections::HashSet<String> = canonical
+            .iter()
+            .filter(|f| f.category == "user")
+            .map(|f| crate::text::owner_projection_family(&f.key))
+            .collect();
+        candidates.retain(|c| {
+            let cat = c.category.trim().to_ascii_lowercase();
+            let shadowed_owner = (is_owner_profile_category(&cat)
+                || (cat == "preference" && crate::text::is_owner_profile_key(&c.key)))
+                && canonical_owner_keys.contains(&crate::text::owner_projection_family(&c.key));
+            !shadowed_owner
+        });
+        for fact in canonical.into_iter().filter(|f| f.category == "user") {
+            candidates.push(super::fact_folds::FoldCandidate {
+                id: fact.id,
+                pinned: true,
+                category: fact.category,
+                key: fact.key,
+                value: fact.value,
+                source_rank: fact_source_rank(&fact.source),
+                recall_count: fact.recall_count as i64,
+                privacy: fact.privacy.to_string(),
+                channel_id: fact.channel_id,
+                vector: Vec::new(),
+            });
+        }
+        Ok(super::fact_folds::detect_overlaps(&mut candidates))
+    }
+
     async fn get_all_facts_with_provenance(&self) -> anyhow::Result<Vec<Fact>> {
         let rows = sqlx::query(
             "SELECT id, category, key, value, source, created_at, updated_at, superseded_at, recall_count, last_recalled_at, channel_id, privacy, first_seen_at, source_excerpt
-             FROM facts WHERE superseded_at IS NULL ORDER BY category, key"
+             FROM facts WHERE superseded_at IS NULL AND archived_at IS NULL ORDER BY category, key"
         )
         .fetch_all(&self.pool)
         .await?;

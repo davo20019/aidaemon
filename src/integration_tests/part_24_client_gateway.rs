@@ -35,6 +35,7 @@ mod client_gateway {
     }
 
     struct Daemon {
+        gateway: Arc<aidaemon_client_gateway::ClientGateway>,
         url: String,
         token: String,
         posted: Arc<std::sync::atomic::AtomicUsize>,
@@ -107,9 +108,10 @@ mod client_gateway {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = aidaemon_client_gateway::router(gateway);
+        let app = aidaemon_client_gateway::router(gateway.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Daemon {
+            gateway,
             url: format!("127.0.0.1:{}", address.port()),
             token,
             posted,
@@ -705,5 +707,47 @@ mod client_gateway {
                 ..
             } if channel == "app" && device == "Synthetic Phone"
         )));
+    }
+
+    /// Settings turn e-ink access on and off while the daemon runs: on, the
+    /// gateway pairs through the connector (here waiting for a bridge that
+    /// is not there); off, the connection task ends and pairing is refused
+    /// as off.
+    #[tokio::test]
+    async fn eink_access_turns_on_and_off_while_running() {
+        use crate::startup::eink::{Slot, apply_in};
+        let daemon = daemon().await;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("bridge-keys");
+        let host = Some((&daemon.gateway, keys.as_path()));
+        let mut slot = Slot::default();
+        let pairing = daemon.gateway.pairing();
+        assert!(!pairing.eink_on());
+        // Port 9 on this computer: nothing answers, the connector retries.
+        let url = "ws://127.0.0.1:9/v1/daemon";
+        assert_eq!(apply_in(&mut slot, host, Some(url)), Ok(true));
+        assert!(pairing.eink_on());
+        let connector = slot.connector().unwrap();
+        assert!(connector.is_running());
+        // The same bridge again changes nothing.
+        assert_eq!(apply_in(&mut slot, host, Some(url)), Ok(true));
+        assert!(std::sync::Arc::ptr_eq(
+            &connector,
+            &slot.connector().unwrap()
+        ));
+        let code = "K7F2-9QXM4HTAPZ6CR-VTPVXVT2";
+        let waiting = pairing.pair_bridge_device(code).await.unwrap_err();
+        assert_eq!(waiting.code, ErrorCode::Conflict);
+
+        assert_eq!(apply_in(&mut slot, host, None), Ok(false));
+        assert!(!pairing.eink_on());
+        assert!(!connector.is_running());
+        assert!(slot.connector().is_none());
+        let off = pairing.pair_bridge_device(code).await.unwrap_err();
+        assert_eq!(off.code, ErrorCode::Conflict);
+        assert_ne!(
+            off.message, waiting.message,
+            "refused as off, not as waiting"
+        );
     }
 }

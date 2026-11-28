@@ -1216,6 +1216,11 @@
           "const": "script",
           "description": "A script or other program.",
           "type": "string"
+        },
+        {
+          "const": "eink",
+          "description": "An e-ink reader paired over the bridge: a fixed small authority the\ndaemon sets (protocol 1.62). Only the daemon records this kind; a\nclient cannot pair as one.",
+          "type": "string"
         }
       ]
     },
@@ -1725,6 +1730,61 @@
             },
             "type": {
               "const": "forget_memory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Update one remembered fact's value in place (protocol 1.61).",
+          "properties": {
+            "memory_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "edit_memory",
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory_id",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Reversibly archive one remembered fact so it leaves active recall (protocol 1.61).",
+          "properties": {
+            "memory_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "archive_memory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Restore an archived memory back to active recall (protocol 1.61).",
+          "properties": {
+            "memory_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "restore_memory",
               "type": "string"
             }
           },
@@ -2540,6 +2600,61 @@
             "scopes"
           ],
           "type": "object"
+        },
+        {
+          "description": "Pair the e-ink reader whose screen shows `code` (protocol 1.62): the\n25 Crockford Base32 characters it shows, spaces and dashes allowed.\nThe owner's local token, or a device that may answer every approval\n(scope `approve`, no risk ceiling, not an e-ink reader). Answers with\n`eink_paired` once the reader finishes its handshake through the\nbridge (up to two minutes).",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "type": {
+              "const": "pair_eink_device",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Set what e-ink reader `device_id` may do (protocol 1.63): the owner's\nlocal token, or a device that may answer every approval, never an\ne-ink reader. Applies at once, raising too: the device asking is\ntrusted and changes another device, not itself. Answers with\n`eink_access_changed`.",
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "level": {
+              "$ref": "#/$defs/EinkAccess"
+            },
+            "type": {
+              "const": "set_eink_access",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "device_id",
+            "level"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Unpair device `device_id` (protocol 1.63): it loses access at once\n(its sockets and bridge connection close) and must pair again. The\nowner's local token, or a device that may answer every approval,\nnever an e-ink reader, and never the device asking. Answers with\n`devices`, as they are after.",
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "revoke_device",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "device_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2787,11 +2902,27 @@
         {
           "description": "`list_memories`.",
           "properties": {
+            "archived": {
+              "description": "Archived memories available for restore (protocol 1.61).",
+              "items": {
+                "$ref": "#/$defs/MemoryItem"
+              },
+              "type": "array"
+            },
             "memories": {
               "items": {
                 "$ref": "#/$defs/MemoryItem"
               },
               "type": "array"
+            },
+            "total": {
+              "description": "Total active memories in the store before any truncation (protocol 1.61).\nAbsent on older daemons.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "type": {
               "const": "memories",
@@ -2818,6 +2949,57 @@
           "required": [
             "type",
             "memory_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`edit_memory`: the updated memory item (protocol 1.61).",
+          "properties": {
+            "memory": {
+              "$ref": "#/$defs/MemoryItem"
+            },
+            "type": {
+              "const": "memory_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`archive_memory`: the memory left active recall and can be restored (protocol 1.61).",
+          "properties": {
+            "memory_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "memory_archived",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`restore_memory`: the memory returned to active recall (protocol 1.61).",
+          "properties": {
+            "memory": {
+              "$ref": "#/$defs/MemoryItem"
+            },
+            "type": {
+              "const": "memory_restored",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "memory"
           ],
           "type": "object"
         },
@@ -3206,6 +3388,13 @@
               },
               "type": "array"
             },
+            "this_device": {
+              "description": "The device asking, when it is a paired one (protocol 1.63), so\na list can mark it; `None` for the daemon's own computer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "const": "devices",
               "type": "string"
@@ -3214,6 +3403,55 @@
           "required": [
             "type",
             "devices"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`pair_eink_device` (protocol 1.62): the reader is paired, under the\nname it gave.",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "eink_paired",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`set_eink_access` (protocol 1.63): the reader's level now.\n`awaiting_approval` and `other_device` are kept for compatibility\nand never set: a change applies at once.",
+          "properties": {
+            "awaiting_approval": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "device_id": {
+              "type": "string"
+            },
+            "level": {
+              "$ref": "#/$defs/EinkAccess"
+            },
+            "other_device": {
+              "default": false,
+              "description": "Only another device (or the owner at the computer) may approve it.",
+              "type": "boolean"
+            },
+            "type": {
+              "const": "eink_access_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "device_id",
+            "level"
           ],
           "type": "object"
         }
@@ -3382,6 +3620,17 @@
         "device_id": {
           "type": "string"
         },
+        "eink_access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EinkAccess"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An e-ink reader's access level (protocol 1.63); `None` for any\nother device."
+        },
         "kind": {
           "$ref": "#/$defs/ClientKind"
         },
@@ -3440,6 +3689,26 @@
         {
           "const": "auto",
           "description": "The model's own setting, raised by the daemon when it needs more.",
+          "type": "string"
+        }
+      ]
+    },
+    "EinkAccess": {
+      "description": "What an e-ink reader may do (protocol 1.63), chosen by the owner. Every\nlevel keeps the reader's fixed command list and never reaches a shell,\nsettings, pairing, lasting grants or setup.",
+      "oneOf": [
+        {
+          "const": "view_only",
+          "description": "Read only: conversations, runs, changes, projects.",
+          "type": "string"
+        },
+        {
+          "const": "limited",
+          "description": "Chat and approve medium-risk agent calls once; runs it starts or\nsteers stay capped at medium risk.",
+          "type": "string"
+        },
+        {
+          "const": "full",
+          "description": "Chat and approve agent calls up to high risk once; its runs follow\nthe owner's settings like any app message. The default.",
           "type": "string"
         }
       ]
@@ -4982,14 +5251,43 @@
     "MemoryItem": {
       "description": "One remembered fact.",
       "properties": {
+        "archived": {
+          "description": "True when archived (hidden from active recall, restorable) (protocol 1.61).",
+          "type": "boolean"
+        },
         "category": {
           "type": "string"
+        },
+        "editable": {
+          "description": "True when the value can be edited in place via `edit_memory` (protocol 1.61).",
+          "type": "boolean"
+        },
+        "excerpt": {
+          "description": "Short quote or context showing where this memory came from (protocol 1.61).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "type": "string"
         },
         "key": {
           "type": "string"
+        },
+        "kind": {
+          "description": "Storage kind: absent for flat facts, `\"canonical\"` for structured personal\nmemory (protocol 1.61).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "overlaps_with": {
+          "description": "Id of another active memory this item appears to overlap or duplicate,\nfor UI review hints (protocol 1.61).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "source": {
           "description": "Where it came from, in a word or two.",

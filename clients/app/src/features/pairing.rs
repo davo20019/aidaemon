@@ -335,3 +335,200 @@ fn send_to_phone(link: String) {
         }
     });
 }
+
+/// What a paired e-ink reader may do, in the owner's words (the daemon
+/// fixes it: `aidaemon-client-gateway`'s `eink` module).
+const EINK_AUTHORITY: &str = "It gets Full access: it can chat, see runs, start and steer coding \
+     sessions, and answer agent approvals up to high risk once. No shell, no settings. Lower it \
+     any time under Paired devices.";
+
+/// Where pairing an e-ink reader from this app stands, on screen.
+#[derive(Clone, PartialEq)]
+enum Eink {
+    Closed,
+    /// The owner types the code the reader shows.
+    Typing,
+    /// A reader's QR link just opened: its check code first.
+    Link(aidaemon_client_core::eink::PairLink),
+    /// Asked: the daemon's answer shows.
+    Sent,
+}
+
+/// Pair an e-ink reader (a Kindle): type the code its page shows, or come
+/// from its QR link and type the check code its page shows beside it. The
+/// daemon pairs it over the bridge with a fixed, small authority.
+pub fn pair_eink(store: Store) -> View {
+    use aidaemon_client_core::eink::{Check, EinkPairing, grouped};
+
+    let phase = signal(Eink::Closed);
+    let code = signal(String::new());
+    let check = signal(String::new());
+    let note = signal(None::<(String, Tone)>);
+    // A reader's QR link opened in this app: offered once, right then.
+    effect(move || {
+        if !store.eink_link_waiting() {
+            return;
+        }
+        untracked(|| {
+            if let Some(link) = store.take_eink_link() {
+                store.clear_eink_pairing();
+                check.set(String::new());
+                note.set(None);
+                phase.set(Eink::Link(link));
+            }
+        });
+    });
+    // A wrong check code ends it: the link may name someone else's reader.
+    effect(move || {
+        let typed = check.get();
+        let wrong = phase.with_untracked(
+            |p| matches!(p, Eink::Link(link) if link.check_typed(&typed) == Check::Wrong),
+        );
+        if wrong {
+            untracked(|| {
+                check.set(String::new());
+                note.set(Some((
+                    "That check code does not match this link. Nothing was paired: scan the \
+                     code on your e-ink device again."
+                        .into(),
+                    Tone::Danger,
+                )));
+                phase.set(Eink::Closed);
+            });
+        }
+    });
+    let open = move || {
+        store.clear_eink_pairing();
+        code.set(String::new());
+        note.set(None);
+        phase.set(Eink::Typing);
+    };
+    let close = move || {
+        store.clear_eink_pairing();
+        check.set(String::new());
+        note.set(None);
+        phase.set(Eink::Closed);
+    };
+    let pair_typed = move || {
+        if store.pair_eink_device(&code.get_untracked()) {
+            phase.set(Eink::Sent);
+        }
+    };
+    let pair_link = move || {
+        let Some(link) = phase.with_untracked(|p| match p {
+            Eink::Link(link) => Some(link.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        if link.check_typed(&check.get_untracked()) != Check::Matches {
+            return;
+        }
+        check.set(String::new());
+        store.pair_eink_device(&link.code);
+        phase.set(Eink::Sent);
+    };
+    let answer = move || {
+        let message = match store.eink_pairing() {
+            EinkPairing::Idle => return None,
+            EinkPairing::Pairing => (
+                "Waiting for your e-ink device to finish (up to 2 minutes). Keep its \
+                 pairing page open."
+                    .to_owned(),
+                Tone::Accent,
+            ),
+            EinkPairing::Paired(name) => (format!("Paired: {name}"), Tone::Success),
+            EinkPairing::Failed(why) => (why, Tone::Danger),
+        };
+        Some(message)
+    };
+    view().gap_2().child(dynamic(move || {
+        let now = phase.get();
+        Some(untracked(move || match now {
+            Eink::Closed => view()
+                .gap_2()
+                .child(view().flex_row().child(btn(
+                    "Pair an e-ink device",
+                    Variant::Secondary,
+                    Size::Sm,
+                    open,
+                )))
+                .child(dynamic(move || {
+                    let (message, tone) = note.get()?;
+                    Some(untracked(move || status_message(message, tone)))
+                })),
+            Eink::Typing => ui::inset()
+                .gap_3()
+                .child(text("Pair an e-ink device").font_weight(FontWeight::MEDIUM))
+                .child(hint(
+                    "Open AIDaemon's e-ink page on your Kindle and type the code it shows. \
+                     Turn on e-ink access first.",
+                ))
+                .child(hint(EINK_AUTHORITY))
+                .child(ui::labeled(
+                    "Code",
+                    field("The 25-character code on your e-ink device", code)
+                        .auto_correct(false)
+                        .label("E-ink pairing code"),
+                ))
+                .child(
+                    view()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            btn("Pair", Variant::Primary, Size::Sm, pair_typed).disabled(
+                                move || {
+                                    code.with(|c| c.trim().is_empty())
+                                        || store.eink_pairing() == EinkPairing::Pairing
+                                },
+                            ),
+                        )
+                        .child(btn("Cancel", Variant::Ghost, Size::Sm, close)),
+                )
+                .child(dynamic(move || {
+                    let (message, tone) = answer()?;
+                    Some(untracked(move || status_message(message, tone)))
+                })),
+            Eink::Link(link) => {
+                let shown = grouped(&link.code);
+                ui::inset()
+                    .gap_3()
+                    .child(text("Pair this e-ink device?").font_weight(FontWeight::MEDIUM))
+                    .child(hint(EINK_AUTHORITY))
+                    .child(hint(format!("Code {shown}")))
+                    .child(ui::labeled(
+                        "Check code",
+                        field("4 characters", check)
+                            .auto_correct(false)
+                            .label("E-ink check code"),
+                    ))
+                    .child(hint(
+                        "Type the 4-character check code shown on your Kindle — never one \
+                         from a message.",
+                    ))
+                    .child(
+                        view()
+                            .flex_row()
+                            .gap_2()
+                            .child(btn("Pair", Variant::Primary, Size::Sm, pair_link).disabled(
+                                move || {
+                                    check.with(|typed| link.check_typed(typed)) != Check::Matches
+                                },
+                            ))
+                            .child(btn("Cancel", Variant::Ghost, Size::Sm, close)),
+                    )
+            }
+            Eink::Sent => ui::inset()
+                .gap_3()
+                .child(dynamic(move || {
+                    let (message, tone) = answer()?;
+                    Some(untracked(move || status_message(message, tone)))
+                }))
+                .child(
+                    view()
+                        .flex_row()
+                        .child(btn("Done", Variant::Ghost, Size::Sm, close)),
+                ),
+        }))
+    }))
+}

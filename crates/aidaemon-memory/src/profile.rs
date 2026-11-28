@@ -161,7 +161,7 @@ where
     let canonical_owner_keys: std::collections::HashSet<String> = canonical_facts
         .iter()
         .filter(|fact| fact.category == "user")
-        .map(|fact| crate::text::canonical_personal_key(&fact.key))
+        .map(|fact| crate::text::owner_projection_family(&fact.key))
         .collect();
     let mut flat_facts = canonical_facts;
     flat_facts.extend(
@@ -171,9 +171,12 @@ where
             .unwrap_or_default()
             .into_iter()
             .filter(|fact| {
-                fact.category != "user"
+                let cat_lower = fact.category.trim().to_ascii_lowercase();
+                let is_owner_cat = matches!(cat_lower.as_str(), "user" | "personal" | "profile")
+                    || (cat_lower == "preference" && crate::text::is_owner_profile_key(&fact.key));
+                !is_owner_cat
                     || !canonical_owner_keys
-                        .contains(&crate::text::canonical_personal_key(&fact.key))
+                        .contains(&crate::text::owner_projection_family(&fact.key))
             }),
     );
     // BTreeMap (not HashMap) so group iteration order is deterministic — combined

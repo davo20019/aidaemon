@@ -20,6 +20,9 @@ pub struct ToolExecCtx<'a> {
     pub produced_files: Option<aidaemon_tools::semantics::ProducedFiles>,
     pub session_id: &'a str,
     pub task_id: Option<&'a str>,
+    /// The owner/user's message text for this turn, used for synchronous
+    /// provenance verification (e.g. `remember_fact` checking `evidence`).
+    pub user_text: Option<&'a str>,
     pub status_tx: Option<mpsc::Sender<StatusUpdate>>,
     pub channel_visibility: ChannelVisibility,
     pub channel_id: Option<&'a str>,

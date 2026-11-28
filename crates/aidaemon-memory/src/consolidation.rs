@@ -417,6 +417,27 @@ async fn store_consolidated<S>(
 {
     let excerpt = crate::text::truncate_chars(user_text, 200);
     for fact in facts {
+        if fact.lifetime.is_transient() {
+            debug!(key = fact.key, "Skipping transient consolidated fact");
+            continue;
+        }
+        // A restatement or an update names a fact the model was shown; a key
+        // it was not shown is ignored, never looked up by name.
+        let shown_fact = |key: &Option<String>| {
+            key.as_deref().and_then(|key| {
+                shown
+                    .iter()
+                    .find(|stored| stored.key.eq_ignore_ascii_case(key.trim()))
+            })
+        };
+        if shown_fact(&fact.updates).is_none() && shown_fact(&fact.restates).is_some() {
+            debug!(
+                key = fact.key,
+                restated = ?fact.restates,
+                "Skipping consolidated restatement"
+            );
+            continue;
+        }
         if let Some(personal) = &fact.personal_memory {
             let privacy = fact
                 .privacy
@@ -437,19 +458,6 @@ async fn store_consolidated<S>(
             }
             continue;
         }
-        if fact.lifetime.is_transient() {
-            debug!(key = fact.key, "Skipping transient consolidated fact");
-            continue;
-        }
-        // A restatement or an update names a fact the model was shown; a key
-        // it was not shown is ignored, never looked up by name.
-        let shown_fact = |key: &Option<String>| {
-            key.as_deref().and_then(|key| {
-                shown
-                    .iter()
-                    .find(|stored| stored.key.eq_ignore_ascii_case(key.trim()))
-            })
-        };
         let evidence_at = evidence_time(messages, &fact.value);
         let (category, key) = match (shown_fact(&fact.updates), shown_fact(&fact.restates)) {
             (Some(target), _) => {

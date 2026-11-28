@@ -84,6 +84,9 @@ struct RememberArgs {
     /// `facts` entries without their own.
     #[serde(default)]
     scope: Option<String>,
+    /// Verbatim quote from the owner's message stating this fact.
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// The `scope` parameter, shared by the single fact and `facts` entries.
@@ -127,6 +130,8 @@ struct FactEntry {
     delete: bool,
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// True when this exact call would delete at least one fact. Mirrors the
@@ -160,7 +165,8 @@ impl Tool for RememberFactTool {
                 "type": "object",
                 "properties": {
                     "category": {
-                        "type": "string"
+                        "type": "string",
+                        "description": "Canonical categories: user (owner identity, name, addressing, location, birthday), preference (likes, style, communication), project (project details), technical (environment, tools)."
                     },
                     "key": {
                         "type": "string"
@@ -244,15 +250,20 @@ impl Tool for RememberFactTool {
                     value,
                     delete: args.delete,
                     scope: None,
+                    evidence: args.evidence.clone(),
                 }]
             };
-            // Each entry's own scope, else the call's.
+            // Each entry's own scope/evidence, else the call's.
             let call_scope = args.scope.clone();
+            let call_evidence = args.evidence.clone();
             let entries: Vec<FactEntry> = entries
                 .into_iter()
                 .map(|mut entry| {
                     if entry.scope.is_none() {
                         entry.scope = call_scope.clone();
+                    }
+                    if entry.evidence.is_none() {
+                        entry.evidence = call_evidence.clone();
                     }
                     entry
                 })
@@ -299,75 +310,56 @@ impl Tool for RememberFactTool {
                 results.push(project_note(notes, project, entry).await);
             }
 
-            let mut structured = PersonalMemoryWrite {
-                direct_user_statement: true,
-                ..Default::default()
-            };
-            let mut owner_added = false;
             let mut structured_indices = std::collections::BTreeSet::new();
             for (index, entry) in entries.iter().enumerate() {
-                if project_indices.contains(&index)
-                    || !matches!(
-                        entry.category.trim().to_ascii_lowercase().as_str(),
-                        "user" | "personal" | "profile"
-                    )
-                {
+                if project_indices.contains(&index) {
                     continue;
                 }
+                let cat = entry.category.trim().to_ascii_lowercase();
                 let key = entry.key.trim().to_ascii_lowercase();
-                let supported = matches!(
-                    key.as_str(),
-                    "name"
-                        | "full_name"
-                        | "preferred_name"
-                        | "nickname"
-                        | "username"
-                        | "online_nickname"
-                        | "online_handle"
-                        | "handle"
-                        | "birthday"
-                        | "birth_date"
-                        | "date_of_birth"
-                        | "residence"
-                        | "current_residence"
-                        | "birthplace"
-                        | "place_of_birth"
-                );
+                let canonical_key = crate::text::canonical_personal_key(&key);
+                let is_profile_cat = matches!(cat.as_str(), "user" | "personal" | "profile");
+                let is_pref_name =
+                    cat == "preference" && crate::text::is_owner_name_key(&canonical_key);
+                let supported = (is_profile_cat && crate::text::is_owner_profile_key(&canonical_key))
+                    || is_pref_name;
                 // A forget takes the delete path below, which also retracts
                 // the canonical record. An empty value is reported there.
                 if !supported || entry.delete || entry.value.trim().is_empty() {
                     continue;
                 }
-                if !owner_added {
-                    structured.entities.push(PersonalEntityCandidate {
+                // Verify provenance per entry so an unquoted entry in the same
+                // batch never borrows direct user_stated authority from a
+                // different entry's evidence quote.
+                let (structured_source, structured_excerpt) =
+                    structured_provenance(call, entry.evidence.as_deref());
+                let mut structured = PersonalMemoryWrite {
+                    entities: vec![PersonalEntityCandidate {
                         local_id: "owner".to_string(),
                         entity_type: "person".to_string(),
-                        canonical_name: if matches!(key.as_str(), "name" | "full_name") {
+                        canonical_name: if matches!(canonical_key.as_str(), "name" | "full_name") {
                             entry.value.clone()
                         } else {
                             "Owner".to_string()
                         },
                         is_reference: false,
-                        canonical_name_confirmed: matches!(key.as_str(), "name" | "full_name"),
-                    });
-                    owner_added = true;
-                } else if matches!(key.as_str(), "name" | "full_name")
-                    && let Some(owner) = structured.entities.first_mut()
-                {
-                    owner.canonical_name = entry.value.clone();
-                    owner.canonical_name_confirmed = true;
-                }
-                match key.as_str() {
+                        canonical_name_confirmed: structured_source != "derived"
+                            && matches!(canonical_key.as_str(), "name" | "full_name"),
+                    }],
+                    direct_user_statement: structured_source != "derived",
+                    ..Default::default()
+                };
+                match canonical_key.as_str() {
                     "name" | "full_name" => structured.aliases.push(PersonalAliasCandidate {
                         entity_local_id: "owner".to_string(),
                         value: entry.value.clone(),
                         alias_type: "legal_name_variant".to_string(),
                     }),
-                    "preferred_name" | "nickname" => {
+                    "preferred_name" | "nickname" | "rejected_alias" => {
                         structured.aliases.push(PersonalAliasCandidate {
                             entity_local_id: "owner".to_string(),
                             value: entry.value.clone(),
-                            alias_type: key,
+                            alias_type: canonical_key,
                         })
                     }
                     "username" | "online_nickname" | "online_handle" | "handle" => {
@@ -379,7 +371,7 @@ impl Tool for RememberFactTool {
                     }
                     _ => structured.facts.push(PersonalFactCandidate {
                         subject_local_id: "owner".to_string(),
-                        predicate: key,
+                        predicate: canonical_key,
                         value: entry.value.clone(),
                         display_value: None,
                         valid_from: None,
@@ -387,28 +379,22 @@ impl Tool for RememberFactTool {
                         retract: false,
                     }),
                 }
-                structured_indices.insert(index);
-            }
-
-            if !structured.entities.is_empty() {
                 let result = self
                     .state
                     .reconcile_personal_memory(
                         &structured,
-                        "agent",
-                        None,
+                        structured_source,
+                        structured_excerpt.as_deref(),
                         channel_id.as_deref(),
                         FactPrivacy::Private,
                     )
                     .await?;
                 results.push(format!("Personal memory: {}", result.concise_summary()));
-                for index in &structured_indices {
-                    let entry = &entries[*index];
-                    results.push(format!(
-                        "Remembered: [{}] {} = {} (canonical)",
-                        entry.category, entry.key, entry.value
-                    ));
-                }
+                results.push(format!(
+                    "Remembered: [{}] {} = {} (canonical)",
+                    entry.category, entry.key, entry.value
+                ));
+                structured_indices.insert(index);
             }
 
             for (index, entry) in entries.iter().enumerate() {
@@ -438,14 +424,18 @@ impl Tool for RememberFactTool {
                     continue;
                 }
 
+                let (source, first_seen_at, source_excerpt) =
+                    entry_provenance(call, entry.evidence.as_deref());
                 self.state
-                    .upsert_fact(
+                    .upsert_fact_with_provenance(
                         &entry.category,
                         &entry.key,
                         &entry.value,
-                        "agent",
+                        source,
                         channel_id.as_deref(),
                         fact_privacy,
+                        first_seen_at,
+                        source_excerpt.as_deref(),
                     )
                     .await?;
                 results.push(format!(
@@ -536,6 +526,51 @@ fn write_access(
         }
         (_, channel_id) => (FactPrivacy::Private, channel_id),
     }
+}
+
+/// Synchronous provenance for a `remember_fact` flat write.
+///
+/// When dispatched inside a live turn (`call.user_message` is present), verify
+/// `evidence` immediately against the owner's own message: a verbatim match
+/// stamps `user_stated` (rank 2), whereas an unquoted/inferred write is
+/// immediately `derived` (rank 0) so write-time folding and rank guards run
+/// before the row can bypass them as rank-2 `agent`. Standalone callers without
+/// turn message text keep `"agent"`.
+fn entry_provenance(
+    call: &aidaemon_tools::semantics::ToolCallContext,
+    evidence: Option<&str>,
+) -> (
+    &'static str,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+) {
+    let Some(user_message) = call.user_message.as_deref() else {
+        let excerpt = evidence
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(|e| crate::text::truncate_chars(e, 200));
+        return ("agent", None, excerpt);
+    };
+    let owner_authored =
+        matches!(call.user_role, Some(aidaemon_core::UserRole::Owner)) && !call.untrusted_source;
+    let quoted = owner_authored
+        && evidence.is_some_and(|quote| crate::progressive::quote_occurs_in(quote, user_message));
+    let source = if quoted { "user_stated" } else { "derived" };
+    let excerpt = if quoted {
+        evidence.map(|e| crate::text::truncate_chars(e.trim(), 200))
+    } else {
+        let trimmed = user_message.trim();
+        (!trimmed.is_empty()).then(|| crate::text::truncate_chars(trimmed, 200))
+    };
+    (source, Some(chrono::Utc::now()), excerpt)
+}
+
+fn structured_provenance(
+    call: &aidaemon_tools::semantics::ToolCallContext,
+    evidence: Option<&str>,
+) -> (&'static str, Option<String>) {
+    let (source, _, excerpt) = entry_provenance(call, evidence);
+    (source, excerpt)
 }
 
 fn call_carries_people(arguments: &str) -> bool {
@@ -1007,5 +1042,147 @@ mod tests {
             .await;
             assert_eq!(out, "Remembered: [technical] db = Postgres");
         }
+    }
+
+    #[tokio::test]
+    async fn synchronous_provenance_distinguishes_quoted_from_derived() {
+        let (tool, state, _db) = setup().await;
+        let owner_ctx = aidaemon_tools::semantics::ToolCallContext {
+            user_role: Some(aidaemon_core::UserRole::Owner),
+            channel_visibility: Some(aidaemon_core::ChannelVisibility::Private),
+            user_message: Some("My favorite tea is sencha green tea.".to_string()),
+            ..Default::default()
+        };
+        // Quoted with verbatim evidence -> immediately user_stated (rank 2).
+        tool.execute(
+            &json!({
+                "category": "preference",
+                "key": "favorite_tea",
+                "value": "sencha green tea",
+                "evidence": "My favorite tea is sencha green tea"
+            })
+            .to_string(),
+            &owner_ctx,
+        )
+        .await
+        .unwrap();
+        // Omitted evidence -> immediately derived (rank 0), never rank-2 agent.
+        tool.execute(
+            &json!({
+                "category": "preference",
+                "key": "inferred_habit",
+                "value": "Drinks tea every morning"
+            })
+            .to_string(),
+            &owner_ctx,
+        )
+        .await
+        .unwrap();
+
+        let facts = state.get_facts(Some("preference")).await.unwrap();
+        let tea = facts.iter().find(|f| f.key == "favorite_tea").unwrap();
+        assert_eq!(tea.source, "user_stated");
+        let habit = facts.iter().find(|f| f.key == "inferred_habit").unwrap();
+        assert_eq!(habit.source, "derived");
+    }
+
+    #[tokio::test]
+    async fn preference_owner_name_and_addressing_promote_to_canonical() {
+        let (tool, state, _db) = setup().await;
+        let owner_ctx = aidaemon_tools::semantics::ToolCallContext {
+            user_role: Some(aidaemon_core::UserRole::Owner),
+            channel_visibility: Some(aidaemon_core::ChannelVisibility::Private),
+            user_message: Some("Call me Alice, not Ally.".to_string()),
+            ..Default::default()
+        };
+        let out = tool
+            .execute(
+                &json!({
+                    "facts": [
+                        {
+                            "category": "preference",
+                            "key": "preferred_name",
+                            "value": "Alice",
+                            "evidence": "Call me Alice"
+                        },
+                        {
+                            "category": "preference",
+                            "key": "address_as",
+                            "value": "Call the owner Alice. Don't call her Ally.",
+                            "evidence": "Call me Alice, not Ally"
+                        }
+                    ]
+                })
+                .to_string(),
+                &owner_ctx,
+            )
+            .await
+            .unwrap()
+            .output;
+        assert!(out.contains("(canonical)"), "{out}");
+        assert!(
+            state
+                .get_facts(Some("preference"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "owner name/addressing must promote to canonical memory instead of duplicating in flat preference"
+        );
+        let canonical = state.get_canonical_memory_facts().await.unwrap();
+        assert!(
+            canonical
+                .iter()
+                .any(|f| f.category == "user" && f.key == "preferred_name" && f.value == "Alice"),
+            "{canonical:?}"
+        );
+        assert!(
+            canonical
+                .iter()
+                .any(|f| f.category == "user" && f.key == "addressing" && f.value.contains("Ally")),
+            "{canonical:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_batch_verifies_evidence_per_entry_without_sharing_authority() {
+        let (tool, state, _db) = setup().await;
+        let owner_ctx = aidaemon_tools::semantics::ToolCallContext {
+            user_role: Some(aidaemon_core::UserRole::Owner),
+            channel_visibility: Some(aidaemon_core::ChannelVisibility::Private),
+            user_message: Some("Call me Alice.".to_string()),
+            ..Default::default()
+        };
+        tool.execute(
+            &json!({
+                "facts": [
+                    {
+                        "category": "user",
+                        "key": "preferred_name",
+                        "value": "Alice",
+                        "evidence": "Call me Alice"
+                    },
+                    {
+                        "category": "user",
+                        "key": "residence",
+                        "value": "Seattle"
+                    }
+                ]
+            })
+            .to_string(),
+            &owner_ctx,
+        )
+        .await
+        .unwrap();
+        let canonical = state.get_canonical_memory_facts().await.unwrap();
+        let name = canonical
+            .iter()
+            .find(|f| f.key == "preferred_name")
+            .expect("preferred_name stored");
+        let residence = canonical
+            .iter()
+            .find(|f| f.key == "residence")
+            .expect("residence stored");
+        assert_eq!(name.source, "canonical:user_stated");
+        assert_eq!(residence.source, "canonical:derived");
     }
 }

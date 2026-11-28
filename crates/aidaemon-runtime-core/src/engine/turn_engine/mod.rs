@@ -2008,6 +2008,7 @@ impl crate::turn::bootstrap::StopSessionWork for TurnEngine<'_> {
                 owner_approval_by_kernel: false,
                 session_id,
                 task_id: Some(task_id),
+                user_text: None,
                 status_tx,
                 channel_visibility: channel_ctx.visibility,
                 channel_id: channel_ctx.channel_id.as_deref(),

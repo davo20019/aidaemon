@@ -3358,7 +3358,7 @@ async fn only_the_daemons_own_computer_changes_what_a_device_may_do() {
         .post_as(&grant.access_token, &command("d-1", Command::ListDevices))
         .await;
     assert!(
-        matches!(&listed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: false }, .. } if devices.len() == 1),
+        matches!(&listed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: false, .. }, .. } if devices.len() == 1),
         "{listed:?}"
     );
     let narrow = Command::SetDeviceScopes {
@@ -3374,7 +3374,7 @@ async fn only_the_daemons_own_computer_changes_what_a_device_may_do() {
     );
     let changed = f.post(&[], &command("d-3", narrow)).await;
     assert!(
-        matches!(&changed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: true }, .. }
+        matches!(&changed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: true, .. }, .. }
             if !devices[0].scopes.contains(&Scope::Control)),
         "{changed:?}"
     );
@@ -3767,4 +3767,220 @@ async fn trust_all_on_from_a_chat_asks_the_paired_devices() {
         .expect("a paired device is asked")
         .unwrap();
     assert!(asked.contains("Approve it in the AIdaemon app"), "{asked}");
+}
+
+/// Pairs any code it is given, as the bridge connector would once the
+/// reader finished its handshake.
+struct FakeBridgePairer;
+
+#[async_trait]
+impl aidaemon_client_gateway::pairing::BridgePairer for FakeBridgePairer {
+    async fn pair(&self, code: &str) -> Result<String, ProtocolError> {
+        assert_eq!(code, "K7F2-9QXM4HTAPZ6CR-VTPVXVT2");
+        Ok("Synthetic Kindle".into())
+    }
+}
+
+#[tokio::test]
+async fn the_owner_or_a_device_that_may_answer_every_approval_pairs_an_eink_reader() {
+    let f = fixture(RiskLevel::Medium).await;
+    let pair = |id: &str| {
+        command(
+            id,
+            Command::PairEinkDevice {
+                code: "K7F2-9QXM4HTAPZ6CR-VTPVXVT2".into(),
+            },
+        )
+    };
+    // E-ink access off: nothing to pair with.
+    let off = f.post(&[], &pair("e-1")).await;
+    assert!(
+        matches!(&off, ServerFrame::Error { error, .. } if error.code == ErrorCode::Conflict),
+        "{off:?}"
+    );
+    f.gateway
+        .pairing()
+        .set_bridge_pairer(Some(Arc::new(FakeBridgePairer)));
+    let owner = f.post(&[], &pair("e-2")).await;
+    assert!(
+        matches!(&owner, ServerFrame::Ack { result: CommandResult::EinkPaired { name }, .. } if name == "Synthetic Kindle"),
+        "{owner:?}"
+    );
+    let phone = f.pair(Vec::new()).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let paired = f.post_as(&grant.access_token, &pair("e-3")).await;
+    assert!(
+        matches!(
+            &paired,
+            ServerFrame::Ack {
+                result: CommandResult::EinkPaired { .. },
+                ..
+            }
+        ),
+        "{paired:?}"
+    );
+    let observer = f.pair(vec![Scope::Observe, Scope::Chat]).await;
+    let grant: AccessGrant = f.sign_in(&observer).await.json().await.unwrap();
+    let refused = f.post_as(&grant.access_token, &pair("e-4")).await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+}
+
+/// A reader's level changes at once, raised or lowered, from the owner's
+/// computer or a trusted device; a device that may only look cannot.
+#[tokio::test]
+async fn an_eink_readers_level_changes_at_once_from_a_trusted_device() {
+    let f = fixture(RiskLevel::Medium).await;
+    let reader = f
+        .gateway
+        .pairing()
+        .add_bridge_device("Synthetic Kindle", &[4u8; 65])
+        .await
+        .unwrap();
+    let set = |id: &str, level| {
+        command(
+            id,
+            Command::SetEinkAccess {
+                device_id: reader.clone(),
+                level,
+            },
+        )
+    };
+    let level = || async { f.gateway.pairing().eink_access(&reader).await.unwrap() };
+    assert_eq!(level().await, Some(EinkAccess::Full), "paired at Full");
+    let changed = |frame: &ServerFrame, want: EinkAccess| {
+        matches!(
+            frame,
+            ServerFrame::Ack {
+                result: CommandResult::EinkAccessChanged {
+                    level,
+                    awaiting_approval: None,
+                    other_device: false,
+                    ..
+                },
+                ..
+            } if *level == want
+        )
+    };
+    let lowered = f.post(&[], &set("l-1", EinkAccess::ViewOnly)).await;
+    assert!(changed(&lowered, EinkAccess::ViewOnly), "{lowered:?}");
+    assert_eq!(level().await, Some(EinkAccess::ViewOnly));
+    // Raising from a phone that may answer every approval: at once, even
+    // with another device paired.
+    let phone = f.pair(Vec::new()).await;
+    let _other = f.pair(Vec::new()).await;
+    let phone_grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let raised = f
+        .post_as(&phone_grant.access_token, &set("l-2", EinkAccess::Full))
+        .await;
+    assert!(changed(&raised, EinkAccess::Full), "{raised:?}");
+    assert_eq!(level().await, Some(EinkAccess::Full));
+    // A device that may not answer approvals cannot change it.
+    let viewer = f.pair(vec![Scope::Observe, Scope::Chat]).await;
+    let viewer_grant: AccessGrant = f.sign_in(&viewer).await.json().await.unwrap();
+    let refused = f
+        .post_as(&viewer_grant.access_token, &set("l-3", EinkAccess::Limited))
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    assert_eq!(level().await, Some(EinkAccess::Full));
+    // Not a reader: nothing to set.
+    let missing = f
+        .post(
+            &[],
+            &command(
+                "l-4",
+                Command::SetEinkAccess {
+                    device_id: phone.device_id.clone(),
+                    level: EinkAccess::ViewOnly,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&missing, ServerFrame::Error { error, .. } if error.code == ErrorCode::NotFound),
+        "{missing:?}"
+    );
+}
+
+/// A trusted device removes another from the list: its socket closes and
+/// its token stops working. It may not remove itself.
+#[tokio::test]
+async fn a_trusted_device_removes_another_but_not_itself() {
+    let f = fixture(RiskLevel::Medium).await;
+    let phone = f.pair(Vec::new()).await;
+    let laptop = f.pair(Vec::new()).await;
+    let phone_grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let laptop_grant: AccessGrant = f.sign_in(&laptop).await.json().await.unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{}/client/v1/ws", f.url))
+        .await
+        .unwrap();
+    let hello = ClientFrame::Hello {
+        version: ProtocolVersion::CURRENT,
+        client: ClientInfo {
+            kind: ClientKind::Web,
+            name: "web".into(),
+            version: None,
+            device: None,
+        },
+        capabilities: Vec::new(),
+        resume_from: None,
+        token: Some(laptop_grant.access_token.clone()),
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next(&mut socket).await,
+        ServerFrame::Welcome { .. }
+    ));
+    let remove = |id: &str, device: &str| {
+        command(
+            id,
+            Command::RevokeDevice {
+                device_id: device.to_string(),
+            },
+        )
+    };
+    let itself = f
+        .post_as(&phone_grant.access_token, &remove("v-1", &phone.device_id))
+        .await;
+    assert!(
+        matches!(&itself, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{itself:?}"
+    );
+    let removed = f
+        .post_as(&phone_grant.access_token, &remove("v-2", &laptop.device_id))
+        .await;
+    assert!(
+        matches!(
+            &removed,
+            ServerFrame::Ack {
+                result: CommandResult::Devices { devices, this_device: Some(this), .. },
+                ..
+            } if *this == phone.device_id
+                && devices.iter().any(|d| d.device_id == laptop.device_id && d.revoked)
+        ),
+        "{removed:?}"
+    );
+    loop {
+        if let ServerFrame::Error { error, .. } = next(&mut socket).await {
+            assert_eq!(error.code, ErrorCode::Unauthorized);
+            break;
+        }
+    }
+    assert_eq!(f.sign_in(&laptop).await.status(), 401);
+    // The owner's computer removes any device; an unknown one is not found.
+    let owner = f.post(&[], &remove("v-3", &phone.device_id)).await;
+    assert!(matches!(&owner, ServerFrame::Ack { .. }), "{owner:?}");
+    let missing = f.post(&[], &remove("v-4", "dv-synthetic-none")).await;
+    assert!(
+        matches!(&missing, ServerFrame::Error { error, .. } if error.code == ErrorCode::NotFound),
+        "{missing:?}"
+    );
 }

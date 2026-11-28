@@ -1,0 +1,10 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "device_id": "dv-synthetic-kindle",
+    "level": "limited",
+    "other_device": false,
+    "type": "eink_access_changed"
+  },
+  "type": "ack"
+}

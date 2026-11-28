@@ -12,9 +12,9 @@ use aidaemon_client_core::client::{Client, Context, Effect};
 use aidaemon_client_core::machine::Update;
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, ViewRequest};
 use aidaemon_client_protocol::{
-    AgentMode, Approval, ApprovalDecision, AttachmentRef, Command, Feature, MemoryItem, MidRun,
-    ProjectSummary, RunSummary, SessionChanges, Settings, SettingsChange, SetupAction, SetupState,
-    SlashCommand, TaskSummary,
+    AgentMode, Approval, ApprovalDecision, AttachmentRef, Command, Feature, MidRun, ProjectSummary,
+    RunSummary, SessionChanges, Settings, SettingsChange, SetupAction, SetupState, SlashCommand,
+    TaskSummary,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
@@ -23,8 +23,8 @@ mod shells;
 pub use shells::{ShellLink, ShellSink};
 
 pub use aidaemon_client_core::client::{
-    Activity, ActivityKind, Bot, Connection, DraftFile, DraftFileState, Felt, Read, SearchRead,
-    Source, SystemRead, TurnLog, channel_name, platform_name, platform_of,
+    Activity, ActivityKind, Bot, Connection, DraftFile, DraftFileState, Felt, MemoriesState, Read,
+    SearchRead, Source, SystemRead, TurnLog, channel_name, platform_name, platform_of,
 };
 
 /// The Automations page's list, as last read.
@@ -90,7 +90,7 @@ pub type FolderRead = Read<aidaemon_client_protocol::ProjectDir>;
 /// The file open in the Files tab.
 pub type FileRead = Read<aidaemon_client_protocol::ProjectFile>;
 /// The Memory page's data.
-pub type MemoryRead = Read<Vec<MemoryItem>>;
+pub type MemoryRead = Read<MemoriesState>;
 /// The Settings page's data.
 pub type SettingsRead = Read<Box<Settings>>;
 
@@ -276,6 +276,7 @@ struct Reads {
     run_view_of: Memo<Option<String>>,
     automation_busy: Memo<Option<String>>,
     memories: Memo<MemoryRead>,
+    can_manage_memories: Memo<bool>,
     settings: Memo<SettingsRead>,
     settings_busy: Memo<bool>,
     settings_error: Memo<Option<String>>,
@@ -382,6 +383,7 @@ impl Reads {
             run_view_of: computed(move || client.with(|c| c.open_run_id().map(str::to_string))),
             automation_busy: computed(move || client.with(|c| c.automation_busy.clone())),
             memories: computed(move || client.with(|c| c.memories.clone())),
+            can_manage_memories: computed(move || client.with(Client::can_manage_memories)),
             settings: computed(move || client.with(|c| c.settings.clone())),
             settings_busy: computed(move || client.with(Client::settings_busy)),
             settings_error: computed(move || client.with(|c| c.settings_error.clone())),
@@ -575,6 +577,10 @@ pub struct Store {
     /// A pairing link opened on this device (a QR code, a tapped link) that
     /// the pairing screen has not used yet, and when the owner confirmed it.
     pairing_link: Signal<Option<(String, u64)>>,
+    /// An e-ink reader's QR link opened in this app, until the e-ink
+    /// pairing panel takes it, and when it was opened. Memory only: a link
+    /// is offered right after it opens, never replayed later.
+    eink_link: Signal<Option<(aidaemon_client_core::eink::PairLink, u64)>>,
     /// The live view's newest picture (beside the client: frames never
     /// enter its state).
     live_frame: Signal<Option<crate::ui::LiveFrame>>,
@@ -679,6 +685,7 @@ impl Store {
             posting: signal(BTreeSet::new()),
             starting_daemon: signal(None),
             pairing_link: signal(None),
+            eink_link: signal(None),
             live_frame: signal(None),
             live_focus: signal(None),
             live_focus_rect: signal(None),
@@ -952,6 +959,40 @@ impl Store {
 
     pub fn set_device_control(&self, device_id: &str, on: bool) {
         self.act(|c| c.set_device_control(device_id, on));
+    }
+
+    /// Pair the e-ink reader showing `code` (as typed).
+    pub fn pair_eink_device(&self, code: &str) -> bool {
+        self.act(|c| c.pair_eink_device(code))
+    }
+
+    /// Where pairing an e-ink reader stands (tracked).
+    pub fn eink_pairing(&self) -> aidaemon_client_core::eink::EinkPairing {
+        self.read(|c| c.eink_pairing.clone())
+    }
+
+    pub fn clear_eink_pairing(&self) {
+        self.act(|c| c.clear_eink_pairing());
+    }
+
+    /// Set an e-ink reader's access level (a raise is approved first).
+    pub fn set_eink_access(&self, device_id: &str, level: aidaemon_client_protocol::EinkAccess) {
+        self.act(|c| c.set_eink_access(device_id, level));
+    }
+
+    /// Unpair a device: it loses access at once.
+    pub fn revoke_device(&self, device_id: &str) {
+        self.act(|c| c.revoke_device(device_id));
+    }
+
+    /// This app's own paired device id, as the device list says (tracked).
+    pub fn this_device(&self) -> Option<String> {
+        self.read(|c| c.this_device.clone())
+    }
+
+    /// What the owner should know about the last level change (tracked).
+    pub fn eink_access_note(&self) -> Option<String> {
+        self.read(|c| c.eink_access_note.clone())
     }
 
     /// The tab of `session` where a run waits for the owner (tracked).
@@ -1263,6 +1304,25 @@ impl Store {
         let link = self.pairing_link.with_untracked(Clone::clone)?;
         self.pairing_link.set(None);
         let (link, at) = link;
+        (now_ms().saturating_sub(at) <= PAIRING_LINK_KEEPS_MS).then_some(link)
+    }
+
+    /// An e-ink reader's QR link was opened: Settings → Connections offers
+    /// to pair it once the app is online (`features::links`).
+    pub fn open_eink_link(&self, link: aidaemon_client_core::eink::PairLink) {
+        self.eink_link.set(Some((link, now_ms())));
+    }
+
+    /// Whether an e-ink link waits for the pairing panel (tracked).
+    pub fn eink_link_waiting(&self) -> bool {
+        self.eink_link.with(Option::is_some)
+    }
+
+    /// Takes the waiting e-ink link, so it is offered once, and only within
+    /// [`PAIRING_LINK_KEEPS_MS`] of opening it.
+    pub fn take_eink_link(&self) -> Option<aidaemon_client_core::eink::PairLink> {
+        let (link, at) = self.eink_link.with_untracked(Clone::clone)?;
+        self.eink_link.set(None);
         (now_ms().saturating_sub(at) <= PAIRING_LINK_KEEPS_MS).then_some(link)
     }
 
@@ -1688,6 +1748,18 @@ impl Store {
 
     pub fn forget_memory(&self, id: &str) {
         self.act(|c| c.forget_memory(id));
+    }
+
+    pub fn edit_memory(&self, id: &str, value: &str) {
+        self.act(|c| c.edit_memory(id, value));
+    }
+
+    pub fn archive_memory(&self, id: &str) {
+        self.act(|c| c.archive_memory(id));
+    }
+
+    pub fn restore_memory(&self, id: &str) {
+        self.act(|c| c.restore_memory(id));
     }
 
     pub fn open_settings(&self) {
@@ -3715,6 +3787,11 @@ impl Store {
     /// Whether the daemon deletes conversations (protocol 1.59).
     pub fn can_delete_sessions(&self) -> bool {
         self.read(|c| c.can_delete_sessions())
+    }
+
+    /// Whether the daemon supports inline memory editing and archiving (protocol 1.61).
+    pub fn can_manage_memories(&self) -> bool {
+        self.reads.can_manage_memories.get()
     }
 
     pub fn can_send_queued_now(&self) -> bool {

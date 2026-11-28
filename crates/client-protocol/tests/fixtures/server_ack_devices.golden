@@ -18,6 +18,7 @@
         ]
       }
     ],
+    "this_device": "dev-phone-1",
     "type": "devices"
   },
   "type": "ack"
