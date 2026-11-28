@@ -130,6 +130,7 @@
   }
 
   function show(view) {
+    if (view !== 'convo' && view !== 'reader') stopWatching();
     current.view = view;
     var views = document.querySelectorAll('.view');
     for (var i = 0; i < views.length; i++) views[i].className = 'view';
@@ -462,12 +463,17 @@
   async function openChat(s, from) {
     current.session = s;
     current.historyLimit = 8;
+    current.historySig = null;
     current.from = from || 'chat';
     $('convo-title').textContent = (s && s.title) || (s && s.id ? 'Conversation' : 'New chat');
     $('convo-note').textContent = '';
     show('convo');
     current.toEnd = true;
     await loadHistory();
+    var busyNow = ((overview && overview.running_tasks) || []).some(function (t) {
+      return s && t.session_id === s.id;
+    });
+    if (s && s.id && busyNow) watchConversation(s.id, true);
   }
 
 
@@ -516,6 +522,41 @@
     window.scrollBy(0, direction * Math.max(200, window.innerHeight - 140));
   }
 
+  // While work runs in the open conversation, a small glance every few
+  // seconds; when it ends, the conversation reloads once and shows the new
+  // messages at the end. Nothing redraws while nothing changed (e-ink).
+  var WATCH_MS = 8000;
+  var watching = null;
+
+  function watchConversation(id, expectWork) {
+    stopWatching();
+    var sawWork = !!expectWork;
+    var quietChecks = 0;
+    watching = setInterval(async function () {
+      if (current.view !== 'convo' || !current.session || current.session.id !== id) { stopWatching(); return; }
+      try {
+        var glance = (await (await ensureLink()).command({ type: 'get_glance' })).glance || {};
+        var busy = (glance.running_tasks || []).some(function (t) { return t.session_id === id; });
+        if (busy) { sawWork = true; quietChecks = 0; return; }
+        // Just sent: give the daemon a few checks to start before giving up.
+        if (!sawWork && ++quietChecks < 4) return;
+        // The turn is done; a coding agent may still be running in the
+        // background. Reload (redrawn only if something changed) and keep
+        // watching while one is.
+        current.toEnd = true;
+        var agentsRunning = await loadHistory();
+        if (!agentsRunning) stopWatching();
+        else sawWork = true;
+      } catch (e) {
+        stopWatching();
+      }
+    }, WATCH_MS);
+  }
+
+  function stopWatching() {
+    if (watching) { clearInterval(watching); watching = null; }
+  }
+
   async function loadHistory() {
     var mine = ++loads.history;
     var box = $('convo-messages');
@@ -523,6 +564,16 @@
     var l = await ensureLink();
     var result = await l.command({ type: 'get_history', session_id: current.session.id, limit: current.historyLimit || 8 });
     if (mine !== loads.history) return;
+    var running = (result.runs || []).some(function (r) { return r.phase === 'running'; });
+    // Same messages and runs as on screen: leave the page alone (e-ink).
+    var sig = (result.messages || []).map(function (m) { return m.id; }).join(',') + '|' +
+      (result.runs || []).map(function (r) { return r.id + ':' + r.phase; }).join(',') + '|' + (current.historyLimit || 8);
+    if (sig === current.historySig && current.historySession === current.session.id) {
+      current.toEnd = false;
+      return running;
+    }
+    current.historySig = sig;
+    current.historySession = current.session.id;
     clear(box);
     blobUrls.forEach(function (u) { URL.revokeObjectURL(u); });
     blobUrls = [];
@@ -585,6 +636,9 @@
       current.toEnd = false;
       window.scrollTo(0, document.body.scrollHeight);
     }
+    // An agent still running here: watch for its answer.
+    if (running && !watching) watchConversation(current.session.id, true);
+    return running;
   }
 
   // ---------------------------------------------------------- writing strip
@@ -743,9 +797,10 @@
       if (handwriting) clearAllLines();
       $('convo-text').value = '';
       if (!current.session || !current.session.id) current.session = { id: result.session_id, title: text.slice(0, 40) };
-      $('convo-note').textContent = 'Sent. Tap Refresh for the reply.';
+      $('convo-note').textContent = 'Sent. The reply appears here when it is ready.';
       current.toEnd = true;
       await loadHistory();
+      watchConversation(current.session.id, false);
     } catch (e) {
       $('convo-note').textContent = e.message;
     } finally {
