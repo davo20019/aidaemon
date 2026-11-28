@@ -454,7 +454,30 @@
     blobUrls.forEach(function (u) { URL.revokeObjectURL(u); });
     blobUrls = [];
     var images = [];
-    (result.messages || []).forEach(function (m) {
+    // A coding agent's answer lives on its run, not in a message: put each
+    // ended run in time order among the messages, its answer a tap away.
+    var items = (result.messages || []).map(function (m) { return { at: m.at_ms || 0, message: m }; });
+    (result.runs || []).forEach(function (r) {
+      items.push({ at: r.ended_at_ms || r.started_at_ms || 0, run: r });
+    });
+    items.sort(function (a, b) { return a.at - b.at; });
+    items.forEach(function (item) {
+      if (item.run) {
+        var r = item.run;
+        var card = el('div', 'msg');
+        card.appendChild(el('div', 'msg-from', (r.agent || 'Agent') + ' · ' + (PHASE_WORD[r.phase] || r.phase) +
+          (r.took ? ' · ' + r.took : '')));
+        var answer = el('div', 'msg-text');
+        richText(answer, r.result || (r.phase === 'running' ? 'Working…' : 'No answer recorded.'));
+        card.appendChild(answer);
+        var steps = el('button', 'btn btn-small', 'Steps \u25b8');
+        steps.type = 'button';
+        steps.addEventListener('click', function () { openRun(r); });
+        card.appendChild(steps);
+        box.appendChild(card);
+        return;
+      }
+      var m = item.message;
       var d = el('div', m.role === 'user' ? 'msg msg-you' : 'msg');
       d.appendChild(el('div', 'msg-from', m.role === 'user' ? 'You' : 'aidaemon'));
       var body = el('div', 'msg-text');
