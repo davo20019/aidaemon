@@ -1,4 +1,4 @@
-//! Test vectors (SPEC §9). This test recomputes `vectors/v1.json` from
+//! Test vectors (SPEC §9). This test recomputes `vectors/v1.golden` from
 //! fixed inputs and fails if the file differs, so the vectors cannot drift
 //! from the code. Regenerate on purpose with
 //! `UPDATE_BRIDGE_VECTORS=1 cargo test -p aidaemon-bridge-proto --test vectors`.
@@ -268,8 +268,8 @@ fn build() -> Value {
     let psig_d = reply_fields[5].clone();
     let psig_k = finish_fields[1].clone();
     let route = route_id(&login_pub);
-    let control_json = paired_json(&daemon_id(&identity_pub), &route);
-    let control = dpaired.paired_control(&route);
+    let control_json = paired_json(&daemon_id(&identity_pub), &route, "dv-0123456789abcdef0123");
+    let control = dpaired.paired_control(&route, "dv-0123456789abcdef0123");
     assert_eq!(control, encode_control(&control_json));
     let pd2p = dpaired
         .channel
@@ -368,7 +368,7 @@ fn build() -> Value {
 
 #[test]
 fn vectors_match_file() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/v1.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/v1.golden");
     let built = build();
     if std::env::var_os("UPDATE_BRIDGE_VECTORS").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -378,9 +378,9 @@ fn vectors_match_file() {
         return;
     }
     let text = std::fs::read_to_string(&path)
-        .expect("vectors/v1.json missing; run with UPDATE_BRIDGE_VECTORS=1");
+        .expect("vectors/v1.golden missing; run with UPDATE_BRIDGE_VECTORS=1");
     let on_disk: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(on_disk, built, "vectors/v1.json is stale");
+    assert_eq!(on_disk, built, "vectors/v1.golden is stale");
 }
 
 #[test]

@@ -61,6 +61,7 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/enrollments/{offer_id}", get(enrollment))
         .route("/client/v1/sessions/challenge", post(challenge))
         .route("/client/v1/sessions", post(open_session))
+        .route("/client/v1/bridge/pair", post(pair_bridge_device))
         .route("/client/v1/devices", get(devices))
         .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
         .route(
@@ -178,6 +179,28 @@ pub(crate) struct Exposed;
 /// Tunnel adapters publish a listener serving this, never the loopback one.
 pub fn exposed_router(gateway: Arc<ClientGateway>) -> Router {
     router(gateway.clone()).layer(axum::middleware::from_fn_with_state(
+        (gateway, true),
+        exposed_guard,
+    ))
+}
+
+/// The routes a device paired over the bridge (an e-ink reader) reaches,
+/// and nothing else: signing in with its key, commands and its message
+/// files. No pairing offers, devices, sockets, shells, surfaces or pages
+/// exist on this router, so none can be reached by any path spelling.
+pub(crate) fn bridge_routes(gateway: Arc<ClientGateway>) -> Router {
+    let routes = Router::new()
+        .route(
+            "/client/v1/commands",
+            post(http_command).layer(axum::extract::DefaultBodyLimit::max(MAX_COMMAND)),
+        )
+        .route("/client/v1/files/{id}/{signature}/{name}", get(file))
+        .route("/client/v1/sessions/challenge", post(challenge))
+        .route("/client/v1/sessions", post(open_session))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
+        .with_state(gateway.clone());
+    // Exposed: never this computer, so the local token is refused.
+    routes.layer(axum::middleware::from_fn_with_state(
         (gateway, true),
         exposed_guard,
     ))
@@ -382,6 +405,36 @@ fn owner_only(gateway: &ClientGateway, headers: &HeaderMap) -> Result<(), Respon
 pub(crate) fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(bytes)
         .map_err(|error| error_response(ErrorCode::Invalid, &error.to_string()))
+}
+
+/// What the owner sends to pair an e-ink device: the code its screen shows.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgePairRequest {
+    code: String,
+}
+
+/// Pair an e-ink device over the bridge from the code the owner read off
+/// its screen: the owner's local token only, like making an offer.
+async fn pair_bridge_device(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    let request: BridgePairRequest = match body(&bytes) {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    reply(
+        gateway
+            .pairing
+            .pair_bridge_device(&request.code)
+            .await
+            .map(|name| serde_json::json!({ "paired": name })),
+    )
 }
 
 async fn create_offer(

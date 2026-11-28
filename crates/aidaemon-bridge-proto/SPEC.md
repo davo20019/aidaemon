@@ -7,7 +7,7 @@ and threat model: `reports/2026-11-27 Kindle e-ink access plan.md` (local)
 and, once published, `crates/aidaemon-bridge/SECURITY.md`.
 
 Every implementation (Rust here, JavaScript in the page) must match this
-document and `vectors/v1.json` exactly. Anything not described is refused.
+document and `vectors/v1.golden` exactly. Anything not described is refused.
 
 ## 1. Primitives and encodings
 
@@ -53,7 +53,12 @@ frames carry protocol frames (§4) the bridge never reads.
 3. Bridge verifies, derives `route_id`, replies `{"type":"ready","route_id":"<64 hex>"}`.
    A second daemon logging in with the same `route_id` replaces the first.
 4. The daemon's one WebSocket carries every browser connection routed to it:
-   - Bridge → daemon `{"type":"open","conn":<u32>}` when a browser joins.
+   - Bridge → daemon `{"type":"open","conn":<u32>}` when a browser connects
+     by route, or `{"type":"open","conn":<u32>,"nameplate":"<4 chars>"}` for
+     the browser that waited on a nameplate the daemon joined. The daemon
+     accepts a pairing handshake (mode 2) only on a connection opened with a
+     nameplate it joined, and a session handshake (mode 1) only on one
+     opened without.
    - Binary frames both ways are `u32 conn ‖ protocol frame`.
    - Daemon → bridge `{"type":"promote","conn":n}` after a handshake
      completes: the bridge raises that connection's frame limit from the
@@ -68,7 +73,9 @@ frames carry protocol frames (§4) the bridge never reads.
 - After pairing: `wss://<bridge>/v1/connect?route=<route_id hex>`. Refused
   (closed) if no daemon with that route is logged in.
 - Pairing: `wss://<bridge>/v1/wait?nameplate=<4 chars>`. The browser waits
-  until a daemon joins that nameplate, up to 10 minutes. A nameplate already
+  until a daemon joins that nameplate, up to 10 minutes. When one does, the
+  bridge sends the browser one text frame `{"type":"joined"}`; the page
+  sends its HELLO only after it (a frame before it closes the wait). A nameplate already
   waiting is refused (the page picks a new random one). Nameplates are 4
   characters from the Crockford Base32 alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`,
   uppercase only (the page uppercases what the owner types).
@@ -171,7 +178,9 @@ leading bytes from a typed code), sends HELLO_REPLY. The page checks
 `mac_d` (constant-time) and `sig_d`; on failure it shows "pairing failed"
 and starts over. The page sends FINISH; the daemon checks `mac_k`
 (constant-time) and `sig_k`, creates the device, and sends a DATA control
-message (§8) `{"type":"paired","daemon_id":…,"route_id":…}`. Only then does
+message (§8) `{"type":"paired","daemon_id":…,"route_id":…,"device":"dv-…"}`
+(`device`: the id the daemon gave the device, which it names when it signs
+in; `dv-` and 1–40 lowercase hex digits). Only then does
 the page store `identity_pub` and `route_id`. Any failure ends this
 pairing; the page starts a new one.
 
@@ -210,7 +219,7 @@ for its response.
 
 ## 9. Test vectors
 
-`vectors/v1.json` fixes private scalars, nonces, secret and names, and gives
+`vectors/v1.golden` fixes private scalars, nonces, secret and names, and gives
 the expected ids, transcripts, transcript hashes, HKDF outputs, MACs, one
 encrypted DATA frame per direction and encoded request/response messages.
 ECDSA signatures are randomized in WebCrypto, so vectors give Rust's

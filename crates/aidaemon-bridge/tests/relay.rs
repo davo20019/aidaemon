@@ -336,7 +336,11 @@ async fn pairing_wait_join_and_join_failed() {
     send_json(&mut daemon, json!({"type": "join", "nameplate": "7K3Q"})).await;
     let open = recv_json(&mut daemon).await;
     assert_eq!(open["type"], "open");
+    // A joined browser's open names its nameplate: pairing only there.
+    assert!(open["nameplate"].is_string());
     let conn = open["conn"].as_u64().unwrap() as u32;
+    // The waiting browser hears that a daemon joined before it sends.
+    assert_eq!(recv_json(&mut waiting).await, json!({"type": "joined"}));
     send(&mut waiting, Message::binary(vec![1, 1])).await;
     assert_eq!(recv_binary(&mut daemon).await, prefixed(conn, &[1, 1]));
     send(&mut daemon, Message::binary(prefixed(conn, &[2]))).await;

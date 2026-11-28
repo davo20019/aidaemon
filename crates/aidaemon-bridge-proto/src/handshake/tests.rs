@@ -105,7 +105,7 @@ fn pairing_round_trip() {
     assert_eq!(paired.daemon_id, daemon_id(&pub_bytes(&identity)));
     assert_eq!(paired_page.identity_pub, pub_bytes(&identity));
     let route = route_id(&pub_bytes(&key(3)));
-    let control = paired.paired_control(&route);
+    let control = paired.paired_control(&route, "dv-0123456789abcdef0123");
     let frames = paired.channel.sealer.seal_message(&control).unwrap();
     let msg = paired_page
         .channel
@@ -116,7 +116,10 @@ fn pairing_round_trip() {
     let DaemonMessage::Control(json) = decode_from_daemon(&msg).unwrap() else {
         panic!("not control");
     };
-    assert_eq!(json, paired_json(&paired_page.daemon_id, &route));
+    assert_eq!(
+        json,
+        paired_json(&paired_page.daemon_id, &route, "dv-0123456789abcdef0123")
+    );
     exchange(&mut paired.channel, &mut paired_page.channel);
 }
 

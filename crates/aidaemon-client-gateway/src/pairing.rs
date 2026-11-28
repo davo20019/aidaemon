@@ -71,6 +71,13 @@ fn random_hex() -> String {
     )
 }
 
+/// Pairs an e-ink device over the bridge (the daemon's bridge connector).
+#[async_trait::async_trait]
+pub trait BridgePairer: Send + Sync {
+    /// Pair the device whose screen shows `code`; its name once paired.
+    async fn pair(&self, code: &str) -> Result<String, ProtocolError>;
+}
+
 /// Who a request comes from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Principal {
@@ -208,6 +215,12 @@ pub struct Pairing {
     /// The web app on a site of its own, named in offers while there is a
     /// remote address.
     web_app: Mutex<Option<String>>,
+    /// This daemon's bridge identity (`daemon_id`, 64 hex) while e-ink
+    /// access is on: devices on the bridge sign in to `bridge:<id>`.
+    bridge_id: Mutex<Option<String>>,
+    /// The bridge connector while e-ink access is on: it pairs a device
+    /// from the code the owner read off its screen.
+    bridge_pairer: Mutex<Option<Arc<dyn BridgePairer>>>,
     /// Offers shown on the owner's own screen ([`Self::offer_shown_here`]):
     /// redeeming one pairs at once. Kept in memory only: after a restart
     /// such an offer asks like any other.
@@ -387,6 +400,8 @@ impl Pairing {
             public_url,
             remote_url: Mutex::default(),
             web_app: Mutex::default(),
+            bridge_id: Mutex::default(),
+            bridge_pairer: Mutex::default(),
             shown_here: Mutex::default(),
             fingerprint,
             access: Mutex::default(),
@@ -482,6 +497,48 @@ impl Pairing {
     /// device that can dial it pairs and signs in over it. `None` stops.
     pub fn set_remote_url(&self, url: Option<String>) {
         *self.remote_url.lock().unwrap_or_else(|p| p.into_inner()) = url;
+    }
+
+    /// The daemon's bridge identity while e-ink access is on (`None`: off,
+    /// and no device signs in over the bridge).
+    pub fn set_bridge_id(&self, daemon_id_hex: Option<String>) {
+        *self.bridge_id.lock().unwrap_or_else(|p| p.into_inner()) = daemon_id_hex;
+    }
+
+    /// The bridge connector that pairs e-ink devices (`None`: e-ink access
+    /// is off, and pairing one is refused).
+    pub fn set_bridge_pairer(&self, pairer: Option<Arc<dyn BridgePairer>>) {
+        *self.bridge_pairer.lock().unwrap_or_else(|p| p.into_inner()) = pairer;
+    }
+
+    /// Pair the e-ink device whose screen shows `code`: the owner read it
+    /// there and sent it from a trusted device. Answers the new device's
+    /// name once its handshake through the bridge completes.
+    pub async fn pair_bridge_device(&self, code: &str) -> Result<String, ProtocolError> {
+        let pairer = self
+            .bridge_pairer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(pairer) = pairer else {
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "E-ink access is off: turn it on before pairing an e-ink device",
+            ));
+        };
+        pairer.pair(code).await
+    }
+
+    /// The public keys (65-byte SEC1) of the active e-ink devices, for the
+    /// bridge connector to find the one a handshake names.
+    pub async fn active_bridge_keys(&self) -> Vec<Vec<u8>> {
+        let Ok(rows) = self.log.devices().await else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter(|d| d.revoked_at_ms.is_none() && d.kind == crate::eink::EINK_KIND)
+            .filter_map(|d| URL_SAFE_NO_PAD.decode(&d.public_key).ok())
+            .collect()
     }
 
     /// Offers name `url` as the web app a phone with no app pairs at
@@ -849,6 +906,17 @@ impl Pairing {
         {
             return true;
         }
+        // A device signing in over the bridge names this daemon's bridge
+        // identity: `bridge:<daemon id>` (64 lowercase hex digits).
+        if let Some(id) = self
+            .bridge_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            && audience.strip_prefix("bridge:") == Some(id)
+        {
+            return true;
+        }
         if audience.starts_with("http") && is_loopback_url(audience) {
             return local;
         }
@@ -1069,7 +1137,7 @@ impl Pairing {
     pub async fn add_bridge_device(
         &self,
         name: &str,
-        public_key_hex: &str,
+        public_key: &[u8],
     ) -> Result<String, ProtocolError> {
         let name: String = name.trim().chars().take(60).collect();
         if name.is_empty() {
@@ -1081,7 +1149,7 @@ impl Pairing {
                 device_id: device_id.clone(),
                 name,
                 kind: crate::eink::EINK_KIND.to_string(),
-                public_key: public_key_hex.to_string(),
+                public_key: URL_SAFE_NO_PAD.encode(public_key),
                 scopes: scopes_text(&EINK_SCOPES),
                 risk_ceiling: serde_json::to_value(Risk::Medium)
                     .ok()

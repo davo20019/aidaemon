@@ -1,5 +1,5 @@
 /*
- * aidaemon bridge protocol v1, page side (see ../SPEC.md and ../vectors/v1.json).
+ * aidaemon bridge protocol v1, page side (see ../SPEC.md and ../vectors/v1.golden).
  *
  * A classic script: defines the global `AidaemonBridgeProto`, or exports it
  * through `module.exports` under Node (`require('./bridge-proto.js')`).
@@ -620,8 +620,9 @@
         !/^[0-9a-f]{64}$/.test(obj.daemon_id) || !/^[0-9a-f]{64}$/.test(obj.route_id)) {
       fail('BadMessage', 'paired control');
     }
+    if (typeof obj.device !== 'string' || !/^dv-[0-9a-f]{1,40}$/.test(obj.device)) fail('BadMessage', 'paired device');
     if (obj.daemon_id !== toHex(await daemonId(identityPub))) fail('BadMessage', 'paired daemon_id mismatch');
-    return { daemonId: obj.daemon_id, routeId: obj.route_id };
+    return { daemonId: obj.daemon_id, routeId: obj.route_id, device: obj.device };
   }
 
   // ---------------------------------------------------------------- messages

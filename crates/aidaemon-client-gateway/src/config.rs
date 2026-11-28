@@ -45,6 +45,22 @@ pub struct ClientGatewayConfig {
     /// tunnel. On whenever the gateway is.
     #[serde(default)]
     pub remote: RemoteAccessConfig,
+    /// E-ink access (`[client_gateway.eink]`): a browser that cannot run the
+    /// app (an e-ink reader) reaches this daemon through a bridge, end to
+    /// end encrypted. Off unless a bridge is named.
+    #[serde(default)]
+    pub eink: EinkAccessConfig,
+}
+
+/// `[client_gateway.eink]`: e-ink access through a bridge.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EinkAccessConfig {
+    /// The bridge to dial out to, e.g. `wss://bridge.aidaemon.ai/v1/daemon`
+    /// (or your own `aidaemon-bridge`). Empty: e-ink access is off, the
+    /// daemon keeps no bridge connection and pairs no e-ink device.
+    #[serde(default)]
+    pub bridge_url: Option<String>,
 }
 
 /// `[client_gateway.remote]`: serve the gateway over iroh too.
@@ -117,6 +133,7 @@ impl Default for ClientGatewayConfig {
             public_url: None,
             app_dir: None,
             remote: RemoteAccessConfig::default(),
+            eink: EinkAccessConfig::default(),
         }
     }
 }

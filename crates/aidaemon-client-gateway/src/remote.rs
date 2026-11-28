@@ -137,10 +137,29 @@ pub fn remote_router<P>(gateway: Arc<ClientGateway>) -> Router
 where
     P: Clone + Eq + Hash + AsRef<[u8]> + Send + Sync + 'static,
 {
+    guarded::<P>(gateway.clone(), crate::exposed_router(gateway))
+}
+
+/// The bridge's routes ([`crate::server::bridge_routes`]: sign-in, commands
+/// and message files only) behind the same peer guard, for the bridge
+/// connector, which puts the device key its handshake proved on each
+/// request as `P`. Build it once per connector: the guard's token bindings
+/// live in it.
+pub fn bridge_router<P>(gateway: Arc<ClientGateway>) -> Router
+where
+    P: Clone + Eq + Hash + AsRef<[u8]> + Send + Sync + 'static,
+{
+    guarded::<P>(gateway.clone(), crate::server::bridge_routes(gateway))
+}
+
+fn guarded<P>(gateway: Arc<ClientGateway>, routes: Router) -> Router
+where
+    P: Clone + Eq + Hash + AsRef<[u8]> + Send + Sync + 'static,
+{
     let bindings = Arc::new(Bindings::<P> {
         tokens: Mutex::default(),
     });
-    crate::exposed_router(gateway.clone()).layer(axum::middleware::from_fn_with_state(
+    routes.layer(axum::middleware::from_fn_with_state(
         (gateway, bindings),
         guard::<P>,
     ))

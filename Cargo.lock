@@ -106,6 +106,7 @@ name = "aidaemon"
 version = "0.25.1"
 dependencies = [
  "aidaemon-agents",
+ "aidaemon-bridge-connector",
  "aidaemon-channel-discord",
  "aidaemon-channel-slack",
  "aidaemon-channel-telegram",
@@ -213,6 +214,30 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "aidaemon-bridge-connector"
+version = "0.25.1"
+dependencies = [
+ "aidaemon-bridge-proto",
+ "aidaemon-client-gateway",
+ "aidaemon-client-protocol",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "futures",
+ "hex",
+ "http",
+ "http-body-util",
+ "p256",
+ "rand 0.10.3",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tower",
+ "tracing",
  "workspace-hack",
 ]
 

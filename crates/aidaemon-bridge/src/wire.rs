@@ -70,6 +70,12 @@ pub(crate) fn open(conn: u32) -> String {
     json!({"type": "open", "conn": conn}).to_string()
 }
 
+/// A browser that waited on `nameplate` joined: the daemon accepts only a
+/// pairing handshake on this connection.
+pub(crate) fn open_joined(conn: u32, nameplate: &str) -> String {
+    json!({"type": "open", "conn": conn, "nameplate": nameplate}).to_string()
+}
+
 pub(crate) fn close(conn: u32) -> String {
     json!({"type": "close", "conn": conn}).to_string()
 }

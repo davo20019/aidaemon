@@ -636,21 +636,33 @@ pub struct DaemonPaired {
 
 impl DaemonPaired {
     /// The control message (SPEC §6, §8) to seal and send once the device
-    /// is created: `{"type":"paired","daemon_id":…,"route_id":…}`.
-    pub fn paired_control(&self, route_id: &[u8; 32]) -> Vec<u8> {
-        message::encode_control(&paired_json(&self.daemon_id, route_id))
+    /// is created: `{"type":"paired","daemon_id":…,"route_id":…,"device":…}`,
+    /// where `device` is the id the daemon gave the device (`dv-…`), which
+    /// the page names when it signs in.
+    pub fn paired_control(&self, route_id: &[u8; 32], device: &str) -> Vec<u8> {
+        message::encode_control(&paired_json(&self.daemon_id, route_id, device))
     }
 }
 
 /// The exact JSON of the `paired` control message: keys in this order,
 /// lowercase hex, no whitespace.
-pub fn paired_json(daemon_id: &[u8; 32], route_id: &[u8; 32]) -> Vec<u8> {
+pub fn paired_json(daemon_id: &[u8; 32], route_id: &[u8; 32], device: &str) -> Vec<u8> {
+    debug_assert!(is_device_ref(device));
     format!(
-        "{{\"type\":\"paired\",\"daemon_id\":\"{}\",\"route_id\":\"{}\"}}",
+        "{{\"type\":\"paired\",\"daemon_id\":\"{}\",\"route_id\":\"{}\",\"device\":\"{}\"}}",
         hex::encode(daemon_id),
-        hex::encode(route_id)
+        hex::encode(route_id),
+        device
     )
     .into_bytes()
+}
+
+/// A daemon's id for a device as `paired` carries it: `dv-` and 1–40
+/// lowercase hex digits.
+pub fn is_device_ref(device: &str) -> bool {
+    device.strip_prefix("dv-").is_some_and(|hex| {
+        (1..=40).contains(&hex.len()) && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 // ---------------------------------------------------------------------------

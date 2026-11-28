@@ -9,6 +9,7 @@ pub(crate) mod client_sessions;
 pub(crate) mod client_settings;
 pub mod db_security;
 pub mod db_upkeep;
+pub(crate) mod eink;
 pub(crate) mod engine;
 pub mod exposure;
 pub mod mcp;

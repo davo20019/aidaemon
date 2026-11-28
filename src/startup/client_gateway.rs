@@ -1390,6 +1390,7 @@ pub async fn start(
     if config.client_gateway.remote.enabled {
         start_remote(&config.client_gateway, gateway.clone()).await;
     }
+    crate::startup::eink::start(&config.client_gateway, gateway.clone());
     #[cfg(not(feature = "remote"))]
     if config.client_gateway.remote.enabled {
         tracing::info!(

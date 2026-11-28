@@ -1,5 +1,5 @@
 // Tests for bridge-proto.js: `node js/test.js` (Node 22+, WebCrypto global).
-// Checks every vector in ../vectors/v1.json the page can reproduce, verifies
+// Checks every vector in ../vectors/v1.golden the page can reproduce, verifies
 // the Rust signatures, and runs full pairing + session handshakes against a
 // daemon-side test double built from the same primitives.
 'use strict';
@@ -10,7 +10,7 @@ var B = require('./bridge-proto.js');
 var P = B.primitives;
 var subtle = globalThis.crypto.subtle;
 
-var V = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'vectors', 'v1.json'), 'utf8'));
+var V = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'vectors', 'v1.golden'), 'utf8'));
 var hx = B.fromHex;
 var toHex = B.toHex;
 
@@ -161,7 +161,7 @@ test('pairing vectors', async function () {
   var msg = await r.opener.open(hx(S.data[0].frame));
   eqHex(msg, S.data[0].plaintext, 'paired control');
   var paired = await B.parsePairedControl(msg, r.identityPub);
-  assert(paired.routeId === V.ids.route_id && paired.daemonId === V.ids.daemon_id, 'paired ids');
+  assert(paired.routeId === V.ids.route_id && paired.daemonId === V.ids.daemon_id && paired.device === 'dv-0123456789abcdef0123', 'paired ids');
   eqHex(await r.sealer.sealFragment(hx(S.data[1].plaintext), true), S.data[1].frame, 'p2d frame');
 });
 
@@ -267,7 +267,7 @@ test('full pairing then session, live', async function () {
   var d = await daemonPairing(identity, hello, secret, (await B.deviceId(devicePub)).subarray(0, 8));
   var r = await page.onReply(d.reply);
   var dch = await d.finish(r.finish);
-  var json = JSON.stringify({ type: 'paired', daemon_id: toHex(await B.daemonId(identity.pub)), route_id: toHex(routeId) });
+  var json = JSON.stringify({ type: 'paired', daemon_id: toHex(await B.daemonId(identity.pub)), route_id: toHex(routeId), device: 'dv-0123456789abcdef0123' });
   var frames = await dch.sealer.sealMessage(B.encodeControl(json));
   var paired = await B.parsePairedControl(await r.opener.open(frames[0]), r.identityPub);
   assert(paired.routeId === toHex(routeId), 'route id');

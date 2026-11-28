@@ -57,6 +57,7 @@ members = [
     "crates/aidaemon-remote",
     "crates/aidaemon-bridge-proto",
     "crates/aidaemon-bridge",
+    "crates/aidaemon-bridge-connector",
     "crates/aidaemon-surfaces",
     "crates/aidaemon-shells",
     "crates/aidaemon-terminal-bridge",
@@ -144,6 +145,8 @@ aidaemon-client-gateway = { version = "=0.25.1", path = "crates/aidaemon-client-
 aidaemon-exposure = { version = "=0.25.1", path = "crates/aidaemon-exposure" }
 # Remote access over iroh: one transport of several, behind the `remote` feature.
 aidaemon-remote = { version = "=0.25.1", path = "crates/aidaemon-remote", optional = true }
+# E-ink access: the daemon's side of the bridge (off unless configured).
+aidaemon-bridge-connector = { version = "=0.25.1", path = "crates/aidaemon-bridge-connector" }
 aidaemon-client-protocol = { version = "=0.25.1", path = "crates/client-protocol" }
 # Sharing this computer's screen with a daemon elsewhere (`aidaemon share-screen`).
 aidaemon-client-core = { version = "=0.25.1", path = "crates/aidaemon-client-core", default-features = false, features = ["native"], optional = true }

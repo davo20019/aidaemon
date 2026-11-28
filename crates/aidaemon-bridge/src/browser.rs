@@ -83,7 +83,11 @@ pub(crate) async fn wait(
             joined = &mut link => {
                 drop(guard);
                 if let Ok(link) = joined {
-                    relay(&bridge, socket, link).await;
+                    // The page sends its HELLO only after this (SPEC §3).
+                    let joined = serde_json::json!({"type": "joined"}).to_string();
+                    if crate::send_text(&mut socket, joined, config.send_timeout).await {
+                        relay(&bridge, socket, link).await;
+                    }
                 } else {
                     close(&mut socket, code::TRY_AGAIN, config.send_timeout).await;
                 }

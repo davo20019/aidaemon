@@ -283,7 +283,7 @@ impl Session {
             return send_text(socket, wire::join_failed(&nameplate), send_timeout).await;
         }
         info!("pairing browser joined");
-        send_text(socket, wire::open(conn), send_timeout).await
+        send_text(socket, wire::open_joined(conn, std::str::from_utf8(&nameplate).unwrap_or_default()), send_timeout).await
     }
 
     /// Take a new browser connection if this daemon's caps and budget allow.
