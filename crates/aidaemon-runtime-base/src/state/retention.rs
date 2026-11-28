@@ -338,6 +338,9 @@ mod tests {
                 value TEXT NOT NULL,
                 source TEXT,
                 superseded_at TEXT,
+                superseded_reason TEXT,
+                folded_into INTEGER,
+                archived_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 recall_count INTEGER DEFAULT 0
