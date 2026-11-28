@@ -153,6 +153,8 @@
     if (view === 'convo' && current.session && current.session.id) {
       return '#' + (current.from || 'chat') + '/' + encodeURIComponent(current.session.id);
     }
+    if (view === 'convo') return '#chat/new';
+    if (view === 'newcode') return '#code/new';
     if (view === 'chat' || view === 'code' || view === 'approvals') return '#' + view;
     return null;
   }
@@ -160,8 +162,9 @@
   function remember(view) {
     var route = routeOf(view);
     if (!route || route === window.location.hash || !window.history || !history.pushState) return;
-    // Opening a conversation is a step back can undo; switching tabs is not.
-    if (view === 'convo') { history.pushState(null, '', route); current.pushed = true; }
+    // Opening a conversation or a form is a step back can undo; switching
+    // tabs is not.
+    if (view === 'convo' || view === 'newcode') { history.pushState(null, '', route); current.pushed = true; }
     else history.replaceState(null, '', route);
   }
 
@@ -169,6 +172,9 @@
   function followRoute() {
     var m = /^#(chat|code|approvals)(?:\/(.+))?$/.exec(window.location.hash || '');
     if (!m) { show('chat'); return false; }
+    // A form to start something new (no conversation id is "new").
+    if (m[2] === 'new' && m[1] === 'code') { openNewCode(); return true; }
+    if (m[2] === 'new' && m[1] === 'chat') { openChat(null, 'chat'); return true; }
     if (m[2] && m[1] !== 'approvals') {
       var id = decodeURIComponent(m[2]);
       var known = null;
