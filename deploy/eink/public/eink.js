@@ -428,6 +428,7 @@
     $('convo-note').textContent = '';
     renderConvoRuns();
     show('convo');
+    current.toEnd = true;
     await loadHistory();
   }
 
@@ -503,6 +504,10 @@
       box.appendChild(d);
     });
     loadImages(images, mine);
+    if (current.toEnd) {
+      current.toEnd = false;
+      window.scrollTo(0, document.body.scrollHeight);
+    }
   }
 
   // ---------------------------------------------------------- writing strip
@@ -662,6 +667,7 @@
       $('convo-text').value = '';
       if (!current.session || !current.session.id) current.session = { id: result.session_id, title: text.slice(0, 40) };
       $('convo-note').textContent = 'Sent. Tap Refresh for the reply.';
+      current.toEnd = true;
       await loadHistory();
     } catch (e) {
       $('convo-note').textContent = e.message;

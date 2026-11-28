@@ -71,7 +71,6 @@ select { min-height: 56px; }
 .msg-from { font-weight: bold; font-size: 16px; margin-bottom: 2px; }
 .msg-text { white-space: normal; word-wrap: break-word; }
 .msg-text code { font-family: "Courier New", monospace; font-size: 17px; }
-.composer { margin-top: 12px; border-top: 2px solid #000; padding-top: 6px; }
 .composer textarea { margin-top: 4px; }
 
 .agent { border: 2px solid #000; padding: 10px 14px; margin: 0 0 10px; }
@@ -101,7 +100,6 @@ select { min-height: 56px; }
   padding: 12px;
   text-align: center;
 }
-.composer { margin-top: 12px; border-top: 2px solid #000; padding-top: 6px; }
 
 .count:empty { display: none; }
 .step { min-height: 52px; padding: 10px 14px; }
@@ -116,3 +114,17 @@ select { min-height: 56px; }
 .msg-image { display: block; max-width: 100%; border: 1px solid #000; margin-top: 6px; }
 
 .runrow { margin: 0 0 10px; }
+
+/* The message box stays at the bottom of the screen while the
+   conversation scrolls; kept short so it covers little of it. */
+.composer {
+  position: -webkit-sticky; position: sticky; bottom: 0; z-index: 2;
+  background: #fff; border-top: 3px solid #000; margin-top: 12px; padding: 8px 0 4px;
+}
+.composer .modes { display: flex; margin: 0 0 6px; }
+.composer .modes .btn { margin: 0 8px 0 0; min-height: 48px; padding: 8px 16px; }
+.composer .modes .send { margin-left: auto; margin-right: 0; }
+.composer textarea { min-height: 0; }
+.composer .note { margin: 4px 0 0; min-height: 0; }
+.composer .actions { margin-top: 6px; }
+.composer .actions .btn { min-height: 44px; padding: 6px 12px; margin: 0 8px 0 0; }
