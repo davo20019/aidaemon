@@ -32,10 +32,10 @@ bot = [
 ]
 
 [dependencies]
-aidaemon-channels = { version = "0.25.1", path = "../aidaemon-channels", features = ["http"] }
-aidaemon-core = { version = "0.25.1", path = "../aidaemon-core", optional = true }
-aidaemon-events = { version = "0.25.1", path = "../aidaemon-events", optional = true }
-aidaemon-tools = { version = "0.25.1", path = "../aidaemon-tools", optional = true }
+aidaemon-channels = { version = "0.25.2", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.25.2", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.25.2", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.25.2", path = "../aidaemon-tools", optional = true }
 anyhow = { version = "1", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 async-trait = "0.1"

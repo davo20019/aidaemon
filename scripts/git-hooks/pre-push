@@ -81,6 +81,7 @@ sdk_crates=(aidaemon-core aidaemon-providers aidaemon-tools aidaemon-tool-browse
     aidaemon-sdk aidaemon-macros aidaemon-memory aidaemon-events aidaemon-work
     aidaemon-decisions aidaemon-runtime-base aidaemon-runtime-core aidaemon-runtime aidaemon-skills aidaemon-secrets aidaemon-nodes
     aidaemon-terminal-bridge aidaemon-client-protocol aidaemon-client-gateway
+    aidaemon-bridge-proto aidaemon-bridge aidaemon-bridge-connector
     aidaemon-channels aidaemon-channel-telegram aidaemon-channel-slack
     aidaemon-channel-discord aidaemon-parity-agent aidaemon-client-core aidaemon-surfaces aidaemon-shells)
 

@@ -2592,13 +2592,25 @@ impl ClientGateway {
         channel_ctx.in_run = match in_run.filter(|_| !new_session) {
             Some(run) => {
                 // Where its agent worked, from the run's record: the
-                // follow-up goes on there.
-                let working_dir = match self.host.run_detail(&run).await {
-                    Ok(detail) => detail.working_dir,
-                    Err(error) => {
-                        warn!(%error, %run, "Could not read a followed-up run's record");
-                        None
+                // follow-up goes on there, and may write there. Only for a
+                // run of this conversation, and never from a capped device
+                // (an e-ink reader), whose turn keeps the project's bounds.
+                let ours = sender_ceiling.is_none()
+                    && self
+                        .host
+                        .past_runs(&session_id)
+                        .await
+                        .is_ok_and(|runs| runs.iter().any(|past| past.id == run));
+                let working_dir = if ours {
+                    match self.host.run_detail(&run).await {
+                        Ok(detail) => detail.working_dir,
+                        Err(error) => {
+                            warn!(%error, %run, "Could not read a followed-up run's record");
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
                 Some(aidaemon_channels::context::RunThread {
                     run,

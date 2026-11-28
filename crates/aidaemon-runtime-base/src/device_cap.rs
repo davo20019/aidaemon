@@ -112,6 +112,68 @@ pub fn above_medium(risk: ApprovalRisk) -> bool {
     risk_rank(risk) > risk_rank(ApprovalRisk::Medium)
 }
 
+/// The channel context of an internal continuation that answers a request
+/// once its runs end (or after a restart): a capped request's answer runs
+/// capped too, as if the capped device had sent it.
+pub fn continuation_context(capped: bool) -> aidaemon_channels::context::ChannelContext {
+    let mut ctx = aidaemon_channels::context::ChannelContext::internal();
+    if capped {
+        ctx.sender_ceiling = Some(aidaemon_channels::context::SenderCeiling::Medium);
+    }
+    ctx
+}
+
+/// The settings key of the chats whose latest request a device capped.
+const CAPPED_SESSIONS_KEY: &str = "runtime.device_capped_sessions";
+/// Chats remembered at once; the oldest are forgotten first.
+const CAPPED_SESSIONS_MAX: usize = 500;
+static CAPPED_SESSIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn read_capped(settings: &dyn aidaemon_tools::services::SettingsStore) -> Vec<String> {
+    settings
+        .get_setting(CAPPED_SESSIONS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Record whether chat `session_id`'s latest request came capped from its
+/// device, so a turn a restart cut off, or a job it started again, is
+/// continued capped too (the cap itself lives in memory only).
+pub async fn mark_session(
+    settings: &dyn aidaemon_tools::services::SettingsStore,
+    session_id: &str,
+    capped: bool,
+) {
+    let _held = CAPPED_SESSIONS.lock().await;
+    let mut sessions = read_capped(settings).await;
+    let known = sessions.iter().any(|s| s == session_id);
+    if known == capped {
+        return;
+    }
+    sessions.retain(|s| s != session_id);
+    if capped {
+        sessions.push(session_id.to_string());
+        let over = sessions.len().saturating_sub(CAPPED_SESSIONS_MAX);
+        sessions.drain(..over);
+    }
+    if let Ok(raw) = serde_json::to_string(&sessions)
+        && let Err(error) = settings.set_setting(CAPPED_SESSIONS_KEY, &raw).await
+    {
+        tracing::warn!(%error, "Could not record a chat's device ceiling");
+    }
+}
+
+/// Whether chat `session_id`'s latest request came capped from its device.
+pub async fn capped_session(
+    settings: &dyn aidaemon_tools::services::SettingsStore,
+    session_id: &str,
+) -> bool {
+    read_capped(settings).await.iter().any(|s| s == session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +208,43 @@ mod tests {
         assert!(above_medium(ApprovalRisk::High));
         assert!(!above_medium(ApprovalRisk::Medium));
         assert!(!above_medium(ApprovalRisk::Low));
+    }
+
+    #[derive(Default)]
+    struct Settings(Mutex<HashMap<String, String>>);
+
+    #[async_trait::async_trait]
+    impl aidaemon_tools::services::SettingsStore for Settings {
+        async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_capped_chat_is_remembered_until_an_uncapped_message() {
+        let settings = Settings::default();
+        assert!(!capped_session(&settings, "app:synthetic-1").await);
+        mark_session(&settings, "app:synthetic-1", true).await;
+        mark_session(&settings, "app:synthetic-2", true).await;
+        assert!(capped_session(&settings, "app:synthetic-1").await);
+        mark_session(&settings, "app:synthetic-1", false).await;
+        assert!(!capped_session(&settings, "app:synthetic-1").await);
+        assert!(capped_session(&settings, "app:synthetic-2").await);
+    }
+
+    #[test]
+    fn a_capped_continuation_carries_the_ceiling() {
+        assert!(continuation_context(false).sender_ceiling.is_none());
+        assert_eq!(
+            continuation_context(true).sender_ceiling,
+            Some(aidaemon_channels::context::SenderCeiling::Medium)
+        );
     }
 }

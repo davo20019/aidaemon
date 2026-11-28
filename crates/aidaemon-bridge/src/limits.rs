@@ -10,6 +10,8 @@ pub(crate) enum Kind {
     Connect,
     Login,
     Wait,
+    /// A daemon claiming a waiting pairing by its nameplate.
+    Join,
 }
 
 const WINDOW: Duration = Duration::from_secs(60);

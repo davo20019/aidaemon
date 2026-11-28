@@ -17,13 +17,13 @@ categories = ["network-programming", "asynchronous"]
 exclude = ["tests/", "benches/"]
 
 [dependencies]
-aidaemon-channels = { version = "0.25.1", path = "../aidaemon-channels" }
-aidaemon-core = { version = "0.25.1", path = "../aidaemon-core" }
-aidaemon-events = { version = "0.25.1", path = "../aidaemon-events" }
+aidaemon-channels = { version = "0.25.2", path = "../aidaemon-channels" }
+aidaemon-core = { version = "0.25.2", path = "../aidaemon-core" }
+aidaemon-events = { version = "0.25.2", path = "../aidaemon-events" }
 aidaemon-node-protocol = { version = "0.1.0", path = "../node-protocol" }
-aidaemon-secrets = { version = "0.25.1", path = "../aidaemon-secrets", default-features = false }
-aidaemon-tools = { version = "0.25.1", path = "../aidaemon-tools" }
-aidaemon-work = { version = "0.25.1", path = "../aidaemon-work" }
+aidaemon-secrets = { version = "0.25.2", path = "../aidaemon-secrets", default-features = false }
+aidaemon-tools = { version = "0.25.2", path = "../aidaemon-tools" }
+aidaemon-work = { version = "0.25.2", path = "../aidaemon-work" }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"

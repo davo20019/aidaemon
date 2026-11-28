@@ -25,6 +25,10 @@ pub struct OwedReport {
     pub parent_task_id: Option<String>,
     /// The continuation's message.
     pub followup: String,
+    /// The request was capped by its device ([`crate::device_cap`]): the
+    /// answer given after a restart is capped too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capped: bool,
 }
 
 static HELD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -106,6 +110,7 @@ mod tests {
             chat: "app:synthetic".into(),
             parent_task_id: Some("task-1".into()),
             followup: format!("[Background command completed] {run}"),
+            capped: false,
         }
     }
 

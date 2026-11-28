@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon-client-core"
-version = "0.25.1"
+version = "0.25.2"
 dependencies = [
  "aidaemon-client-protocol",
  "aidaemon-remote",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon-client-protocol"
-version = "0.25.1"
+version = "0.25.2"
 dependencies = [
  "schemars",
  "serde",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon-remote"
-version = "0.25.1"
+version = "0.25.2"
 dependencies = [
  "anyhow",
  "bytes",

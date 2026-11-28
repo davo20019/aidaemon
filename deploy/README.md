@@ -1,13 +1,15 @@
 # deploy
 
-How the project's two public servers are set up. Both run n0's open-source
-iroh servers at the iroh version the code uses (1.5.0), on any Ubuntu 24.04
-machine with a public address.
+How the project's public servers are set up. The relay and the address
+lookup run n0's open-source iroh servers at the iroh version the code uses
+(1.5.0), on any Ubuntu 24.04 machine with a public address.
 
 | Server | What it does | Ports |
 |---|---|---|
 | `relay.aidaemon.ai` (`relay/`) | Remote access's default relay: daemons keep a connection here so apps find them by key, and it forwards end-to-end encrypted traffic when two devices can't connect directly. | 443/tcp, 80/tcp (certificates), 7842/udp (address discovery) |
 | `app.aidaemon.ai` (`web/`) | The web app on a site of its own: static files on a Cloudflare Worker. A phone with no app pairs there from a QR code and reaches its daemon by key through the relay; this site never sees that traffic. | 443/tcp (Cloudflare) |
+| `bridge.aidaemon.ai` (`bridge/`) | E-ink access's bridge (`aidaemon-bridge`): a daemon dials out to it and e-ink readers reach that daemon through it. It relays end-to-end encrypted frames only, rate-limits logins, pairing waits and joins per address, and keeps no access log. Runs on the lookup server behind its Caddy (`cohost-on-lookup.sh`), or on its own machine (`cloud-init.sh`). | 443/tcp, 80/tcp (certificates) |
+| `eink.aidaemon.ai` (`eink/`) | The e-ink page: static files on a Cloudflare Worker, with a strict content policy, for a reader's old browser. | 443/tcp (Cloudflare) |
 | `dns.aidaemon.ai` (`lookup/`) | Address lookup: a daemon on the project's relays publishes which relay it is on (signed with its key, the relay URL only), so an app whose saved relay is stale still finds it. | 443/tcp, 80/tcp |
 
 Each `cloud-init.sh` installs the server, its firewall rules (IPv4 and IPv6),
@@ -39,6 +41,21 @@ in `web/_headers`) and point your daemon at it:
 ```toml
 [client_gateway.remote]
 web_app = "https://app.example.com"
+```
+
+## E-ink access
+
+`bridge/deploy.sh` cross-compiles `aidaemon-bridge` and installs it on the
+server (`HOST=`, `TARGET=`), staged in a private folder and checked by its
+hash. `eink/build.sh` assembles the page into `eink/dist` with its headers
+(`AIDAEMON_EINK_BRIDGE` names the bridge, `AIDAEMON_EINK_PAIR_URL` the app's
+pairing page); `cd eink && npx wrangler deploy` publishes it. To use your own
+bridge, run `aidaemon-bridge` behind TLS, build the page against it, and
+point your daemon at it:
+
+```toml
+[client_gateway.eink]
+bridge_url = "wss://bridge.example.com/v1/daemon"
 ```
 
 ## Your own relay

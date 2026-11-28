@@ -152,6 +152,7 @@ impl Bridge {
             Kind::Connect => self.config.connects_per_ip_per_minute,
             Kind::Login => self.config.logins_per_ip_per_minute,
             Kind::Wait => self.config.waits_per_ip_per_minute,
+            Kind::Join => self.config.joins_per_ip_per_minute,
         };
         self.state().rates.allow(kind, ip, limit, Instant::now())
     }
@@ -164,7 +165,8 @@ impl Bridge {
         if !state.daemons.contains_key(&route) && state.daemons.len() >= self.config.max_daemons {
             return None;
         }
-        if state.budgets.len() > self.config.max_daemons.saturating_mul(2) {
+        let budgets_max = self.config.max_daemons.saturating_mul(2);
+        if !state.budgets.contains_key(&route) && state.budgets.len() >= budgets_max {
             state.budgets.retain(|_, budget| {
                 Arc::strong_count(budget) > 1
                     || !budget
@@ -172,6 +174,11 @@ impl Bridge {
                         .map(|budget| budget.expired(now))
                         .unwrap_or(true)
             });
+            // Still full of today's routes (many fresh keys): a new one
+            // waits, so the map, and each login's scan of it, stay bounded.
+            if state.budgets.len() >= budgets_max {
+                return None;
+            }
         }
         let budget = state
             .budgets
@@ -292,14 +299,15 @@ async fn daemon_route(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !bridge.allow(Kind::Login, bridge.client_ip(peer, &headers)) {
+    let ip = bridge.client_ip(peer, &headers);
+    if !bridge.allow(Kind::Login, ip) {
         info!("daemon login refused: rate limit");
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     let max = bridge.config.daemon_frame_max();
     ws.max_message_size(max)
         .max_frame_size(max)
-        .on_upgrade(move |socket| daemon::run(bridge, socket))
+        .on_upgrade(move |socket| daemon::run(bridge, socket, ip))
 }
 
 async fn connect_route(

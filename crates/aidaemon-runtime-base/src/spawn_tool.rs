@@ -943,6 +943,13 @@ impl SpawnAgentTool {
         let facts = facts.clone();
         let project_scope = facts.project_scope.clone();
         let mut parent_authority = crate::authority::parent_authority(&facts).cloned();
+        // The request's device ceiling ([`crate::device_cap`]), taken before
+        // a task lead's executor leaves the request's tree: whatever tree a
+        // child joins, and the turn that answers once it ends, stay capped.
+        let device_cap = parent_authority
+            .as_ref()
+            .and_then(|parent| parent.spawn_family.as_ref())
+            .map(|family| family.device_cap().clone());
         // A child can be made narrower than its parent and never wider.
         let agent = self.get_agent()?;
         if let Some(requested) = requested_child_authority(&args)? {
@@ -979,7 +986,10 @@ impl SpawnAgentTool {
             .await?;
 
         // Preserve the parent call's execution context.
-        let channel_ctx = build_child_channel_context(&facts);
+        let mut channel_ctx = build_child_channel_context(&facts);
+        if device_cap.as_ref().is_some_and(|cap| cap.is_capped()) {
+            channel_ctx.sender_ceiling = Some(aidaemon_channels::context::SenderCeiling::Medium);
+        }
 
         // Propagate parent's user role to prevent privilege escalation.
         // Default to Guest (least privilege) if not provided.
@@ -1293,6 +1303,7 @@ impl SpawnAgentTool {
                 max_response_chars,
                 turn: aidaemon_channels::turns::TurnOver::current(),
                 parent_task_id,
+                device_cap: device_cap.clone(),
             },
         ));
         let at_start = match hub.as_ref() {
@@ -2207,6 +2218,7 @@ mod group_tests {
             max_response_chars: 8_000,
             turn: None,
             parent_task_id: Some("task-1".to_string()),
+            device_cap: None,
         }
     }
 

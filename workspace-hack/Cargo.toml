@@ -29,10 +29,8 @@ chrono = { version = "0.4", features = ["serde"] }
 console = { version = "0.16" }
 crossbeam-utils = { version = "0.8" }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
-crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
-digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
+digest = { version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
 elliptic-curve = { version = "0.14", default-features = false, features = ["ecdh", "getrandom", "pem", "std"] }
 fastrand = { version = "2" }
@@ -73,8 +71,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde-saphyr = { version = "2" }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
-sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
-sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
+sha2 = { version = "0.11" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive", "runtime-tokio", "sqlite"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "any", "migrate", "offline"] }
@@ -94,7 +91,6 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = { version = "0.30", default-features = false, features = ["__rustls-tls", "handshake"] }
-typenum = { version = "1", default-features = false, features = ["const-generics"] }
 ureq = { version = "3", features = ["json", "socks-proxy"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 winnow = { version = "1" }
@@ -111,10 +107,8 @@ chrono = { version = "0.4", features = ["serde"] }
 console = { version = "0.16" }
 crossbeam-utils = { version = "0.8" }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
-crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
-digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
+digest = { version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
 elliptic-curve = { version = "0.14", default-features = false, features = ["ecdh", "getrandom", "pem", "std"] }
 fastrand = { version = "2" }
@@ -155,8 +149,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde-saphyr = { version = "2" }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
-sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
-sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
+sha2 = { version = "0.11" }
 smallvec = { version = "1", default-features = false, features = ["const_new"] }
 sqlx = { version = "0.9", default-features = false, features = ["derive", "runtime-tokio", "sqlite"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "any", "migrate", "offline"] }
@@ -178,7 +171,6 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = { version = "0.30", default-features = false, features = ["__rustls-tls", "handshake"] }
-typenum = { version = "1", default-features = false, features = ["const-generics"] }
 ureq = { version = "3", features = ["json", "socks-proxy"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 winnow = { version = "1" }
@@ -188,13 +180,15 @@ zeroize = { version = "1" }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 crc32fast = { version = "1" }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 dispatch2 = { version = "0.3" }
 errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -225,13 +219,15 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 crc32fast = { version = "1" }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 dispatch2 = { version = "0.3" }
 errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -264,13 +260,15 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 crc32fast = { version = "1" }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 dispatch2 = { version = "0.3" }
 errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -301,13 +299,15 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 crc32fast = { version = "1" }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 dispatch2 = { version = "0.3" }
 errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -340,12 +340,14 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cipher = { version = "0.5", default-features = false, features = ["alloc", "block-padding", "stream-wrapper"] }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 event-listener-strategy = { version = "0.5" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -377,12 +379,14 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cipher = { version = "0.5", default-features = false, features = ["alloc", "block-padding", "stream-wrapper"] }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 event-listener-strategy = { version = "0.5" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -414,12 +418,14 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cipher = { version = "0.5", default-features = false, features = ["alloc", "block-padding", "stream-wrapper"] }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 event-listener-strategy = { version = "0.5" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -451,12 +457,14 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 cipher = { version = "0.5", default-features = false, features = ["alloc", "block-padding", "stream-wrapper"] }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 event-listener-strategy = { version = "0.5" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -486,11 +494,13 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 
 [target.x86_64-pc-windows-msvc.dependencies]
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }
@@ -518,11 +528,13 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 base16ct = { version = "1", default-features = false, features = ["alloc"] }
+crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
 data-encoding = { version = "2" }
 der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
-digest-a6292c17cd707f01 = { package = "digest", version = "0.11", default-features = false, features = ["rand_core"] }
+digest = { version = "0.11", default-features = false, features = ["rand_core"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher", "inline-more"] }
 hyper = { version = "1", default-features = false, features = ["http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12"] }

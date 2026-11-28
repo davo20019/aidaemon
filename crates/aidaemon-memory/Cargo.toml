@@ -26,10 +26,10 @@ fastembed = ["dep:fastembed"]
 conformance = ["aidaemon-core/testing"]
 
 [dependencies]
-aidaemon-core = { version = "0.25.1", path = "../aidaemon-core" }
-aidaemon-policies = { version = "0.25.1", path = "../aidaemon-policies" }
-aidaemon-store-sqlite = { version = "0.25.1", path = "../aidaemon-store-sqlite" }
-aidaemon-tools = { version = "0.25.1", path = "../aidaemon-tools", features = ["sqlite"] }
+aidaemon-core = { version = "0.25.2", path = "../aidaemon-core" }
+aidaemon-policies = { version = "0.25.2", path = "../aidaemon-policies" }
+aidaemon-store-sqlite = { version = "0.25.2", path = "../aidaemon-store-sqlite" }
+aidaemon-tools = { version = "0.25.2", path = "../aidaemon-tools", features = ["sqlite"] }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

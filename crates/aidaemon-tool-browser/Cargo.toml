@@ -42,11 +42,11 @@ chromium = [
 
 [dependencies]
 dunce = "1.0"
-aidaemon-core = { version = "0.25.1", path = "../aidaemon-core", optional = true }
-aidaemon-channels = { version = "0.25.1", path = "../aidaemon-channels", optional = true }
-aidaemon-events = { version = "0.25.1", path = "../aidaemon-events", optional = true }
-aidaemon-tools = { version = "0.25.1", path = "../aidaemon-tools", optional = true }
-aidaemon-surfaces = { version = "0.25.1", path = "../aidaemon-surfaces", optional = true }
+aidaemon-core = { version = "0.25.2", path = "../aidaemon-core", optional = true }
+aidaemon-channels = { version = "0.25.2", path = "../aidaemon-channels", optional = true }
+aidaemon-events = { version = "0.25.2", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.25.2", path = "../aidaemon-tools", optional = true }
+aidaemon-surfaces = { version = "0.25.2", path = "../aidaemon-surfaces", optional = true }
 anyhow = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 base64 = { version = "0.23", optional = true }

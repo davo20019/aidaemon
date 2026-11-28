@@ -3,6 +3,7 @@
 //! WebSocket (`u32 conn ‖ frame` binary, JSON control text).
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ use tokio::time::{MissedTickBehavior, interval_at, timeout};
 use tracing::{debug, info};
 
 use crate::browser::{GoneGuard, Link, ToBrowser};
-use crate::limits::Budget;
+use crate::limits::{Budget, Kind};
 use crate::wire::{self, DaemonMessage, Nameplate};
 use crate::{Bridge, close, code, send, send_text};
 
@@ -24,7 +25,7 @@ pub(crate) struct Admit {
     pub reply: oneshot::Sender<Option<Link>>,
 }
 
-pub(crate) async fn run(bridge: Arc<Bridge>, mut socket: WebSocket) {
+pub(crate) async fn run(bridge: Arc<Bridge>, mut socket: WebSocket, ip: IpAddr) {
     let config = bridge.config.clone();
     let mut nonce = [0u8; 32];
     if getrandom::fill(&mut nonce).is_err() {
@@ -57,7 +58,7 @@ pub(crate) async fn run(bridge: Arc<Bridge>, mut socket: WebSocket) {
     let session_id = registration.session;
     if send_text(&mut socket, wire::ready(&route), config.send_timeout).await {
         info!("daemon logged in");
-        Session::new(bridge.clone(), registration.budget)
+        Session::new(bridge.clone(), registration.budget, ip)
             .run(socket, registration.admit, registration.shutdown)
             .await;
         info!("daemon disconnected");
@@ -73,6 +74,9 @@ struct Conn {
 struct Session {
     bridge: Arc<Bridge>,
     budget: Arc<Mutex<Budget>>,
+    /// The daemon's address, for the per-address join limit.
+    ip: IpAddr,
+    failed_joins: u32,
     conns: HashMap<u32, Conn>,
     handshaking: usize,
     next_conn: u32,
@@ -87,13 +91,15 @@ struct Session {
 type Flow = bool;
 
 impl Session {
-    fn new(bridge: Arc<Bridge>, budget: Arc<Mutex<Budget>>) -> Self {
+    fn new(bridge: Arc<Bridge>, budget: Arc<Mutex<Budget>>, ip: IpAddr) -> Self {
         let (frames_tx, frames_rx) = mpsc::channel(bridge.config.daemon_queue);
         // One message per admitted browser, so bounded by the connection cap.
         let (gone_tx, gone_rx) = mpsc::unbounded_channel();
         Self {
             bridge,
             budget,
+            ip,
+            failed_joins: 0,
             conns: HashMap::new(),
             handshaking: 0,
             next_conn: 0,
@@ -267,6 +273,13 @@ impl Session {
 
     async fn join(&mut self, socket: &mut WebSocket, nameplate: Nameplate) -> Flow {
         let send_timeout = self.bridge.config.send_timeout;
+        // Anyone can log in as a daemon, so joins are limited per address
+        // and per session: guessing nameplates would otherwise take every
+        // waiting page before its owner's daemon could.
+        if !self.bridge.allow(Kind::Join, self.ip) {
+            info!("pairing join refused: rate limit");
+            return send_text(socket, wire::join_failed(&nameplate), send_timeout).await;
+        }
         let Some(link) = self.admit() else {
             info!("pairing join refused: connection limit");
             return send_text(socket, wire::join_failed(&nameplate), send_timeout).await;
@@ -274,6 +287,10 @@ impl Session {
         let conn = link.conn;
         let Some(waiter) = self.bridge.take_waiter(&nameplate) else {
             self.forget(conn);
+            self.failed_joins += 1;
+            if self.failed_joins > self.bridge.config.max_failed_joins_per_session {
+                return self.refuse(socket, "too many failed pairing joins").await;
+            }
             info!("pairing join failed: no browser waiting");
             return send_text(socket, wire::join_failed(&nameplate), send_timeout).await;
         };
@@ -283,7 +300,12 @@ impl Session {
             return send_text(socket, wire::join_failed(&nameplate), send_timeout).await;
         }
         info!("pairing browser joined");
-        send_text(socket, wire::open_joined(conn, std::str::from_utf8(&nameplate).unwrap_or_default()), send_timeout).await
+        send_text(
+            socket,
+            wire::open_joined(conn, std::str::from_utf8(&nameplate).unwrap_or_default()),
+            send_timeout,
+        )
+        .await
     }
 
     /// Take a new browser connection if this daemon's caps and budget allow.

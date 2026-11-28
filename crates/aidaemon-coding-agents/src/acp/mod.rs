@@ -273,6 +273,7 @@ impl CodingAgent for AcpAgent {
     /// Google credential environment variables are stripped.
     fn signed_in(&self, sign_in: &crate::SignIn) -> Result<crate::SignedIn, String> {
         match (sign_in, self.supports_gemini_key, self.gemini_key_folder) {
+            (crate::SignIn::Own, _, _) if self.per_provider_sign_ins => opencode::own(),
             (crate::SignIn::Own, _, _) => Ok(crate::SignedIn::default()),
             (crate::SignIn::GeminiApiKey(key), true, Some(folder)) => {
                 let gemini = dirs::home_dir()
@@ -536,9 +537,14 @@ mod tests {
         assert!(agent.delegation(SignInMethod::Own).permits(false));
         assert!(agent.sign_in_note().is_some());
         assert!(agent.sign_ins().is_empty());
-        assert_eq!(
-            agent.signed_in(&crate::SignIn::Own).unwrap(),
-            crate::SignedIn::default()
+        // Its own sign-in, with its actions asked.
+        let own = agent.signed_in(&crate::SignIn::Own).unwrap();
+        assert!(own.args.is_empty() && own.env_remove.is_empty());
+        assert!(
+            own.env
+                .iter()
+                .any(|(name, config)| name == "OPENCODE_CONFIG_CONTENT"
+                    && config.contains(r#""bash":"ask""#))
         );
         let mut launch = Launch {
             args: Vec::new(),

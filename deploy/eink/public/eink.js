@@ -61,8 +61,25 @@
   function cacheLoad() {
     try { return JSON.parse(localStorage.getItem(CACHE_KEY) || 'null'); } catch (e) { return null; }
   }
+  // What is kept on the device at rest: an approval's summary and risk, never
+  // its exact request (a command line can carry a secret); the approval view
+  // reads that live.
+  function cacheable(snapshot) {
+    if (!snapshot || !snapshot.pending_approvals) return snapshot;
+    var copy = {};
+    Object.keys(snapshot).forEach(function (k) { copy[k] = snapshot[k]; });
+    copy.pending_approvals = snapshot.pending_approvals.map(function (a) {
+      return { id: a.id, summary: a.summary, risk: a.risk, requested_at_ms: a.requested_at_ms,
+               session_id: a.session_id, kind: a.kind, options: a.options,
+               expires_at_ms: a.expires_at_ms, channel: a.channel };
+    });
+    return copy;
+  }
+  function cacheClear() {
+    try { localStorage.removeItem(CACHE_KEY); } catch (e) { /* blocked */ }
+  }
   function cacheSave(snapshot) {
-    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), snapshot: snapshot })); } catch (e) { /* full or blocked */ }
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), snapshot: cacheable(snapshot) })); } catch (e) { /* full or blocked */ }
   }
 
   // -------------------------------------------------------------------- dom
@@ -389,14 +406,14 @@
     async function signIn() {
       var deviceHex = B.toHex(await B.deviceId(await B.exportPoint(pinned.key.publicKey)));
       var ch = await raw('POST', '/client/v1/sessions/challenge', { device_id: pinned.device, endpoint: deviceHex });
-      if (ch.status !== 200 || !ch.json) throw new Error('Sign-in refused');
+      if (ch.status !== 200 || !ch.json) { if (ch.status === 401 || ch.status === 403) cacheClear(); throw new Error('Sign-in refused'); }
       var audience = 'bridge:' + pinned.daemonId;
       var message = 'aidaemon-client-v2:' + ch.json.challenge_id + ':' + ch.json.nonce + ':' + audience + ':' + deviceHex;
       var sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pinned.key.privateKey, enc.encode(message)));
       var grant = await raw('POST', '/client/v1/sessions', {
         challenge_id: ch.json.challenge_id, signature: base64url(sig), audience: audience
       });
-      if (grant.status !== 200 || !grant.json || !grant.json.access_token) throw new Error('Sign-in refused');
+      if (grant.status !== 200 || !grant.json || !grant.json.access_token) { if (grant.status === 401 || grant.status === 403) cacheClear(); throw new Error('Sign-in refused'); }
       token = grant.json.access_token;
       tokenExpires = grant.json.expires_at_ms || 0;
       // The highest risk this device may approve (AccessGrant.risk_ceiling,
@@ -471,6 +488,7 @@
   async function pair() {
     var ready = busyButton('btn-pair', 'Pairing…');
     $('pair-note').textContent = '';
+    cacheClear();
     try {
       var key = await B.generateDeviceKey();
       var nameplate = B.generateNameplate();

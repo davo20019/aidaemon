@@ -501,3 +501,42 @@ async fn per_ip_login_rate_limit() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn guessing_nameplates_is_limited_and_ends_the_session() {
+    let addr = start(Config {
+        joins_per_ip_per_minute: 100,
+        max_failed_joins_per_session: 2,
+        ..test_config()
+    })
+    .await;
+    let (mut daemon, _route) = login(addr, &key(1)).await;
+    for nameplate in ["ABCD", "ABCE"] {
+        send_json(&mut daemon, json!({"type": "join", "nameplate": nameplate})).await;
+        assert_eq!(recv_json(&mut daemon).await["type"], "join_failed");
+    }
+    // The third wrong guess closes the session.
+    send_json(&mut daemon, json!({"type": "join", "nameplate": "ABCF"})).await;
+    assert!(matches!(
+        next(&mut daemon).await,
+        Some(Message::Close(_)) | None
+    ));
+
+    // Past the per-address limit a join fails without taking the waiting page.
+    let addr = start(Config {
+        joins_per_ip_per_minute: 1,
+        ..test_config()
+    })
+    .await;
+    let (mut daemon, _route) = login(addr, &key(2)).await;
+    let (_waiting, _) = connect_async(format!("ws://{addr}/v1/wait?nameplate=7K3Q"))
+        .await
+        .unwrap();
+    send_json(&mut daemon, json!({"type": "join", "nameplate": "ABCD"})).await;
+    assert_eq!(recv_json(&mut daemon).await["type"], "join_failed");
+    send_json(&mut daemon, json!({"type": "join", "nameplate": "7K3Q"})).await;
+    assert_eq!(
+        recv_json(&mut daemon).await,
+        json!({"type": "join_failed", "nameplate": "7K3Q"})
+    );
+}

@@ -45,6 +45,9 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 const CONN_QUEUE: usize = 64;
 /// Frames waiting to go out on the bridge socket.
 const OUT_QUEUE: usize = 256;
+/// Browser connections served at once: the project's bridge allows 8 per
+/// daemon; this bounds what a misbehaving bridge can make the daemon hold.
+const MAX_CONNS: usize = 32;
 
 /// The device key a handshake proved (`device_id`, 32 bytes): the peer the
 /// gateway's guard binds sign-in tokens to.
@@ -219,6 +222,13 @@ impl Connector {
                         Some("open") => {
                             let conn = u32::try_from(control["conn"].as_u64().unwrap_or(u64::MAX))?;
                             let nameplate = control["nameplate"].as_str().map(str::to_string);
+                            // Connections whose task ended are gone.
+                            conns.retain(|_, tx| !tx.is_closed());
+                            if conns.len() >= MAX_CONNS && !conns.contains_key(&conn) {
+                                warn!("E-ink bridge connection refused: too many at once");
+                                let _ = out_tx.try_send(Out::Text(close_json(conn)));
+                                continue;
+                            }
                             let (tx, rx) = mpsc::channel(CONN_QUEUE);
                             conns.insert(conn, tx);
                             let me = self.clone();

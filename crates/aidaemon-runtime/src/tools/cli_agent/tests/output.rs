@@ -18,6 +18,10 @@ fn only_the_daemons_database_is_a_prohibited_command() {
         "python3 -c \"import sqlite3; sqlite3.connect('aidaemon.db').execute('delete from facts')\""
     ));
     assert!(blocked("sqlite3 x.db \"PRAGMA key = 'abc'\""));
+    // The key pragma in a here-document, on a copy of the database.
+    assert!(blocked(
+        "sqlcipher /tmp/copy.db <<EOF\nPRAGMA key = 'abc';\nselect 1;\nEOF"
+    ));
     assert!(blocked("brew install sqlcipher"));
     // A project's own database.
     assert!(!blocked("sqlite3 app.db 'select 1'"));

@@ -194,6 +194,9 @@ pub struct RunsAnswer {
     /// ran and when the last ended: the answer's total is measured against
     /// it.
     pub clock: Option<crate::run_state::RequestClock>,
+    /// The request was capped by its device ([`crate::device_cap`]): its
+    /// answer is capped too.
+    pub capped: bool,
 }
 
 /// Where a background child's result goes: straight to the parent session
@@ -278,6 +281,8 @@ pub struct ResultRoute {
     pub turn: Option<aidaemon_channels::turns::TurnOver>,
     /// The chat turn's task, when the run is one of that turn's group.
     pub parent_task_id: Option<String>,
+    /// The device ceiling of the request that started the run.
+    pub device_cap: Option<crate::device_cap::DeviceCap>,
 }
 
 /// The subscriber on one run's terminal transition: when the run ends it
@@ -416,6 +421,7 @@ async fn answer_group(
             parent_task_id: route.parent_task_id.clone(),
             followup: group_followup(&ends, route.max_response_chars, GroupWork::Helpers),
             clock: crate::run_state::RequestClock::of_group(&ends),
+            capped: route.device_cap.as_ref().is_some_and(|cap| cap.is_capped()),
         })
         .await;
     // The request's turn is over, answered or not: the card settles from

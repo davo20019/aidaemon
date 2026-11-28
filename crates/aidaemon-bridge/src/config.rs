@@ -49,6 +49,13 @@ pub struct Config {
     pub logins_per_ip_per_minute: u32,
     /// Nameplate waits per client address per minute.
     pub waits_per_ip_per_minute: u32,
+    /// Pairing joins per client address per minute: a daemon joins once
+    /// per pairing, so a stream of joins is someone guessing nameplates to
+    /// take other people's waiting pages.
+    pub joins_per_ip_per_minute: u32,
+    /// Joins one daemon session may get wrong (no page waiting) before the
+    /// bridge closes it.
+    pub max_failed_joins_per_session: u32,
     /// Bytes forwarded per route (both directions) per day.
     pub daily_bytes_per_route: u64,
 }
@@ -75,6 +82,8 @@ impl Default for Config {
             connects_per_ip_per_minute: 30,
             logins_per_ip_per_minute: 10,
             waits_per_ip_per_minute: 10,
+            joins_per_ip_per_minute: 6,
+            max_failed_joins_per_session: 5,
             daily_bytes_per_route: 2 * 1024 * 1024 * 1024,
         }
     }
@@ -184,6 +193,8 @@ impl Config {
             "connects-per-ip-per-minute" => self.connects_per_ip_per_minute = num(name, value)?,
             "logins-per-ip-per-minute" => self.logins_per_ip_per_minute = num(name, value)?,
             "waits-per-ip-per-minute" => self.waits_per_ip_per_minute = num(name, value)?,
+            "joins-per-ip-per-minute" => self.joins_per_ip_per_minute = num(name, value)?,
+            "max-failed-joins-per-session" => self.max_failed_joins_per_session = num(name, value)?,
             "daily-bytes-per-route" => self.daily_bytes_per_route = num(name, value)?,
             _ => return Err(format!("unknown option --{name}")),
         }

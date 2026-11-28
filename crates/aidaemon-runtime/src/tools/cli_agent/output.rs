@@ -298,14 +298,22 @@ pub(super) fn prohibited_cli_agent_command_reason(command: &str) -> Option<&'sta
         return None;
     }
     for (segment, _) in aidaemon_tools::command_risk::split_by_operators(command) {
-        if let Some(reason) = segment_reason(&segment) {
+        if let Some(reason) = segment_reason(&segment, command) {
             return Some(reason);
         }
     }
     None
 }
 
-fn segment_reason(segment: &str) -> Option<&'static str> {
+/// SQLCipher's key pragmas (machine format: SQL).
+fn key_pragma(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("pragma key")
+        || lower.contains("pragma rekey")
+        || lower.contains("pragma cipher")
+}
+
+fn segment_reason(segment: &str, whole: &str) -> Option<&'static str> {
     let segment = segment.trim();
     if segment.is_empty() || aidaemon_tools::command_effects::only_reads(segment) {
         return None;
@@ -318,15 +326,10 @@ fn segment_reason(segment: &str) -> Option<&'static str> {
     let args = &tokens[program_at + 1..];
     let inline_code = INLINE_CODE_PROGRAMS.contains(&program.as_str());
 
-    // SQLCipher's key pragmas (machine format: SQL), in code it runs.
-    if inline_code
-        && args.iter().any(|arg| {
-            let lower = arg.to_ascii_lowercase();
-            lower.contains("pragma key")
-                || lower.contains("pragma rekey")
-                || lower.contains("pragma cipher")
-        })
-    {
+    // SQLCipher's key pragmas, in code it runs: in an argument, or in a
+    // here-document the whole command carries (its lines split apart as
+    // segments, its words as tokens).
+    if inline_code && (args.iter().any(|arg| key_pragma(arg)) || key_pragma(whole)) {
         return Some(
             "Reading or setting aidaemon's database key is prohibited. Use aidaemon's built-in tools \
              (manage_memories and the like) instead of terminal SQL.",

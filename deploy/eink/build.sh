@@ -66,7 +66,7 @@ for name, text in assets.items():
 (dist / 'index.html').write_text(html)
 
 origin = re.match(r'^(wss?://[^/]+)', bridge).group(1)
-policy = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
+policy = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; "
           f"connect-src {origin}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 (dist / '_headers').write_text(f"""/*
   Content-Security-Policy: {policy}

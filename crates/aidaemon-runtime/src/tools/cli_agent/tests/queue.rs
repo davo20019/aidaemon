@@ -526,6 +526,7 @@ async fn folder_waiter_blocks_subfolder_waiter_but_allows_disjoint_write_paths()
         is_peer_run: false,
         continues_session: false,
         peer_binding: None,
+        device_cap: None,
     };
     let earlier_at = Instant::now() - Duration::from_secs(5);
     let later_shared = RunShared::default();
@@ -762,6 +763,7 @@ async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped()
         is_peer_run: false,
         continues_session: false,
         peer_binding: None,
+        device_cap: None,
     };
 
     // The peer endpoint's guard: dropping it revokes the run's MCP token.
@@ -884,6 +886,7 @@ async fn continue_run_steers_live_host_that_accepts_mid_run_notes() {
         is_peer_run: false,
         continues_session: false,
         peer_binding: None,
+        device_cap: None,
     };
     tool.running.lock().await.insert(
         task_id.to_string(),

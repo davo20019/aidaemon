@@ -9,6 +9,11 @@ use aidaemon_client_protocol::FileStatus;
 /// How long one git command may run before it is killed.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The most of one git command's output kept: the rest is read and dropped,
+/// so a commit holding a huge generated file costs no more memory than this
+/// (its callers cut what they show far shorter).
+const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
+
 /// Run `git args` in `dir` (blocking) and return its stdout on success. The
 /// folder's repository is not the daemon's: none of the programs its own
 /// configuration names runs (`aidaemon_tools::git_guard`), git never prompts
@@ -41,7 +46,9 @@ fn run_git(dir: &Path, guard: &[String], args: &[&str]) -> Option<Vec<u8>> {
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
-        stdout.read_to_end(&mut out).map(|_| out)
+        (&mut stdout).take(MAX_OUTPUT).read_to_end(&mut out)?;
+        std::io::copy(&mut stdout, &mut std::io::sink())?;
+        Ok::<_, std::io::Error>(out)
     });
     let deadline = Instant::now() + GIT_TIMEOUT;
     let status = loop {

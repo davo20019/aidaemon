@@ -6,12 +6,17 @@
 //! every provider it is signed in to with OAuth (`disabled_providers`, in
 //! the config it reads from `OPENCODE_CONFIG_CONTENT`): it then works only
 //! on its API-key providers. The owner's own prompts use them all.
+//!
+//! OpenCode lets itself edit files and run commands unasked by default, so
+//! every launch sets its permissions to ask (`permission`): each action
+//! then comes to AIdaemon's host, which judges it in the checked mode and
+//! answers yes in full access.
 
 /// The variable OpenCode reads extra config from, merged over its own.
 const CONFIG_VARIABLE: &str = "OPENCODE_CONFIG_CONTENT";
 
 /// What its own sign-in adds to a launch whose work another agent handed
-/// it: its OAuth providers turned off.
+/// it: its OAuth providers turned off, and its actions asked.
 pub(super) fn delegated() -> Result<crate::SignedIn, String> {
     let auth = match std::fs::read_to_string(auth_path()?) {
         Ok(text) => Some(text),
@@ -20,12 +25,44 @@ pub(super) fn delegated() -> Result<crate::SignedIn, String> {
     };
     let existing = std::env::var(CONFIG_VARIABLE).ok();
     let config = without_plans(auth.as_deref(), existing.as_deref())?;
-    Ok(crate::SignedIn {
-        env: config
-            .map(|config| vec![(CONFIG_VARIABLE.to_string(), config)])
-            .unwrap_or_default(),
+    let config = asking(config.as_deref().or(existing.as_deref()));
+    Ok(signed(config))
+}
+
+/// What the owner's own launch of it adds: its actions asked.
+pub(super) fn own() -> Result<crate::SignedIn, String> {
+    let existing = std::env::var(CONFIG_VARIABLE).ok();
+    Ok(signed(asking(existing.as_deref())))
+}
+
+fn signed(config: String) -> crate::SignedIn {
+    crate::SignedIn {
+        env: vec![(CONFIG_VARIABLE.to_string(), config)],
         ..crate::SignedIn::default()
-    })
+    }
+}
+
+/// The permissions OpenCode asks about (its config's `permission`).
+const ASKED: [&str; 3] = ["edit", "bash", "webfetch"];
+
+/// `existing` (a config, if any) with each of [`ASKED`] set to ask, unless
+/// it already denies it.
+fn asking(existing: Option<&str>) -> String {
+    let mut config = existing
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let permission = &mut config["permission"];
+    if !permission.is_object() {
+        *permission = serde_json::json!({});
+    }
+    for key in ASKED {
+        // Machine format: its config's permission values ("allow" | "ask" | "deny").
+        if permission[key].as_str() != Some("deny") {
+            permission[key] = serde_json::json!("ask");
+        }
+    }
+    config.to_string()
 }
 
 /// Where OpenCode keeps its sign-ins: `$XDG_DATA_HOME/opencode/auth.json`,
@@ -110,6 +147,30 @@ mod tests {
             None
         );
         assert!(without_plans(Some("not json"), None).is_err());
+    }
+
+    #[test]
+    fn every_launch_asks_and_keeps_a_deny() {
+        let value: serde_json::Value = serde_json::from_str(&asking(None)).unwrap();
+        for key in ASKED {
+            assert_eq!(value["permission"][key], "ask");
+        }
+        let value: serde_json::Value = serde_json::from_str(&asking(Some(
+            r#"{"model":"openrouter/synthetic","permission":{"bash":"deny","edit":"allow"}}"#,
+        )))
+        .unwrap();
+        assert_eq!(value["permission"]["bash"], "deny");
+        assert_eq!(value["permission"]["edit"], "ask");
+        assert_eq!(value["model"], "openrouter/synthetic");
+        // A plain "allow" for everything becomes asking.
+        let value: serde_json::Value =
+            serde_json::from_str(&asking(Some(r#"{"permission":"allow"}"#))).unwrap();
+        assert_eq!(value["permission"]["webfetch"], "ask");
+        // Plans turned off and actions asked, together.
+        let config = without_plans(Some(r#"{"anthropic":{"type":"oauth"}}"#), None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&asking(config.as_deref())).unwrap();
+        assert_eq!(value["disabled_providers"][0], "anthropic");
+        assert_eq!(value["permission"]["bash"], "ask");
     }
 
     #[test]

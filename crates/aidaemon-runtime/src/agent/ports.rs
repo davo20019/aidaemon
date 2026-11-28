@@ -166,7 +166,7 @@ impl crate::helper_run::delivery::RunResultSink for Agent {
                 user_text: answer.followup,
                 status_tx: None,
                 user_role: aidaemon_tools::semantics::UserRole::Owner,
-                channel_ctx: aidaemon_channels::context::ChannelContext::internal(),
+                channel_ctx: crate::device_cap::continuation_context(answer.capped),
                 heartbeat: None,
                 parent_task_id: answer.parent_task_id,
                 parent_tool_call_id: None,

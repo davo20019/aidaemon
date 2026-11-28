@@ -328,6 +328,7 @@ async fn a_capped_note_never_enters_a_full_access_run() {
             is_peer_run: false,
             continues_session: false,
             peer_binding: None,
+            device_cap: None,
         };
         tool.running.lock().await.insert(
             task_id.to_string(),

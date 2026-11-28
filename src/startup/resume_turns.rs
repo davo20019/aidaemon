@@ -230,7 +230,8 @@ pub async fn resume_cut_off_turns(
     }
     // A chat with both a cut-off turn and jobs to start again gets one
     // continuation, the jobs' note after the turn's.
-    let mut continuations: Vec<(String, Option<String>, String)> = Vec::new();
+    // (chat, the turn's task, the follow-up, capped by its device)
+    let mut continuations: Vec<(String, Option<String>, String, bool)> = Vec::new();
     for run in &to_continue {
         let mut followup = recovery::resume_note(run);
         if let Some(note) = job_notes.remove(&run.session_id) {
@@ -245,11 +246,14 @@ pub async fn resume_cut_off_turns(
             .flatten()
             .and_then(|event| event.task_id);
         info!(session_id = %run.session_id, run_id = %run.run_id, "Continuing a turn the last stop cut off");
-        continuations.push((run.session_id.clone(), parent_task_id, followup));
+        let capped =
+            aidaemon_runtime::device_cap::capped_session(&*deps.state, &run.session_id).await;
+        continuations.push((run.session_id.clone(), parent_task_id, followup, capped));
     }
     for (chat, note) in job_notes {
         info!(session_id = %chat, "Starting again a background job the last stop cut off");
-        continuations.push((chat, None, note));
+        let capped = aidaemon_runtime::device_cap::capped_session(&*deps.state, &chat).await;
+        continuations.push((chat, None, note, capped));
     }
     // Background runs' answers the stop came between their end and their
     // answer: given now, once (taking them clears them, so one that takes
@@ -261,13 +265,16 @@ pub async fn resume_cut_off_turns(
         info!(session_id = %owed.chat, run = %owed.run, "Giving a background run's answer the last stop cut off");
         match continuations
             .iter_mut()
-            .find(|(chat, _, _)| *chat == owed.chat)
+            .find(|(chat, _, _, _)| *chat == owed.chat)
         {
-            Some((_, _, followup)) => {
+            Some((_, _, followup, capped)) => {
                 followup.push_str("\n\n");
                 followup.push_str(&owed.followup);
+                *capped |= owed.capped;
             }
-            None => continuations.push((owed.chat, owed.parent_task_id, owed.followup)),
+            None => {
+                continuations.push((owed.chat, owed.parent_task_id, owed.followup, owed.capped))
+            }
         }
     }
     if continuations.is_empty() {
@@ -283,7 +290,7 @@ pub async fn resume_cut_off_turns(
     })
     .await;
     let mut tasks = Vec::with_capacity(continuations.len());
-    for (chat, parent_task_id, followup) in continuations {
+    for (chat, parent_task_id, followup, capped) in continuations {
         let agent = deps.agent.clone();
         let hub = Arc::downgrade(&hub);
         let state = deps.state.clone();
@@ -297,6 +304,7 @@ pub async fn resume_cut_off_turns(
                     parent_task_id,
                     followup,
                     clock: None,
+                    capped,
                 })
                 .await;
             // The continuation ended on its own: a later cut-off in this
@@ -884,6 +892,8 @@ mod tests {
                 chat: chat.into(),
                 parent_task_id: Some("task-1".into()),
                 followup: "[Background command completed] Command: `cli_agent codex`".into(),
+                // An e-ink request's answer stays capped after the restart.
+                capped: true,
             },
         )
         .await;
@@ -894,6 +904,7 @@ mod tests {
             assert_eq!(answers[0].chat, chat);
             assert_eq!(answers[0].parent_task_id.as_deref(), Some("task-1"));
             assert!(answers[0].followup.contains("cli_agent codex"));
+            assert!(answers[0].capped, "a capped request's answer stays capped");
         }
         boot(&store, &state, &sessions, &agent, &hub).await;
         assert_eq!(agent.0.lock().unwrap().len(), 1, "given once");

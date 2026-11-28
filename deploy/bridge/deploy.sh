@@ -11,5 +11,9 @@ TARGET="${TARGET:-aarch64-unknown-linux-musl}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/aidaemon_relay}"
 (cd "$root" && cargo zigbuild --release -p aidaemon-bridge --target "$TARGET")
 bin="$root/target/$TARGET/release/aidaemon-bridge"
-scp -i "$SSH_KEY" "$bin" "$HOST:/tmp/aidaemon-bridge"
-ssh -i "$SSH_KEY" "$HOST" 'sudo install -m 0755 /tmp/aidaemon-bridge /usr/local/bin/aidaemon-bridge && rm /tmp/aidaemon-bridge && sudo systemctl restart aidaemon-bridge && systemctl is-active aidaemon-bridge'
+sum="$(shasum -a 256 "$bin" | cut -d' ' -f1)"
+# Staged in a folder only the deploy user can write (not a shared /tmp
+# path another account could swap), and checked before root installs it.
+stage="$(ssh -i "$SSH_KEY" "$HOST" 'mktemp -d')"
+scp -i "$SSH_KEY" "$bin" "$HOST:$stage/aidaemon-bridge"
+ssh -i "$SSH_KEY" "$HOST" "echo '$sum  $stage/aidaemon-bridge' | sha256sum -c - && sudo install -m 0755 '$stage/aidaemon-bridge' /usr/local/bin/aidaemon-bridge && rm -rf '$stage' && sudo systemctl restart aidaemon-bridge && systemctl is-active aidaemon-bridge"

@@ -158,12 +158,35 @@ pub(crate) fn check(
     }
 }
 
+/// Folders right under home that start programs or hold the system's own
+/// settings (login items, launch agents, the user's `PATH`): a project
+/// there would let a run write what runs later, outside any ceiling.
+const NOT_PROJECTS: [&str; 5] = ["Library", "AppData", "Applications", "bin", "Start Menu"];
+
 /// A project folder an e-ink device may name: inside the home folder, with
-/// no hidden part (`.ssh`, `.config`) and no `..`.
+/// no hidden part (`.ssh`, `.config`), no `..`, not one of
+/// [`NOT_PROJECTS`], and still so once symbolic links are followed.
 fn check_project_folder(path: &str, home: Option<&Path>) -> Result<(), ProtocolError> {
     let Some(home) = home else {
         return Err(refused("No home folder to make projects in"));
     };
+    let full = check_named_folder(path, home)?;
+    // Where it really is: the deepest part that exists, links followed.
+    let mut existing = full.as_path();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => break,
+        }
+    }
+    if let (Ok(real), Ok(real_home)) = (existing.canonicalize(), home.canonicalize()) {
+        let rest = full.strip_prefix(existing).unwrap_or(Path::new(""));
+        check_named_folder(&real.join(rest).to_string_lossy(), &real_home)?;
+    }
+    Ok(())
+}
+
+fn check_named_folder(path: &str, home: &Path) -> Result<PathBuf, ProtocolError> {
     let full: PathBuf = match path.strip_prefix("~/") {
         Some(rest) => home.join(rest),
         None if path == "~" => home.to_path_buf(),
@@ -189,7 +212,16 @@ fn check_project_folder(path: &str, home: Option<&Path>) -> Result<(), ProtocolE
             }
         }
     }
-    Ok(())
+    if let Some(Component::Normal(first)) = inside.components().next()
+        && NOT_PROJECTS
+            .iter()
+            .any(|name| first.to_string_lossy().eq_ignore_ascii_case(name))
+    {
+        return Err(refused(
+            "A project folder from this device may not be a system folder (Library, AppData, bin)",
+        ));
+    }
+    Ok(full)
 }
 
 /// A PNG within limits, judged from its header before anything decodes it.
@@ -377,6 +409,9 @@ mod tests {
             "/home/alice",
             "~",
             "/home/alicex/projects",
+            "~/Library/LaunchAgents",
+            "~/bin",
+            "/home/alice/AppData/Roaming",
         ] {
             assert!(
                 check_full(&create(bad), Some(home)).is_err(),
@@ -384,6 +419,27 @@ mod tests {
             );
         }
         assert!(check_full(&create("~/projects/garden"), None).is_err());
+    }
+
+    /// A link inside home that leads out of it, or into a hidden folder,
+    /// is judged where it leads.
+    #[cfg(unix)]
+    #[test]
+    fn project_folders_are_judged_where_their_links_lead() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join("away")).unwrap();
+        std::os::unix::fs::symlink(home.path().join(".ssh"), home.path().join("keys")).unwrap();
+        std::fs::create_dir(home.path().join("projects")).unwrap();
+        let home_dir = home.path();
+        assert!(check_full(&create("~/projects/garden"), Some(home_dir)).is_ok());
+        for bad in ["~/away", "~/away/new", "~/keys", "~/keys/new"] {
+            assert!(
+                check_full(&create(bad), Some(home_dir)).is_err(),
+                "{bad} passed"
+            );
+        }
     }
 
     #[test]

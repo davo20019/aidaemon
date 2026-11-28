@@ -264,6 +264,10 @@ pub(super) struct RunCall {
     pub(super) continues_session: bool,
     /// Tree binding for permit parking, completion updates, and cascading cancel.
     pub(super) peer_binding: Option<peers::ActivePeerBinding>,
+    /// The device ceiling of the request that launched it
+    /// ([`crate::device_cap`]): the turn that answers its chat when it ends
+    /// stays capped if the request was.
+    pub(super) device_cap: Option<crate::device_cap::DeviceCap>,
 }
 
 /// What a run shares with its entry in the tool's task table.
@@ -770,6 +774,10 @@ impl CliAgentTool {
             is_peer_run: false,
             continues_session: spec.continues.is_some(),
             peer_binding: root_peer_binding,
+            device_cap: prep
+                .spawn_family
+                .as_ref()
+                .map(|family| family.device_cap().clone()),
         };
 
         if prep.thread_wait.is_some() || prep.folder_wait.is_some() {
@@ -1288,6 +1296,10 @@ impl CliAgentTool {
             is_peer_run: true,
             continues_session: spec.spec.continues.is_some(),
             peer_binding: Some(spec.peer_binding),
+            device_cap: prep
+                .spawn_family
+                .as_ref()
+                .map(|family| family.device_cap().clone()),
         };
 
         let handles = self.run_handles();

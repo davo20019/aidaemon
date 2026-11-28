@@ -82,14 +82,25 @@ One app for Mac, Windows, Linux, iOS, Android, the browser and the terminal, whe
 - **Conversation details** show its Changes, Files, Steps, Terminal and Browser. The Terminal tab is that conversation's own shell on the daemon's computer, started in its folder; the agent can read it and type into it once you allow. The Browser tab shows the agent's browser live: take control, give it back, or point at something for it.
 - **Messages sent while work runs** wait under "Waiting to send", where you can edit or remove them, or press **Send now** to give one to the running work.
 - **Model and effort per conversation:** pick Auto or a model you pin, and Auto, Low, Medium or High effort.
-- **Automations, Memory and System pages:** your automations as cards you pause or run now; what it remembers, which you can delete; and versions, the model and its fallbacks, how the app reaches the daemon, token use, background jobs, health checks, chat bots and paired devices.
+- **Automations, Memory and System pages:** your automations as cards you pause or run now; what it remembers, which you can edit, archive, restore or delete; and versions, the model and its fallbacks, how the app reaches the daemon, token use, background jobs, health checks, chat bots and paired devices.
+- **Changes** lists uncommitted edits and the commits an agent made since the conversation began working in a repository, each with its diff.
 - **`aidaemon share-screen`** shares a Mac's screen with your daemon elsewhere so you can watch and drive it from the app (`--pair <link>` the first time, with a link from `aidaemon pair`; needs the `computer_use-macos` build).
+
+### E-ink readers
+A Kindle (or another e-ink reader whose browser cannot run the app) can reach your daemon too. Turn on **Settings → Connections → E-ink access**, open [eink.aidaemon.ai](https://eink.aidaemon.ai) on the reader, and pair it from Settings with the code it shows, or scan its QR code and type its 4-character check code. The reader then chats, follows and steers coding sessions (typed, or handwritten on its screen) and answers agent approvals.
+
+Its traffic goes through a bridge that relays end-to-end encrypted frames only: the project's (`bridge.aidaemon.ai`) or your own `aidaemon-bridge` ([deploy/](deploy/README.md)). Choose each reader's level under Paired devices: **View only**, **Limited** (its runs are held to Medium: anything that sends data out, deletes or changes configuration waits for your phone or computer) or **Full**. A reader never reaches a shell, settings, pairing or lasting grants. Its browser is no longer updated, so give it Full access only if you never browse elsewhere on it. Off by default; in `config.toml`:
+
+```toml
+[client_gateway.eink]
+bridge_url = "wss://bridge.aidaemon.ai/v1/daemon"
+```
 
 ### Chat apps
 Talk to it on **Telegram**, **Slack** (Socket Mode) or **Discord**. Run several bots; on Telegram, add new ones at runtime with `/connect`, no restart needed. Send pictures and it looks at them with a vision-capable model. Ask for an image and `generate_image` makes one (with a connected ChatGPT plan, whatever model the conversation runs on). Send voice notes: audio-capable models hear them directly; otherwise turn on local Whisper speech-to-text under `[files.stt]` (needs `whisper-cli`, a GGUF model, and `ffmpeg` for OGG/Opus). On Telegram, `/terminal` opens the hosted terminal Mini App with secure pairing, and `/agent [codex|claude|gemini|opencode] [dir]` starts a coding-agent session; `aidaemon attach <code>` continues it in a terminal on your computer, and `aidaemon share` makes a code to resume one from Telegram.
 
 ### Tools and agents
-Dozens of built-in tools: terminal, files, git, a headless Chrome browser, web search, HTTP requests with saved auth profiles, MCP servers, images and more. Each tool declares what it does: reading runs freely, side effects ask first. Hand complex work to **sub-agents** or to **coding agents** (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, Aider, found automatically). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first.
+Dozens of built-in tools: terminal, files, git, a headless Chrome browser, web search, HTTP requests with saved auth profiles, MCP servers, images and more. Each tool declares what it does: reading runs freely, side effects ask first. Hand complex work to **sub-agents** or to **coding agents** (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Antigravity, OpenCode, Aider, found automatically). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first.
 
 `manage_api` connects an API from its OpenAPI spec or GraphQL schema and checks the connection safely. Credentials stay in the OS keychain.
 

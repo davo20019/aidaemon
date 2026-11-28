@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-11-28
+
+### Added
+
+- **E-ink access: use AIdaemon from a Kindle's browser.** Turn it on under Settings → Connections → E-ink access (or `[client_gateway.eink] bridge_url`), open `eink.aidaemon.ai` on the reader and pair it from Settings with the code it shows, or scan its QR code and type its 4-character check code. The reader reaches the daemon through a bridge that only relays end-to-end encrypted frames (`bridge.aidaemon.ai`, or your own `aidaemon-bridge`). It can chat, follow and steer coding sessions (typed or handwritten), and answer agent approvals. Each reader has a level, set under Paired devices: **View only**, **Limited** (its runs are held to Medium: anything that sends data out, deletes or changes configuration waits for your phone or computer) or **Full**. A reader never reaches a shell, settings, pairing or lasting grants (protocol 1.62–1.63).
+- **Memory can be edited, archived and restored** from the Memory page, which shows the true total, a Needs review view and an Archived view (protocol 1.61).
+- **Paired devices can be removed** from Settings; each row says when it was paired and last used, and warns when unused for 14 days.
+- **OpenCode** (`opencode acp`) is a coding agent, found on `PATH` like the others, with every action checked.
+- **Changes shows what an agent committed:** each repository's commits since the conversation began working there, with their files and diffs (protocol 1.60).
+- **An agent's thread is no dead end:** copy or edit what it was asked into a follow-up, and Try again after a failed or stopped exchange.
+- **Watching automations adapt better:** outcomes are attributed to the actions that caused them, and the owner can steer a running one.
+
+### Changed
+
+- **Each coding agent says whether another agent may hand it work on its sign-in** (its maker's terms), checked at every delegated launch: Antigravity on its own Google sign-in takes handed work only in a Code session you drive and watch; OpenCode's plan sign-ins are left out of handed work.
+- **ChatGPT sign-in:** pressing Sign in while one is under way joins it instead of cancelling it; only the device that started it sees its start; a paired device's sign-in can finish in a browser on the daemon's computer, or with Paste and finish elsewhere.
+- **An agent's steps fold by one rule,** and each hand-off reads as one row; only an agent's first hand-off stands out.
+- **A coding agent is stopped only for changing or opening the daemon's database,** not for listing its files.
+- **The Memory list's duplicate check is fast** on thousands of memories (it took ~17 s).
+
+### Fixed
+
+- **A new conversation's first message shows as sending at once** instead of "Loading…".
+- **The owner's follow-up to a run may work in that run's folder** (a peer's worktree outside the project).
+- **A peer resumed later gets its kept branch in the folder it worked in,** and a peer worktree still in use is released only once its run ends.
+- **A coding agent whose turn ended finished is judged by its work** when its program then exits with an error.
+- **The app reads the coding agents again when one's run fails,** so the picker stops offering an agent taken out of use.
+- **OpenRouter usage reads expand a `${ENV_VAR}` key** written in `config.toml`.
+- **A device's sign-in challenge is logged at debug,** not every 2 s.
+
+### Security
+
+- **SQLite updated for CVE-2026-119375** (RUSTSEC-2026-0459): `libsqlite3-sys` 0.40 through `sqlx` 0.9.1.
+- **A run started or steered from a Limited e-ink reader stays capped** in the turn that answers once its background runs or coding agents end, after a restart, and in a task lead's executors.
+- **A follow-up's write access to a run's folder** applies only to a run of the same conversation, and never from a capped device.
+- **OpenCode asks before every edit, command and web fetch** (its own default allows them), so its checked mode really checks.
+- **E-ink project folders are judged where their links lead,** and system folders (`Library`, `AppData`, `bin`) are refused.
+- **The bridge limits pairing joins** per address and per session (guessing codes could take other readers' waiting pairings), and bounds its per-route records; the daemon's connector caps the connections a bridge can open.
+- **The e-ink page keeps no approval's exact request at rest,** clears its saved screens when sign-in is refused or a new pairing starts, and its content policy no longer allows `data:` images.
+- **Git output read for the Changes view is capped** at 32 MB, and the database guard catches SQLCipher key pragmas in here-documents.
+
 ## [0.25.1] - 2026-11-26
 
 ### Upgrading

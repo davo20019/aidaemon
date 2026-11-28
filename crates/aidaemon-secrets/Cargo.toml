@@ -22,7 +22,7 @@ default = ["keychain"]
 keychain = ["dep:keyring"]
 
 [dependencies]
-aidaemon-core = { version = "0.25.1", path = "../aidaemon-core" }
+aidaemon-core = { version = "0.25.2", path = "../aidaemon-core" }
 anyhow = "1"
 dirs = "7"
 dotenvy = "0.15"

@@ -786,6 +786,21 @@ impl TurnEngine<'_> {
         if channel_ctx.sender_ceiling.is_some() {
             spawn_family.device_cap().raise();
         }
+        // Remembered past a restart: a capped request's turn or jobs are
+        // continued capped. A message the owner sends from an uncapped
+        // device (a phone, the computer) clears it; the daemon's own
+        // continuations leave it as it is.
+        if channel_ctx.sender_ceiling.is_some()
+            || (user_role == UserRole::Owner
+                && channel_ctx.visibility != aidaemon_core::ChannelVisibility::Internal)
+        {
+            crate::device_cap::mark_session(
+                self.settings(),
+                session_id,
+                channel_ctx.sender_ceiling.is_some(),
+            )
+            .await;
+        }
         let owned_folders = spawn_family.owned_folders().clone();
         let mut detached_tools: std::collections::HashMap<String, Arc<dyn sdk::Tool>> =
             std::collections::HashMap::new();

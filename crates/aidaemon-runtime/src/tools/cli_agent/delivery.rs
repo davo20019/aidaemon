@@ -269,6 +269,9 @@ pub(super) async fn deliver_end(
             if let Some(run) = run.as_ref() {
                 run.step(Step::Reporting).await;
             }
+            // A request its device capped stays capped in the turn that
+            // answers it (`crate::device_cap`).
+            let capped = call.device_cap.as_ref().is_some_and(|cap| cap.is_capped());
             crate::owed_reports::owe(
                 &*handles.state,
                 crate::owed_reports::OwedReport {
@@ -276,6 +279,7 @@ pub(super) async fn deliver_end(
                     chat: notify_session_id.clone(),
                     parent_task_id: parent_task_id.clone(),
                     followup: followup.clone(),
+                    capped,
                 },
             )
             .await;
@@ -286,7 +290,7 @@ pub(super) async fn deliver_end(
                     user_text: followup,
                     status_tx: None,
                     user_role: aidaemon_tools::semantics::UserRole::Owner,
-                    channel_ctx: aidaemon_channels::context::ChannelContext::internal(),
+                    channel_ctx: crate::device_cap::continuation_context(capped),
                     heartbeat: None,
                     parent_task_id,
                     parent_tool_call_id: None,

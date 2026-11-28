@@ -10,12 +10,16 @@
 # Caddy sets to the real client address and never takes from a client), so
 # clients are not all counted as Caddy. Nothing writes access logs.
 #
-# Needs /tmp/aidaemon-bridge (deploy.sh's binary) and the bridge.aidaemon.ai
-# A/AAAA records pointing here. Keeps a copy of the old dns config.
+# Needs the bridge binary (deploy.sh's build) at $BRIDGE_BIN, staged where
+# only you can write (not a shared /tmp path), with BRIDGE_SHA256 its
+# sha256, and the bridge.aidaemon.ai A/AAAA records pointing here. Keeps a
+# copy of the old dns config.
 set -euxo pipefail
 
 CONTACT=relay@aidaemon.ai
-[ -f /tmp/aidaemon-bridge ] || { echo "copy the bridge binary to /tmp/aidaemon-bridge first" >&2; exit 1; }
+BRIDGE_BIN="${BRIDGE_BIN:?set BRIDGE_BIN to the staged bridge binary}"
+BRIDGE_SHA256="${BRIDGE_SHA256:?set BRIDGE_SHA256 to its sha256}"
+echo "$BRIDGE_SHA256  $BRIDGE_BIN" | sha256sum -c -
 
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v caddy >/dev/null; then
@@ -30,8 +34,8 @@ fi
 systemctl stop caddy || true
 
 # The bridge, on loopback behind Caddy.
-install -m 0755 /tmp/aidaemon-bridge /usr/local/bin/aidaemon-bridge
-rm -f /tmp/aidaemon-bridge
+install -m 0755 "$BRIDGE_BIN" /usr/local/bin/aidaemon-bridge
+rm -f "$BRIDGE_BIN"
 id aidaemon-bridge >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin aidaemon-bridge
 cat > /etc/systemd/system/aidaemon-bridge.service <<'UNIT'
 [Unit]

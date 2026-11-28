@@ -18,7 +18,7 @@ name = "aidaemon-bridge"
 path = "src/main.rs"
 
 [dependencies]
-aidaemon-bridge-proto = { version = "=0.25.1", path = "../aidaemon-bridge-proto" }
+aidaemon-bridge-proto = { version = "=0.25.2", path = "../aidaemon-bridge-proto" }
 axum = { version = "0.8", features = ["ws"] }
 getrandom = "0.4"
 hex = "0.4"
