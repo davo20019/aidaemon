@@ -55,6 +55,8 @@ members = [
     "crates/aidaemon-nodes",
     "crates/aidaemon-exposure",
     "crates/aidaemon-remote",
+    "crates/aidaemon-bridge-proto",
+    "crates/aidaemon-bridge",
     "crates/aidaemon-surfaces",
     "crates/aidaemon-shells",
     "crates/aidaemon-terminal-bridge",

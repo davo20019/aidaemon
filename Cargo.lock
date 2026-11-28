@@ -198,6 +198,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-bridge"
+version = "0.25.1"
+dependencies = [
+ "aidaemon-bridge-proto",
+ "axum",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "p256",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "aidaemon-bridge-proto"
+version = "0.25.1"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "hex",
+ "hkdf",
+ "hmac",
+ "p256",
+ "rand 0.10.3",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "workspace-hack",
+]
+
+[[package]]
 name = "aidaemon-channel-discord"
 version = "0.25.1"
 dependencies = [

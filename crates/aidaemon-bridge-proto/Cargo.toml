@@ -1,0 +1,28 @@
+[package]
+name = "aidaemon-bridge-proto"
+description = "The aidaemon bridge protocol: end-to-end encrypted frames between a browser without iroh (an e-ink reader) and the owner's daemon, through an untrusted relay; implementation crate of the aidaemon SDK, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-bridge-proto"
+readme = "SPEC.md"
+keywords = ["agent", "e2ee", "relay", "protocol"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+aes-gcm = "0.11"
+hex = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
+rand = "0.10"
+sha2 = "0.11"
+subtle = "2"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+serde_json = "1"
