@@ -128,3 +128,12 @@ select { min-height: 56px; }
 .composer .note { margin: 4px 0 0; min-height: 0; }
 .composer .actions { margin-top: 6px; }
 .composer .actions .btn { min-height: 44px; padding: 6px 12px; margin: 0 8px 0 0; }
+
+/* The reader pages a screen at a time (scrolling smears on e-ink). */
+.reader { font-size: 21px; line-height: 1.5; padding-bottom: 90px; }
+.pager {
+  position: -webkit-sticky; position: sticky; bottom: 0; z-index: 2;
+  display: flex; justify-content: space-between;
+  background: #fff; border-top: 3px solid #000; padding: 8px 0;
+}
+.pager .btn { margin: 0; }

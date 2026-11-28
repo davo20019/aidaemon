@@ -116,7 +116,7 @@
     return ((h % 12) || 12) + ':' + (m < 10 ? '0' : '') + m + (h < 12 ? ' AM' : ' PM');
   }
 
-  var TAB_OF = { pair: null, chat: 'chat', convo: 'chat', code: 'code', newcode: 'code', run: 'code',
+  var TAB_OF = { pair: null, reader: null, chat: 'chat', convo: 'chat', code: 'code', newcode: 'code', run: 'code',
     detail: 'code', approvals: 'approvals', approval: 'approvals', confirm: 'approvals' };
   var current = { view: 'chat', session: null, approval: null, run: null };
   // Bumped by each load of a screen, so an older load that finishes late
@@ -125,7 +125,7 @@
 
   // A conversation (or a run inside one) belongs to the tab it was opened from.
   function tabFor(view) {
-    if (view === 'convo') return current.from || 'chat';
+    if (view === 'convo' || view === 'reader') return current.from || 'chat';
     return TAB_OF[view];
   }
 
@@ -423,6 +423,7 @@
 
   async function openChat(s, from) {
     current.session = s;
+    current.showAll = false;
     current.from = from || 'chat';
     $('convo-title').textContent = (s && s.title) || 'New chat';
     $('convo-note').textContent = '';
@@ -448,6 +449,51 @@
     box.appendChild(el('h3', null, 'Messages'));
   }
 
+  // How much of a message shows in the conversation; the rest is a tap
+  // away in the reader, where it pages a screen at a time.
+  var PREVIEW_LINES = 6;
+  var PREVIEW_CHARS = 420;
+  var SHOWN_ITEMS = 8;
+
+  function preview(text) {
+    var lines = String(text || '').split('\n').filter(function (l, i, all) {
+      return l.trim() || (i > 0 && all[i - 1].trim());
+    });
+    var cut = lines.slice(0, PREVIEW_LINES).join('\n');
+    if (cut.length > PREVIEW_CHARS) cut = cut.slice(0, cut.lastIndexOf(' ', PREVIEW_CHARS) > 200 ? cut.lastIndexOf(' ', PREVIEW_CHARS) : PREVIEW_CHARS);
+    var whole = lines.join('\n');
+    return { text: cut.length < whole.length ? cut.replace(/\s+$/, '') + ' \u2026' : whole, more: cut.length < whole.length };
+  }
+
+  // A message body: a short one whole, a long one previewed with Read all.
+  function messageBody(container, text, from) {
+    var p = preview(text);
+    var body = el('div', 'msg-text');
+    richText(body, p.text);
+    container.appendChild(body);
+    if (p.more) {
+      var more = el('button', 'btn btn-small', 'Read all \u25b8');
+      more.type = 'button';
+      more.addEventListener('click', function () { openReader(text, from); });
+      container.appendChild(more);
+    }
+  }
+
+  var readerReturn = 0;
+  function openReader(text, from) {
+    readerReturn = window.pageYOffset;
+    $('reader-from').textContent = from || '';
+    var body = $('reader-body');
+    clear(body);
+    richText(body, text);
+    show('reader');
+  }
+
+  function pageBy(direction) {
+    // A screen at a time, keeping two lines from the last one.
+    window.scrollBy(0, direction * Math.max(200, window.innerHeight - 140));
+  }
+
   async function loadHistory() {
     var mine = ++loads.history;
     var box = $('convo-messages');
@@ -466,17 +512,23 @@
       items.push({ at: r.ended_at_ms || r.started_at_ms || 0, run: r });
     });
     items.sort(function (a, b) { return a.at - b.at; });
+    var hidden = current.showAll ? 0 : Math.max(0, items.length - SHOWN_ITEMS);
+    if (hidden) {
+      var earlier = el('button', 'btn', 'Show ' + hidden + ' earlier');
+      earlier.type = 'button';
+      earlier.addEventListener('click', function () { current.showAll = true; loadHistory(); });
+      box.appendChild(earlier);
+      items = items.slice(hidden);
+    }
     items.forEach(function (item) {
       if (item.run) {
         var r = item.run;
         var card = el('div', 'msg');
         card.appendChild(el('div', 'msg-from', (r.agent || 'Agent') + ' · ' + (PHASE_WORD[r.phase] || r.phase) +
           (r.took ? ' · ' + r.took : '')));
-        var answer = el('div', 'msg-text');
         // A run's result is { text, report, mismatches }: its answer is text.
         var said = r.result && typeof r.result.text === 'string' ? r.result.text : '';
-        richText(answer, said || (r.phase === 'running' ? 'Working…' : 'No answer recorded.'));
-        card.appendChild(answer);
+        messageBody(card, said || (r.phase === 'running' ? 'Working…' : 'No answer recorded.'), r.agent || 'Agent');
         var steps = el('button', 'btn btn-small', 'Steps \u25b8');
         steps.type = 'button';
         steps.addEventListener('click', function () { openRun(r); });
@@ -487,9 +539,7 @@
       var m = item.message;
       var d = el('div', m.role === 'user' ? 'msg msg-you' : 'msg');
       d.appendChild(el('div', 'msg-from', m.role === 'user' ? 'You' : 'aidaemon'));
-      var body = el('div', 'msg-text');
-      richText(body, m.text);
-      d.appendChild(body);
+      messageBody(d, m.text, m.role === 'user' ? 'You' : 'aidaemon');
       (m.attachments || []).forEach(function (a) {
         if (!a.url || !/^image\//.test(a.mime || '')) {
           d.appendChild(el('div', 'meta', 'File: ' + a.name));
@@ -1001,6 +1051,12 @@
     $('btn-clear-line').addEventListener('click', clearStrip);
     $('btn-clear-all').addEventListener('click', clearAllLines);
     setupStrip();
+    $('btn-page-down').addEventListener('click', function () { pageBy(1); });
+    $('btn-page-up').addEventListener('click', function () { pageBy(-1); });
+    $('btn-reader-back').addEventListener('click', function () {
+      show('convo');
+      window.scrollTo(0, readerReturn);
+    });
     setMode('type');
     $('btn-new-code').addEventListener('click', openNewCode);
     $('btn-start-code').addEventListener('click', startCode);
